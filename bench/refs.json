@@ -1,0 +1,368 @@
+﻿{
+    "_meta":  {
+                  "measured_at":  "2026-11-16",
+                  "machine":  "Windows 11 Pro 10.0.26200, 16 logical cores, 1920x1080 @ 96 DPI",
+                  "script":  "bench/measure_app.ps1 -Exe \u003cexe\u003e -Name \u003cname\u003e -Runs 5 (helpers in bench/BenchNative.ps1; screenshots via bench/screenshot_app.ps1)",
+                  "method":  "window=first visible top-level \u003e= 300x200; idle=start of first \u003e=1000ms span with every 250ms sample \u003c 2% of 16 logical cores (tree); RAM=sum private working set 10s after idle. All numbers are the median of 5 runs, none discarded; per-run values under \u0027runs\u0027.",
+                  "caveats":  [
+                                  "\u0027Cold start\u0027 here means a fresh process start with a warm OS file cache (the app had been launched before); the standby list was not flushed, so true first-boot disk-cold starts would be slower for every app.",
+                                  "cold_start_window_ms counts the first visible top-level window \u003e= 300x200 of the process tree. For Postman and Insomnia this window appears while the app is still showing its own in-window loading state, so cold_start_idle_ms is the better proxy for \u0027usable\u0027.",
+                                  "Idle detection takes the first 1 s span in which every 250 ms sample is \u003c 2% of total machine CPU (16 cores). A quiet gap during loading (for example while waiting on network) can end it early. Postman run 2 (2665 ms against 5.6-8.5 s for the others) is likely such a case.",
+                                  "idle_ram_mb = sum of private working set (Task Manager \u0027Memory\u0027 column), MB = 2^20 bytes, measured 10 s after idle. Private commit and full working set are in \u0027runs\u0027.",
+                                  "Each app was measured after its first-run onboarding had been completed for the screenshots, so runs show the normal steady-state launch (Postman in Lightweight API Client mode with one history entry; Insomnia in local Scratch Pad; BloomRPC with one small proto loaded; Bruno with its auto-created sample collection and one unsaved tab).",
+                                  "Screenshots: the outer window is set to 1600x1000 with SetWindowPos and the visible frame (DWMWA_EXTENDED_FRAME_BOUNDS) is captured with CopyFromScreen. Apps with a native Windows frame (Insomnia, BloomRPC) capture at 1586x993 because the invisible resize border is excluded. Postman\u0027s onboarding and login windows are fixed at 1280x800 and could not be resized."
+                              ]
+              },
+    "postman":  {
+                    "version":  "12.37.0",
+                    "source_url":  "https://dl.pstmn.io/download/latest/win64",
+                    "exe_path":  "%LOCALAPPDATA%\\Postman\\Postman.exe (Squirrel stub; runs %LOCALAPPDATA%\\Postman\\app-12.37.0\\Postman.exe)",
+                    "cold_start_window_ms":  1007,
+                    "cold_start_idle_ms":  5965,
+                    "idle_ram_mb":  406.1,
+                    "process_count":  5,
+                    "install_size_mb":  759.3,
+                    "screenshots":  [
+                                        "bench/refs/screens/postman.png",
+                                        "bench/refs/screens/postman-login.png",
+                                        "bench/refs/screens/postman-onboarding.png",
+                                        "bench/refs/screens/postman-request.png",
+                                        "bench/refs/screens/postman-response.png",
+                                        "bench/refs/screens/postman-timing.png"
+                                    ],
+                    "notes":  "Official Squirrel installer (signed \u0027Postman, Inc.\u0027), per-user silent install (--silent) to %LOCALAPPDATA%\\Postman. 759.3 MB includes the packages\\ nupkg cache (app-12.37.0 alone is 548.2 MB). First launch shows a sign-up wall (postman-login.png, fixed 1280x800); \u0027Continue without an account\u0027 then \u0027Open Lightweight API Client\u0027 gives a no-account HTTP client (postman.png = postman-request.png). Collections, environments and workspaces need an account. gRPC was not checked because no account was created. Measured launches open straight into the Lightweight client. The first window (\u0027Postman\u0027, about 1.0 s) is an in-window loader; the title changes to the request name when ready.",
+                    "timing_detail":  "Observed (postman-response.png, postman-timing.png): the response bar shows \u0027Status: 200 OK  Time: 143 ms  Size: 640 B\u0027. Hovering Time opens a waterfall table with a bar and duration per phase: Prepare 7.32 ms, Socket Initialization 49.14 ms, DNS Lookup 26.25 ms, TCP Handshake 9.18 ms, SSL Handshake 27.15 ms, Transfer Start (TTFB) 23.53 ms, Download 7.05 ms, Process 2.94 ms, Total 152.5 ms. This is the richest timing UI of the set.",
+                    "runs":  [
+                                 {
+                                     "run":  1,
+                                     "window_visible_ms":  1086,
+                                     "idle_ms":  5965,
+                                     "idle_ram_mb":  428.5,
+                                     "private_commit_mb":  568.1,
+                                     "working_set_mb":  722.7,
+                                     "process_count":  5,
+                                     "peak_cpu_pct":  18.8,
+                                     "first_window":  "1600x1000 \u0027Postman\u0027 [Chrome_WidgetWin_1]",
+                                     "final_window":  "1600x1000 \u0027https://example.com - My Workspace\u0027 [Chrome_WidgetWin_1]"
+                                 },
+                                 {
+                                     "run":  2,
+                                     "window_visible_ms":  1039,
+                                     "idle_ms":  2665,
+                                     "idle_ram_mb":  406.1,
+                                     "private_commit_mb":  552.2,
+                                     "working_set_mb":  700,
+                                     "process_count":  5,
+                                     "peak_cpu_pct":  6.2,
+                                     "first_window":  "1600x1000 \u0027Postman\u0027 [Chrome_WidgetWin_1]",
+                                     "final_window":  "1600x1000 \u0027https://example.com - My Workspace\u0027 [Chrome_WidgetWin_1]"
+                                 },
+                                 {
+                                     "run":  3,
+                                     "window_visible_ms":  1007,
+                                     "idle_ms":  8525,
+                                     "idle_ram_mb":  397.6,
+                                     "private_commit_mb":  537.4,
+                                     "working_set_mb":  691.5,
+                                     "process_count":  5,
+                                     "peak_cpu_pct":  16.2,
+                                     "first_window":  "1600x1000 \u0027Postman\u0027 [Chrome_WidgetWin_1]",
+                                     "final_window":  "1600x1000 \u0027https://example.com - My Workspace\u0027 [Chrome_WidgetWin_1]"
+                                 },
+                                 {
+                                     "run":  4,
+                                     "window_visible_ms":  978,
+                                     "idle_ms":  5570,
+                                     "idle_ram_mb":  429.7,
+                                     "private_commit_mb":  569.8,
+                                     "working_set_mb":  724.1,
+                                     "process_count":  5,
+                                     "peak_cpu_pct":  25.2,
+                                     "first_window":  "1600x1000 \u0027Postman\u0027 [Chrome_WidgetWin_1]",
+                                     "final_window":  "1600x1000 \u0027https://example.com - My Workspace\u0027 [Chrome_WidgetWin_1]"
+                                 },
+                                 {
+                                     "run":  5,
+                                     "window_visible_ms":  867,
+                                     "idle_ms":  6777,
+                                     "idle_ram_mb":  398.4,
+                                     "private_commit_mb":  537.3,
+                                     "working_set_mb":  692.5,
+                                     "process_count":  5,
+                                     "peak_cpu_pct":  14.8,
+                                     "first_window":  "1600x1000 \u0027Postman\u0027 [Chrome_WidgetWin_1]",
+                                     "final_window":  "1600x1000 \u0027https://example.com - My Workspace\u0027 [Chrome_WidgetWin_1]"
+                                 }
+                             ]
+                },
+    "insomnia":  {
+                     "version":  "13.4.0",
+                     "source_url":  "https://github.com/Kong/insomnia/releases/download/core%4013.4.0/Insomnia.Core-nsis-13.4.0.exe",
+                     "exe_path":  "bench\\refs\\insomnia\\app\\Insomnia.exe (2.8 MB stub; real binary Insomnia-origin-13.4.0.exe in the same dir)",
+                     "cold_start_window_ms":  2275,
+                     "cold_start_idle_ms":  6518,
+                     "idle_ram_mb":  673.1,
+                     "process_count":  7,
+                     "install_size_mb":  1802,
+                     "screenshots":  [
+                                         "bench/refs/screens/insomnia.png",
+                                         "bench/refs/screens/insomnia-console.png",
+                                         "bench/refs/screens/insomnia-login.png",
+                                         "bench/refs/screens/insomnia-request.png",
+                                         "bench/refs/screens/insomnia-response.png"
+                                     ],
+                     "notes":  "Insomnia.Core-13.4.0.zip on the release page contains only the macOS Insomnia.app, so the signed (Kong Inc.) NSIS installer was used: per-user silent install /S /currentuser /D=bench\\refs\\insomnia\\app. 1802 MB on disk (resources\\ alone is 1234.5 MB). First launch shows a \u0027Welcome to 13.3\u0027 dialog (insomnia.png), then a login wall (insomnia-login.png); \u0027Use local Scratch Pad\u0027 works without an account (limited: one scratch collection, no sync). Measured launches open into the Scratch Pad. HTTPS to example.com failed in Insomnia with \u0027SSL peer certificate or SSH remote key was not OK\u0027, while Bruno and Postman succeeded on the same machine; http:// worked (insomnia-response.png).",
+                     "timing_detail":  "Observed (insomnia-response.png, insomnia-console.png): three badges above the response, status (\u0027200 OK\u0027), total time (\u002782 ms\u0027) and size (\u0027577 B\u0027), plus a history dropdown (\u0027Just Now\u0027). The Console tab is a libcurl verbose log (preparing request, connect target IP:port, request and response headers, \u0027Received 589 B chunk\u0027, connection kept) with no per-phase durations. There is no DNS/TCP/TLS/TTFB breakdown in the UI. gRPC requests were not exercised.",
+                     "runs":  [
+                                  {
+                                      "run":  1,
+                                      "window_visible_ms":  2364,
+                                      "idle_ms":  6444,
+                                      "idle_ram_mb":  681.7,
+                                      "private_commit_mb":  808.9,
+                                      "working_set_mb":  1065,
+                                      "process_count":  7,
+                                      "peak_cpu_pct":  21.6,
+                                      "first_window":  "1600x1000 \u0027Insomnia 13.4.0\u0027 [Chrome_WidgetWin_1]",
+                                      "final_window":  "1600x1000 \u0027Insomnia 13.4.0\u0027 [Chrome_WidgetWin_1]"
+                                  },
+                                  {
+                                      "run":  2,
+                                      "window_visible_ms":  2248,
+                                      "idle_ms":  6284,
+                                      "idle_ram_mb":  677.4,
+                                      "private_commit_mb":  807.1,
+                                      "working_set_mb":  1055.5,
+                                      "process_count":  7,
+                                      "peak_cpu_pct":  21.8,
+                                      "first_window":  "1600x1000 \u0027Insomnia 13.4.0\u0027 [Chrome_WidgetWin_1]",
+                                      "final_window":  "1600x1000 \u0027Insomnia 13.4.0\u0027 [Chrome_WidgetWin_1]"
+                                  },
+                                  {
+                                      "run":  3,
+                                      "window_visible_ms":  2240,
+                                      "idle_ms":  6518,
+                                      "idle_ram_mb":  673.1,
+                                      "private_commit_mb":  801.8,
+                                      "working_set_mb":  1051.5,
+                                      "process_count":  7,
+                                      "peak_cpu_pct":  20.9,
+                                      "first_window":  "1600x1000 \u0027Insomnia 13.4.0\u0027 [Chrome_WidgetWin_1]",
+                                      "final_window":  "1600x1000 \u0027Insomnia 13.4.0\u0027 [Chrome_WidgetWin_1]"
+                                  },
+                                  {
+                                      "run":  4,
+                                      "window_visible_ms":  2542,
+                                      "idle_ms":  8215,
+                                      "idle_ram_mb":  610,
+                                      "private_commit_mb":  711.6,
+                                      "working_set_mb":  982.1,
+                                      "process_count":  7,
+                                      "peak_cpu_pct":  20.5,
+                                      "first_window":  "1600x1000 \u0027Insomnia 13.4.0\u0027 [Chrome_WidgetWin_1]",
+                                      "final_window":  "1600x1000 \u0027Insomnia 13.4.0\u0027 [Chrome_WidgetWin_1]"
+                                  },
+                                  {
+                                      "run":  5,
+                                      "window_visible_ms":  2275,
+                                      "idle_ms":  7386,
+                                      "idle_ram_mb":  611.1,
+                                      "private_commit_mb":  712.8,
+                                      "working_set_mb":  983.2,
+                                      "process_count":  7,
+                                      "peak_cpu_pct":  20.1,
+                                      "first_window":  "1600x1000 \u0027Insomnia 13.4.0\u0027 [Chrome_WidgetWin_1]",
+                                      "final_window":  "1600x1000 \u0027Insomnia 13.4.0\u0027 [Chrome_WidgetWin_1]"
+                                  }
+                              ]
+                 },
+    "bruno":  {
+                  "version":  "4.3.0",
+                  "source_url":  "https://github.com/usebruno/bruno/releases/download/v4.3.0/bruno_4.3.0_x64_win.zip",
+                  "exe_path":  "bench\\refs\\bruno\\Bruno.exe",
+                  "cold_start_window_ms":  6411,
+                  "cold_start_idle_ms":  7269,
+                  "idle_ram_mb":  471.9,
+                  "process_count":  4,
+                  "install_size_mb":  537.7,
+                  "screenshots":  [
+                                      "bench/refs/screens/bruno.png",
+                                      "bench/refs/screens/bruno-request.png",
+                                      "bench/refs/screens/bruno-response.png",
+                                      "bench/refs/screens/bruno-timeline.png"
+                                  ],
+                  "notes":  "Official portable x64 zip, no install. No account needed. First launch shows a \u0027Welcome to Bruno\u0027 modal over the workspace (bruno.png) and auto-creates \u0027Sample API Collection\u0027 in %USERPROFILE%\\Documents\\bruno. \u0027Start with a Request\u0027 opens an untitled HTTP request (bruno-request.png). Bruno shows its window only when the UI is ready (about 6.4 s), so window and idle times are close together. It was the slowest to show a window of the four.",
+                  "timing_detail":  "Observed (bruno-response.png, bruno-timeline.png): the response header shows status (\u0027200 OK\u0027), total time (\u0027121ms\u0027) and size (\u0027577B\u0027). The Timeline tab lists each sent request (status, method, URL, relative age), and each entry expands into Request/Response/Network sub-tabs. The Request sub-tab shows the headers and body that were sent. The Network sub-tab was not opened. No phase breakdown (DNS/TCP/TLS/TTFB) was visible in the main response UI.",
+                  "runs":  [
+                               {
+                                   "run":  1,
+                                   "window_visible_ms":  6411,
+                                   "idle_ms":  7269,
+                                   "idle_ram_mb":  471.9,
+                                   "private_commit_mb":  589.6,
+                                   "working_set_mb":  730.1,
+                                   "process_count":  4,
+                                   "peak_cpu_pct":  13.6,
+                                   "first_window":  "1600x1000 \u0027Bruno\u0027 [Chrome_WidgetWin_1]",
+                                   "final_window":  "1600x1000 \u0027Bruno\u0027 [Chrome_WidgetWin_1]"
+                               },
+                               {
+                                   "run":  2,
+                                   "window_visible_ms":  6460,
+                                   "idle_ms":  7278,
+                                   "idle_ram_mb":  473.2,
+                                   "private_commit_mb":  597.6,
+                                   "working_set_mb":  731.3,
+                                   "process_count":  4,
+                                   "peak_cpu_pct":  15.3,
+                                   "first_window":  "1600x1000 \u0027Bruno\u0027 [Chrome_WidgetWin_1]",
+                                   "final_window":  "1600x1000 \u0027Bruno\u0027 [Chrome_WidgetWin_1]"
+                               },
+                               {
+                                   "run":  3,
+                                   "window_visible_ms":  6478,
+                                   "idle_ms":  7300,
+                                   "idle_ram_mb":  471.2,
+                                   "private_commit_mb":  590.5,
+                                   "working_set_mb":  729.3,
+                                   "process_count":  4,
+                                   "peak_cpu_pct":  17.1,
+                                   "first_window":  "1600x1000 \u0027Bruno\u0027 [Chrome_WidgetWin_1]",
+                                   "final_window":  "1600x1000 \u0027Bruno\u0027 [Chrome_WidgetWin_1]"
+                               },
+                               {
+                                   "run":  4,
+                                   "window_visible_ms":  5416,
+                                   "idle_ms":  6225,
+                                   "idle_ram_mb":  469.6,
+                                   "private_commit_mb":  587.6,
+                                   "working_set_mb":  727.8,
+                                   "process_count":  4,
+                                   "peak_cpu_pct":  16.8,
+                                   "first_window":  "1600x1000 \u0027Bruno\u0027 [Chrome_WidgetWin_1]",
+                                   "final_window":  "1600x1000 \u0027Bruno\u0027 [Chrome_WidgetWin_1]"
+                               },
+                               {
+                                   "run":  5,
+                                   "window_visible_ms":  6397,
+                                   "idle_ms":  7211,
+                                   "idle_ram_mb":  472.8,
+                                   "private_commit_mb":  596.3,
+                                   "working_set_mb":  731.5,
+                                   "process_count":  4,
+                                   "peak_cpu_pct":  19.9,
+                                   "first_window":  "1600x1000 \u0027Bruno\u0027 [Chrome_WidgetWin_1]",
+                                   "final_window":  "1600x1000 \u0027Bruno\u0027 [Chrome_WidgetWin_1]"
+                               }
+                           ]
+              },
+    "bloomrpc":  {
+                     "version":  "1.5.3",
+                     "source_url":  "https://github.com/bloomrpc/bloomrpc/releases/download/1.5.3/BloomRPC-Setup-1.5.3.exe",
+                     "exe_path":  "bench\\refs\\bloomrpc\\app\\BloomRPC.exe",
+                     "cold_start_window_ms":  1840,
+                     "cold_start_idle_ms":  2175,
+                     "idle_ram_mb":  161.1,
+                     "process_count":  4,
+                     "install_size_mb":  203,
+                     "screenshots":  [
+                                         "bench/refs/screens/bloomrpc.png",
+                                         "bench/refs/screens/bloomrpc-request.png",
+                                         "bench/refs/screens/bloomrpc-response.png"
+                                     ],
+                     "notes":  "Last release (repo archived). Only an installer is published for Windows. The NSIS installer is NOT Authenticode-signed; it was downloaded from the official GitHub release and installed per-user silently with /S /currentuser /D=bench\\refs\\bloomrpc\\app. No account. The main window is the request view (bloomrpc.png). bloomrpc-request.png has a small demo proto (demo.Greeter/SayHello) imported, and bloomrpc-response.png shows a call to the default 0.0.0.0:3009 with no server running. BloomRPC does not keep the window size, so it relaunches at 1324x728 and its RAM was measured at that size, unlike the others (1600x1000). It is Electron 4-era and gRPC-only, which explains the smaller footprint.",
+                     "timing_detail":  "Observed (bloomrpc-response.png): only one total elapsed time, shown in seconds in the top-right of the response pane (\u00272.062s\u0027 for a failed connect). No status badge apart from the error JSON, no size, no phases, and no per-message timing for streams.",
+                     "runs":  [
+                                  {
+                                      "run":  1,
+                                      "window_visible_ms":  1937,
+                                      "idle_ms":  2233,
+                                      "idle_ram_mb":  161.1,
+                                      "private_commit_mb":  231.5,
+                                      "working_set_mb":  343.7,
+                                      "process_count":  4,
+                                      "peak_cpu_pct":  8.2,
+                                      "first_window":  "1324x728 \u0027BloomRPC\u0027 [Chrome_WidgetWin_1]",
+                                      "final_window":  "1324x728 \u0027BloomRPC\u0027 [Chrome_WidgetWin_1]"
+                                  },
+                                  {
+                                      "run":  2,
+                                      "window_visible_ms":  1797,
+                                      "idle_ms":  2349,
+                                      "idle_ram_mb":  185,
+                                      "private_commit_mb":  263.1,
+                                      "working_set_mb":  374.9,
+                                      "process_count":  4,
+                                      "peak_cpu_pct":  14.4,
+                                      "first_window":  "1324x728 \u0027BloomRPC\u0027 [Chrome_WidgetWin_1]",
+                                      "final_window":  "1324x728 \u0027BloomRPC\u0027 [Chrome_WidgetWin_1]"
+                                  },
+                                  {
+                                      "run":  3,
+                                      "window_visible_ms":  1893,
+                                      "idle_ms":  2175,
+                                      "idle_ram_mb":  159.1,
+                                      "private_commit_mb":  228.4,
+                                      "working_set_mb":  341.7,
+                                      "process_count":  4,
+                                      "peak_cpu_pct":  10.2,
+                                      "first_window":  "1324x728 \u0027BloomRPC\u0027 [Chrome_WidgetWin_1]",
+                                      "final_window":  "1324x728 \u0027BloomRPC\u0027 [Chrome_WidgetWin_1]"
+                                  },
+                                  {
+                                      "run":  4,
+                                      "window_visible_ms":  1839,
+                                      "idle_ms":  2122,
+                                      "idle_ram_mb":  161.2,
+                                      "private_commit_mb":  230.5,
+                                      "working_set_mb":  343.7,
+                                      "process_count":  4,
+                                      "peak_cpu_pct":  10.4,
+                                      "first_window":  "1324x728 \u0027BloomRPC\u0027 [Chrome_WidgetWin_1]",
+                                      "final_window":  "1324x728 \u0027BloomRPC\u0027 [Chrome_WidgetWin_1]"
+                                  },
+                                  {
+                                      "run":  5,
+                                      "window_visible_ms":  1840,
+                                      "idle_ms":  2119,
+                                      "idle_ram_mb":  160.3,
+                                      "private_commit_mb":  232.4,
+                                      "working_set_mb":  342.8,
+                                      "process_count":  4,
+                                      "peak_cpu_pct":  9.5,
+                                      "first_window":  "1324x728 \u0027BloomRPC\u0027 [Chrome_WidgetWin_1]",
+                                      "final_window":  "1324x728 \u0027BloomRPC\u0027 [Chrome_WidgetWin_1]"
+                                  }
+                              ]
+                 },
+    "grpcurl":  {
+                    "version":  "1.9.4",
+                    "source_url":  "https://github.com/fullstorydev/grpcurl/releases/download/v1.9.4/grpcurl_1.9.4_windows_x86_64.zip",
+                    "exe_path":  "bench\\refs\\grpcurl\\grpcurl.exe",
+                    "install_size_mb":  30.5,
+                    "screenshots":  [
+
+                                    ],
+                    "cold_start_window_ms":  null,
+                    "cold_start_idle_ms":  null,
+                    "idle_ram_mb":  null,
+                    "process_count":  null,
+                    "notes":  "CLI gRPC baseline, not measured with measure_app.ps1 (no window). Size covers the zip contents (grpcurl.exe plus LICENSE).",
+                    "timing_detail":  "From \u0027grpcurl -help\u0027: -v enables verbose output (headers and trailers). -vv enables very verbose output that \u0027includes timing data\u0027. The exact phases printed were not observed because no gRPC server was run in this step."
+                },
+    "curl":  {
+                 "version":  "8.22.0 (Windows) libcurl/8.22.0 Schannel zlib/1.3.2 WinIDN WinLDAP",
+                 "source_url":  "built into Windows (C:\\Windows\\System32\\curl.exe)",
+                 "exe_path":  "C:\\Windows\\System32\\curl.exe",
+                 "install_size_mb":  0.79,
+                 "screenshots":  [
+
+                                 ],
+                 "cold_start_window_ms":  null,
+                 "cold_start_idle_ms":  null,
+                 "idle_ram_mb":  null,
+                 "process_count":  null,
+                 "notes":  "REST baseline. CLI, not measured with measure_app.ps1. Schannel TLS (uses the Windows certificate store).",
+                 "timing_detail":  "No timing by default. -w/--write-out exposes time_namelookup (DNS), time_connect (TCP), time_appconnect (TLS), time_pretransfer, time_starttransfer (TTFB) and time_total (cumulative seconds from the start, with microsecond resolution), and -v gives a connection log. Example: curl -s -o NUL -w \u0027dns=%{time_namelookup} tcp=%{time_connect} tls=%{time_appconnect} ttfb=%{time_starttransfer} total=%{time_total}\u0027 URL"
+             }
+}

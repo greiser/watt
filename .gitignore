@@ -1,0 +1,5 @@
+build/
+out/
+.vcpkg-install.log
+bench/refs/
+*.user

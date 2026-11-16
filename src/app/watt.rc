@@ -1,0 +1,2 @@
+// Windows resources: manifest for per-monitor DPI awareness + common controls v6.
+#include "wx/msw/wx.rc"
