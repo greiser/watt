@@ -109,6 +109,10 @@ struct GrpcResponse {
   // request was already in flight by then, and reflect_ms runs from READY to the schema.
   Timing timing;
   double reflect_ms = 0;        // auto-reflection before the call (also inside timing.total_ms)
+  // What the channel dials after watt's own name resolution, as a gRPC target URI
+  // ("ipv4:127.0.0.1:50051", "ipv4:a:443,b:443" for several addresses, "dns:///host:443" when
+  // gRPC resolves itself). Empty when no channel was leased (gRPC-Web, local failures).
+  std::string peer;
 };
 
 // Message format for requests and responses. Text is protobuf text format (grpcurl -format text):

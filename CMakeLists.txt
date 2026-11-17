@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.25)
+﻿cmake_minimum_required(VERSION 3.25)
 project(watt VERSION 0.1.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
@@ -73,6 +73,15 @@ if(APP_SRC)
   # wx::webview: Edge WebView2 for the response HTML preview. Create the control lazily (first
   # Preview), so the browser processes never start for users who do not open it.
   target_link_libraries(watt PRIVATE watt_core wx::core wx::base wx::stc wx::aui wx::webview)
+  if(MSVC)
+    # Start-up: DLLs only some features need are delay-loaded, so the loader neither maps nor
+    # relocates them (nor runs their DllMain / static init) until first use.
+    set(WATT_DELAYLOAD libprotobuf.dll cares.dll libssl-3-x64.dll libcrypto-3-x64.dll WebView2Loader.dll)
+    foreach(d ${WATT_DELAYLOAD})
+      target_link_options(watt PRIVATE "/DELAYLOAD:${d}")
+    endforeach()
+    target_link_libraries(watt PRIVATE delayimp)
+  endif()
 endif()
 
 # ---------------------------------------------------------------- test server (gRPC + HTTP)

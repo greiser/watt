@@ -4000,6 +4000,7 @@ std::shared_ptr<GrpcCall::Core> make_core(const std::shared_ptr<GrpcClient::Impl
     resp.timing.connect_ms = p.lease.connect_ms;
     resp.timing.tls_ms = p.lease.tls_ms;
     resp.timing.connection_reused = p.lease.reused;
+    resp.peer = p.lease.uri;
   }
   if (!p.method) return local_fail(p.code, p.error);
   if (target.web && p.method->client_streaming()) {
@@ -4046,6 +4047,7 @@ std::shared_ptr<GrpcCall::Core> make_core(const std::shared_ptr<GrpcClient::Impl
   }
   core->resp.reflect_ms = p.reflect_ms;
   core->resp.timing = resp.timing;
+  core->resp.peer = resp.peer;
 
   std::string err;
   const bool filled = fill(*core, err);
@@ -4076,6 +4078,8 @@ std::shared_ptr<GrpcCall::Core> make_core(const std::shared_ptr<GrpcClient::Impl
     core->resp.timing.connect_ms = lease.connect_ms;
     core->resp.timing.tls_ms = lease.tls_ms;
     core->resp.timing.connection_reused = lease.reused;
+    core->resp.peer = lease.uri;
+    resp.peer = lease.uri;
     core->lease_channel = lease.ch;
     if (lease.refused) {
       resp.timing = core->resp.timing;

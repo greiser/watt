@@ -1,2 +1,10 @@
-// Windows resources: manifest for per-monitor DPI awareness + common controls v6.
+// Windows resources: wx's standard icons/bitmaps.
+//
+// No RT_MANIFEST here on purpose: CMake links MSVC executables with /MANIFEST:EMBED,ID=1, so a
+// manifest resource with ID 1 in this file fails the link (CVT1100 duplicate resource). The
+// linker-generated manifest gets common controls v6 from the #pragma comment(linker,
+// "/manifestdependency:...") in app.cpp, and per-monitor DPI awareness v2 is set in app.cpp
+// before the first window exists (SetProcessDpiAwarenessContext), which is equivalent to
+// <dpiAwareness>PerMonitorV2</dpiAwareness>.
+#define wxUSE_NO_MANIFEST 1
 #include "wx/msw/wx.rc"
