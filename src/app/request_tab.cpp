@@ -586,9 +586,9 @@ void RequestTab::realize() {
                                 wxSP_LIVE_UPDATE | wxSP_NOBORDER | wxSP_THIN_SASH);
   split_->SetSashGravity(0.5);
   split_->SetMinimumPaneSize(FromDIP(240));
-  // The response view (status strip, waterfall, body editor, tables: ~70 ms cold) is not needed
-  // for the first paint: a plain pane in its colour stands in until shortly after the tab is
-  // shown (see on_idle), or until something has to be displayed (response()).
+  // The response view is not needed for the first paint: a pane in its colour stands in until the
+  // tab's first idle after it is shown (see on_idle, 6-8 ms build), or until something has to be
+  // displayed (response()).
   resp_ph_ = new wxPanel(split_, wxID_ANY);
   resp_ph_->SetBackgroundColour(rv::Theme::get().bg);
   // Until the real view is built (it waits for a quiet moment), the pane is never blank: it
@@ -638,11 +638,12 @@ void RequestTab::center_sash() {
 void RequestTab::on_idle(wxIdleEvent& e) {
   e.Skip();
   if (resp_ || !IsShownOnScreen()) return;
-  // Build the response view a little after the tab first shows, not at its first idle: the
-  // first paint and the first keystrokes in the URL field come first, and the ~70 ms build
-  // does not pile onto the window's own start-up work.
+  // Build the response view at the tab's first idle after it is shown: the first paint has
+  // happened, and the build is cheap now (6-8 ms measured; its pages are built lazily), so there
+  // is no reason to wait for a quiet moment and leave the pane empty. response() keeps the
+  // keyboard focus where it is, so a URL being typed is not disturbed.
   Unbind(wxEVT_IDLE, &RequestTab::on_idle, this);
-  resp_timer_.StartOnce(kResponseViewDelayMs);
+  response();
 }
 
 void RequestTab::on_resp_timer() {
