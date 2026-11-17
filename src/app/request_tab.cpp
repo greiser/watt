@@ -945,12 +945,17 @@ void RequestTab::send_http(Clock::time_point click) {
   // Files from outside the workspace and OS environment variables need the user's consent
   // (Workspace::blocked_files / blocked_env_vars). http_to_send() refuses them regardless, so
   // this is the prompt, not the gate. Only requests that go through http_to_send can reach them.
+  // Time the user spends answering a consent prompt is not request time: after any prompt the
+  // clock restarts, so queue_ms / total_ms (and asserts on res.responseTime) stay honest.
+  bool prompted = false;
   if (ws && needs_workspace(req_)) {
+    prompted = !ws->blocked_env_vars(req_).empty();
     if (std::string err; !confirm_env_vars(*ws, req_, this, &err)) {
       response()->show_error(err);
       return;
     }
     for (const auto& p : ws->blocked_files(req_)) {
+      prompted = true;
       const auto ans = wxMessageBox(
           wxString::Format("This request wants to upload\n\n%s\n\nfrom outside the workspace. Allow it?",
                            p.wstring()),
@@ -964,6 +969,7 @@ void RequestTab::send_http(Clock::time_point click) {
     // NTLM / Negotiate with no user name signs in as the current Windows user: a cloned
     // workspace could aim that at a hostile host, so each host needs the user's consent.
     for (const auto& host : ws->blocked_sso_hosts(req_)) {
+      prompted = true;
       const auto ans = wxMessageBox(
           wxString::Format("This request signs in to\n\n%s\n\nwith your Windows account (%s, no user name "
                            "given). Only allow this for servers you trust. Allow it for this workspace?",
@@ -982,6 +988,7 @@ void RequestTab::send_http(Clock::time_point click) {
   if (ws && (!req_.pre_script.empty() || !req_.post_script.empty())) {
     run_scripts = ws->scripts_trusted();
     if (!run_scripts) {
+      prompted = true;
       const auto ans = wxMessageBox(
           wxString::Format("Requests in this workspace contain scripts:\n\n%s\n\nScripts run in a sandbox "
                            "(no file or process access; network only through watt's own checks), but they "
@@ -993,6 +1000,7 @@ void RequestTab::send_http(Clock::time_point click) {
       scripts_skipped = !run_scripts;  // sent without its scripts; the response says so
     }
   }
+  if (prompted) click = Clock::now();
   const uint64_t gen = ++gen_;
   in_flight_ = true;
   sent_at_ = click;
@@ -1098,10 +1106,12 @@ void RequestTab::send_grpc(Clock::time_point click) {
   }
   Workspace* ws = ctx_.workspace ? ctx_.workspace() : nullptr;
   if (ws && grpc_has_vars(req_)) {
+    const bool prompted = !ws->blocked_env_vars(req_).empty();
     if (std::string err; !confirm_env_vars(*ws, req_, this, &err)) {
       response()->show_error(err);
       return;
     }
+    if (prompted) click = Clock::now();  // time spent in the prompt is not request time
   }
   const uint64_t gen = ++gen_;
   in_flight_ = true;
