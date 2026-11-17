@@ -3084,6 +3084,12 @@ GrpcSchema GrpcClient::load_protoset(const std::vector<std::string>& protoset_pa
   std::vector<std::string> order;  // file names in the order the sets list them
   std::string err;
   for (const auto& p : protoset_paths) {
+    // A descriptor set is read straight from disk: only absolute paths, never relative to the
+    // process cwd (callers pass Workspace::schema_plan() paths, already anchored and checked).
+    if (!u8path(p).is_absolute()) {
+      err += (err.empty() ? "" : "\n") + p + ": a descriptor set path must be absolute";
+      continue;
+    }
     std::ifstream f(u8path(p), std::ios::binary);
     if (!f) {
       err += (err.empty() ? "" : "\n") + p + ": cannot open";

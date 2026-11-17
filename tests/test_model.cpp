@@ -2948,6 +2948,27 @@ TEST_CASE("UNC and outside schema paths are blocked without touching them", "[gr
     // otherwise it is a refused virtual name. Either way it is never loaded unchecked.
     CHECK((!pb.invalid.empty() || !pb.blocked.empty()));
   }
+  // A relative descriptor set that is not a file under the workspace is never passed on as a
+  // virtual name (the loader would open it against the process cwd).
+  for (const std::string& ps : {std::string("schema.protoset"), std::string("sub/x.pb"), std::string("a.desc")}) {
+    SavedRequest b;
+    b.kind = RequestKind::Grpc;
+    b.proto_files = {ps};
+    INFO(ps);
+    const auto pb = ws.schema_plan(b);
+    CHECK(pb.proto_files.empty());
+    CHECK(pb.invalid.size() == 1);
+  }
+  // One that is a file under the workspace is anchored there, absolute.
+  spit(root / "sets" / "s.protoset", "x");
+  {
+    SavedRequest b;
+    b.kind = RequestKind::Grpc;
+    b.proto_files = {"sets/s.protoset"};
+    const auto pb = ws.schema_plan(b);
+    REQUIRE(pb.proto_files.size() == 1);
+    CHECK(fs::path(pb.proto_files[0]).is_absolute());
+  }
   for (const std::string& dev : {std::string("\\??\\C:\\Windows\\win.ini"), std::string("\\\\?\\C:\\Windows\\win.ini"),
                                  std::string("\\\\.\\pipe\\x")}) {
     SavedRequest d;

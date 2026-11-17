@@ -671,6 +671,18 @@ TEST_CASE("protoset files load like proto sources", "[grpc][proto]") {
   CHECK(r.reflect_ms == 0);  // the protoset supplied the schema
   auto bad = p.load_protoset({(proto_dir() / "test.proto").string()});
   CHECK_FALSE(bad.ok);
+  // A relative descriptor-set path is refused, even when it exists relative to the cwd.
+  {
+    const auto old_cwd = fs::current_path();
+    fs::current_path(tmp);
+    GrpcClient q;
+    auto rel = q.load_protoset({"test.protoset"});
+    auto rel2 = q.load_proto_files({"test.protoset"}, {});
+    fs::current_path(old_cwd);
+    CHECK_FALSE(rel.ok);
+    CHECK(rel.error.find("must be absolute") != std::string::npos);
+    CHECK_FALSE(rel2.ok);
+  }
   fs::remove_all(tmp);
 }
 

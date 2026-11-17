@@ -2359,6 +2359,11 @@ Workspace::SchemaPlan Workspace::schema_plan(const SavedRequest& r) const {
     bool escapes = false;
     for (const auto& part : p.lexically_normal()) escapes = escapes || part == "..";
     if (escapes) { bad(f, "an import name cannot contain \"..\""); continue; }
+    // Only .proto sources are looked up through the import dirs. Anything else (a .protoset,
+    // .pb, .desc ...) is read straight from disk by the loader, so a relative one that is not
+    // a file under the workspace would be opened against the process cwd: refuse it.
+    std::string ext = lower_ascii(to_utf8(p.extension()));
+    if (ext != ".proto") { bad(f, "not found in the workspace (only .proto files can be looked up in import paths)"); continue; }
     plan.proto_files.push_back(generic_utf8(p.lexically_normal()));  // virtual: import dirs only
   }
   return plan;
