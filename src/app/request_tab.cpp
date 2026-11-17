@@ -611,8 +611,16 @@ void RequestTab::load_schema(const SavedRequest& r) {
   // The schema loads as soon as a saved gRPC request is opened, so a cloned workspace could
   // point it at \\attacker\share\x.proto (NTLM hash leak) or any local file. Paths outside the
   // workspace need the user's approval first; nothing outside is touched before that.
+  auto req = std::make_shared<SavedRequest>(ws ? ws->expanded(r) : r);
   if (ws && !r.proto_files.empty()) {
-    for (const auto& p : ws->blocked_schema_paths(r)) {
+    Workspace::SchemaPlan plan = ws->schema_plan(r);
+    if (!plan.invalid.empty()) {
+      auto cs = std::make_shared<GrpcSchema>();
+      cs->error = "Schema not loaded: " + plan.invalid.front();
+      if (grpc_) grpc_->set_schema(cs);
+      return;
+    }
+    for (const auto& p : plan.blocked) {
       const auto ans = wxMessageBox(
           wxString::Format("This request loads its gRPC schema from\n\n%s\n\nwhich is outside the "
                            "workspace%s. Load it?",
@@ -626,8 +634,10 @@ void RequestTab::load_schema(const SavedRequest& r) {
         return;
       }
     }
+    // Load exactly what was checked: root-anchored absolute paths, not the raw strings.
+    req->proto_files = std::move(plan.proto_files);
+    req->import_dirs = std::move(plan.import_dirs);
   }
-  auto req = std::make_shared<SavedRequest>(ws ? ws->expanded(r) : r);
   std::thread([w, client, req] {
     GrpcSchema s;
     if (req->proto_files.empty()) {

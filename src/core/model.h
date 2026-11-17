@@ -202,6 +202,18 @@ class Workspace {
   // the schema must not be loaded until each is approved with allow_file(). Paths are judged
   // from their text and never touched before approval (no SMB session to a planted host).
   std::vector<std::filesystem::path> blocked_schema_paths(const SavedRequest& r) const;
+  // What a schema load may read, as absolute paths anchored at the workspace root (relative
+  // proto names that are not files under the root stay virtual names, looked up only in the
+  // import dirs). Pass these to GrpcClient::load_proto_files, never the raw request strings:
+  // the loader would resolve those against the process cwd. Load only if blocked and invalid
+  // are both empty (after the user approved each blocked path).
+  struct SchemaPlan {
+    std::vector<std::string> proto_files;
+    std::vector<std::string> import_dirs;
+    std::vector<std::filesystem::path> blocked;  // outside the workspace, not yet allowed
+    std::vector<std::string> invalid;            // refused forms ("\foo", "C:foo", "../x" names)
+  };
+  SchemaPlan schema_plan(const SavedRequest& r) const;
   // Whether `file` (relative paths against the root) may be uploaded: inside the workspace, or
   // allowlisted.
   bool is_file_allowed(const std::filesystem::path& file) const;

@@ -2917,6 +2917,46 @@ TEST_CASE("UNC and outside schema paths are blocked without touching them", "[gr
   CHECK_FALSE(std::any_of(after.begin(), after.end(),
                           [&](const fs::path& p) { return p.generic_string().find("outside") != std::string::npos; }));
   CHECK(after.size() == 3);  // both UNC dirs and the UNC proto stay blocked
+
+  // The loader gets exactly what was checked: absolute, anchored at the workspace root.
+  SavedRequest rel;
+  rel.kind = RequestKind::Grpc;
+  rel.import_dirs = {"protos"};
+  rel.proto_files = {"protos/a.proto", "google/protobuf/empty.proto"};
+  const auto plan = ws.schema_plan(rel);
+  CHECK(plan.blocked.empty());
+  CHECK(plan.invalid.empty());
+  REQUIRE(plan.import_dirs.size() == 1);
+  CHECK(fs::path(plan.import_dirs[0]).is_absolute());
+  CHECK(fs::path(plan.import_dirs[0]).filename() == "protos");
+  REQUIRE(plan.proto_files.size() == 2);
+  CHECK(fs::path(plan.proto_files[0]).is_absolute());  // a file under the root, anchored there
+  CHECK(plan.proto_files[1] == "google/protobuf/empty.proto");  // virtual: import dirs only
+
+#ifdef _WIN32
+  // Forms that mean a different place to every process, or that name an NT device namespace.
+  for (const std::string& bad : {std::string("\\Windows\\win.ini"), std::string("C:relative\\x.proto"),
+                                 std::string("../unapproved/c.proto"), std::string("../nowhere/d.proto")}) {
+    spit(t.path / "unapproved" / "c.proto", "syntax = \"proto3\";\n");  // exists, never allowed
+    SavedRequest b;
+    b.kind = RequestKind::Grpc;
+    b.proto_files = {bad};
+    b.import_dirs = {"protos"};
+    INFO(bad);
+    const auto pb = ws.schema_plan(b);
+    // "../x" may be a real file under the root's parent: then it is checked (and blocked);
+    // otherwise it is a refused virtual name. Either way it is never loaded unchecked.
+    CHECK((!pb.invalid.empty() || !pb.blocked.empty()));
+  }
+  for (const std::string& dev : {std::string("\\??\\C:\\Windows\\win.ini"), std::string("\\\\?\\C:\\Windows\\win.ini"),
+                                 std::string("\\\\.\\pipe\\x")}) {
+    SavedRequest d;
+    d.kind = RequestKind::Grpc;
+    d.import_dirs = {dev};
+    INFO(dev);
+    CHECK(ws.blocked_schema_paths(d).size() == 1);
+  }
+#endif
 }
 
 TEST_CASE("curl file references outside the workspace are blocked until allowed", "[curl][workspace][security]") {

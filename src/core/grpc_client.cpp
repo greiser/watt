@@ -3152,7 +3152,10 @@ GrpcSchema GrpcClient::load_proto_files(const std::vector<std::string>& proto_pa
   std::string err;
   for (const auto& p : proto_paths) {
     std::error_code ec;
-    if (fs::is_regular_file(u8path(p), ec)) {
+    // Only an absolute path is a disk file. A relative one is a virtual name looked up in the
+    // import dirs, never against the process cwd (callers pass Workspace::schema_plan() paths,
+    // which anchor workspace-relative files at the workspace root and check them first).
+    if (u8path(p).is_absolute() && fs::is_regular_file(u8path(p), ec)) {
       std::string disk = generic(u8path(p)), virt, shadow;
       auto r = set->tree->disk.DiskFileToVirtualFile(disk, &virt, &shadow);
       if (r == pb::compiler::DiskSourceTree::NO_MAPPING) {

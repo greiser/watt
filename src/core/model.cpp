@@ -2113,13 +2113,34 @@ bool same_path(const fs::path& a, const fs::path& b) {
 #endif
 }
 
-// \\host\share\..., //host/..., \\?\UNC\..., \\.\device: decided from the text alone. Touching such
-// a path (even weakly_canonical's stat) opens an SMB session, which sends the user's NTLM hash to
-// whoever named the host in a cloned workspace, before any consent prompt could be answered.
+// \\host\share\..., //host/..., \\?\UNC\..., \\.\device, \??\...: decided from the text alone.
+// Touching such a path (even weakly_canonical's stat) opens an SMB session, which sends the
+// user's NTLM hash to whoever named the host in a cloned workspace, before any consent prompt
+// could be answered. On Windows the only local root accepted is a plain drive letter ("C:").
 bool is_remote_or_device_path(const fs::path& p) {
   const auto& s = p.native();
   auto sep = [](auto c) { return c == '\\' || c == '/'; };
-  return s.size() >= 2 && sep(s[0]) && sep(s[1]);
+  if (s.size() >= 2 && sep(s[0]) && sep(s[1])) return true;  // UNC, \\?\, \\.\, //host
+#ifdef _WIN32
+  if (s.size() >= 4 && sep(s[0]) && s[1] == '?' && s[2] == '?' && sep(s[3])) return true;  // \??\ NT prefix
+  const auto rn = p.root_name().native();
+  if (!rn.empty()) {
+    const bool drive = rn.size() == 2 && rn[1] == ':' && ((rn[0] >= 'A' && rn[0] <= 'Z') || (rn[0] >= 'a' && rn[0] <= 'z'));
+    if (!drive) return true;
+  }
+#endif
+  return false;
+}
+
+// "\foo" (root-relative: current drive) and "C:foo" (drive-relative: that drive's cwd) mean
+// something different to every process; a workspace path must be relative or fully absolute.
+bool is_ambiguous_rooted_path(const fs::path& p) {
+#ifdef _WIN32
+  return p.has_root_name() != p.has_root_directory();
+#else
+  (void)p;
+  return false;
+#endif
 }
 
 fs::path resolved_path(const fs::path& p) {
@@ -2291,25 +2312,59 @@ std::vector<fs::path> Workspace::blocked_files(const SavedRequest& r) const {
 // Proto files and import directories a schema load would read. The loader runs when a gRPC
 // request is merely opened, so anything outside the workspace (UNC shares included) must be
 // approved first, through the same per-user allowlist as uploads (allow_file()).
-std::vector<fs::path> Workspace::blocked_schema_paths(const SavedRequest& r) const {
+// One plan, used both to ask for approval and to load: the loader gets exactly the paths that
+// were checked (absolute, anchored at the workspace root), never the raw strings it would resolve
+// against the process cwd.
+//   import dir  : relative -> <root>/dir; absolute -> as is. Checked against the policy.
+//   proto file  : absolute -> checked like a dir. Relative and an existing file under <root>
+//                 -> that file, checked. Otherwise a virtual name looked up only in the (checked)
+//                 import dirs: it must have no root and no "..".
+//   "\foo" and "C:foo" are refused: they name a different place for every process.
+Workspace::SchemaPlan Workspace::schema_plan(const SavedRequest& r) const {
   const SavedRequest x = expanded(r);
   const UploadPolicy policy(root_);
-  std::vector<fs::path> out;
-  auto check = [&](const std::string& ref) {
-    if (ref.empty()) return;
-    const fs::path fp = policy.resolve(ref);
+  SchemaPlan plan;
+  auto block = [&](const fs::path& fp) {
     if (policy.allowed(fp)) return;
-    for (const auto& o : out)
+    for (const auto& o : plan.blocked)
       if (same_path(o, fp)) return;
-    out.push_back(fp);
+    plan.blocked.push_back(fp);
   };
-  for (const auto& d : x.import_dirs) check(d);
-  // A relative proto file is looked up in the import dirs; resolving it against the workspace
-  // root here is the conservative choice (anything that escapes is still caught by its dir).
-  for (const auto& f : x.proto_files)
-    if (fs::path p = from_utf8(f); p.is_absolute() || is_remote_or_device_path(p)) check(f);
-  return out;
+  auto bad = [&](const std::string& ref, const char* why) { plan.invalid.push_back(ref + ": " + why); };
+  for (const auto& d : x.import_dirs) {
+    if (d.empty()) continue;
+    const fs::path p = from_utf8(d);
+    if (is_ambiguous_rooted_path(p)) { bad(d, "use a path relative to the workspace or a full path with a drive letter"); continue; }
+    const fs::path fp = policy.resolve(p);
+    block(fp);
+    plan.import_dirs.push_back(to_utf8(fp));
+  }
+  for (const auto& f : x.proto_files) {
+    if (f.empty()) continue;
+    const fs::path p = from_utf8(f);
+    if (is_ambiguous_rooted_path(p)) { bad(f, "use a path relative to the workspace or a full path with a drive letter"); continue; }
+    if (p.is_absolute() || is_remote_or_device_path(p)) {
+      const fs::path fp = policy.resolve(p);
+      block(fp);
+      plan.proto_files.push_back(to_utf8(fp));
+      continue;
+    }
+    const fs::path under_root = policy.resolve(p);  // local only: p is relative, root is local
+    std::error_code ec;
+    if (!is_remote_or_device_path(under_root) && fs::is_regular_file(under_root, ec)) {
+      block(under_root);
+      plan.proto_files.push_back(to_utf8(under_root));
+      continue;
+    }
+    bool escapes = false;
+    for (const auto& part : p.lexically_normal()) escapes = escapes || part == "..";
+    if (escapes) { bad(f, "an import name cannot contain \"..\""); continue; }
+    plan.proto_files.push_back(generic_utf8(p.lexically_normal()));  // virtual: import dirs only
+  }
+  return plan;
 }
+
+std::vector<fs::path> Workspace::blocked_schema_paths(const SavedRequest& r) const { return schema_plan(r).blocked; }
 
 bool Workspace::is_file_allowed(const fs::path& file) const {
   const UploadPolicy policy(root_);
