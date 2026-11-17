@@ -222,6 +222,13 @@ struct TabWorker : std::enable_shared_from_this<TabWorker> {
 
 RequestTab::RequestTab(wxWindow* parent, TabContext ctx, SavedRequest req, bool preview)
     : wxPanel(parent, wxID_ANY), ctx_(std::move(ctx)), req_(std::move(req)), preview_(preview) {
+  // The worker must exist before ensure_editor(): GrpcEditor::load() calls back into
+  // load_schema() right away for a request with an address, and its schema thread posts the
+  // result through worker_ (a null one crashed in post_m's lock once reflection returned).
+  worker_ = std::make_shared<TabWorker>();
+  worker_->tab = this;
+  worker_->start();
+
   split_ = new wxSplitterWindow(this, wxID_ANY, wxDefaultPosition, wxDefaultSize,
                                 wxSP_LIVE_UPDATE | wxSP_NOBORDER | wxSP_THIN_SASH);
   split_->SetSashGravity(0.5);
@@ -241,10 +248,6 @@ RequestTab::RequestTab(wxWindow* parent, TabContext ctx, SavedRequest req, bool 
     }
   });
   resp_->clear();
-
-  worker_ = std::make_shared<TabWorker>();
-  worker_->tab = this;
-  worker_->start();
 }
 
 RequestTab::~RequestTab() { worker_->shutdown(); }
@@ -605,6 +608,7 @@ void RequestTab::on_error(uint64_t gen, const std::string& msg) {
 
 void RequestTab::load_schema(const SavedRequest& r) {
   // Not on the tab worker: an interactive stream may keep it busy for minutes.
+  wxASSERT_MSG(worker_, "load_schema() before the tab worker exists");
   auto w = worker_;
   auto client = ctx_.grpc();
   Workspace* ws = ctx_.workspace ? ctx_.workspace() : nullptr;
