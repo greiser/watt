@@ -2874,6 +2874,51 @@ TEST_CASE("curl file references are read when sent, as curl reads them", "[curl]
   CHECK(slurp(t.path / "data" / "body.json") == "{\"k\": 1}\n");
 }
 
+TEST_CASE("UNC and outside schema paths are blocked without touching them", "[grpc][workspace][security]") {
+  TempDir t;
+  TempDir cfg;
+  ConfigDirOverride use_cfg(cfg.path / "watt");
+  const fs::path root = t.path / "ws";
+  Workspace ws = Workspace::create(root);
+  spit(root / "protos" / "a.proto", "syntax = \"proto3\";\n");
+  spit(t.path / "outside" / "b.proto", "syntax = \"proto3\";\n");
+  // An unroutable host: if anything touched these paths, the SMB connect would hang for
+  // seconds before failing. Judging them from text takes microseconds.
+  const std::string unc = "\\\\192.0.2.1\\share";  // TEST-NET-1: unroutable, an SMB connect hangs until timeout
+  SavedRequest r;
+  r.kind = RequestKind::Grpc;
+  r.import_dirs = {"protos", unc, "//192.0.2.1/other", (t.path / "outside").string()};
+  r.proto_files = {"a.proto", unc + "\\x.proto", (t.path / "outside" / "b.proto").string()};
+  const auto t0 = std::chrono::steady_clock::now();
+  const auto blocked = ws.blocked_schema_paths(r);
+  const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+  CHECK(ms < 200);  // a touched UNC path costs seconds
+  auto has = [&](const std::string& needle) {
+    return std::any_of(blocked.begin(), blocked.end(), [&](const fs::path& p) {
+      return p.generic_string().find(needle) != std::string::npos;
+    });
+  };
+  CHECK(has("192.0.2.1/share"));
+  CHECK(has("192.0.2.1/other"));
+  CHECK(has("outside"));
+  CHECK_FALSE(has("/protos"));  // inside the workspace: loads silently
+  // Upload checks judge UNC paths the same way (no SMB session before the prompt is answered).
+  SavedRequest u;
+  u.http.url = "https://h.test/";
+  u.body_file = unc + "\\loot.bin";
+  const auto t1 = std::chrono::steady_clock::now();
+  CHECK(ws.blocked_files(u).size() == 1);
+  CHECK(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t1).count() < 200);
+  // Approving a path through the shared allowlist unblocks exactly that path.
+  const fs::path outside_dir = t.path / "outside";
+  for (const auto& p : blocked)
+    if (p.generic_string().find("outside") != std::string::npos) REQUIRE(ws.allow_file(p));
+  const auto after = ws.blocked_schema_paths(r);
+  CHECK_FALSE(std::any_of(after.begin(), after.end(),
+                          [&](const fs::path& p) { return p.generic_string().find("outside") != std::string::npos; }));
+  CHECK(after.size() == 3);  // both UNC dirs and the UNC proto stay blocked
+}
+
 TEST_CASE("curl file references outside the workspace are blocked until allowed", "[curl][workspace][security]") {
   TempDir t;
   TempDir cfg;

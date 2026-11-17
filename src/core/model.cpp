@@ -2113,7 +2113,17 @@ bool same_path(const fs::path& a, const fs::path& b) {
 #endif
 }
 
+// \\host\share\..., //host/..., \\?\UNC\..., \\.\device: decided from the text alone. Touching such
+// a path (even weakly_canonical's stat) opens an SMB session, which sends the user's NTLM hash to
+// whoever named the host in a cloned workspace, before any consent prompt could be answered.
+bool is_remote_or_device_path(const fs::path& p) {
+  const auto& s = p.native();
+  auto sep = [](auto c) { return c == '\\' || c == '/'; };
+  return s.size() >= 2 && sep(s[0]) && sep(s[1]);
+}
+
 fs::path resolved_path(const fs::path& p) {
+  if (is_remote_or_device_path(p)) return p.lexically_normal();  // never touch the network
   std::error_code ec;
   fs::path c = fs::weakly_canonical(p, ec);  // symlinks / junctions in the existing part resolved
   return ec || c.empty() ? p.lexically_normal() : c;
@@ -2214,7 +2224,7 @@ class UploadPolicy {
   fs::path resolve(const std::string& ref) const { return resolve(from_utf8(ref)); }
 
   bool inside(const fs::path& fp) const {
-    if (!is_inside(root_, fp)) return false;
+    if (is_remote_or_device_path(fp) || !is_inside(root_, fp)) return false;
     const std::string first = lower_ascii(to_utf8(*fp.lexically_relative(root_).begin()));
     return first != ".watt" && first != ".git" && first != ".env";  // personal, never uploaded silently
   }
@@ -2275,6 +2285,29 @@ std::vector<fs::path> Workspace::blocked_files(const SavedRequest& r) const {
   }
   for (const auto& f : x.header_files) check(policy.resolve(expand(f)));
   for (const auto& f : x.cookie_files) check(policy.resolve(expand(f)));
+  return out;
+}
+
+// Proto files and import directories a schema load would read. The loader runs when a gRPC
+// request is merely opened, so anything outside the workspace (UNC shares included) must be
+// approved first, through the same per-user allowlist as uploads (allow_file()).
+std::vector<fs::path> Workspace::blocked_schema_paths(const SavedRequest& r) const {
+  const SavedRequest x = expanded(r);
+  const UploadPolicy policy(root_);
+  std::vector<fs::path> out;
+  auto check = [&](const std::string& ref) {
+    if (ref.empty()) return;
+    const fs::path fp = policy.resolve(ref);
+    if (policy.allowed(fp)) return;
+    for (const auto& o : out)
+      if (same_path(o, fp)) return;
+    out.push_back(fp);
+  };
+  for (const auto& d : x.import_dirs) check(d);
+  // A relative proto file is looked up in the import dirs; resolving it against the workspace
+  // root here is the conservative choice (anything that escapes is still caught by its dir).
+  for (const auto& f : x.proto_files)
+    if (fs::path p = from_utf8(f); p.is_absolute() || is_remote_or_device_path(p)) check(f);
   return out;
 }
 

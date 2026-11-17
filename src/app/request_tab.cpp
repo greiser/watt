@@ -608,6 +608,25 @@ void RequestTab::load_schema(const SavedRequest& r) {
   auto w = worker_;
   auto client = ctx_.grpc();
   Workspace* ws = ctx_.workspace ? ctx_.workspace() : nullptr;
+  // The schema loads as soon as a saved gRPC request is opened, so a cloned workspace could
+  // point it at \\attacker\share\x.proto (NTLM hash leak) or any local file. Paths outside the
+  // workspace need the user's approval first; nothing outside is touched before that.
+  if (ws && !r.proto_files.empty()) {
+    for (const auto& p : ws->blocked_schema_paths(r)) {
+      const auto ans = wxMessageBox(
+          wxString::Format("This request loads its gRPC schema from\n\n%s\n\nwhich is outside the "
+                           "workspace%s. Load it?",
+                           p.wstring(), p.native().rfind(L"\\\\", 0) == 0 ? L" (a network share)" : L""),
+          "watt", wxYES_NO | wxNO_DEFAULT | wxICON_WARNING, this);
+      std::string err;
+      if (ans != wxYES || !ws->allow_file(p, &err)) {
+        auto cs = std::make_shared<GrpcSchema>();
+        cs->error = err.empty() ? "Schema not loaded: " + p.string() + " is outside the workspace and was not allowed." : err;
+        if (grpc_) grpc_->set_schema(cs);
+        return;
+      }
+    }
+  }
   auto req = std::make_shared<SavedRequest>(ws ? ws->expanded(r) : r);
   std::thread([w, client, req] {
     GrpcSchema s;

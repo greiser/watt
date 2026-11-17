@@ -198,6 +198,10 @@ class Workspace {
   // sending, the UI asks "this request wants to upload <path> from outside the workspace: allow?"
   // and calls allow_file() for each one the user accepts.
   std::vector<std::filesystem::path> blocked_files(const SavedRequest& r) const;
+  // Proto files / import dirs of a gRPC request outside the workspace (UNC paths always count):
+  // the schema must not be loaded until each is approved with allow_file(). Paths are judged
+  // from their text and never touched before approval (no SMB session to a planted host).
+  std::vector<std::filesystem::path> blocked_schema_paths(const SavedRequest& r) const;
   // Whether `file` (relative paths against the root) may be uploaded: inside the workspace, or
   // allowlisted.
   bool is_file_allowed(const std::filesystem::path& file) const;
