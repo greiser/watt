@@ -168,6 +168,50 @@ struct RedirectHop {
   uint64_t bytes_received = 0;  // response headers + wire body of this hop
 };
 
+// The server's leaf certificate, as Schannel received it.
+struct TlsCertificate {
+  std::string subject;      // X.500 DN, most specific first: "CN=www.google.com"
+  std::string subject_cn;   // simple display name: "www.google.com"
+  std::string issuer;       // X.500 DN: "CN=WR2, O=Google Trust Services, C=US"
+  std::string issuer_cn;    // "WR2"
+  std::vector<std::string> subject_alt_names;  // DNS names and IP addresses, in certificate order
+  std::string not_before;   // ISO 8601 UTC, "2026-01-15T08:00:00Z"
+  std::string not_after;    // ISO 8601 UTC
+  std::string serial;       // big-endian hex, upper case, no separators (as openssl x509 -serial)
+  std::string sha256_fingerprint;  // "AB:CD:...", 32 colon-separated bytes (openssl -fingerprint)
+};
+
+// TLS session of one connection. Immutable once read; shared by every response that went over
+// that connection.
+struct TlsInfo {
+  std::string version;  // "TLSv1.3", "TLSv1.2", ... (SECPKG_ATTR_CONNECTION_INFO)
+  std::string cipher;   // "TLS_AES_256_GCM_SHA384" (SECPKG_ATTR_CIPHER_INFO)
+  std::string alpn;     // "h2", "http/1.1"; empty when the server did not negotiate ALPN
+  std::string verify_result;  // "verified: ..." / "not verified (...)" / "failed (...)"
+  TlsCertificate leaf;
+  int chain_length = 0;  // certificates in the chain the server sent, leaf included
+  std::string chain;     // that chain, one "CN  (issued by CN, until YYYY-MM-DD)" per line
+  double read_ms = 0;    // what reading all this cost (once per connection)
+};
+
+// The connection that carried the final request. Read once per connection, right after it is
+// ready (TLS handshake done) and before the first request on it goes out (libcurl's pre-request
+// callback, for a new connection or a pooled one this client has not seen yet), and cached per
+// client: a request on a reused connection gets a copy of the same values (two short strings
+// and a shared_ptr), which describe that same connection, whose handshake happened earlier.
+// TLS details come from the Schannel context (no CURLOPT_CERTINFO, nothing extra per request).
+// A transfer that never got a connection ready (refused, TLS failure) has addresses at most.
+struct ConnectionInfo {
+  long long id = -1;     // libcurl's connection id (CURLINFO_CONN_ID); equal id = same connection
+  bool reused = false;   // == timing.connection_reused
+  std::string local_ip;  // CURLINFO_LOCAL_IP / _PORT
+  long local_port = 0;
+  std::string remote_ip;  // == HttpResponse::remote_ip / remote_port
+  long remote_port = 0;
+  bool tls = false;       // a TLS session was established on this connection
+  std::shared_ptr<const TlsInfo> tls_info;  // non-null when tls (null if it could not be read)
+};
+
 struct HttpResponse {
   bool ok = false;              // transport succeeded (any HTTP status)
   std::string error;            // transport error text when !ok
@@ -179,6 +223,18 @@ struct HttpResponse {
   std::string effective_url;
   std::string remote_ip;
   long remote_port = 0;
+  // Mirrors of conn / conn.tls_info, in the form the response view first used (kept so it
+  // compiles unchanged; new code should read `conn`). Empty when conn.tls_info is null.
+  std::string local_ip;        // == conn.local_ip
+  long local_port = 0;         // == conn.local_port
+  std::string tls_version;     // == conn.tls_info->version ("TLSv1.3")
+  std::string tls_cipher;      // == conn.tls_info->cipher
+  std::string cert_subject;    // == conn.tls_info->leaf.subject
+  std::string cert_san;        // leaf.subject_alt_names joined with ", "
+  std::string cert_issuer;     // == conn.tls_info->leaf.issuer
+  std::string cert_not_after;  // leaf expiry, "2026-01-15 23:59:59 UTC"
+  std::string cert_chain;      // == conn.tls_info->chain
+  std::string verify_result;   // == conn.tls_info->verify_result
   Timing timing;
   long redirect_count = 0;
   HttpSizes sizes;
@@ -191,6 +247,7 @@ struct HttpResponse {
   // detaching the handle) plus watt's result collection. curl.exe's -w time_total leaves
   // all of this out; here it is counted so total_ms is the real wall time of send().
   double process_ms = 0;
+  ConnectionInfo conn;  // see ConnectionInfo
 };
 
 // Sum of all phases; equals timing.total_ms.
@@ -221,7 +278,8 @@ class HttpClient {
   HttpClient(const HttpClient&) = delete;
   HttpClient& operator=(const HttpClient&) = delete;
 
-  // Process-wide start-up warm-up, about 3 ms once: libcurl / TLS initialisation, one
+  // Process-wide start-up warm-up, about 5 ms once: libcurl / TLS initialisation, crypt32's
+  // name tables (the first certificate read otherwise pays ~5 ms for them), one
   // pre-built libcurl multi handle (curl_multi_init costs about 0.5 ms), and one throwaway
   // HTTP exchange with an in-process responder over loopback, which loads the Winsock
   // providers, runs the TCP stack's first connect and pages in the request code (the first

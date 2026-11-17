@@ -39,6 +39,12 @@
 #include <ws2tcpip.h>
 #include <mstcpip.h>
 #include <timeapi.h>
+#include <wincrypt.h>
+#ifndef SECURITY_WIN32
+#define SECURITY_WIN32
+#endif
+#include <security.h>
+#include <schannel.h>
 
 #include <curl/curl.h>
 
@@ -53,6 +59,8 @@
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "winmm.lib")
+#pragma comment(lib, "secur32.lib")
+#pragma comment(lib, "crypt32.lib")
 
 namespace watt {
 
@@ -237,6 +245,231 @@ struct RawHop {
   std::string url, ip;
 };
 
+std::string narrow(const wchar_t* w, int n = -1) {
+  if (!w) return {};
+  const int len = WideCharToMultiByte(CP_UTF8, 0, w, n, nullptr, 0, nullptr, nullptr);
+  if (len <= 0) return {};
+  std::string s(static_cast<size_t>(len), '\0');
+  WideCharToMultiByte(CP_UTF8, 0, w, n, s.data(), len, nullptr, nullptr);
+  if (n < 0 && !s.empty() && s.back() == '\0') s.pop_back();
+  return s;
+}
+
+std::string x500(const CERT_NAME_BLOB* name) {
+  wchar_t buf[1024];
+  const DWORD n = CertNameToStrW(X509_ASN_ENCODING, const_cast<CERT_NAME_BLOB*>(name),
+                                 CERT_X500_NAME_STR | CERT_NAME_STR_REVERSE_FLAG, buf, 1024);
+  return n > 1 ? narrow(buf) : std::string();
+}
+
+std::string simple_name(PCCERT_CONTEXT c, bool issuer) {
+  wchar_t buf[512];
+  const DWORD n = CertGetNameStringW(c, CERT_NAME_SIMPLE_DISPLAY_TYPE,
+                                     issuer ? CERT_NAME_ISSUER_FLAG : 0, nullptr, buf, 512);
+  return n > 1 ? narrow(buf) : std::string();
+}
+
+std::string iso_utc(const FILETIME& ft) {
+  SYSTEMTIME st{};
+  if (!FileTimeToSystemTime(&ft, &st)) return {};
+  char b[32];
+  snprintf(b, sizeof b, "%04u-%02u-%02uT%02u:%02u:%02uZ", st.wYear, st.wMonth, st.wDay, st.wHour,
+           st.wMinute, st.wSecond);
+  return b;
+}
+
+// "2026-01-15T23:59:59Z" -> "2026-01-15 23:59:59 UTC" (HttpResponse::cert_not_after).
+std::string display_utc(const std::string& iso) {
+  if (iso.size() != 20) return iso;
+  std::string s = iso;
+  s[10] = ' ';
+  s.pop_back();
+  return s + " UTC";
+}
+
+std::string hex_bytes(const BYTE* b, size_t n, bool reverse, bool colons) {
+  static constexpr char kHex[] = "0123456789ABCDEF";
+  std::string s;
+  s.reserve(n * 3);
+  for (size_t i = 0; i < n; ++i) {
+    const BYTE v = b[reverse ? n - 1 - i : i];
+    if (colons && i) s.push_back(':');
+    s.push_back(kHex[v >> 4]);
+    s.push_back(kHex[v & 15]);
+  }
+  return s;
+}
+
+std::vector<std::string> alt_names(PCCERT_CONTEXT c) {
+  std::vector<std::string> out;
+  PCERT_EXTENSION ext = CertFindExtension(szOID_SUBJECT_ALT_NAME2, c->pCertInfo->cExtension,
+                                          c->pCertInfo->rgExtension);
+  if (!ext) return out;
+  CERT_ALT_NAME_INFO* info = nullptr;
+  DWORD sz = 0;
+  if (!CryptDecodeObjectEx(X509_ASN_ENCODING, X509_ALTERNATE_NAME, ext->Value.pbData,
+                           ext->Value.cbData, CRYPT_DECODE_ALLOC_FLAG, nullptr, &info, &sz) ||
+      !info)
+    return out;
+  out.reserve(std::min<DWORD>(info->cAltEntry, 200));
+  for (DWORD i = 0; i < info->cAltEntry && i < 200; ++i) {
+    const CERT_ALT_NAME_ENTRY& e = info->rgAltEntry[i];
+    char buf[64] = {};
+    if (e.dwAltNameChoice == CERT_ALT_NAME_DNS_NAME) {
+      if (std::string n = narrow(e.pwszDNSName); !n.empty()) out.push_back(std::move(n));
+    } else if (e.dwAltNameChoice == CERT_ALT_NAME_IP_ADDRESS &&
+               (e.IPAddress.cbData == 4 || e.IPAddress.cbData == 16)) {
+      if (inet_ntop(e.IPAddress.cbData == 4 ? AF_INET : AF_INET6, e.IPAddress.pbData, buf,
+                    sizeof buf))
+        out.emplace_back(buf);
+    }
+  }
+  LocalFree(info);
+  return out;
+}
+
+const char* tls_version_name(DWORD p) {
+  if (p & 0x00003000) return "TLSv1.3";  // SP_PROT_TLS1_3_{SERVER,CLIENT}
+  if (p & SP_PROT_TLS1_2) return "TLSv1.2";
+  if (p & SP_PROT_TLS1_1) return "TLSv1.1";
+  if (p & SP_PROT_TLS1_0) return "TLSv1.0";
+  if (p & SP_PROT_SSL3) return "SSLv3";
+  return p ? "unknown" : "";
+}
+
+// How the request asked for the peer to be checked. Read when a connection is first seen; curl
+// only reuses a connection for a request with the same TLS settings.
+struct VerifyMode {
+  bool verify = true;
+  bool own_ca = false;
+};
+
+// Reads version, cipher, ALPN and the server's certificate from the connection's Schannel
+// context. Runs once per connection (~0.1 ms, next to a handshake of a millisecond or more;
+// global_init pre-loads crypt32's name tables, which would add ~5 ms to the first one), from
+// the pre-request callback (on_prereq): see there for why then.
+std::shared_ptr<const TlsInfo> read_tls(curl_tlssessioninfo* si, CURL* easy, VerifyMode vm) {
+  if (!si || !si->internals || si->backend != CURLSSLBACKEND_SCHANNEL) return nullptr;
+  const auto t0 = Clock::now();
+  auto* ctx = static_cast<CtxtHandle*>(si->internals);
+  auto t = std::make_shared<TlsInfo>();
+  SecPkgContext_ConnectionInfo ci{};
+  if (QueryContextAttributesW(ctx, SECPKG_ATTR_CONNECTION_INFO, &ci) == SEC_E_OK)
+    t->version = tls_version_name(ci.dwProtocol);
+  SecPkgContext_CipherInfo ki{};
+  ki.dwVersion = SECPKGCONTEXT_CIPHERINFO_V1;
+  if (QueryContextAttributesW(ctx, SECPKG_ATTR_CIPHER_INFO, &ki) == SEC_E_OK)
+    t->cipher = narrow(ki.szCipherSuite);
+  if (t->cipher.empty() && ci.dwCipherStrength)
+    t->cipher = "ALG 0x" + std::to_string(ci.aiCipher) + ", " +
+                std::to_string(ci.dwCipherStrength) + "-bit";
+  SecPkgContext_ApplicationProtocol ap{};
+  if (QueryContextAttributesW(ctx, SECPKG_ATTR_APPLICATION_PROTOCOL, &ap) == SEC_E_OK &&
+      ap.ProtoNegoStatus == SecApplicationProtocolNegotiationStatus_Success)
+    t->alpn.assign(reinterpret_cast<const char*>(ap.ProtocolId),
+                   std::min<size_t>(ap.ProtocolIdSize, sizeof ap.ProtocolId));
+  long vr = 0;
+  curl_easy_getinfo(easy, CURLINFO_SSL_VERIFYRESULT, &vr);
+  if (!vm.verify)
+    t->verify_result = "not verified (certificate verification is off for this request)";
+  else if (vr != 0)
+    t->verify_result = "failed (verify result " + std::to_string(vr) + ")";
+  else
+    t->verify_result = vm.own_ca
+                           ? "verified: chain and host name, against the request's CA certificate"
+                           : "verified: chain and host name, against the Windows trust store";
+  PCCERT_CONTEXT leaf = nullptr;
+  if (QueryContextAttributesW(ctx, SECPKG_ATTR_REMOTE_CERT_CONTEXT, &leaf) == SEC_E_OK && leaf) {
+    TlsCertificate& c = t->leaf;
+    const CERT_INFO* in = leaf->pCertInfo;
+    c.subject = x500(&in->Subject);
+    c.issuer = x500(&in->Issuer);
+    c.subject_cn = simple_name(leaf, false);
+    c.issuer_cn = simple_name(leaf, true);
+    c.subject_alt_names = alt_names(leaf);
+    c.not_before = iso_utc(in->NotBefore);
+    c.not_after = iso_utc(in->NotAfter);
+    c.serial = hex_bytes(in->SerialNumber.pbData, in->SerialNumber.cbData, true, false);
+    BYTE sha[32];
+    DWORD n = sizeof sha;
+    if (CertGetCertificateContextProperty(leaf, CERT_SHA256_HASH_PROP_ID, sha, &n) && n == 32)
+      c.sha256_fingerprint = hex_bytes(sha, 32, false, true);
+    // The chain as the server sent it (the leaf's store holds what came over the wire): follow
+    // issuer names from the leaf through the certificates it included.
+    PCCERT_CONTEXT cur = CertDuplicateCertificateContext(leaf);
+    for (int depth = 0; cur && depth < 10; ++depth) {
+      ++t->chain_length;
+      if (!t->chain.empty()) t->chain += "\n";
+      t->chain += simple_name(cur, false) + "  (issued by " + simple_name(cur, true) +
+                  ", until " + iso_utc(cur->pCertInfo->NotAfter).substr(0, 10) + ")";
+      if (CertCompareCertificateName(X509_ASN_ENCODING, &cur->pCertInfo->Subject,
+                                     &cur->pCertInfo->Issuer))
+        break;  // self-signed: the root
+      PCCERT_CONTEXT up =
+          leaf->hCertStore
+              ? CertFindCertificateInStore(leaf->hCertStore, X509_ASN_ENCODING, 0,
+                                           CERT_FIND_SUBJECT_NAME, &cur->pCertInfo->Issuer, nullptr)
+              : nullptr;
+      CertFreeCertificateContext(cur);
+      cur = up;
+    }
+    if (cur) CertFreeCertificateContext(cur);
+    CertFreeCertificateContext(leaf);
+  }
+  t->read_ms = ms_between(t0, Clock::now());
+  return t;
+}
+
+// One connection as this client saw it, plus the HttpResponse mirror strings ready to copy.
+struct ConnEntry {
+  ConnectionInfo info;
+  std::string cert_san, cert_not_after;  // joined / display forms of tls_info's fields
+};
+
+// Connections this client has delivered responses on, keyed by libcurl's connection id (ids
+// are never reused within a share handle). A few entries cover alternating hosts (redirects);
+// a stale entry for a closed connection is harmless and gets overwritten.
+struct ConnCache {
+  static constexpr size_t kSize = 4;
+  std::array<ConnEntry, kSize> e;
+  size_t next = 0;
+  const ConnEntry* find(curl_off_t id) const {
+    if (id < 0) return nullptr;
+    for (const ConnEntry& c : e)
+      if (c.info.id == id) return &c;
+    return nullptr;
+  }
+  ConnEntry& insert() {
+    ConnEntry& c = e[next];
+    next = (next + 1) % kSize;
+    c = ConnEntry{};
+    return c;
+  }
+};
+
+// Reads the connection the transfer is on right now (called from on_prereq).
+void read_connection(CURL* easy, curl_off_t id, VerifyMode vm, ConnEntry& out) {
+  ConnectionInfo& ci = out.info;
+  ci.id = id;
+  char* s = nullptr;
+  if (curl_easy_getinfo(easy, CURLINFO_LOCAL_IP, &s) == CURLE_OK && s) ci.local_ip = s;
+  curl_easy_getinfo(easy, CURLINFO_LOCAL_PORT, &ci.local_port);
+  s = nullptr;
+  if (curl_easy_getinfo(easy, CURLINFO_PRIMARY_IP, &s) == CURLE_OK && s) ci.remote_ip = s;
+  curl_easy_getinfo(easy, CURLINFO_PRIMARY_PORT, &ci.remote_port);
+  curl_tlssessioninfo* si = nullptr;
+  if (curl_easy_getinfo(easy, CURLINFO_TLS_SSL_PTR, &si) != CURLE_OK) si = nullptr;
+  ci.tls = si && si->internals;
+  if (!ci.tls) return;
+  ci.tls_info = read_tls(si, easy, vm);
+  if (!ci.tls_info) return;
+  for (const std::string& n : ci.tls_info->leaf.subject_alt_names) {
+    if (!out.cert_san.empty()) out.cert_san += ", ";
+    out.cert_san += n;
+  }
+  out.cert_not_after = display_utc(ci.tls_info->leaf.not_after);
+}
+
 struct TransferCtx {
   HttpResponse* resp = nullptr;
   const BodyChunkFn* on_chunk = nullptr;
@@ -258,6 +491,10 @@ struct TransferCtx {
   const char* hop_version = "";  // protocol of the latest status line ("HTTP/1.1", "HTTP/2")
   std::array<SocketOpen, 8> opens;  // sockets curl opened during this send(), in order
   size_t n_opens = 0;
+  // Connection details (HttpResponse::conn), read at a status line on a connection this client
+  // has not seen yet and kept across sends; a reused connection costs one CONN_ID lookup.
+  ConnCache conns;
+  VerifyMode verify_mode;
 
   void begin(HttpResponse* r, const BodyChunkFn* chunk, const HttpRequest& req) {
     resp = r;
@@ -273,6 +510,8 @@ struct TransferCtx {
     hops.clear();
     hop_version = "";
     n_opens = 0;
+    verify_mode.verify = req.verify_tls;
+    verify_mode.own_ca = !req.ca_pem.empty();
     r->headers.reserve(last_hdr_bytes, last_hdr_count);
   }
   // curl has moved on from the last followed 3xx: close that hop.
@@ -363,6 +602,21 @@ size_t on_header(char* buf, size_t size, size_t nitems, void* userdata) {
   }
   r.headers.add(name, value);
   return n;
+}
+
+// libcurl calls this once per request (and per redirect hop) when the connection is ready,
+// after any TLS handshake and before the request goes out. A connection this client has not
+// seen yet gets its addresses and TLS session read here: Schannel's negotiated ALPN is only
+// readable until the first post-handshake records (TLS 1.3 session tickets) are decrypted,
+// and CURLINFO_TLS_SSL_PTR only while the connection is attached. A known connection costs
+// one CONN_ID lookup and a compare.
+int on_prereq(void* userdata, char*, char*, int, int) {
+  auto* ctx = static_cast<TransferCtx*>(userdata);
+  curl_off_t cid = -1;
+  if (curl_easy_getinfo(ctx->easy, CURLINFO_CONN_ID, &cid) == CURLE_OK && cid >= 0 &&
+      !ctx->conns.find(cid))
+    read_connection(ctx->easy, cid, ctx->verify_mode, ctx->conns.insert());
+  return CURL_PREREQFUNC_OK;
 }
 
 size_t on_write(char* ptr, size_t size, size_t nmemb, void* userdata) {
@@ -555,6 +809,8 @@ struct HttpClient::Impl {
     curl_easy_setopt(h, CURLOPT_OPENSOCKETDATA, &ctx);
     curl_easy_setopt(h, CURLOPT_HEADERFUNCTION, &on_header);
     curl_easy_setopt(h, CURLOPT_HEADERDATA, &ctx);
+    curl_easy_setopt(h, CURLOPT_PREREQFUNCTION, &on_prereq);
+    curl_easy_setopt(h, CURLOPT_PREREQDATA, &ctx);
     curl_easy_setopt(h, CURLOPT_WRITEFUNCTION, &on_write);
     curl_easy_setopt(h, CURLOPT_WRITEDATA, &ctx);
     // No progress callback: cancel() wakes the transfer loop, which checks the flag after
@@ -748,16 +1004,32 @@ void warm_up_transfer() {
   responder.join();
 }
 
+// crypt32's first name formatting in a process loads its OID tables (~5 ms); the first TLS
+// connection's certificate read (read_tls) would pay that. Round-trip a name with the usual
+// attributes once instead.
+void warm_up_cert_names() {
+  BYTE enc[256];
+  DWORD n = sizeof enc;
+  if (!CertStrToNameW(X509_ASN_ENCODING, L"CN=a, OU=b, O=c, L=d, S=e, C=US", CERT_X500_NAME_STR,
+                      nullptr, enc, &n, nullptr))
+    return;
+  CERT_NAME_BLOB blob{n, enc};
+  (void)x500(&blob);
+}
+
 }  // namespace
 
 void HttpClient::global_init() {
   static std::once_flag once;
   std::call_once(once, [] {
+    // Runs next to the rest (it only touches crypt32), so it adds nothing to the wall time.
+    std::thread certs(warm_up_cert_names);
     MultiPool::get().prefill(1);
     // The first timeBeginPeriod in a process costs ~0.05 ms (winmm start-up); later ones ~5 us.
     timeBeginPeriod(1);
     timeEndPeriod(1);
     warm_up_transfer();
+    certs.join();
   });
 }
 
@@ -926,6 +1198,34 @@ HttpResponse HttpClient::send(const HttpRequest& req, const BodyChunkFn& on_chun
     resp.remote_ip = im.last_ip;
     resp.remote_port = im.last_port;
   }
+  // Connection details: a copy of what was read when this connection delivered its first
+  // response (two short strings and a shared_ptr), plus the mirror fields.
+  if (const ConnEntry* ce = ctx.conns.find(conn_id)) {
+    resp.conn = ce->info;
+    resp.local_ip = ce->info.local_ip;
+    resp.local_port = ce->info.local_port;
+    if (const TlsInfo* t = ce->info.tls_info.get()) {
+      resp.tls_version = t->version;
+      resp.tls_cipher = t->cipher;
+      resp.cert_subject = t->leaf.subject;
+      resp.cert_san = ce->cert_san;
+      resp.cert_issuer = t->leaf.issuer;
+      resp.cert_not_after = ce->cert_not_after;
+      resp.cert_chain = t->chain;
+      resp.verify_result = t->verify_result;
+    }
+  } else if (conn_id >= 0) {
+    // curl never got as far as sending the request (refused connect, TLS failure, ...): only
+    // what curl kept about the attempt.
+    resp.conn.id = conn_id;
+    s = nullptr;
+    if (curl_easy_getinfo(h, CURLINFO_LOCAL_IP, &s) == CURLE_OK && s) resp.conn.local_ip = s;
+    curl_easy_getinfo(h, CURLINFO_LOCAL_PORT, &resp.conn.local_port);
+    resp.conn.remote_ip = resp.remote_ip;
+    resp.conn.remote_port = resp.remote_port;
+    resp.local_ip = resp.conn.local_ip;
+    resp.local_port = resp.conn.local_port;
+  }
   if (resp.status != 0) {
     ctx.last_hdr_bytes = std::max<size_t>(resp.headers.text_bytes(), 64);
     ctx.last_hdr_count = std::max<size_t>(resp.headers.size(), 4);
@@ -998,6 +1298,7 @@ HttpResponse HttpClient::send(const HttpRequest& req, const BodyChunkFn& on_chun
   const bool no_new_conn = f.conns == 0 && !opened_final;
   const bool failed_early = !resp.ok && resp.status == 0;  // no response line at all
   tm.connection_reused = no_new_conn && (resp.status != 0 || f.req > 0);
+  resp.conn.reused = tm.connection_reused;
   if (failed_early) {
     // When a transfer fails before it has a response, curl stamps the transfer marks it never
     // reached (pretransfer, posttransfer, first byte) with the failure time; only those it

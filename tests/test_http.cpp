@@ -7,6 +7,10 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <chrono>
 #include <memory>
 #include <optional>
@@ -1052,4 +1056,397 @@ TEST_CASE("busy-poll window on and off", "[http][timing]") {
   t.join();
   CHECK(k.error == "cancelled");
   CHECK(ms_between(t0, Clock::now()) < 500);
+}
+
+// ---------------------------------------------------------------- local TLS server
+namespace {
+
+std::filesystem::path test_exe_dir() {
+  wchar_t buf[MAX_PATH];
+  GetModuleFileNameW(nullptr, buf, MAX_PATH);
+  return std::filesystem::path(buf).parent_path();
+}
+
+std::filesystem::path testserver_cert_dir() {
+  auto here = std::filesystem::path(__FILE__).parent_path().parent_path() / "tools" / "testserver" / "certs";
+  if (std::filesystem::exists(here / "ca.pem")) return here;
+  return test_exe_dir().parent_path().parent_path() / "tools" / "testserver" / "certs";
+}
+
+std::string slurp_file(const std::filesystem::path& p) {
+  std::ifstream f(p, std::ios::binary);
+  return std::string((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+}
+
+// watt_testserver (built next to this exe) with --tls: its gRPC-Web listener is an HTTP/1.1
+// server over OpenSSL with tools/testserver/certs/server.pem (CN=localhost, issued by the test
+// CA). Any GET answers 405 on a kept-alive connection, which is all a TLS test needs. Started
+// once, killed with the test process. port() == 0 when the exe is not there.
+class TlsTestServer {
+ public:
+  static TlsTestServer& get() {
+    static TlsTestServer s;
+    return s;
+  }
+  int port() const { return port_; }
+  std::string url(const std::string& path = "/") const {
+    return "https://localhost:" + std::to_string(port_) + path;
+  }
+  HttpRequest request(const std::string& path = "/") const {
+    HttpRequest r;
+    r.url = url(path);
+    r.ca_pem = ca_pem_;
+    r.timeout_ms = 5000;
+    return r;
+  }
+  ~TlsTestServer() {
+    if (pi_.hProcess) {
+      TerminateProcess(pi_.hProcess, 0);
+      CloseHandle(pi_.hThread);
+      CloseHandle(pi_.hProcess);
+    }
+    if (job_) CloseHandle(job_);
+  }
+
+ private:
+  TlsTestServer() {
+    const auto exe = test_exe_dir() / "watt_testserver.exe";
+    const auto certs = testserver_cert_dir();
+    if (!std::filesystem::exists(exe) || !std::filesystem::exists(certs / "ca.pem")) return;
+    ca_pem_ = slurp_file(certs / "ca.pem");
+    job_ = CreateJobObjectW(nullptr, nullptr);
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION li{};
+    li.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    SetInformationJobObject(job_, JobObjectExtendedLimitInformation, &li, sizeof(li));
+    SECURITY_ATTRIBUTES sa{sizeof(sa), nullptr, TRUE};
+    HANDLE rd = nullptr, wr = nullptr;
+    CreatePipe(&rd, &wr, &sa, 0);
+    SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdOutput = wr;
+    si.hStdError = GetStdHandle(STD_ERROR_HANDLE);
+    si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+    std::wstring cmd = L"\"" + exe.wstring() + L"\" 0 --tls \"" + certs.wstring() + L"\"";
+    if (!CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr,
+                        nullptr, &si, &pi_)) {
+      CloseHandle(rd);
+      CloseHandle(wr);
+      pi_ = {};
+      return;
+    }
+    AssignProcessToJobObject(job_, pi_.hProcess);
+    CloseHandle(wr);
+    auto read_line = [&] {
+      std::string line;
+      char c;
+      DWORD n;
+      while (ReadFile(rd, &c, 1, &n, nullptr) && n == 1 && c != '\n') line += c;
+      return line;
+    };
+    (void)read_line();                      // gRPC port banner
+    const std::string web = read_line();    // "... grpc-web listening on 127.0.0.1:<port>"
+    if (web.find("grpc-web listening") != std::string::npos)
+      port_ = std::stoi(web.substr(web.rfind(':') + 1));
+    CloseHandle(rd);
+  }
+  PROCESS_INFORMATION pi_{};
+  HANDLE job_ = nullptr;
+  int port_ = 0;
+  std::string ca_pem_;
+};
+
+double p50(std::vector<double> v) {
+  if (v.empty()) return 0;
+  std::sort(v.begin(), v.end());
+  return v[v.size() / 2];
+}
+
+}  // namespace
+
+// watt_test_http "[.bench]": warm p50 of total_ms, local plaintext and local HTTPS (and a
+// public HTTPS server with WATT_NET_BENCH=1).
+TEST_CASE("warm request p50", "[.bench]") {
+  auto run = [](HttpClient& c, const HttpRequest& r, int n) {
+    std::vector<double> t;
+    t.reserve(n);
+    for (int i = 0; i < 200; ++i) REQUIRE(c.send(r).status != 0);  // warm-up
+    for (int i = 0; i < n; ++i) {
+      auto x = c.send(r);
+      REQUIRE(x.status != 0);
+      REQUIRE(x.timing.connection_reused);
+      t.push_back(x.timing.total_ms);
+    }
+    return p50(t);
+  };
+  for (int round = 0; round < 3; ++round) {
+    HttpClient c;
+    const double plain = run(c, get("/json/10"), 5000);
+    double tls = 0;
+    if (TlsTestServer::get().port()) {
+      HttpClient ct;
+      tls = run(ct, TlsTestServer::get().request(), 5000);
+    }
+    WARN("round " << round << ": warm p50 local http " << plain << " ms, local https " << tls
+                  << " ms");
+  }
+  char* env = nullptr;
+  size_t len = 0;
+  if (_dupenv_s(&env, &len, "WATT_NET_BENCH") == 0 && env) {
+    free(env);
+    HttpClient c;
+    HttpRequest r;
+    r.url = "https://www.google.com/generate_204";
+    std::vector<double> t;
+    REQUIRE(c.send(r).ok);
+    for (int i = 0; i < 50; ++i) t.push_back(c.send(r).timing.total_ms);
+    WARN("warm p50 google https " << p50(t) << " ms");
+  }
+}
+
+// ---------------------------------------------------------------- connection / TLS details
+TEST_CASE("connection info: plaintext", "[http][conn]") {
+  HttpClient c;
+  auto a = c.send(get("/status/200"));
+  REQUIRE(a.ok);
+  const ConnectionInfo& ca = a.conn;
+  CHECK(ca.id >= 0);
+  CHECK_FALSE(ca.reused);
+  CHECK_FALSE(ca.tls);
+  CHECK(ca.tls_info == nullptr);
+  CHECK(ca.local_ip == "127.0.0.1");
+  CHECK(ca.local_port > 0);
+  CHECK(ca.local_port != server().port());
+  CHECK(ca.remote_ip == "127.0.0.1");
+  CHECK(ca.remote_port == server().port());
+  CHECK(ca.remote_ip == a.remote_ip);
+  CHECK(ca.remote_port == a.remote_port);
+  CHECK(a.local_ip == ca.local_ip);  // mirrors
+  CHECK(a.local_port == ca.local_port);
+  CHECK(a.tls_version.empty());
+  CHECK(a.cert_subject.empty());
+  // Reuse: the same connection, the same details.
+  auto b = c.send(get("/json/10"));
+  REQUIRE(b.ok);
+  CHECK(b.conn.reused);
+  CHECK(b.conn.id == ca.id);
+  CHECK(b.conn.local_port == ca.local_port);
+  CHECK(b.conn.local_ip == ca.local_ip);
+  CHECK(b.conn.remote_port == ca.remote_port);
+  // A new connection has a new id and local port.
+  HttpRequest fr = get("/status/200");
+  fr.fresh_connection = true;
+  auto f = c.send(fr);
+  REQUIRE(f.ok);
+  CHECK_FALSE(f.conn.reused);
+  CHECK(f.conn.id != ca.id);
+  CHECK(f.conn.local_port != ca.local_port);
+  // A refused connect has no connection details to show beyond what curl knows.
+  HttpClient d;
+  HttpRequest dead;
+  dead.url = "http://127.0.0.1:1/";
+  auto x = d.send(dead);
+  CHECK_FALSE(x.ok);
+  CHECK_FALSE(x.conn.tls);
+  CHECK(x.conn.tls_info == nullptr);
+}
+
+TEST_CASE("connection info: TLS against the local test server", "[http][conn][tls]") {
+  auto& srv = TlsTestServer::get();
+  if (!srv.port()) SKIP("watt_testserver.exe is not next to the test exe");
+  HttpClient c;
+  auto a = c.send(srv.request());
+  INFO("error " << a.error);
+  REQUIRE(a.ok);
+  CHECK(a.status == 405);  // the gRPC-Web listener only takes POST; any answer will do
+  const ConnectionInfo& ci = a.conn;
+  CHECK_FALSE(ci.reused);
+  CHECK(ci.tls);
+  CHECK(ci.local_ip == "127.0.0.1");
+  CHECK(ci.local_port > 0);
+  CHECK(ci.remote_ip == "127.0.0.1");
+  CHECK(ci.remote_port == srv.port());
+  REQUIRE(ci.tls_info);
+  const TlsInfo& t = *ci.tls_info;
+  WARN("local TLS: " << t.version << " " << t.cipher << " alpn '" << t.alpn << "', read in "
+                     << t.read_ms * 1000 << " us");
+  CHECK((t.version == "TLSv1.3" || t.version == "TLSv1.2"));
+  CHECK(t.cipher.rfind("TLS_", 0) == 0);
+  CHECK((t.alpn.empty() || t.alpn == "http/1.1"));  // the OpenSSL listener selects no ALPN
+  CHECK(t.verify_result.rfind("verified", 0) == 0);
+  CHECK(t.leaf.subject == "CN=localhost");
+  CHECK(t.leaf.subject_cn == "localhost");
+  CHECK(t.leaf.issuer == "CN=watt test CA");
+  CHECK(t.leaf.issuer_cn == "watt test CA");
+  CHECK(t.leaf.subject_alt_names ==
+        std::vector<std::string>{"localhost", "watt.test", "127.0.0.1"});
+  CHECK(t.leaf.not_before == "2026-11-16T23:06:29Z");
+  CHECK(t.leaf.not_after == "2126-10-23T23:06:29Z");
+  CHECK(t.leaf.serial == "1D29EDA45D4C26B44DD66472531F028C5556227A");
+  CHECK(t.leaf.sha256_fingerprint ==
+        "F3:01:B3:F3:55:F3:67:49:37:70:D4:E2:EC:C8:42:5D:4C:A5:F2:0B:00:67:85:D7:CD:22:99:FD:3C:"
+        "BA:48:AE");
+  CHECK(t.chain_length == 1);  // the server sends its leaf only
+  CHECK(t.read_ms < 5.0);
+  // Mirrors the response view reads.
+  CHECK(a.tls_version == t.version);
+  CHECK(a.tls_cipher == t.cipher);
+  CHECK(a.cert_subject == "CN=localhost");
+  CHECK(a.cert_issuer == "CN=watt test CA");
+  CHECK(a.cert_san == "localhost, watt.test, 127.0.0.1");
+  CHECK(a.cert_not_after == "2126-10-23 23:06:29 UTC");
+  CHECK(a.cert_chain.find("localhost  (issued by watt test CA, until 2126-10-23)") == 0);
+  CHECK(a.verify_result == t.verify_result);
+  CHECK(a.local_ip == ci.local_ip);
+  CHECK(a.local_port == ci.local_port);
+
+  // Re-fires on the same connection share the very same details (no re-read).
+  for (int i = 0; i < 5; ++i) {
+    auto b = c.send(srv.request());
+    REQUIRE(b.ok);
+    CHECK(b.conn.reused);
+    CHECK(b.conn.id == ci.id);
+    CHECK(b.conn.tls);
+    CHECK(b.conn.tls_info.get() == ci.tls_info.get());
+    CHECK(b.conn.local_port == ci.local_port);
+    CHECK(b.tls_version == a.tls_version);
+    CHECK(b.cert_not_after == a.cert_not_after);
+  }
+  // A fresh connection is read again.
+  HttpRequest fr = srv.request();
+  fr.fresh_connection = true;
+  auto f = c.send(fr);
+  REQUIRE(f.ok);
+  CHECK_FALSE(f.conn.reused);
+  CHECK(f.conn.id != ci.id);
+  REQUIRE(f.conn.tls_info);
+  CHECK(f.conn.tls_info.get() != ci.tls_info.get());
+  CHECK(f.conn.tls_info->leaf.sha256_fingerprint == t.leaf.sha256_fingerprint);
+
+  // Verification off: still the details, and the verdict says so.
+  HttpClient u;
+  HttpRequest ur = srv.request();
+  ur.ca_pem.clear();
+  ur.verify_tls = false;
+  auto v = u.send(ur);
+  REQUIRE(v.ok);
+  REQUIRE(v.conn.tls_info);
+  CHECK(v.conn.tls_info->verify_result.rfind("not verified", 0) == 0);
+  CHECK(v.conn.tls_info->leaf.subject == "CN=localhost");
+}
+
+TEST_CASE("connection info: real HTTPS server", "[http][conn][tls][net]") {
+  HttpClient c;
+  HttpRequest r;
+  r.url = "https://www.google.com/generate_204";
+  r.timeout_ms = 10000;
+  auto a = c.send(r);
+  if (!a.ok) SKIP("network unavailable: " << a.error);
+  REQUIRE(a.conn.tls);
+  REQUIRE(a.conn.tls_info);
+  const TlsInfo& t = *a.conn.tls_info;
+  WARN("google: " << t.version << " " << t.cipher << " alpn " << t.alpn << " | "
+                  << t.leaf.subject << " | " << t.leaf.issuer << " | " << t.leaf.not_before
+                  << " .. " << t.leaf.not_after << " | chain " << t.chain_length << " | read "
+                  << t.read_ms * 1000 << " us");
+  CHECK((t.version == "TLSv1.3" || t.version == "TLSv1.2"));
+  CHECK(t.cipher.rfind("TLS_", 0) == 0);
+  CHECK(t.alpn == "h2");
+  CHECK(a.http_version == "HTTP/2");
+  CHECK(t.verify_result.rfind("verified", 0) == 0);
+  CHECK(t.leaf.subject.find("google") != std::string::npos);
+  CHECK_FALSE(t.leaf.issuer.empty());
+  CHECK(t.leaf.not_before.size() == 20);
+  CHECK(t.leaf.not_after.size() == 20);
+  CHECK(t.leaf.not_before < t.leaf.not_after);
+  CHECK(t.leaf.sha256_fingerprint.size() == 32 * 3 - 1);
+  CHECK_FALSE(t.leaf.serial.empty());
+  CHECK(std::find(t.leaf.subject_alt_names.begin(), t.leaf.subject_alt_names.end(),
+                  "www.google.com") != t.leaf.subject_alt_names.end());
+  CHECK(t.chain_length >= 2);
+  CHECK_FALSE(a.conn.local_ip.empty());
+  CHECK(a.conn.local_port > 0);
+  CHECK(a.conn.remote_port == 443);
+  auto b = c.send(r);
+  REQUIRE(b.ok);
+  CHECK(b.conn.reused);
+  CHECK(b.conn.id == a.conn.id);
+  CHECK(b.conn.tls_info.get() == a.conn.tls_info.get());
+  // A second new connection in the same process: the steady-state cost of reading the details.
+  HttpRequest fr = r;
+  fr.fresh_connection = true;
+  auto f = c.send(fr);
+  REQUIRE(f.ok);
+  REQUIRE(f.conn.tls_info);
+  CHECK(f.conn.tls_info->alpn == "h2");
+  WARN("google: second new connection read in " << f.conn.tls_info->read_ms * 1000 << " us (tls "
+                                                << f.timing.tls_ms << " ms)");
+}
+
+// watt_test_http "[.tlscold]": the first certificate read in a process after global_init
+// (as the app runs it), against a public server.
+TEST_CASE("connection info: first read in a process", "[.tlscold]") {
+  const auto t0 = Clock::now();
+  HttpClient::global_init();
+  const double init_ms = ms_between(t0, Clock::now());
+  HttpClient c;
+  HttpRequest r;
+  r.url = "https://www.google.com/generate_204";
+  auto a = c.send(r);
+  if (!a.ok) SKIP("network unavailable: " << a.error);
+  REQUIRE(a.conn.tls_info);
+  WARN("global_init " << init_ms << " ms; first certificate read " << a.conn.tls_info->read_ms * 1000
+                      << " us; tls " << a.timing.tls_ms << " ms, send " << a.timing.send_ms << " ms");
+}
+
+// watt_test_http "[.bench]": what HttpResponse::conn adds to a warm request, measured in
+// isolation (the warm end-to-end p50 moves by more than that from run to run): the copy send()
+// makes from the per-connection cache (ConnectionInfo + the mirror strings) and the
+// CURLINFO_CONN_ID lookup on_prereq does.
+TEST_CASE("connection info: warm per-request cost", "[.bench]") {
+  auto& srv = TlsTestServer::get();
+  if (!srv.port()) SKIP("watt_testserver.exe is not next to the test exe");
+  HttpClient c;
+  auto a = c.send(srv.request());
+  REQUIRE(a.conn.tls_info);
+  const int n = 200000;
+  volatile size_t sink = 0;
+  auto t0 = Clock::now();
+  for (int i = 0; i < n; ++i) {
+    HttpResponse r;  // what send() does on a cache hit
+    r.conn = a.conn;
+    r.local_ip = a.conn.local_ip;
+    r.local_port = a.conn.local_port;
+    r.tls_version = a.tls_version;
+    r.tls_cipher = a.tls_cipher;
+    r.cert_subject = a.cert_subject;
+    r.cert_san = a.cert_san;
+    r.cert_issuer = a.cert_issuer;
+    r.cert_not_after = a.cert_not_after;
+    r.cert_chain = a.cert_chain;
+    r.verify_result = a.verify_result;
+    sink = sink + r.cert_san.size();
+  }
+  const double with_us = ms_between(t0, Clock::now()) * 1000 / n;
+  t0 = Clock::now();
+  for (int i = 0; i < n; ++i) {
+    HttpResponse r;
+    r.remote_ip = a.remote_ip;
+    sink = sink + r.remote_ip.size();
+  }
+  const double without_us = ms_between(t0, Clock::now()) * 1000 / n;
+  CURL* e = curl_easy_init();
+  t0 = Clock::now();
+  for (int i = 0; i < n; ++i) {
+    curl_off_t id = -1;
+    curl_easy_getinfo(e, CURLINFO_CONN_ID, &id);
+    sink = sink + static_cast<size_t>(id);
+  }
+  const double getinfo_us = ms_between(t0, Clock::now()) * 1000 / n;
+  curl_easy_cleanup(e);
+  WARN("per warm request: copy conn + mirrors " << (with_us - without_us) * 1000
+                                               << " ns (of which conn alone is a shared_ptr + 2 "
+                                                  "short strings), CONN_ID lookup "
+                                               << getinfo_us * 1000 << " ns");
 }
