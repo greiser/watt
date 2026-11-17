@@ -22,9 +22,12 @@ if(WATT_CURL_ROOT)
   add_library(watt_curl INTERFACE)
   target_include_directories(watt_curl BEFORE INTERFACE "${WATT_CURL_ROOT}/include")
   target_compile_definitions(watt_curl INTERFACE CURL_STATICLIB)
+  # zlib: link the process-wide vcpkg zlib (the one gRPC uses), never the overlay's static zs.lib.
+  # Two zlibs in one exe collide (LNK2005 inflate) depending on which member the linker pulls first.
+  find_package(ZLIB REQUIRED)
   target_link_libraries(watt_curl INTERFACE
     "${WATT_CURL_ROOT}/lib/libcurl.lib" "${WATT_CURL_ROOT}/lib/nghttp2.lib"
-    "${WATT_CURL_ROOT}/lib/zs.lib" bcrypt advapi32 crypt32 secur32 ws2_32 iphlpapi)
+    ZLIB::ZLIB bcrypt advapi32 crypt32 secur32 ws2_32 iphlpapi)
   message(STATUS "watt: pinned static libcurl from ${WATT_CURL_ROOT}")
 else()
   find_package(CURL CONFIG REQUIRED)
