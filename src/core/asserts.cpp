@@ -609,6 +609,9 @@ ResponseData::ResponseData(const HttpResponse& r) : impl_(std::make_unique<Impl>
 ResponseData::ResponseData(const GrpcResponse& r) : impl_(std::make_unique<Impl>()) { impl_->grpc = &r; }
 ResponseData::~ResponseData() = default;
 double ResponseData::parse_us() const { return impl_->parse_us; }
+const HttpResponse* ResponseData::http() const { return impl_->http; }
+const GrpcResponse* ResponseData::grpc() const { return impl_->grpc; }
+const rapidjson::Value* ResponseData::json(size_t i) const { return impl_->json(i); }
 
 namespace {
 

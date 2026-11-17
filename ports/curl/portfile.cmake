@@ -72,6 +72,9 @@ endif()
 
 if(VCPKG_TARGET_IS_WINDOWS)
     list(APPEND OPTIONS -DENABLE_UNICODE=ON)
+    # watt: NTLM auth (off by default since curl 8.x), done by Windows SSPI. Implicit Windows
+    # credentials are gated per origin by Workspace::blocked_sso_hosts().
+    list(APPEND OPTIONS -DCURL_ENABLE_NTLM=ON)
 endif()
 
 if(VCPKG_TARGET_IS_APPLE AND

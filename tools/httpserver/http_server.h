@@ -13,6 +13,21 @@
 //   /drip/<n>?interval=ms -> n body bytes, one every `interval` ms (Content-Length known)
 //   /gzip/<n>             -> n bytes of 'x', sent with Content-Encoding: gzip (wire << n)
 //   /close                -> responds then closes the connection
+// Authentication (watt's auth tests; credentials are test fixtures):
+//   /digest-auth/<user>/<pass> -> RFC 7616 Digest (MD5, qop=auth): 401 + challenge, then
+//                                {"authenticated":true,"user":...} when the response checks out
+//   /ntlm-probe, /negotiate-probe -> 401 WWW-Authenticate: NTLM / Negotiate until a request carries
+//                                "Authorization: NTLM|Negotiate <token>"; then 200 {"scheme","token"}
+//                                (the handshake is not completed: proves the client started it)
+//   /oauth/token          -> OAuth 2.0 token endpoint (form POST). Client "watt-client" /
+//                            "s3cret" (Basic header or client_id / client_secret fields). Grants:
+//                            client_credentials, password (alice / wonderland), authorization_code
+//                            (with PKCE S256 when the code was issued with a challenge),
+//                            refresh_token. ?expires_in=<s> sets the lifetime (default 3600).
+//   /oauth/authorize      -> 302 to redirect_uri?code=...&state=... (no login page)
+//   /oauth/protected      -> 200 {"ok":true,...} with a live token (Bearer header or
+//                            ?access_token=), else 401
+//   /oauth/stats          -> {"token_requests":n,"grants":{...}}
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -21,6 +36,8 @@
 #endif
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <windows.h>
+#include <bcrypt.h>
 
 #include <algorithm>
 #include <atomic>
@@ -29,6 +46,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <map>
 #include <mutex>
 #include <set>
 #include <string>
@@ -38,6 +56,7 @@
 #include <vector>
 
 #pragma comment(lib, "ws2_32.lib")
+#pragma comment(lib, "bcrypt.lib")
 
 namespace watt::httpserver {
 
@@ -222,6 +241,102 @@ inline std::string gzip_x(uint64_t n) {
   const auto isize = static_cast<uint32_t>(n);
   for (int i = 0; i < 4; ++i) out.push_back(static_cast<char>((crc >> (8 * i)) & 0xff));
   for (int i = 0; i < 4; ++i) out.push_back(static_cast<char>((isize >> (8 * i)) & 0xff));
+  return out;
+}
+
+// Digest helpers (BCrypt) for the Digest and PKCE checks.
+inline std::string bcrypt_digest(const wchar_t* alg, std::string_view data) {
+  BCRYPT_ALG_HANDLE a = nullptr;
+  std::string out;
+  if (BCryptOpenAlgorithmProvider(&a, alg, nullptr, 0) != 0) return out;
+  DWORD len = 0, got = 0;
+  BCryptGetProperty(a, BCRYPT_HASH_LENGTH, reinterpret_cast<PUCHAR>(&len), sizeof(len), &got, 0);
+  out.resize(len);
+  static UCHAR empty = 0;
+  BCryptHash(a, nullptr, 0, data.empty() ? &empty : reinterpret_cast<PUCHAR>(const_cast<char*>(data.data())),
+             static_cast<ULONG>(data.size()), reinterpret_cast<PUCHAR>(out.data()), len);
+  BCryptCloseAlgorithmProvider(a, 0);
+  return out;
+}
+inline std::string md5_hex(std::string_view s) {
+  static const char* hx = "0123456789abcdef";
+  std::string d = bcrypt_digest(BCRYPT_MD5_ALGORITHM, s), out;
+  for (unsigned char c : d) {
+    out.push_back(hx[c >> 4]);
+    out.push_back(hx[c & 15]);
+  }
+  return out;
+}
+inline std::string b64(std::string_view in, bool url) {
+  const char* t = url ? "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+                      : "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  std::string out;
+  size_t i = 0;
+  const auto* p = reinterpret_cast<const unsigned char*>(in.data());
+  for (; i + 2 < in.size(); i += 3) {
+    const uint32_t v = (uint32_t{p[i]} << 16) | (uint32_t{p[i + 1]} << 8) | p[i + 2];
+    for (int k = 18; k >= 0; k -= 6) out.push_back(t[(v >> k) & 63]);
+  }
+  if (i + 1 == in.size()) {
+    const uint32_t v = uint32_t{p[i]} << 16;
+    out.push_back(t[(v >> 18) & 63]);
+    out.push_back(t[(v >> 12) & 63]);
+    if (!url) out += "==";
+  } else if (i + 2 == in.size()) {
+    const uint32_t v = (uint32_t{p[i]} << 16) | (uint32_t{p[i + 1]} << 8);
+    out.push_back(t[(v >> 18) & 63]);
+    out.push_back(t[(v >> 12) & 63]);
+    out.push_back(t[(v >> 6) & 63]);
+    if (!url) out.push_back('=');
+  }
+  return out;
+}
+inline std::string unb64(std::string_view in) {
+  std::string out;
+  uint32_t acc = 0;
+  int bits = 0;
+  for (char c : in) {
+    int v;
+    if (c >= 'A' && c <= 'Z') v = c - 'A';
+    else if (c >= 'a' && c <= 'z') v = c - 'a' + 26;
+    else if (c >= '0' && c <= '9') v = c - '0' + 52;
+    else if (c == '+' || c == '-') v = 62;
+    else if (c == '/' || c == '_') v = 63;
+    else continue;
+    acc = (acc << 6) | static_cast<uint32_t>(v);
+    bits += 6;
+    if (bits >= 8) {
+      bits -= 8;
+      out.push_back(static_cast<char>((acc >> bits) & 0xFF));
+    }
+  }
+  return out;
+}
+// key="value" / key=token pairs of an auth header value ("a=b, c=\"d\"").
+inline std::map<std::string, std::string> auth_params(std::string_view s) {
+  std::map<std::string, std::string> out;
+  size_t i = 0;
+  while (i < s.size()) {
+    while (i < s.size() && (s[i] == ' ' || s[i] == ',')) ++i;
+    const size_t eq = s.find('=', i);
+    if (eq == std::string_view::npos) break;
+    std::string k(trim(s.substr(i, eq - i)));
+    for (auto& c : k) c = lower(c);
+    i = eq + 1;
+    std::string v;
+    if (i < s.size() && s[i] == '"') {
+      ++i;
+      while (i < s.size() && s[i] != '"') {
+        if (s[i] == '\\' && i + 1 < s.size()) ++i;
+        v.push_back(s[i++]);
+      }
+      ++i;
+    } else {
+      while (i < s.size() && s[i] != ',') v.push_back(s[i++]);
+      v = std::string(trim(v));
+    }
+    out[k] = v;
+  }
   return out;
 }
 
@@ -625,11 +740,202 @@ class Server {
              !close;
     }
 
+    if (path.rfind("/digest-auth/", 0) == 0) return digest_auth(s, req, close) && !close;
+    if (path == "/ntlm-probe" || path == "/negotiate-probe") {
+      const char* scheme = path == "/ntlm-probe" ? "NTLM" : "Negotiate";
+      const std::string* a = req.header("authorization");
+      const std::string pre = std::string(scheme) + " ";
+      if (a && a->size() > pre.size() && detail::iequals(std::string_view(*a).substr(0, pre.size()), pre)) {
+        std::string j = "{\"scheme\":";
+        detail::json_escape(j, scheme);
+        j += ",\"token\":";
+        detail::json_escape(j, a->substr(pre.size()));
+        j += "}";
+        return respond(s, req, 200, "application/json", j, close) && !close;
+      }
+      return respond(s, req, 401, "application/json", "{\"error\":\"unauthorized\"}", close,
+                     {{"WWW-Authenticate", scheme}}) && !close;
+    }
+    if (path.rfind("/oauth/", 0) == 0) return oauth(s, req, close) && !close;
+
     if (path == "/") {
       return respond(s, req, 200, "text/plain", "watt_httpserver\n", close) && !close;
     }
     return respond(s, req, 404, "application/json", "{\"error\":\"not found\"}", close) && !close;
   }
+
+  // ---------------------------------------------------------------- auth endpoints
+  bool digest_auth(SOCKET s, const detail::Request& req, bool close) {
+    const std::string rest = req.path.substr(13);
+    const size_t sl = rest.find('/');
+    if (sl == std::string::npos) return respond(s, req, 404, "text/plain", "use /digest-auth/<user>/<pass>", close);
+    const std::string user = rest.substr(0, sl), pass = rest.substr(sl + 1);
+    const std::string realm = "watt@test";
+    const std::string* a = req.header("authorization");
+    if (a && a->size() > 7 && detail::iequals(std::string_view(*a).substr(0, 7), "Digest ")) {
+      auto p = detail::auth_params(std::string_view(*a).substr(7));
+      bool known_nonce;
+      {
+        std::lock_guard<std::mutex> lk(mu_);
+        known_nonce = nonces_.count(p["nonce"]) > 0;
+      }
+      const std::string ha1 = detail::md5_hex(user + ":" + realm + ":" + pass);
+      const std::string ha2 = detail::md5_hex(req.method + ":" + p["uri"]);
+      const std::string expect =
+          detail::md5_hex(ha1 + ":" + p["nonce"] + ":" + p["nc"] + ":" + p["cnonce"] + ":" + p["qop"] + ":" + ha2);
+      if (known_nonce && p["username"] == user && p["realm"] == realm && p["qop"] == "auth" && p["response"] == expect &&
+          p["uri"] == req.target) {
+        std::string j = "{\"authenticated\":true,\"user\":";
+        detail::json_escape(j, user);
+        j += "}";
+        return respond(s, req, 200, "application/json", j, close);
+      }
+    }
+    char nonce[48];
+    std::snprintf(nonce, sizeof(nonce), "%016llx%08x",
+                  static_cast<unsigned long long>(GetTickCount64()) * 2654435761ull, static_cast<unsigned>(++nonce_seq_));
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      nonces_.insert(nonce);
+    }
+    const std::string chal = "Digest realm=\"" + realm + "\", qop=\"auth\", nonce=\"" + nonce +
+                             "\", opaque=\"5ccc069c403ebaf9f0171e9517f40e41\", algorithm=MD5";
+    return respond(s, req, 401, "application/json", "{\"authenticated\":false}", close, {{"WWW-Authenticate", chal}});
+  }
+
+  bool oauth(SOCKET s, const detail::Request& req, bool close) {
+    auto form = detail::parse_query(req.body);
+    auto query = detail::parse_query(req.query);
+    auto get = [](const std::vector<std::pair<std::string, std::string>>& v, const char* k) {
+      for (const auto& [a, b] : v)
+        if (a == k) return b;
+      return std::string{};
+    };
+    auto json_error = [&](int code, const char* err, const char* desc) {
+      std::string j = std::string("{\"error\":\"") + err + "\",\"error_description\":\"" + desc + "\"}";
+      return respond(s, req, code, "application/json", j, close);
+    };
+    if (req.path == "/oauth/authorize") {
+      const std::string redirect = get(query, "redirect_uri"), state = get(query, "state");
+      if (get(query, "response_type") != "code" || get(query, "client_id") != "watt-client" || redirect.empty())
+        return json_error(400, "invalid_request", "bad authorize request");
+      std::string code = "code-" + std::to_string(++token_seq_);
+      {
+        std::lock_guard<std::mutex> lk(mu_);
+        codes_[code] = {get(query, "code_challenge"), get(query, "code_challenge_method"), redirect};
+      }
+      std::string loc = redirect + (redirect.find('?') == std::string::npos ? "?" : "&") + "code=" + code + "&state=" + state;
+      return respond(s, req, 302, "text/plain", "redirect", close, {{"Location", loc}});
+    }
+    if (req.path == "/oauth/protected") {
+      std::string tok;
+      if (const std::string* a = req.header("authorization"); a && a->size() > 7 && detail::iequals(a->substr(0, 7), "Bearer "))
+        tok = a->substr(7);
+      if (tok.empty()) tok = get(query, "access_token");
+      bool live = false;
+      {
+        std::lock_guard<std::mutex> lk(mu_);
+        auto it = tokens_.find(tok);
+        live = it != tokens_.end() && GetTickCount64() < it->second;
+      }
+      if (!live) return respond(s, req, 401, "application/json", "{\"ok\":false}", close, {{"WWW-Authenticate", "Bearer"}});
+      std::string j = "{\"ok\":true,\"token\":";
+      detail::json_escape(j, tok);
+      j += "}";
+      return respond(s, req, 200, "application/json", j, close);
+    }
+    if (req.path == "/oauth/stats") {
+      std::lock_guard<std::mutex> lk(mu_);
+      std::string j = "{\"token_requests\":" + std::to_string(token_requests_) + ",\"grants\":{";
+      bool first = true;
+      for (const auto& [g, n] : grants_) {
+        if (!first) j += ',';
+        first = false;
+        detail::json_escape(j, g);
+        j += ':' + std::to_string(n);
+      }
+      j += "}}";
+      return respond(s, req, 200, "application/json", j, close);
+    }
+    if (req.path != "/oauth/token") return json_error(404, "not_found", "unknown oauth endpoint");
+    if (req.method != "POST") return json_error(405, "invalid_request", "POST only");
+    std::string id = get(form, "client_id"), secret = get(form, "client_secret");
+    if (const std::string* a = req.header("authorization"); a && a->size() > 6 && detail::iequals(a->substr(0, 6), "Basic ")) {
+      const std::string dec = detail::unb64(a->substr(6));
+      const size_t c = dec.find(':');
+      id = detail::url_decode(dec.substr(0, c));
+      secret = c == std::string::npos ? std::string{} : detail::url_decode(dec.substr(c + 1));
+    }
+    const std::string grant = get(form, "grant_type");
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      ++token_requests_;
+      ++grants_[grant];
+    }
+    if (id != "watt-client" || secret != "s3cret") return json_error(401, "invalid_client", "bad client credentials");
+    bool with_refresh = false;
+    if (grant == "client_credentials") {
+    } else if (grant == "password") {
+      if (get(form, "username") != "alice" || get(form, "password") != "wonderland")
+        return json_error(400, "invalid_grant", "bad user credentials");
+      with_refresh = true;
+    } else if (grant == "authorization_code") {
+      Code c;
+      {
+        std::lock_guard<std::mutex> lk(mu_);
+        auto it = codes_.find(get(form, "code"));
+        if (it == codes_.end()) return json_error(400, "invalid_grant", "unknown code");
+        c = it->second;
+        codes_.erase(it);
+      }
+      if (c.redirect != get(form, "redirect_uri")) return json_error(400, "invalid_grant", "redirect_uri mismatch");
+      if (!c.challenge.empty()) {
+        const std::string v = get(form, "code_verifier");
+        const std::string want =
+            c.method == "S256" ? detail::b64(detail::bcrypt_digest(BCRYPT_SHA256_ALGORITHM, v), true) : v;
+        if (v.empty() || want != c.challenge) return json_error(400, "invalid_grant", "PKCE verification failed");
+      }
+      with_refresh = true;
+    } else if (grant == "refresh_token") {
+      std::lock_guard<std::mutex> lk(mu_);
+      if (!refresh_.count(get(form, "refresh_token"))) return json_error(400, "invalid_grant", "unknown refresh token");
+    } else {
+      return json_error(400, "unsupported_grant_type", "unsupported grant");
+    }
+    uint64_t expires = 3600;
+    detail::parse_u64(get(query, "expires_in"), expires);
+    const std::string tok = "tok-" + grant + "-" + std::to_string(++token_seq_);
+    std::string rt;
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      tokens_[tok] = GetTickCount64() + expires * 1000;
+      if (with_refresh) {
+        rt = "rt-" + std::to_string(++token_seq_);
+        refresh_.insert(rt);
+      }
+    }
+    std::string j = "{\"access_token\":\"" + tok + "\",\"token_type\":\"Bearer\",\"expires_in\":" + std::to_string(expires);
+    if (!rt.empty()) j += ",\"refresh_token\":\"" + rt + "\"";
+    const std::string scope = get(form, "scope");
+    if (!scope.empty()) {
+      j += ",\"scope\":";
+      detail::json_escape(j, scope);
+    }
+    j += "}";
+    return respond(s, req, 200, "application/json", j, close, {{"Cache-Control", "no-store"}});
+  }
+
+  struct Code {
+    std::string challenge, method, redirect;
+  };
+  std::set<std::string> nonces_;
+  std::atomic<unsigned> nonce_seq_{0};
+  std::atomic<uint64_t> token_seq_{0};
+  std::map<std::string, Code> codes_;
+  std::map<std::string, uint64_t> tokens_;  // token -> expiry (GetTickCount64 ms)
+  std::set<std::string> refresh_;
+  std::map<std::string, int> grants_;
+  int token_requests_ = 0;
 
   void serve(SOCKET s) {
     std::string buf;

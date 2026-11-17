@@ -823,6 +823,9 @@ struct HttpClient::Impl {
     // (local file reads, UNC/SMB NTLM credential leaks).
     curl_easy_setopt(h, CURLOPT_PROTOCOLS_STR, "http,https");
     curl_easy_setopt(h, CURLOPT_REDIR_PROTOCOLS_STR, "http,https");
+    // Credentials (Basic / Digest / NTLM / Negotiate / SigV4, including implicit Windows SSO)
+    // go to the original host only, never to a redirect target on another host or port.
+    curl_easy_setopt(h, CURLOPT_UNRESTRICTED_AUTH, 0L);
     // Like curl (curl/x) and Postman (PostmanRuntime/x), every request names its client: some
     // APIs refuse requests without one (api.github.com answers 403). A User-Agent header in the
     // request replaces it; an empty one ("User-Agent" with no value) sends it empty.
@@ -845,7 +848,44 @@ struct HttpClient::Impl {
     std::string ca_pem;
     int kind = 0;  // 0 GET-like, 1 HEAD, 2 with body
     std::string custom;
+    HttpRequest::Auth auth = HttpRequest::Auth::None;
+    std::string auth_user, auth_password, aws_sigv4;
   } last;
+
+  // Authentication options: only touched when they differ from the last request, so a request
+  // without auth (the common case) costs four comparisons.
+  void apply_auth(const HttpRequest& req, bool all) {
+    CURL* h = easy;
+    const bool sig = !req.aws_sigv4.empty();
+    const bool none = req.auth == HttpRequest::Auth::None && !sig;
+    if (all && none) return;  // a fresh handle has curl's defaults already
+    if (!all && req.auth == last.auth && req.auth_user == last.auth_user && req.auth_password == last.auth_password &&
+        req.aws_sigv4 == last.aws_sigv4)
+      return;
+    long mask = CURLAUTH_BASIC;
+    switch (req.auth) {
+      case HttpRequest::Auth::None:
+      case HttpRequest::Auth::Basic: mask = CURLAUTH_BASIC; break;
+      case HttpRequest::Auth::Digest: mask = CURLAUTH_DIGEST; break;
+      case HttpRequest::Auth::Ntlm: mask = CURLAUTH_NTLM; break;
+      case HttpRequest::Auth::Negotiate: mask = CURLAUTH_NEGOTIATE; break;
+    }
+    if (sig) mask = CURLAUTH_AWS_SIGV4;
+    curl_easy_setopt(h, CURLOPT_HTTPAUTH, mask);
+    curl_easy_setopt(h, CURLOPT_AWS_SIGV4, sig ? req.aws_sigv4.c_str() : nullptr);
+    if (none) {
+      curl_easy_setopt(h, CURLOPT_USERNAME, nullptr);
+      curl_easy_setopt(h, CURLOPT_PASSWORD, nullptr);
+    } else {
+      // Empty strings (not null): with SSPI, NTLM / Negotiate then use the current Windows logon.
+      curl_easy_setopt(h, CURLOPT_USERNAME, req.auth_user.c_str());
+      curl_easy_setopt(h, CURLOPT_PASSWORD, req.auth_password.c_str());
+    }
+    last.auth = req.auth;
+    last.auth_user = req.auth_user;
+    last.auth_password = req.auth_password;
+    last.aws_sigv4 = req.aws_sigv4;
+  }
 
   void apply(const HttpRequest& req) {
     CURL* h = easy;
@@ -919,6 +959,7 @@ struct HttpClient::Impl {
                                               : CURLFOLLOW_ALL;
     if (all || follow != last.follow) curl_easy_setopt(h, CURLOPT_FOLLOWLOCATION, follow);
     last.follow = follow;
+    apply_auth(req, all);
     last.valid = true;
   }
 

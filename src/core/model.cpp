@@ -24,6 +24,7 @@
 #include "core/model_json.h"
 #include "core/model_prescan.h"
 #include "core/model_secure.h"
+#include "core/oauth2.h"
 
 // On-disk formats
 // ---------------
@@ -455,6 +456,92 @@ std::vector<CurlData> curl_data_from(const Value& o) {
   return out;
 }
 
+// "auth_scheme": {type, ...}: only the fields of that type, and of OAuth 2.0 only what is not
+// OAuth2Config's default.
+Value auth_scheme_value(const HttpAuth& x, Alloc& a) {
+  Value o(rapidjson::kObjectType);
+  o.AddMember("type", Value(rapidjson::StringRef(auth_type_name(x.type))), a);
+  auto put = [&](const char* k, const std::string& v, bool always = false) {
+    if (always || !v.empty()) o.AddMember(rapidjson::StringRef(k), jstr(v, a), a);
+  };
+  switch (x.type) {
+    case HttpAuth::Type::None: break;
+    case HttpAuth::Type::Digest:
+    case HttpAuth::Type::Ntlm:
+    case HttpAuth::Type::Negotiate:
+      put("user", x.user, true);
+      put("password", x.password, true);
+      break;
+    case HttpAuth::Type::AwsSigV4:
+      put("access_key", x.aws_access_key, true);
+      put("secret_key", x.aws_secret_key, true);
+      put("session_token", x.aws_session_token);
+      put("region", x.aws_region, true);
+      put("service", x.aws_service, true);
+      break;
+    case HttpAuth::Type::OAuth2: {
+      const OAuth2Config& c = x.oauth2;
+      const OAuth2Config d;
+      const char* g = c.grant == OAuth2Config::Grant::Password            ? "password"
+                      : c.grant == OAuth2Config::Grant::AuthorizationCode ? "authorization_code"
+                                                                          : "client_credentials";
+      o.AddMember("grant", Value(rapidjson::StringRef(g)), a);
+      put("token_url", c.token_url, true);
+      put("auth_url", c.auth_url);
+      put("client_id", c.client_id, true);
+      put("client_secret", c.client_secret);
+      put("scope", c.scope);
+      put("audience", c.audience);
+      put("username", c.username);
+      put("password", c.password);
+      put("redirect_uri", c.redirect_uri);
+      if (c.pkce != d.pkce) o.AddMember("pkce", c.pkce, a);
+      if (c.client_auth != d.client_auth) o.AddMember("client_auth", "body", a);
+      if (c.add_to != d.add_to) o.AddMember("add_to", "query", a);
+      if (c.header_prefix != d.header_prefix) put("header_prefix", c.header_prefix, true);
+      if (c.query_param != d.query_param) put("query_param", c.query_param, true);
+      if (c.auto_refresh != d.auto_refresh) o.AddMember("auto_refresh", c.auto_refresh, a);
+      break;
+    }
+  }
+  return o;
+}
+
+void auth_scheme_from(const Value& o, HttpAuth& x) {
+  x = HttpAuth{};
+  x.type = auth_type_from(get_str(o, "type"));
+  x.user = get_str(o, "user");
+  x.password = get_str(o, "password");
+  x.aws_access_key = get_str(o, "access_key");
+  x.aws_secret_key = get_str(o, "secret_key");
+  x.aws_session_token = get_str(o, "session_token");
+  x.aws_region = get_str(o, "region");
+  x.aws_service = get_str(o, "service");
+  if (x.type == HttpAuth::Type::OAuth2) {
+    OAuth2Config& c = x.oauth2;
+    const std::string g = get_str(o, "grant");
+    c.grant = g == "password"             ? OAuth2Config::Grant::Password
+              : g == "authorization_code" ? OAuth2Config::Grant::AuthorizationCode
+                                          : OAuth2Config::Grant::ClientCredentials;
+    c.token_url = get_str(o, "token_url");
+    c.auth_url = get_str(o, "auth_url");
+    c.client_id = get_str(o, "client_id");
+    c.client_secret = get_str(o, "client_secret");
+    c.scope = get_str(o, "scope");
+    c.audience = get_str(o, "audience");
+    c.username = get_str(o, "username");
+    c.password = get_str(o, "password");
+    c.redirect_uri = get_str(o, "redirect_uri");
+    c.pkce = get_bool(o, "pkce", c.pkce);
+    c.client_auth = get_str(o, "client_auth") == "body" ? OAuth2Config::ClientAuth::Body
+                                                         : OAuth2Config::ClientAuth::BasicHeader;
+    c.add_to = get_str(o, "add_to") == "query" ? OAuth2Config::AddTo::Query : OAuth2Config::AddTo::Header;
+    c.header_prefix = get_str(o, "header_prefix", c.header_prefix);
+    c.query_param = get_str(o, "query_param", c.query_param);
+    c.auto_refresh = get_bool(o, "auto_refresh", c.auto_refresh);
+  }
+}
+
 Value request_value(const SavedRequest& r, Alloc& a, bool lines, size_t body_cap) {
   Value o(rapidjson::kObjectType);
   o.AddMember("version", 1, a);
@@ -489,6 +576,7 @@ Value request_value(const SavedRequest& r, Alloc& a, bool lines, size_t body_cap
     auth.AddMember("password", jstr(ba.password, a), a);
     http.AddMember("auth", auth, a);
   }
+  if (r.auth.type != HttpAuth::Type::None) http.AddMember("auth_scheme", auth_scheme_value(r.auth, a), a);
   if (r.kind == RequestKind::Http || detail::json_compact(http) != default_http_json())
     o.AddMember("http", http, a);
   Value grpc = grpc_section(r, a, lines, body_cap);
@@ -518,6 +606,9 @@ Value request_value(const SavedRequest& r, Alloc& a, bool lines, size_t body_cap
     }
     o.AddMember("captures", arr, a);
   }
+  // Scripts: multi-line ones as an array of lines, like bodies (a one-line edit is a one-line diff).
+  if (!r.pre_script.empty()) o.AddMember("pre_script", body_value(r.pre_script, a, true), a);
+  if (!r.post_script.empty()) o.AddMember("post_script", body_value(r.post_script, a, true), a);
   return o;
 }
 
@@ -560,6 +651,7 @@ void request_from_value(const Value& o, SavedRequest& r) {
       r.basic_auth.user = get_str(*auth, "user");
       r.basic_auth.password = get_str(*auth, "password");
     }
+    if (const Value* sch = get_obj(*h, "auth_scheme")) auth_scheme_from(*sch, r.auth);
   }
   if (const Value* g = get_obj(o, "grpc")) {
     r.grpc_target.address = get_str(*g, "address");
@@ -603,6 +695,8 @@ void request_from_value(const Value& o, SavedRequest& r) {
       c.enabled = get_bool(e, "enabled", true);
       r.captures.push_back(std::move(c));
     }
+  r.pre_script = body_from(o, "pre_script");
+  r.post_script = body_from(o, "post_script");
 }
 
 std::string parse_error_text(const rapidjson::Document& d, const fs::path& file) {
@@ -2153,6 +2247,15 @@ SavedRequest Workspace::expanded(const SavedRequest& r) const {
   for (auto& p : x.import_dirs) p = expand(p);
   x.basic_auth.user = expand(r.basic_auth.user);
   x.basic_auth.password = expand(r.basic_auth.password);
+  if (r.auth.type != HttpAuth::Type::None) {
+    HttpAuth& au = x.auth;
+    for (std::string* f : {&au.user, &au.password, &au.aws_access_key, &au.aws_secret_key, &au.aws_session_token,
+                           &au.aws_region, &au.aws_service, &au.oauth2.token_url, &au.oauth2.auth_url,
+                           &au.oauth2.client_id, &au.oauth2.client_secret, &au.oauth2.scope, &au.oauth2.audience,
+                           &au.oauth2.username, &au.oauth2.password, &au.oauth2.redirect_uri,
+                           &au.oauth2.header_prefix, &au.oauth2.query_param})
+      *f = expand(*f);
+  }
   for (auto& p : x.form) {
     p.name = expand(p.name);
     p.value = expand(p.value);
@@ -2282,6 +2385,29 @@ std::vector<std::string> read_env_allowlist(const fs::path& root) {
   rapidjson::Document d;
   std::lock_guard<std::mutex> lock(config_mutex());
   if (!parse_json_file(dir / kAllowedEnvFile, d)) return out;
+  const Value* wss = get_obj(d, "workspaces");
+  if (!wss) return out;
+  for (auto it = wss->MemberBegin(); it != wss->MemberEnd(); ++it)
+    if (it->value.IsArray() && is_root_key(it->name, rroot))
+      for (const auto& f : it->value.GetArray())
+        if (f.IsString()) out.emplace_back(f.GetString(), f.GetStringLength());
+  return out;
+}
+
+// <user_config_dir()>/trusted_scripts.json: {"version": 1, "workspaces": {"<resolved root>": ["scripts"]}}.
+constexpr const char* kTrustedScriptsFile = "trusted_scripts.json";
+// <user_config_dir()>/allowed_sso.json: {"version": 1, "workspaces": {"<resolved root>": ["https://host:443", ...]}}.
+constexpr const char* kAllowedSsoFile = "allowed_sso.json";
+
+// `root`'s string list in <user_config_dir()>/<file>.
+std::vector<std::string> read_root_list(const char* file, const fs::path& root) {
+  std::vector<std::string> out;
+  const fs::path dir = Workspace::user_config_dir();
+  if (dir.empty()) return out;
+  const fs::path rroot = resolved_path(root);
+  rapidjson::Document d;
+  std::lock_guard<std::mutex> lock(config_mutex());
+  if (!parse_json_file(dir / file, d)) return out;
   const Value* wss = get_obj(d, "workspaces");
   if (!wss) return out;
   for (auto it = wss->MemberBegin(); it != wss->MemberEnd(); ++it)
@@ -2493,6 +2619,15 @@ std::vector<std::string> Workspace::env_refs_left(const SavedRequest& x) const {
   scan(x.http.body);
   scan(x.basic_auth.user);
   scan(x.basic_auth.password);
+  if (x.auth.type != HttpAuth::Type::None) {
+    const HttpAuth& au = x.auth;
+    for (const std::string* f : {&au.user, &au.password, &au.aws_access_key, &au.aws_secret_key, &au.aws_session_token,
+                                 &au.aws_region, &au.aws_service, &au.oauth2.token_url, &au.oauth2.auth_url,
+                                 &au.oauth2.client_id, &au.oauth2.client_secret, &au.oauth2.scope,
+                                 &au.oauth2.audience, &au.oauth2.username, &au.oauth2.password,
+                                 &au.oauth2.redirect_uri, &au.oauth2.header_prefix, &au.oauth2.query_param})
+      scan(*f);
+  }
   for (const auto& p : x.form) {
     scan(p.name);
     scan(p.value);
@@ -2659,7 +2794,9 @@ std::optional<HttpRequest> Workspace::http_to_send(const SavedRequest& r, std::s
       if (!merged) x.http.headers.emplace_back("Cookie", jar_cookies);
     }
   }
-  if (x.basic_auth.enabled) {
+  if (x.auth.type != HttpAuth::Type::None) {
+    if (!apply_http_auth(r, x, err)) return std::nullopt;
+  } else if (x.basic_auth.enabled) {
     bool own = false;  // the request's own Authorization header wins, as with curl -u -H
     for (const auto& [k, v] : x.http.headers) own = own || lower_ascii(k) == "authorization";
     if (!own)
@@ -2667,6 +2804,208 @@ std::optional<HttpRequest> Workspace::http_to_send(const SavedRequest& r, std::s
                                   "Basic " + detail::base64(x.basic_auth.user + ":" + x.basic_auth.password));
   }
   return std::move(x.http);
+}
+
+// The non-Basic schemes of `x` (already expanded) into x.http: libcurl options for Digest / NTLM /
+// Negotiate / SigV4, or a token from the OAuth 2.0 cache (fetched or refreshed now if needed).
+bool Workspace::apply_http_auth(const SavedRequest& r, SavedRequest& x, std::string* err) const {
+  const HttpAuth& au = x.auth;
+  auto has_header = [&](std::string_view name) {
+    for (const auto& [k, v] : x.http.headers)
+      if (lower_ascii(k) == name) return true;
+    return false;
+  };
+  auto bad_text = [](const std::string& v) {
+    return std::any_of(v.begin(), v.end(), [](char c) { return c == '\r' || c == '\n' || c == '\0'; });
+  };
+  switch (au.type) {
+    case HttpAuth::Type::None: return true;
+    case HttpAuth::Type::Digest:
+    case HttpAuth::Type::Ntlm:
+    case HttpAuth::Type::Negotiate:
+      if (au.type == HttpAuth::Type::Digest && au.user.empty()) {
+        if (err) *err = "Digest auth needs a user name: request not sent.";
+        return false;
+      }
+      if (au.type != HttpAuth::Type::Digest && au.user.empty()) {
+        // Implicit Windows credentials: only to an origin the user allowed (blocked_sso_hosts()).
+        const std::string origin = url_origin(x.http.url);
+        if (origin.empty() || !is_sso_host_allowed(origin)) {
+          if (err)
+            *err = "the request wants to sign in to " + (origin.empty() ? x.http.url : origin) +
+                   " with your Windows account (" + auth_type_name(au.type) +
+                   " without a user name), which is not allowed for this workspace: request not sent. The user "
+                   "must allow single sign-on to this host first, or enter a user name and password.";
+          return false;
+        }
+      }
+      x.http.auth = au.type == HttpAuth::Type::Digest ? HttpRequest::Auth::Digest
+                    : au.type == HttpAuth::Type::Ntlm ? HttpRequest::Auth::Ntlm
+                                                      : HttpRequest::Auth::Negotiate;
+      x.http.auth_user = au.user;
+      x.http.auth_password = au.password;
+      return true;
+    case HttpAuth::Type::AwsSigV4: {
+      auto field_ok = [](const std::string& v) {
+        if (v.empty()) return false;
+        for (const char c : v)
+          if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_' ||
+                c == '.'))
+            return false;
+        return true;
+      };
+      if (au.aws_access_key.empty() || au.aws_secret_key.empty()) {
+        if (err) *err = "AWS Signature v4 needs an access key id and a secret access key: request not sent.";
+        return false;
+      }
+      if (!field_ok(au.aws_region) || !field_ok(au.aws_service)) {
+        if (err) *err = "AWS Signature v4 needs a region and a service (letters, digits, '-', '_', '.'): request not sent.";
+        return false;
+      }
+      if (bad_text(au.aws_session_token)) {
+        if (err) *err = "the AWS session token contains a line break: request not sent.";
+        return false;
+      }
+      x.http.aws_sigv4 = "aws:amz:" + au.aws_region + ":" + au.aws_service;
+      x.http.auth_user = au.aws_access_key;
+      x.http.auth_password = au.aws_secret_key;
+      if (!au.aws_session_token.empty() && !has_header("x-amz-security-token"))
+        x.http.headers.emplace_back("X-Amz-Security-Token", au.aws_session_token);
+      return true;
+    }
+    case HttpAuth::Type::OAuth2: {
+      OAuth2Hooks hooks;  // non-interactive: an authorization code grant must have been run first
+      const OAuth2Result t = oauth2_get_token(*this, r, hooks);
+      if (!t.ok) {
+        if (err) *err = "OAuth 2.0: " + t.error + ": request not sent.";
+        return false;
+      }
+      std::string e;
+      if (!oauth2_apply_token(x.http, x.auth.oauth2, t.token, &e)) {
+        if (err) *err = "OAuth 2.0: " + e + ": request not sent.";
+        return false;
+      }
+      return true;
+    }
+  }
+  return true;
+}
+
+const char* auth_type_name(HttpAuth::Type t) {
+  switch (t) {
+    case HttpAuth::Type::None: return "none";
+    case HttpAuth::Type::Digest: return "digest";
+    case HttpAuth::Type::Ntlm: return "ntlm";
+    case HttpAuth::Type::Negotiate: return "negotiate";
+    case HttpAuth::Type::AwsSigV4: return "awsv4";
+    case HttpAuth::Type::OAuth2: return "oauth2";
+  }
+  return "none";
+}
+
+HttpAuth::Type auth_type_from(const std::string& s) {
+  const std::string l = lower_ascii(s);
+  if (l == "digest") return HttpAuth::Type::Digest;
+  if (l == "ntlm") return HttpAuth::Type::Ntlm;
+  if (l == "negotiate" || l == "kerberos" || l == "spnego") return HttpAuth::Type::Negotiate;
+  if (l == "awsv4" || l == "aws_sigv4" || l == "awssigv4" || l == "aws") return HttpAuth::Type::AwsSigV4;
+  if (l == "oauth2" || l == "oauth2.0" || l == "oauth") return HttpAuth::Type::OAuth2;
+  return HttpAuth::Type::None;
+}
+
+// ------------------------------------------------------------------ single sign-on allowlist
+
+std::string Workspace::url_origin(const std::string& url) {
+  const std::string l = lower_ascii(url);
+  size_t start;
+  std::string scheme;
+  if (l.rfind("https://", 0) == 0) {
+    scheme = "https";
+    start = 8;
+  } else if (l.rfind("http://", 0) == 0) {
+    scheme = "http";
+    start = 7;
+  } else {
+    return {};
+  }
+  const size_t end = l.find_first_of("/?#\\", start);
+  std::string auth = l.substr(start, end == std::string::npos ? std::string::npos : end - start);
+  if (const size_t at = auth.rfind('@'); at != std::string::npos) auth = auth.substr(at + 1);
+  std::string host = auth, port;
+  if (!auth.empty() && auth.front() == '[') {
+    const size_t close = auth.find(']');
+    if (close == std::string::npos) return {};
+    host = auth.substr(0, close + 1);
+    if (close + 1 < auth.size()) {
+      if (auth[close + 1] != ':') return {};
+      port = auth.substr(close + 2);
+    }
+  } else if (const size_t colon = auth.rfind(':'); colon != std::string::npos) {
+    host = auth.substr(0, colon);
+    port = auth.substr(colon + 1);
+  }
+  while (!host.empty() && host.back() == '.') host.pop_back();  // "example.com." is example.com
+  if (host.empty() || host.find_first_of(" \t\r\n{}") != std::string::npos) return {};
+  if (port.empty()) port = scheme == "https" ? "443" : "80";
+  if (port.size() > 5 || port.find_first_not_of("0123456789") != std::string::npos) return {};
+  const unsigned long pn = std::stoul(port);
+  if (pn == 0 || pn > 65535) return {};
+  return scheme + "://" + host + ":" + std::to_string(pn);
+}
+
+std::vector<std::string> Workspace::blocked_sso_hosts(const SavedRequest& r) const {
+  if (r.kind != RequestKind::Http) return {};
+  if (r.auth.type != HttpAuth::Type::Ntlm && r.auth.type != HttpAuth::Type::Negotiate) return {};
+  if (!expand(r.auth.user).empty()) return {};
+  const std::string url = expand(r.http.url);
+  const std::string origin = url_origin(url);
+  // Not an http(s) URL (yet): nothing to ask; http_to_send() refuses it anyway.
+  if (origin.empty() || is_sso_host_allowed(origin)) return {};
+  return {origin};
+}
+
+bool Workspace::is_sso_host_allowed(const std::string& origin_or_url) const {
+  const std::string o = url_origin(origin_or_url);
+  if (o.empty()) return false;
+  const auto list = read_root_list(kAllowedSsoFile, root_);
+  return std::find(list.begin(), list.end(), o) != list.end();
+}
+
+std::vector<std::string> Workspace::allowed_sso_hosts() const { return read_root_list(kAllowedSsoFile, root_); }
+
+bool Workspace::allow_sso_host(const std::string& origin_or_url, std::string* err) const {
+  const std::string o = url_origin(origin_or_url);
+  if (o.empty()) {
+    if (err) *err = "not an http(s) origin: " + origin_or_url;
+    return false;
+  }
+  std::vector<std::string> list = read_root_list(kAllowedSsoFile, root_);
+  if (std::find(list.begin(), list.end(), o) != list.end()) return true;
+  list.push_back(o);
+  return write_root_list(kAllowedSsoFile, root_, list, "single sign-on allowlist", err);
+}
+
+bool Workspace::disallow_sso_host(const std::string& origin_or_url, std::string* err) const {
+  const std::string o = url_origin(origin_or_url);
+  std::vector<std::string> list = read_root_list(kAllowedSsoFile, root_);
+  const auto end = std::remove(list.begin(), list.end(), o);
+  if (end == list.end()) return true;
+  list.erase(end, list.end());
+  return write_root_list(kAllowedSsoFile, root_, list, "single sign-on allowlist", err);
+}
+
+// ------------------------------------------------------------------ script trust
+
+bool Workspace::scripts_trusted() const {
+  const auto list = read_root_list(kTrustedScriptsFile, root_);
+  return std::find(list.begin(), list.end(), "scripts") != list.end();
+}
+
+bool Workspace::trust_scripts(bool trusted, std::string* err) const {
+  if (trusted == scripts_trusted()) return true;
+  return write_root_list(kTrustedScriptsFile, root_,
+                         trusted ? std::vector<std::string>{"scripts"} : std::vector<std::string>{},
+                         "script trust decision", err);
 }
 
 }  // namespace watt

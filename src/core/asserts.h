@@ -65,6 +65,8 @@
 #include <string>
 #include <vector>
 
+#include <rapidjson/fwd.h>
+
 namespace watt {
 
 struct HttpResponse;
@@ -123,6 +125,12 @@ class ResponseData {
   ResponseData(const ResponseData&) = delete;
   ResponseData& operator=(const ResponseData&) = delete;
   double parse_us() const;  // time spent parsing JSON so far
+  // For other evaluators of the same response (request scripts, core/script.h): the response it
+  // was made from (one of the two is set), and the parsed JSON of the HTTP body / gRPC message i,
+  // or null when it is not JSON. Parsed at most once and shared with asserts and captures.
+  const HttpResponse* http() const;
+  const GrpcResponse* grpc() const;
+  const rapidjson::Value* json(size_t i = 0) const;
 
   struct Impl;
   Impl& impl() const { return *impl_; }

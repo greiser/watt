@@ -142,6 +142,20 @@ struct HttpRequest {
   // when sleeping, ~0.05 ms when polling; a 3 ms local server wait: 3.17 -> 3.07 ms total).
   // Costs one core for at most this long per request; longer waits then sleep as usual.
   long busy_poll_ms = 20;
+  // HTTP authentication done by libcurl (CURLOPT_HTTPAUTH with CURLOPT_USERNAME / _PASSWORD):
+  // Digest, NTLM and Negotiate (SPNEGO) answer the server's 401 challenge, so they cost one
+  // extra round trip on the first request of a connection. NTLM and Negotiate use Windows SSPI:
+  // with an empty auth_user they sign in as the current Windows user. Basic here sends the
+  // header pre-emptively (Workspace::http_to_send() adds Basic as a header instead). Credentials
+  // are sent to the original host only, never to a redirect target on another host.
+  enum class Auth { None, Basic, Digest, Ntlm, Negotiate };
+  Auth auth = Auth::None;
+  std::string auth_user;
+  std::string auth_password;
+  // AWS Signature Version 4 (CURLOPT_AWS_SIGV4), e.g. "aws:amz:eu-west-1:execute-api": curl
+  // signs the request with auth_user = access key id, auth_password = secret access key (auth
+  // is ignored then). A session token goes in an X-Amz-Security-Token header, which is signed.
+  std::string aws_sigv4;
 };
 
 // Final request/response sizes in bytes (see "Sizes" above).

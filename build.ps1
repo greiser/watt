@@ -12,7 +12,10 @@ $bdir = Join-Path $root "build\$name"
 # is installed once into build\_curl822, shared by every build dir, and re-installed when the
 # overlay port's version changes (about a minute, or a binary-cache hit).
 $curlTriplet = "x64-windows-static-md-rel"
-$curlBase = Join-Path $root "build\_curl822"
+# A new port-version (changed build options) installs into its own folder, so build trees that
+# are configured against the previous one keep working; reconfigure a tree to pick it up.
+$curlPortVersion = (Get-Content (Join-Path $root "ports\curl\vcpkg.json") -Raw | ConvertFrom-Json)."port-version"
+$curlBase = Join-Path $root ("build\_curl822" + $(if ($curlPortVersion) { "r$curlPortVersion" } else { "" }))
 $curlPrefix = Join-Path $curlBase "installed\$curlTriplet"
 function Install-PinnedCurl {
   $want = (Get-Content (Join-Path $root "ports\curl\vcpkg.json") -Raw | ConvertFrom-Json).version

@@ -51,6 +51,59 @@ struct BasicAuth {
   bool operator==(const BasicAuth&) const = default;
 };
 
+// OAuth 2.0 settings of a request (Postman's / Bruno's OAuth 2.0 auth). Every string may hold
+// {{vars}}, so client secrets and passwords can live in secret environment variables (sealed with
+// DPAPI in .watt/secrets.json) instead of the request file. Tokens are fetched and cached by
+// core/oauth2.h (in memory, per workspace, environment, request and settings, with expiry);
+// Workspace::http_to_send() adds the cached token, refreshing or fetching it first for the
+// non-interactive grants.
+struct OAuth2Config {
+  enum class Grant { ClientCredentials, Password, AuthorizationCode };
+  Grant grant = Grant::ClientCredentials;
+  std::string token_url;      // http(s) token endpoint
+  std::string auth_url;       // authorization endpoint (AuthorizationCode)
+  std::string client_id;
+  std::string client_secret;  // may be empty (public client with PKCE)
+  std::string scope;
+  std::string audience;       // optional "audience" parameter (Auth0 and others)
+  std::string username;       // Password grant
+  std::string password;
+  // AuthorizationCode: where the browser is sent back to. Empty: http://127.0.0.1:<free port>/callback.
+  // Only loopback http URLs (127.0.0.1, [::1], localhost) can be received; the port may be fixed.
+  std::string redirect_uri;
+  bool pkce = true;  // AuthorizationCode: S256 code challenge (RFC 7636)
+  // How the client authenticates to the token endpoint: HTTP Basic header or form fields.
+  enum class ClientAuth { BasicHeader, Body };
+  ClientAuth client_auth = ClientAuth::BasicHeader;
+  // Where the access token goes: "Authorization: <header_prefix> <token>" or ?<query_param>=<token>.
+  enum class AddTo { Header, Query };
+  AddTo add_to = AddTo::Header;
+  std::string header_prefix = "Bearer";
+  std::string query_param = "access_token";
+  bool auto_refresh = true;  // use the refresh token when the access token expired
+  bool operator==(const OAuth2Config&) const = default;
+};
+
+// Authentication schemes beyond Basic (which stays in SavedRequest::basic_auth). When type is not
+// None it replaces basic_auth. Strings may hold {{vars}} (see OAuth2Config).
+struct HttpAuth {
+  enum class Type { None, Digest, Ntlm, Negotiate, AwsSigV4, OAuth2 };
+  Type type = Type::None;
+  // Digest / NTLM / Negotiate. NTLM and Negotiate with an empty user use the current Windows logon.
+  std::string user;
+  std::string password;
+  // AWS Signature Version 4 (curl --aws-sigv4 "aws:amz:<region>:<service>").
+  std::string aws_access_key;
+  std::string aws_secret_key;
+  std::string aws_session_token;  // optional: sent as X-Amz-Security-Token (signed)
+  std::string aws_region;         // "eu-west-1"
+  std::string aws_service;        // "execute-api", "s3", ...
+  OAuth2Config oauth2;
+  bool operator==(const HttpAuth&) const = default;
+};
+const char* auth_type_name(HttpAuth::Type t);  // "none", "digest", "ntlm", "negotiate", "awsv4", "oauth2"
+HttpAuth::Type auth_type_from(const std::string& s);
+
 // One curl -d family argument kept as written because it reads a file (-d @f, --data-binary @f,
 // --json @f, --data-urlencode name@f): nothing is read when a command is imported, the file is
 // read when the request is sent (Workspace::http_to_send(), under the upload policy of
@@ -117,6 +170,14 @@ struct SavedRequest {
   // vars:post-response), both kinds of request; see core/asserts.h. Saved only when not empty.
   std::vector<Assertion> asserts;
   std::vector<Capture> captures;
+  // Digest / NTLM / Negotiate / AWS SigV4 / OAuth 2.0 (HTTP only); saved as "http.auth_scheme"
+  // only when type is not None.
+  HttpAuth auth;
+  // JavaScript run before the request is sent / after the response arrived (Postman's
+  // Pre-request Script and Tests, Bruno's script:pre-request / script:post-response), in a
+  // sandbox; see core/script.h. They run only once the user trusted this workspace's scripts
+  // (Workspace::scripts_trusted()). Saved last, only when not empty.
+  std::string pre_script, post_script;
 };
 
 struct Environment {
@@ -203,6 +264,12 @@ class Workspace {
   // (files read now, relative paths against the workspace root only). nullopt if one of these
   // files cannot be read or is not allowed (see blocked_files()): then *err names the path and
   // the request must not be sent.
+  // Authentication: SavedRequest::auth (when not None) replaces basic_auth: Digest / NTLM /
+  // Negotiate / AWS SigV4 become HttpRequest auth options (libcurl does the handshake / signing),
+  // OAuth 2.0 adds the cached access token (header or query), first fetching or refreshing it for
+  // the client credentials / password grants (a blocking token request: call this off the UI
+  // thread). An authorization code grant is never started here (it opens a browser): without a
+  // cached or refreshable token the send fails with *err saying to authorize first (oauth2.h).
   std::optional<HttpRequest> http_to_send(const SavedRequest& r, std::string* err = nullptr) const;
 
   // Files a request uploads (form file parts, body_file, body_data, header_files, cookie_files)
@@ -259,6 +326,34 @@ class Workspace {
   bool allow_env_var(const std::string& name, std::string* err = nullptr) const;
   bool disallow_env_var(const std::string& name, std::string* err = nullptr) const;
   std::vector<std::string> allowed_env_vars() const;
+  // Single sign-on: NTLM / Negotiate auth with an empty user name signs in with the current
+  // Windows logon (SSPI). A cloned workspace could point such a request at its own host and
+  // collect an NTLM challenge-response for the user, so implicit credentials go only to origins
+  // ("scheme://host:port", lower case, default port filled in) the user allowed for this
+  // workspace, in the per-user <user_config_dir()>/allowed_sso.json ({version, workspaces:
+  // {resolved root: [origins]}}; never read from the workspace). Explicit user + password needs
+  // no approval. The origins `r` would send implicit credentials to (after {{var}} expansion)
+  // that are not allowed: before sending, the UI asks "this request wants to sign in to <origin>
+  // with your Windows account: allow?" and calls allow_sso_host() for each one accepted.
+  // http_to_send() refuses to send while any is left, naming it. libcurl never sends credentials
+  // to a redirect target on another host (CURLOPT_UNRESTRICTED_AUTH stays off).
+  std::vector<std::string> blocked_sso_hosts(const SavedRequest& r) const;
+  bool is_sso_host_allowed(const std::string& origin_or_url) const;
+  bool allow_sso_host(const std::string& origin_or_url, std::string* err = nullptr) const;
+  bool disallow_sso_host(const std::string& origin_or_url, std::string* err = nullptr) const;
+  std::vector<std::string> allowed_sso_hosts() const;
+  // "scheme://host:port" of an http(s) URL (or of an origin), lower case with the default port;
+  // "" if it is not one.
+  static std::string url_origin(const std::string& url);
+  // Request scripts (SavedRequest::pre_script / post_script) are code from whoever wrote the
+  // workspace, often a cloned repository: they run only after the user trusted this workspace.
+  // The decision is stored per user, outside every workspace, in
+  // <user_config_dir()>/trusted_scripts.json ({version, workspaces: {resolved root: ["scripts"]}}),
+  // keyed by the canonical root like the allowlists above: nothing inside a workspace (a planted
+  // .watt/trusted_scripts.json or a watt.json key) can trust it. Until trusted, the run
+  // functions in core/script.h return without running and say why (the UI asks once).
+  bool scripts_trusted() const;
+  bool trust_scripts(bool trusted, std::string* err = nullptr) const;
   static std::filesystem::path user_config_dir();
   static void set_user_config_dir(const std::filesystem::path& dir);
 
@@ -266,6 +361,7 @@ class Workspace {
   void note_saved(const std::filesystem::path& file, const SavedRequest& r) const;
   bool write_allowlist(const std::vector<std::filesystem::path>& files, std::string* err) const;
   std::vector<std::string> env_refs_left(const SavedRequest& expanded_request) const;
+  bool apply_http_auth(const SavedRequest& r, SavedRequest& expanded_request, std::string* err) const;
 
   // Sealed secret values as read or last written: "env\0var" -> {plain, stored}. A value that
   // did not change is written back with the same ciphertext (DPAPI output is randomized), so a
