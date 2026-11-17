@@ -1,5 +1,7 @@
 #include "core/model.h"
 
+#include <curl/curl.h>  // curl_url: the transport's own URL parser for single sign-on origins
+
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
@@ -2915,42 +2917,39 @@ HttpAuth::Type auth_type_from(const std::string& s) {
 
 // ------------------------------------------------------------------ single sign-on allowlist
 
+// The origin the transport will actually connect to, decided by libcurl's own URL parser (the
+// same one the HTTP engine hands the URL to), so the allowlist check and the connection can
+// never disagree about the host ("http://good\@evil/" and friends). Anything that is not a
+// plain http(s) URL, or that carries a backslash or user info, has no origin: implicit Windows
+// credentials are then refused (fail closed).
 std::string Workspace::url_origin(const std::string& url) {
-  const std::string l = lower_ascii(url);
-  size_t start;
-  std::string scheme;
-  if (l.rfind("https://", 0) == 0) {
-    scheme = "https";
-    start = 8;
-  } else if (l.rfind("http://", 0) == 0) {
-    scheme = "http";
-    start = 7;
-  } else {
-    return {};
-  }
-  const size_t end = l.find_first_of("/?#\\", start);
-  std::string auth = l.substr(start, end == std::string::npos ? std::string::npos : end - start);
-  if (const size_t at = auth.rfind('@'); at != std::string::npos) auth = auth.substr(at + 1);
-  std::string host = auth, port;
-  if (!auth.empty() && auth.front() == '[') {
-    const size_t close = auth.find(']');
-    if (close == std::string::npos) return {};
-    host = auth.substr(0, close + 1);
-    if (close + 1 < auth.size()) {
-      if (auth[close + 1] != ':') return {};
-      port = auth.substr(close + 2);
+  if (url.find('\\') != std::string::npos) return {};
+  for (const char c : url)
+    if (static_cast<unsigned char>(c) <= 0x20 || c == 0x7F) return {};
+  CURLU* u = curl_url();
+  if (!u) return {};
+  std::string out;
+  if (curl_url_set(u, CURLUPART_URL, url.c_str(), 0) == CURLUE_OK) {
+    char *scheme = nullptr, *host = nullptr, *port = nullptr, *user = nullptr, *pass = nullptr;
+    const bool got = curl_url_get(u, CURLUPART_SCHEME, &scheme, 0) == CURLUE_OK &&
+                     curl_url_get(u, CURLUPART_HOST, &host, 0) == CURLUE_OK &&
+                     curl_url_get(u, CURLUPART_PORT, &port, CURLU_DEFAULT_PORT) == CURLUE_OK;
+    const bool has_user = curl_url_get(u, CURLUPART_USER, &user, 0) == CURLUE_OK && user && *user;
+    const bool has_pass = curl_url_get(u, CURLUPART_PASSWORD, &pass, 0) == CURLUE_OK && pass && *pass;
+    if (got && !has_user && !has_pass) {
+      const std::string s = lower_ascii(scheme);
+      std::string h = lower_ascii(host);
+      while (!h.empty() && h.back() == '.') h.pop_back();  // "example.com." is example.com
+      if ((s == "http" || s == "https") && !h.empty()) out = s + "://" + h + ":" + port;
     }
-  } else if (const size_t colon = auth.rfind(':'); colon != std::string::npos) {
-    host = auth.substr(0, colon);
-    port = auth.substr(colon + 1);
+    curl_free(scheme);
+    curl_free(host);
+    curl_free(port);
+    curl_free(user);
+    curl_free(pass);
   }
-  while (!host.empty() && host.back() == '.') host.pop_back();  // "example.com." is example.com
-  if (host.empty() || host.find_first_of(" \t\r\n{}") != std::string::npos) return {};
-  if (port.empty()) port = scheme == "https" ? "443" : "80";
-  if (port.size() > 5 || port.find_first_not_of("0123456789") != std::string::npos) return {};
-  const unsigned long pn = std::stoul(port);
-  if (pn == 0 || pn > 65535) return {};
-  return scheme + "://" + host + ":" + std::to_string(pn);
+  curl_url_cleanup(u);
+  return out;
 }
 
 std::vector<std::string> Workspace::blocked_sso_hosts(const SavedRequest& r) const {

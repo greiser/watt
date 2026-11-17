@@ -220,7 +220,16 @@ TEST_CASE("implicit Windows SSO needs per-user consent per origin", "[auth][ntlm
 
 TEST_CASE("url_origin normalises origins", "[auth][sso]") {
   CHECK(Workspace::url_origin("HTTPS://Example.COM/a?b") == "https://example.com:443");
-  CHECK(Workspace::url_origin("http://user:pw@host.:8080#x") == "http://host:8080");
+  CHECK(Workspace::url_origin("http://host.:8080#x") == "http://host:8080");
+  // Parser differentials: the origin is what libcurl will connect to, or nothing at all.
+  CHECK(Workspace::url_origin("http://user:pw@host:8080/").empty());       // user info: refused
+  CHECK(Workspace::url_origin("http://good.test\\@evil.test/").empty());   // backslash: refused
+  CHECK(Workspace::url_origin("http://good.test\\evil.test/").empty());
+  CHECK(Workspace::url_origin("http://evil.test#@good.test/") == "http://evil.test:80");
+  CHECK(Workspace::url_origin("http://evil.test?@good.test/") == "http://evil.test:80");
+  CHECK(Workspace::url_origin("http://evil.test/@good.test/") == "http://evil.test:80");
+  CHECK(Workspace::url_origin("http://good.test @evil.test/").empty());    // space
+  CHECK(Workspace::url_origin(std::string("http://good.test\0@evil.test/", 29)).empty());
   CHECK(Workspace::url_origin("http://[::1]/") == "http://[::1]:80");
   CHECK(Workspace::url_origin("file:///c:/x").empty());
   CHECK(Workspace::url_origin("http://{{host}}/").empty());

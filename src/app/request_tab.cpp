@@ -1056,10 +1056,14 @@ void RequestTab::send_http(Clock::time_point click) {
     sent->post_script = post;
     std::shared_ptr<const HttpResponse> cresp = resp;
     std::shared_ptr<const SentHttp> csent = sent;
-    w->post([gen, cresp, csent, pre, post](RequestTab& t) {
+    const std::filesystem::path script_root = wsc ? wsc->root() : std::filesystem::path{};
+    w->post([gen, cresp, csent, pre, post, script_root](RequestTab& t) {
       // Script variable writes land in the real workspace on the UI thread (persisted for
-      // environment/globals, in memory for runtime vars), even if the tab moved on.
-      if (Workspace* real = t.ctx_.workspace ? t.ctx_.workspace() : nullptr) {
+      // environment/globals, in memory for runtime vars), even if the tab moved on, but only
+      // in the workspace whose scripts produced them: if the user opened another workspace
+      // meanwhile (or revoked trust), they are dropped.
+      if (Workspace* real = t.ctx_.workspace ? t.ctx_.workspace() : nullptr;
+          real && (pre || post) && real->root() == script_root && real->scripts_trusted()) {
         if (pre) apply_script_vars(*real, *pre, true);
         if (post && post->ok) apply_script_vars(*real, *post, true);
       }
