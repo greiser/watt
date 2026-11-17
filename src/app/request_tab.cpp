@@ -591,6 +591,24 @@ void RequestTab::realize() {
   // shown (see on_idle), or until something has to be displayed (response()).
   resp_ph_ = new wxPanel(split_, wxID_ANY);
   resp_ph_->SetBackgroundColour(rv::Theme::get().bg);
+  // Until the real view is built (it waits for a quiet moment), the pane is never blank: it
+  // shows the same hint the empty view shows, or that the last response is on its way.
+  resp_ph_->Bind(wxEVT_PAINT, [this](wxPaintEvent&) {
+    wxPaintDC dc(resp_ph_);
+    const auto& th = rv::Theme::get();
+    dc.SetBackground(wxBrush(th.bg));
+    dc.Clear();
+    dc.SetTextForeground(th.dim);
+    dc.SetFont(resp_ph_->GetFont().Scaled(1.1f));
+    const wxString msg = last_pending_ ? wxString::FromUTF8("Loading the last response\xE2\x80\xA6")
+                                       : wxString("Send the request to see the response (Ctrl+Enter)");
+    const wxSize ts = dc.GetTextExtent(msg), cs = resp_ph_->GetClientSize();
+    dc.DrawText(msg, std::max(0, (cs.x - ts.x) / 2), std::max(0, cs.y / 3 - ts.y / 2));
+  });
+  resp_ph_->Bind(wxEVT_SIZE, [this](wxSizeEvent& e) {
+    resp_ph_->Refresh(false);
+    e.Skip();
+  });
   RequestEditorPanel* ed = ensure_editor(req_.kind);
   split_->SplitVertically(ed->window(), resp_ph_);
   auto* sz = new wxBoxSizer(wxVERTICAL);
@@ -637,7 +655,9 @@ void RequestTab::on_resp_timer() {
     resp_timer_.StartOnce(500);
     return;
   }
-  if (const int wait = input_quiet_wait(kQuietMs); wait > 0) {
+  // A stored last response the user opened this request to see: a short pause is enough (the
+  // user is looking at the pane, not typing a URL), so it shows within ~0.2 s of the click.
+  if (const int wait = input_quiet_wait(last_pending_ ? kQuietShortMs : kQuietMs); wait > 0) {
     resp_timer_.StartOnce(wait);
     return;
   }

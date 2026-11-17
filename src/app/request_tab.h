@@ -41,6 +41,7 @@ LastResponse last_response_from_json(const std::string& json, const SavedRequest
 // Speculative UI work (building the views of tabs not used yet) runs only after this long without
 // any keyboard or mouse input: a typist's pauses are shorter, so it never lands between keys.
 constexpr int kQuietMs = 1500;
+constexpr int kQuietShortMs = 200;  // building to show a stored last response
 // Milliseconds still to wait until quiet_ms have passed since the last input (0: quiet now).
 int input_quiet_wait(int quiet_ms);
 
