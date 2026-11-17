@@ -22,6 +22,7 @@
 
 #include "app/request_tab.h"
 #include "app/response_widgets.h"  // rv::Theme (the "+" button)
+#include "app/runner_view.h"
 #include "app/sidebar_quickopen.h"
 #include "core/model_json.h"  // session file: read / atomic write, UTF-8 paths
 
@@ -282,10 +283,35 @@ MainFrame::MainFrame(std::filesystem::path workspace_dir)
   Bind(wxEVT_MENU, [this](wxCommandEvent&) { nb_->AdvanceSelection(false); }, ID_PREV_TAB);
   Bind(wxEVT_MENU, [this](wxCommandEvent&) { sidebar_->focus_filter(); }, ID_FOCUS_FILTER);
 
+  // The tab's X: decide here, synchronously, and let wxAuiNotebook close the page itself.
+  // Vetoing and deleting the page later from CallAfter crashed (AV in RemoveEmptyTabFrames ->
+  // ~wxSizer) when the deferred DeletePage ran while wxAuiTabCtrl was still handling the mouse
+  // over the closed tab's button; the captured index could also name another tab by then.
   nb_->Bind(wxEVT_AUINOTEBOOK_PAGE_CLOSE, [this](wxAuiNotebookEvent& e) {
-    e.Veto();  // close_tab() decides (unsaved changes) and deletes the page itself
     const int idx = e.GetSelection();
-    CallAfter([this, idx] { close_tab(idx); });
+    if (idx < 0 || idx >= static_cast<int>(nb_->GetPageCount())) return;
+    auto* t = static_cast<RequestTab*>(nb_->GetPage(idx));
+    if (!t->dirty()) return;  // not vetoed: the notebook closes it
+    nb_->SetSelection(idx);
+    wxString what = t->title();
+    what.Replace(L" ●", "");  // the unsaved-changes dot
+    const int a = ask_save(this, what);
+    if (a == wxID_CANCEL) {
+      e.Veto();
+      return;
+    }
+    if (a == wxID_YES) {
+      save_current();
+      if (t->dirty()) e.Veto();  // the save failed or was cancelled: keep the tab
+    }
+  });
+  nb_->Bind(wxEVT_AUINOTEBOOK_PAGE_CLOSED, [this](wxAuiNotebookEvent& e) {
+    e.Skip();
+    // Adding a page is deferred too, until the notebook has finished closing this one.
+    CallAfter([this] {
+      if (nb_->GetPageCount() == 0) add_tab(SavedRequest{}, false);
+      session_changed();
+    });
   });
   nb_->Bind(wxEVT_AUINOTEBOOK_PAGE_CHANGED, [this](wxAuiNotebookEvent& e) {
     e.Skip();
@@ -1135,6 +1161,13 @@ void MainFrame::environment_changed() {
   // sidebar also calls this after switching to another workspace: bring back that workspace's
   // last session the first time it is opened in this process.
   if (ws_ && !restored_roots_.count(ws_->root())) restore_session();
+}
+
+void MainFrame::run_folder(const std::filesystem::path& folder) {
+  // The runner reads the folder and sends on its own worker threads; until the workspace has
+  // opened (start-up) the request waits for it.
+  auto open = [this, folder] { open_runner(this, [this] { return ws_.get(); }, folder, &MainFrame::grpc); };
+  if (!when_workspace(open) && ws_) open();
 }
 
 void MainFrame::SetTitle(const wxString& title) {
