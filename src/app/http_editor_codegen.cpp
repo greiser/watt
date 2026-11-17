@@ -196,7 +196,10 @@ std::string httpie(const SavedRequest& r) {
   const bool form = has_form(r);
   if (form) o += " --multipart";
   if (!form && r.body_file.empty() && r.body_data.empty() && !r.http.body.empty()) o += " --raw " + sh(r.http.body);
-  o += " " + sh(r.http.method) + " " + sh(r.http.url);  // quoted: a saved method is untrusted text
+  // "--" ends HTTPie's (argparse) options: everything after it is METHOD, URL and request items,
+  // so a saved header/form name, method or URL that starts with '-' (e.g. --output=...) can
+  // never be read as an option. Quoting alone stops the shell, not the option parser.
+  o += " -- " + sh(r.http.method) + " " + sh(r.http.url);
   for (const auto& [k, v] : sent_headers(r)) o += " " + sh(k + (v.empty() ? ";" : ":" + v));
   if (form) {
     for (const auto& p : r.form) {
