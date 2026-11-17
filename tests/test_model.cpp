@@ -2884,6 +2884,55 @@ TEST_CASE("curl file references are read when sent, as curl reads them", "[curl]
   CHECK(slurp(t.path / "data" / "body.json") == "{\"k\": 1}\n");
 }
 
+TEST_CASE("requests are only loaded from and saved to the workspace", "[workspace][security]") {
+  TempDir t;
+  const fs::path root = t.path / "ws";
+  Workspace ws = Workspace::create(root);
+  SavedRequest ok = sample_http();
+  ok.file = "inside/a.req.json";
+  REQUIRE(ws.save_request(ok));
+  CHECK(ws.load_request("inside/a.req.json"));
+  CHECK(ws.load_request(root / "inside" / "a.req.json"));
+
+  // Outside copies of a valid request file: never loaded through this workspace.
+  spit(t.path / "outside" / "x.req.json", slurp(root / "inside" / "a.req.json"));
+  std::string err;
+  for (const fs::path& bad : {fs::path("../outside/x.req.json"), t.path / "outside" / "x.req.json",
+                              fs::path("inside/../../outside/x.req.json")}) {
+    INFO(bad.string());
+    err.clear();
+    CHECK_FALSE(ws.load_request(bad, &err));
+    CHECK_THAT(err, ContainsSubstring("not inside the workspace"));
+    SavedRequest w = sample_http();
+    w.file = bad;
+    CHECK_FALSE(ws.save_request(w));
+  }
+  CHECK_FALSE(fs::exists(t.path / "outside" / "Create user.req.json"));
+
+#ifdef _WIN32
+  // A planted UNC path (e.g. from a committed session file) is refused from its text: the
+  // unroutable host would make any SMB attempt hang for seconds.
+  const auto t0 = std::chrono::steady_clock::now();
+  CHECK_FALSE(ws.load_request(fs::path("\\\\192.0.2.1\\share\\x.req.json")));
+  SavedRequest u = sample_http();
+  u.file = "\\\\192.0.2.1\\share\\x.req.json";
+  CHECK_FALSE(ws.save_request(u));
+  CHECK(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() < 200);
+  CHECK_FALSE(ws.load_request(fs::path("\\Windows\\x.req.json")));  // root-relative
+  CHECK_FALSE(ws.load_request(fs::path("C:x.req.json")));           // drive-relative
+
+  // A junction inside the workspace that leads out of it.
+  const fs::path junction = root / "link";
+  const std::string cmd = "cmd /c mklink /J \"" + junction.string() + "\" \"" + (t.path / "outside").string() + "\" >nul 2>&1";
+  if (std::system(cmd.c_str()) == 0 && fs::exists(junction / "x.req.json")) {
+    CHECK_FALSE(ws.load_request("link/x.req.json"));
+    fs::remove(junction);
+  } else {
+    WARN("could not create a junction; junction escape not exercised");
+  }
+#endif
+}
+
 TEST_CASE("UNC and outside schema paths are blocked without touching them", "[grpc][workspace][security]") {
   TempDir t;
   TempDir cfg;

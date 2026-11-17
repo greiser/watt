@@ -1267,6 +1267,27 @@ void Workspace::note_saved(const fs::path& file, const SavedRequest& r) const {
   idx.flush();  // one journal line now: survives a crash, and no rewrite of index.json
 }
 
+namespace {
+bool is_remote_or_device_path(const fs::path& p);
+bool is_ambiguous_rooted_path(const fs::path& p);
+fs::path resolved_path(const fs::path& p);
+
+// A request file must live inside the workspace. Paths can come from untrusted places (a
+// session or history file committed to a cloned repo), so judge the text first (no UNC or
+// device path is ever touched: an SMB open leaks the NTLM hash), then the resolved path
+// (a junction inside the workspace must not lead out of it).
+bool request_path_inside(const fs::path& root, const fs::path& p, std::string* err) {
+  auto refuse = [&] {
+    if (err) *err = to_utf8(p) + " is not inside the workspace " + to_utf8(root);
+    return false;
+  };
+  if (is_remote_or_device_path(p) || is_ambiguous_rooted_path(p) || !is_inside(root, p)) return refuse();
+  const fs::path rr = resolved_path(root);
+  if (!is_inside(rr, resolved_path(p))) return refuse();
+  return true;
+}
+}  // namespace
+
 bool Workspace::save_request(SavedRequest& r, std::string* err) {
   if (r.id.empty()) r.id = new_uuid();
   if (r.name.empty()) r.name = "Untitled";
@@ -1290,10 +1311,11 @@ bool Workspace::save_request(SavedRequest& r, std::string* err) {
       if (err) *err = "no free file name for " + r.name;
       return false;
     }
-  } else if (target.is_relative()) {
+  } else if (target.is_relative() && !is_ambiguous_rooted_path(target)) {
     target = root_ / target;
   }
   target = target.lexically_normal();
+  if (!request_path_inside(root_, target, err)) return false;
   detail::ensure_dir(target.parent_path());
 
   // Form files inside the workspace are stored relative to its root (portable through git).
@@ -1329,7 +1351,8 @@ bool Workspace::save_request(SavedRequest& r, std::string* err) {
 }
 
 std::optional<SavedRequest> Workspace::load_request(const fs::path& file, std::string* err) const {
-  const fs::path p = (file.is_relative() ? root_ / file : file).lexically_normal();
+  const fs::path p = (file.is_relative() && !is_ambiguous_rooted_path(file) ? root_ / file : file).lexically_normal();
+  if (!request_path_inside(root_, p, err)) return std::nullopt;
   std::string text;
   if (!detail::read_file(p, text)) {
     if (err) *err = "cannot read " + to_utf8(p);
