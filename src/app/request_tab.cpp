@@ -948,7 +948,10 @@ void RequestTab::send_http(Clock::time_point click) {
   // Time the user spends answering a consent prompt is not request time: after any prompt the
   // clock restarts, so queue_ms / total_ms (and asserts on res.responseTime) stay honest.
   bool prompted = false;
-  if (ws && needs_workspace(req_)) {
+  // Folder / collection settings (folder.json) add headers, auth, vars and scripts that only
+  // http_to_send applies: such a request never takes the fast path.
+  const bool inherited = ws && ws->has_inherited_settings(req_);
+  if (ws && (needs_workspace(req_) || inherited)) {
     prompted = !ws->blocked_env_vars(req_).empty();
     if (std::string err; !confirm_env_vars(*ws, req_, this, &err)) {
       response()->show_error(err);
@@ -984,8 +987,13 @@ void RequestTab::send_http(Clock::time_point click) {
     }
   }
   // Scripts are code from the workspace (possibly a cloned repo): ask once per workspace.
-  bool run_scripts = false, scripts_skipped = false;
-  if (ws && (!req_.pre_script.empty() || !req_.post_script.empty())) {
+  bool run_scripts = false, scripts_skipped = false, has_pre = false, has_post = false;
+  if (ws) {  // the request's own scripts plus those inherited from its folders / collection
+    const auto eff = ws->effective_settings(req_);
+    has_pre = !eff.pre_scripts.empty();
+    has_post = !eff.post_scripts.empty();
+  }
+  if (ws && (has_pre || has_post)) {
     run_scripts = ws->scripts_trusted();
     if (!run_scripts) {
       prompted = true;
@@ -1008,7 +1016,7 @@ void RequestTab::send_http(Clock::time_point click) {
   auto saved = std::make_shared<const SavedRequest>(req_);
   auto wsc = ws ? std::make_shared<Workspace>(*ws) : nullptr;
   auto w = worker_;
-  w->push([w, gen, click, saved, wsc, run_scripts, scripts_skipped] {
+  w->push([w, gen, click, saved, wsc, run_scripts, scripts_skipped, has_pre, has_post, inherited] {
     if (w->is_cancelled(gen)) return;
     auto sent = std::make_shared<SentHttp>();
     sent->scripts_skipped_untrusted = scripts_skipped;
@@ -1016,7 +1024,7 @@ void RequestTab::send_http(Clock::time_point click) {
     // worker's workspace copy (so this send sees them) and later to the real one (UI thread).
     auto toSend = std::make_shared<SavedRequest>(*saved);
     std::shared_ptr<ScriptRun> pre, post;
-    if (run_scripts && !toSend->pre_script.empty()) {
+    if (run_scripts && has_pre) {
       pre = std::make_shared<ScriptRun>(run_pre_script(*wsc, *toSend));
       if (!pre->ok) {
         const std::string err = "Pre-request script failed: " + pre->error;
@@ -1025,7 +1033,7 @@ void RequestTab::send_http(Clock::time_point click) {
       }
       apply_script_vars(*wsc, *pre, false);
     }
-    if (wsc && needs_workspace(*toSend)) {
+    if (wsc && (needs_workspace(*toSend) || inherited)) {
       std::string err;
       auto r = wsc->http_to_send(*toSend, &err);
       if (!r) {
@@ -1056,7 +1064,7 @@ void RequestTab::send_http(Clock::time_point click) {
     auto resp = std::make_shared<HttpResponse>(client.send(sent->request, on_chunk));
     resp->timing.queue_ms += ui_queue;
     resp->timing.total_ms += ui_queue;
-    if (run_scripts && !toSend->post_script.empty() && resp->ok) {
+    if (run_scripts && has_post && resp->ok) {
       ResponseData rd(*resp);
       post = std::make_shared<ScriptRun>(run_post_script(*wsc, *toSend, rd));
     }
@@ -1105,7 +1113,8 @@ void RequestTab::send_grpc(Clock::time_point click) {
     return;
   }
   Workspace* ws = ctx_.workspace ? ctx_.workspace() : nullptr;
-  if (ws && grpc_has_vars(req_)) {
+  const bool grpc_inherited = ws && ws->has_inherited_settings(req_);  // folder metadata / vars
+  if (ws && (grpc_has_vars(req_) || grpc_inherited)) {
     const bool prompted = !ws->blocked_env_vars(req_).empty();
     if (std::string err; !confirm_env_vars(*ws, req_, this, &err)) {
       response()->show_error(err);
@@ -1127,10 +1136,10 @@ void RequestTab::send_grpc(Clock::time_point click) {
   auto wsc = ws ? std::make_shared<Workspace>(*ws) : nullptr;
   const bool interactive = grpc_ && grpc_->interactive();
   auto w = worker_;
-  w->push([w, gen, click, saved, wsc, interactive, grpc = ctx_.grpc] {
+  w->push([w, gen, click, saved, wsc, interactive, grpc = ctx_.grpc, grpc_inherited] {
     if (w->is_cancelled(gen)) return;
     auto client = grpc();  // first use starts the engine: on the worker, not the UI thread
-    const SavedRequest r = wsc && grpc_has_vars(*saved) ? wsc->expanded(*saved) : *saved;
+    const SavedRequest r = wsc && (grpc_has_vars(*saved) || grpc_inherited) ? wsc->expanded(*saved) : *saved;
     const auto start = Clock::now();
     const double ui_queue = ms_between(click, start);
     std::shared_ptr<GrpcCall> call(client->start_call(
