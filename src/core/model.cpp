@@ -349,6 +349,9 @@ Value grpc_section(const SavedRequest& r, Alloc& a, bool lines, size_t body_cap)
   o.AddMember("address", jstr(r.grpc_target.address, a), a);
   o.AddMember("tls", r.grpc_target.tls, a);
   o.AddMember("insecure_skip_verify", r.grpc_target.insecure_skip_verify, a);
+  // gRPC-Web: written only when on, so existing request files stay byte-identical.
+  if (r.grpc_target.web) o.AddMember("web", true, a);
+  if (r.grpc_target.web_text) o.AddMember("web_text", true, a);
   o.AddMember("authority", jstr(r.grpc_target.authority, a), a);
   o.AddMember("root_cert_pem", body_value(r.grpc_target.root_cert_pem, a, lines), a);
   o.AddMember("method", jstr(r.grpc_method, a), a);
@@ -468,6 +471,7 @@ Value request_value(const SavedRequest& r, Alloc& a, bool lines, size_t body_cap
   }
   if (!r.body_file.empty()) http.AddMember("body_file", jstr(r.body_file, a), a);
   if (!r.body_data.empty()) http.AddMember("body_data", curl_data_value(r.body_data, a), a);
+  if (!r.disabled_params.empty()) http.AddMember("disabled_params", pairs_value(r.disabled_params, a), a);
   if (!r.header_files.empty()) http.AddMember("header_files", strings_value(r.header_files, a), a);
   if (!r.cookie_files.empty()) http.AddMember("cookie_files", strings_value(r.cookie_files, a), a);
   if (!r.form.empty()) http.AddMember("form", form_value(r.form, a), a);
@@ -517,6 +521,7 @@ void request_from_value(const Value& o, SavedRequest& r) {
     r.form = form_from(*h);
     r.body_file = get_str(*h, "body_file");
     r.body_data = curl_data_from(*h);
+    r.disabled_params = pairs_from(*h, "disabled_params");
     r.header_files = strings_from(*h, "header_files");
     r.cookie_files = strings_from(*h, "cookie_files");
     if (const Value* auth = get_obj(*h, "auth"); auth && get_str(*auth, "type", "basic") == "basic") {
@@ -529,6 +534,8 @@ void request_from_value(const Value& o, SavedRequest& r) {
     r.grpc_target.address = get_str(*g, "address");
     r.grpc_target.tls = get_bool(*g, "tls", false);
     r.grpc_target.insecure_skip_verify = get_bool(*g, "insecure_skip_verify", false);
+    r.grpc_target.web = get_bool(*g, "web", false);
+    r.grpc_target.web_text = get_bool(*g, "web_text", false);
     r.grpc_target.authority = get_str(*g, "authority");
     r.grpc_target.root_cert_pem = body_from(*g, "root_cert_pem");
     r.grpc_method = get_str(*g, "method");

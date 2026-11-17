@@ -128,6 +128,10 @@ struct HttpRequest {
   long timeout_ms = 30000;      // 0 = no timeout
   bool follow_redirects = true;
   bool verify_tls = true;
+  // PEM CA certificate(s) trusted for this request's TLS instead of the system store (a private
+  // CA, e.g. a dev proxy's). Revocation is not checked for such a chain: private CAs rarely
+  // publish CRLs. Empty = the system roots.
+  std::string ca_pem;
   HttpVersion version = HttpVersion::Auto;
   bool fresh_connection = false;  // force a new connection (measure cold cost)
   bool keep_body = true;  // false: body is only streamed to on_chunk, never held in memory

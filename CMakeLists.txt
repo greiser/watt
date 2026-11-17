@@ -60,7 +60,7 @@ foreach(part http grpc model)
   target_include_directories(watt_${part} PUBLIC src)
 endforeach()
 target_link_libraries(watt_http PUBLIC watt_curl)
-target_link_libraries(watt_grpc PUBLIC gRPC::grpc++ gRPC::grpc++_reflection protobuf::libprotobuf rapidjson)
+target_link_libraries(watt_grpc PUBLIC watt_http gRPC::grpc++ gRPC::grpc++_reflection protobuf::libprotobuf rapidjson)  # watt_http: gRPC-Web
 target_link_libraries(watt_model PUBLIC rapidjson)
 add_library(watt_core INTERFACE)
 target_link_libraries(watt_core INTERFACE watt_http watt_grpc watt_model)
@@ -69,7 +69,9 @@ target_link_libraries(watt_core INTERFACE watt_http watt_grpc watt_model)
 file(GLOB_RECURSE APP_SRC CONFIGURE_DEPENDS src/app/*.cpp src/app/*.h)
 if(APP_SRC)
   add_executable(watt WIN32 ${APP_SRC} src/app/watt.rc)
-  target_link_libraries(watt PRIVATE watt_core wx::core wx::base wx::stc wx::aui)
+  # wx::webview: Edge WebView2 for the response HTML preview. Create the control lazily (first
+  # Preview), so the browser processes never start for users who do not open it.
+  target_link_libraries(watt PRIVATE watt_core wx::core wx::base wx::stc wx::aui wx::webview)
 endif()
 
 # ---------------------------------------------------------------- test server (gRPC + HTTP)
@@ -77,7 +79,9 @@ file(GLOB TESTSERVER_PROTO CONFIGURE_DEPENDS tools/testserver/*.proto)
 file(GLOB TESTSERVER_SRC CONFIGURE_DEPENDS tools/testserver/*.cpp)
 if(TESTSERVER_SRC)
   add_executable(watt_testserver ${TESTSERVER_SRC} ${TESTSERVER_PROTO})
-  target_link_libraries(watt_testserver PRIVATE gRPC::grpc++ gRPC::grpc++_reflection protobuf::libprotobuf rapidjson)
+  find_package(OpenSSL REQUIRED)  # the gRPC-Web listener's TLS (grpcweb.cpp)
+  target_link_libraries(watt_testserver PRIVATE gRPC::grpc++ gRPC::grpc++_reflection protobuf::libprotobuf rapidjson
+    OpenSSL::SSL OpenSSL::Crypto ws2_32)
   target_include_directories(watt_testserver PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/gen)
   if(MSVC)
     target_compile_options(watt_testserver PRIVATE /wd4267 /wd4244)  # protoc-generated code

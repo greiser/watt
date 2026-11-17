@@ -33,6 +33,19 @@ struct GrpcTarget {
   long keepalive_ms = 0;        // HTTP/2 keepalive ping interval; 0 = off
   int max_message_bytes = 0;    // largest message sent or received; 0 = unlimited
   std::string user_agent;       // prepended to gRPC's own user-agent
+  // gRPC-Web (as BloomRPC / Postman offer it): calls go over HTTP/1.1 or HTTP/2 to a gRPC-Web
+  // endpoint (Envoy's grpc_web filter, grpcwebproxy, a Connect/ASP.NET/tonic-web server) instead
+  // of a gRPC channel: POST <http|https>://<address>/<service>/<method>. address may carry a
+  // scheme and a path prefix ("https://api.example.com/rpc"); tls or an https:// scheme selects
+  // https. Unary and server streaming work (messages are timed as their frames arrive, timing is
+  // filled as for HTTP); client and bidi streaming cannot be expressed in gRPC-Web and fail with
+  // UNIMPLEMENTED. Reflection is sent as one request body on the reflection stream, which
+  // proxies that forward the body whole (Envoy, grpcwebproxy) serve. insecure_skip_verify,
+  // root_cert_pem, authority (as Host), user_agent and max_message_bytes apply; client
+  // certificates, server_name, connect_timeout_ms and keepalive_ms do not (client certificates
+  // and server_name are refused with UNIMPLEMENTED rather than ignored).
+  bool web = false;
+  bool web_text = false;        // with web: application/grpc-web-text (base64 bodies) instead of +proto
   bool operator==(const GrpcTarget&) const = default;
 };
 

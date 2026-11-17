@@ -77,6 +77,15 @@ class TestServer {
     t.address = address();
     return t;
   }
+  // The server's gRPC-Web listener (tools/testserver/grpcweb.cpp).
+  GrpcTarget web_target(bool text = false) const {
+    if (web_port_ == 0) throw std::runtime_error("watt_testserver has no gRPC-Web listener");
+    GrpcTarget t;
+    t.address = "127.0.0.1:" + std::to_string(web_port_);
+    t.web = true;
+    t.web_text = text;
+    return t;
+  }
 
  private:
   explicit TestServer(const std::wstring& args) {
@@ -103,18 +112,26 @@ class TestServer {
     AssignProcessToJobObject(job_, pi_.hProcess);
     CloseHandle(wr);
 
-    std::string line;
-    char c;
-    DWORD n;
-    while (ReadFile(rd, &c, 1, &n, nullptr) && n == 1 && c != '\n') line += c;
-    CloseHandle(rd);
+    auto read_line = [&] {
+      std::string line;
+      char c;
+      DWORD n;
+      while (ReadFile(rd, &c, 1, &n, nullptr) && n == 1 && c != '\n') line += c;
+      return line;
+    };
+    const std::string line = read_line();
     auto colon = line.rfind(':');
     if (colon == std::string::npos) throw std::runtime_error("unexpected server banner: " + line);
     port_ = std::stoi(line.substr(colon + 1));
+    // "... grpc-web listening on 127.0.0.1:<port>", or "... grpc-web disabled: <why>"
+    const std::string web = read_line();
+    if (web.find("grpc-web listening") != std::string::npos) web_port_ = std::stoi(web.substr(web.rfind(':') + 1));
+    CloseHandle(rd);
   }
   PROCESS_INFORMATION pi_{};
   HANDLE job_ = nullptr;
   int port_ = 0;
+  int web_port_ = 0;
 };
 
 fs::path proto_dir() {
@@ -1596,4 +1613,290 @@ TEST_CASE("a 12 MB response decodes in well under the transfer time", "[grpc][la
   std::printf("12MB response: total=%.1f ttfb=%.1f download(decode)=%.1f ms\n", r.timing.total_ms, r.timing.ttfb_ms,
               r.timing.download_ms);
   CHECK(r.timing.download_ms < 60);  // was ~155 ms with protobuf's printer alone
+}
+
+// ---------------------------------------------------------------- gRPC-Web (tools/testserver/grpcweb.cpp)
+TEST_CASE("gRPC-Web unary: message, metadata both ways, trailers (binary and base64 text)", "[grpc][web]") {
+  for (bool text : {false, true}) {
+    INFO((text ? "application/grpc-web-text" : "application/grpc-web+proto"));
+    GrpcClient c;
+    auto t = TestServer::get().web_target(text);
+    GrpcCallOptions o;
+    o.metadata = {{"X-Foo", "bar"}, {"x-blob-bin", "AAEC"}};
+    auto r = c.invoke(t, "/watt.test.Echo/Say", R"({"message":"hi","repeat":3})", o);
+    INFO(r.status_message);
+    REQUIRE(r.ok);
+    CHECK(r.status_name == "OK");
+    REQUIRE(r.messages.size() == 1);
+    CHECK(r.messages[0].json.find("{\n  \"message\": \"hihihi\"") == 0);  // same pretty JSON as native
+    auto d = parse(r.messages[0].json);
+    CHECK(d["message"] == "hihihi");
+    CHECK(d["metadata"]["x-foo"] == "bar");
+    CHECK_FALSE(d["metadata"].HasMember("x-grpc-web"));  // the proxy strips the transport headers
+    CHECK(header(r.headers, "x-server") == "watt-testserver");
+    CHECK(header(r.headers, "echo-x-foo") == "bar");
+    CHECK(header(r.headers, "echo-x-blob-bin") == "AAEC");  // binary metadata round-trips as base64
+    CHECK(header(r.headers, "content-type").empty());       // HTTP headers are not metadata
+    CHECK(header(r.trailers, "x-trailer") == "done");
+    CHECK(header(r.trailers, "grpc-status").empty());
+    CHECK(r.messages[0].wire_bytes > 5);
+    CHECK(r.timing.bytes_sent > r.messages[0].wire_bytes);  // HTTP request line + headers + body
+    CHECK(r.timing.bytes_received > r.messages[0].wire_bytes);
+    CHECK(r.messages[0].at_ms <= r.timing.total_ms);
+  }
+}
+
+TEST_CASE("gRPC-Web reflection lists services and auto-reflects a single service", "[grpc][web][reflection]") {
+  GrpcClient c;
+  auto t = TestServer::get().web_target();
+  check_schema(c.load_via_reflection(t));
+  // Auto-reflection on first use; JSON conversion as native.
+  GrpcClient fresh;
+  auto r = fresh.invoke(t, "/watt.test.Everything/Echo", R"({"fString":"s","fInt64":"7","level":"LEVEL_HIGH"})", {});
+  INFO(r.status_message);
+  REQUIRE(r.ok);
+  auto d = parse(r.messages[0].json);
+  CHECK(d["fString"] == "s");
+  CHECK(d["fInt64"] == "7");
+  CHECK(d["level"] == "LEVEL_HIGH");
+  // .proto files instead of reflection: no reflection traffic at all.
+  GrpcClient files;
+  REQUIRE(files.load_proto_files({(proto_dir() / "test.proto").string()}, {}).ok);
+  auto f = files.invoke(t, "/watt.test.Echo/Say", R"({"message":"p"})", {});
+  REQUIRE(f.ok);
+  CHECK(f.reflect_ms == 0);
+  CHECK_FALSE(f.timing.connection_reused);
+  CHECK(f.timing.connect_ms > 0);
+}
+
+TEST_CASE("gRPC-Web errors: status, message, details from the trailer frame and trailers-only", "[grpc][web][errors]") {
+  GrpcClient c;
+  auto t = TestServer::get().web_target();
+  for (bool trailers_only : {false, true}) {
+    INFO((trailers_only ? "trailers-only" : "trailer frame"));
+    GrpcCallOptions o;
+    if (trailers_only) o.rpc_metadata = {{"x-grpcweb-trailers-only", "1"}};
+    auto r = c.invoke(t, "/watt.test.Echo/Fail", R"({"code":5,"message":"no such thing: 100%","withDetails":true})", o);
+    CHECK_FALSE(r.ok);
+    CHECK(r.status_code == 5);
+    CHECK(r.status_name == "NOT_FOUND");
+    CHECK(r.status_message == "no such thing: 100%");  // percent-encoded on the wire
+    CHECK(r.messages.empty());
+    CHECK(header(r.trailers, "x-trailer") == "failed");
+    if (trailers_only) CHECK(r.headers.empty());
+    INFO(r.error_details);
+    auto d = parse(r.error_details);
+    REQUIRE(d.IsObject());
+    CHECK(d["code"] == 5);
+    REQUIRE(d["details"].Size() == 2);
+    CHECK(d["details"][0]["@type"] == "type.googleapis.com/watt.test.ErrorDetail");
+    CHECK(d["details"][0]["reason"] == "BAD_THING");
+    CHECK(d["details"][1]["@type"] == "type.googleapis.com/google.rpc.ErrorInfo");
+    CHECK(d["details"][1]["metadata"]["limit"] == "10");
+
+    auto plain = c.invoke(t, "/watt.test.Echo/Fail", R"({"code":7})", o);
+    CHECK(plain.status_name == "PERMISSION_DENIED");
+    CHECK(plain.status_message == "requested failure");
+    CHECK(plain.error_details.empty());
+  }
+  // A response without any grpc-status maps its HTTP status as gRPC does.
+  GrpcCallOptions o;
+  o.rpc_metadata = {{"x-grpcweb-http-status", "404"}};
+  auto nf = c.invoke(t, "/watt.test.Echo/Say", "{}", o);
+  CHECK(nf.status_name == "UNIMPLEMENTED");
+  CHECK(nf.status_message.find("HTTP 404") != std::string::npos);
+  o.rpc_metadata = {{"x-grpcweb-http-status", "503"}};
+  CHECK(c.invoke(t, "/watt.test.Echo/Say", "{}", o).status_name == "UNAVAILABLE");
+  // Client-side errors are the same as native.
+  CHECK(c.invoke(t, "/watt.test.Echo/Say", R"({"mesage":"typo"})", {}).status_name == "INVALID_ARGUMENT");
+  CHECK(c.invoke(t, "/watt.test.Echo/Nope", "{}", {}).status_name == "NOT_FOUND");
+  GrpcCallOptions bad;
+  bad.metadata = {{"bad key", "v"}};
+  CHECK(c.invoke(t, "/watt.test.Echo/Say", "{}", bad).status_name == "INVALID_ARGUMENT");
+}
+
+TEST_CASE("gRPC-Web server streaming: each message is timed as its frame arrives", "[grpc][web][stream]") {
+  for (bool text : {false, true}) {
+    INFO((text ? "application/grpc-web-text" : "application/grpc-web+proto"));
+    GrpcClient c;
+    auto t = TestServer::get().web_target(text);
+    std::vector<double> seen_at;
+    auto r = c.invoke(t, "/watt.test.Echo/Count", R"({"count":5,"intervalMs":30})", {},
+                      [&](const GrpcMessageEvent& e) { seen_at.push_back(e.at_ms); });
+    INFO(r.status_message);
+    REQUIRE(r.ok);
+    REQUIRE(r.messages.size() == 5);
+    REQUIRE(seen_at.size() == 5);
+    for (int i = 0; i < 5; ++i) CHECK(parse(r.messages[i].json)["index"] == i);
+    for (int i = 1; i < 5; ++i) CHECK(r.messages[i].at_ms >= r.messages[i - 1].at_ms + 10);  // not all at the end
+    CHECK(r.messages[4].at_ms - r.messages[0].at_ms >= 100);
+    CHECK(header(r.headers, "x-server") == "watt-testserver");
+    CHECK(header(r.trailers, "x-count") == "5");
+    CHECK(r.timing.download_ms >= 100);
+  }
+}
+
+TEST_CASE("gRPC-Web deadline exceeded", "[grpc][web][deadline]") {
+  GrpcClient c;
+  auto t = TestServer::get().web_target();
+  REQUIRE(c.load_via_reflection(t).ok);
+  GrpcCallOptions o;
+  o.deadline_ms = 150;
+  auto r = c.invoke(t, "/watt.test.Echo/Slow", R"({"delayMs":3000})", o);
+  CHECK_FALSE(r.ok);
+  CHECK(r.status_name == "DEADLINE_EXCEEDED");
+  CHECK(r.timing.total_ms >= 140);
+  CHECK(r.timing.total_ms < 1500);
+  o.deadline_ms = 3000;
+  auto ok = c.invoke(t, "/watt.test.Echo/Slow", R"({"delayMs":50})", o);
+  REQUIRE(ok.ok);
+  CHECK(ok.timing.ttfb_ms >= 45);
+}
+
+TEST_CASE("gRPC-Web refuses client and bidi streaming without sending anything", "[grpc][web][stream]") {
+  GrpcClient c;
+  auto t = TestServer::get().web_target();
+  REQUIRE(c.load_via_reflection(t).ok);
+  for (const char* path : {"/watt.test.Echo/Sum", "/watt.test.Echo/Chat"}) {
+    INFO(path);
+    auto r = c.invoke(t, path, R"([{"value":1}])", {});
+    CHECK(r.status_name == "UNIMPLEMENTED");
+    CHECK(r.status_message.find("not possible over gRPC-Web") != std::string::npos);
+    CHECK(r.status_message.find(path) != std::string::npos);
+    CHECK(r.timing.bytes_sent == 0);
+    auto call = c.start_call(t, path, {});
+    CHECK(call->done());
+    CHECK(call->wait().status_name == "UNIMPLEMENTED");
+    CHECK_FALSE(call->send("{}"));
+  }
+  // Targets the transport cannot serve are refused, not silently downgraded.
+  auto mtls = t;
+  mtls.client_cert_pem = "x";
+  mtls.client_key_pem = "y";
+  auto m = c.invoke(mtls, "/watt.test.Echo/Say", "{}", {});
+  CHECK(m.status_name == "UNIMPLEMENTED");
+  CHECK(m.status_message.find("mTLS") != std::string::npos);
+}
+
+TEST_CASE("gRPC-Web timing: phases filled like HTTP and adding up", "[grpc][web][timing]") {
+  GrpcClient c;
+  auto t = TestServer::get().web_target();
+  auto r = c.invoke(t, "/watt.test.Echo/Say", R"({"message":"t"})", {});
+  INFO(r.status_message);
+  REQUIRE(r.ok);
+  CHECK_FALSE(r.timing.connection_reused);  // auto-reflection opened the connection for this call
+  CHECK(r.timing.connect_ms > 0);
+  CHECK(r.reflect_ms > 0);
+  CHECK(r.timing.tls_ms == 0);  // plaintext
+  CHECK(r.timing.ttfb_ms > 0);
+  CHECK(phase_sum(r) <= r.timing.total_ms + 0.01);
+  CHECK(phase_sum(r) > r.timing.total_ms * 0.9);
+
+  auto warm = c.invoke(t, "/watt.test.Echo/Say", R"({"message":"t"})", {});
+  REQUIRE(warm.ok);
+  CHECK(warm.timing.connection_reused);  // the reflection's keep-alive connection
+  CHECK(warm.timing.connect_ms == 0);
+  CHECK(warm.timing.dns_ms == 0);
+  CHECK(warm.reflect_ms == 0);
+  CHECK(warm.timing.ttfb_ms > 0);
+  CHECK(phase_sum(warm) <= warm.timing.total_ms + 0.01);
+  CHECK(phase_sum(warm) > warm.timing.total_ms * 0.9);
+
+  // A host name is resolved and timed as dns_ms.
+  GrpcClient named;
+  auto host = t;
+  host.address = "localhost:" + host.address.substr(host.address.rfind(':') + 1);
+  auto n = named.invoke(host, "/watt.test.Echo/Say", "{}", {});
+  INFO(n.status_message);
+  REQUIRE(n.ok);
+  CHECK(n.timing.dns_ms > 0);
+  CHECK(phase_sum(n) <= n.timing.total_ms + 0.01);
+}
+
+TEST_CASE("gRPC-Web cancel, interactive calls and unreachable targets", "[grpc][web][cancel]") {
+  GrpcClient c;
+  auto t = TestServer::get().web_target();
+  REQUIRE(c.load_via_reflection(t).ok);
+  SECTION("cancel from another thread") {
+    std::thread th([&] {
+      std::this_thread::sleep_for(std::chrono::milliseconds(150));
+      c.cancel();
+    });
+    auto r = c.invoke(t, "/watt.test.Echo/Slow", R"({"delayMs":5000})", {});
+    th.join();
+    CHECK(r.status_name == "CANCELLED");
+    CHECK(r.timing.total_ms < 2000);
+  }
+  SECTION("cancel from the message callback") {
+    auto r = c.invoke(t, "/watt.test.Echo/Count", R"({"count":1000,"intervalMs":10})", {},
+                      [&](const GrpcMessageEvent&) { c.cancel(); });
+    CHECK(r.status_name == "CANCELLED");
+    CHECK(r.messages.size() < 10);
+  }
+  SECTION("interactive server stream and unary") {
+    auto call = c.start_call(t, "/watt.test.Echo/Count", {});
+    CHECK_FALSE(call->done());
+    REQUIRE(call->send(R"({"count":3})"));
+    std::string err;
+    CHECK_FALSE(call->send(R"({"count":3})", &err));  // one request message
+    auto r = call->wait();
+    INFO(r.status_message);
+    REQUIRE(r.ok);
+    CHECK(r.messages.size() == 3);
+
+    auto slow = c.start_call(t, "/watt.test.Echo/Slow", {});
+    REQUIRE(slow->send(R"({"delayMs":5000})"));
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    slow->cancel();
+    auto s = slow->wait();
+    CHECK(s.status_name == "CANCELLED");
+    CHECK(s.timing.total_ms < 2000);
+
+    auto unsent = c.start_call(t, "/watt.test.Echo/Say", {});
+    unsent->cancel();
+    CHECK(unsent->wait().status_name == "CANCELLED");
+  }
+  SECTION("unreachable") {
+    GrpcClient u;
+    GrpcTarget dead;
+    dead.address = "127.0.0.1:1";
+    dead.web = true;
+    auto r = u.invoke(dead, "/watt.test.Echo/Say", "{}", {});
+    CHECK(r.status_name == "UNAVAILABLE");
+    CHECK(r.reflect_ms == 0);
+    CHECK(r.timing.total_ms < 5000);
+    auto s = u.load_via_reflection(dead);
+    CHECK_FALSE(s.ok);
+    CHECK(s.error.find("UNAVAILABLE") != std::string::npos);
+  }
+}
+
+TEST_CASE("gRPC-Web over TLS: verified with a custom CA, untrusted, skip-verify", "[grpc][web][tls]") {
+  auto& s = TestServer::get(tls_args(false));
+  auto t = s.web_target();
+  t.tls = true;
+  t.root_cert_pem = slurp(cert_dir() / "ca.pem");
+  GrpcClient c;
+  auto r = c.invoke(t, "/watt.test.Echo/Say", R"({"message":"tls"})", {});
+  INFO(r.status_message);
+  REQUIRE(r.ok);
+  CHECK(parse(r.messages[0].json)["message"] == "tls");
+  CHECK(r.timing.tls_ms > 0);
+  CHECK(r.timing.connect_ms > 0);
+  CHECK(phase_sum(r) <= r.timing.total_ms + 0.01);
+  auto warm = c.invoke(t, "/watt.test.Echo/Say", "{}", {});
+  REQUIRE(warm.ok);
+  CHECK(warm.timing.connection_reused);
+  CHECK(warm.timing.tls_ms == 0);
+
+  GrpcClient c2;
+  auto untrusted = t;
+  untrusted.root_cert_pem.clear();  // the system store does not know the test CA
+  auto bad = c2.invoke(untrusted, "/watt.test.Echo/Say", "{}", {});
+  CHECK(bad.status_name == "UNAVAILABLE");
+  auto skip = untrusted;
+  skip.insecure_skip_verify = true;
+  auto ok = c2.invoke(skip, "/watt.test.Echo/Say", "{}", {});
+  INFO(ok.status_message);
+  CHECK(ok.ok);
 }

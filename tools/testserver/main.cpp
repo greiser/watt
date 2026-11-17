@@ -1,12 +1,16 @@
 // watt_testserver: local gRPC server with reflection, used by tests, benchmarks and manual QA.
-//   watt_testserver [port] [--tls <dir>] [--mtls] [--reflection v1alpha|none]
+//   watt_testserver [port] [--tls <dir>] [--mtls] [--reflection v1alpha|none] [--web <port>]
 //     port 0 picks a free port (default 50051).
+//     --web <port>  the gRPC-Web (HTTP/1.1) listener's port (see grpcweb.cpp); default: port + 1
+//                   (50052), or a free port when port is 0. TLS with --tls (no client certs).
 //     --tls <dir>   serve TLS with <dir>/server.pem + server.key (tools/testserver/certs: a test CA
 //                   ca.pem, a server cert for localhost / 127.0.0.1, and a client cert)
 //     --mtls        also require a client certificate signed by <dir>/ca.pem
 //     --reflection  v1alpha: serve only the v1alpha reflection service (like older servers);
 //                   none: no reflection at all. Default: v1 and v1alpha.
-// Prints "watt_testserver listening on 127.0.0.1:<port>" on stdout once ready.
+// Prints "watt_testserver listening on 127.0.0.1:<port>" on stdout once ready, then
+// "watt_testserver grpc-web listening on 127.0.0.1:<port>" (or "watt_testserver grpc-web
+// disabled: <why>" when that port cannot be opened; the gRPC port works either way).
 #include <google/protobuf/descriptor.h>
 #include <google/protobuf/descriptor.pb.h>
 #include <google/protobuf/duration.pb.h>
@@ -383,13 +387,17 @@ class PackerService final : public t::Packer::Service {
 
 }  // namespace
 
+int start_grpc_web(int port, std::shared_ptr<grpc::Channel> backend, const std::string& tls_dir, std::string& err);
+
 int main(int argc, char** argv) {
   int port = 50051;
   std::string tls_dir, reflection = "both";
   bool mtls = false;
+  int web_port = -1;
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     if (a == "--tls" && i + 1 < argc) tls_dir = argv[++i];
+    else if (a == "--web" && i + 1 < argc) web_port = std::atoi(argv[++i]);
     else if (a == "--mtls") mtls = true;
     else if (a == "--reflection" && i + 1 < argc) reflection = argv[++i];
     else port = std::atoi(a.c_str());
@@ -431,6 +439,14 @@ int main(int argc, char** argv) {
     return 1;
   }
   std::printf("watt_testserver listening on 127.0.0.1:%d\n", selected);
+  std::fflush(stdout);
+  if (web_port < 0) web_port = port == 0 ? 0 : port + 1;
+  grpc::ChannelArguments web_args;
+  web_args.SetMaxReceiveMessageSize(-1);
+  std::string web_err;
+  const int web = start_grpc_web(web_port, server->InProcessChannel(web_args), tls_dir, web_err);
+  if (web) std::printf("watt_testserver grpc-web listening on 127.0.0.1:%d\n", web);
+  else std::printf("watt_testserver grpc-web disabled: %s\n", web_err.c_str());
   std::fflush(stdout);
   server->Wait();
   return 0;

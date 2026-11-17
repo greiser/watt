@@ -586,6 +586,7 @@ struct HttpClient::Impl {
     std::string url;
     long timeout = 0, version = 0, follow = 0;
     bool verify = false, fresh = false;
+    std::string ca_pem;
     int kind = 0;  // 0 GET-like, 1 HEAD, 2 with body
     std::string custom;
   } last;
@@ -615,6 +616,17 @@ struct HttpClient::Impl {
       curl_easy_setopt(h, CURLOPT_SSL_VERIFYHOST, req.verify_tls ? 2L : 0L);
     }
     last.verify = req.verify_tls;
+    if ((all && !req.ca_pem.empty()) || req.ca_pem != last.ca_pem) {
+      if (req.ca_pem.empty()) {
+        curl_easy_setopt(h, CURLOPT_CAINFO_BLOB, nullptr);
+        curl_easy_setopt(h, CURLOPT_SSL_OPTIONS, static_cast<long>(CURLSSLOPT_NATIVE_CA));
+      } else {
+        curl_blob blob{const_cast<char*>(req.ca_pem.data()), req.ca_pem.size(), CURL_BLOB_COPY};
+        curl_easy_setopt(h, CURLOPT_CAINFO_BLOB, &blob);
+        curl_easy_setopt(h, CURLOPT_SSL_OPTIONS, static_cast<long>(CURLSSLOPT_NO_REVOKE));
+      }
+      last.ca_pem = req.ca_pem;
+    }
     if (all || req.fresh_connection != last.fresh) {
       curl_easy_setopt(h, CURLOPT_FRESH_CONNECT, req.fresh_connection ? 1L : 0L);
       curl_easy_setopt(h, CURLOPT_SSL_SESSIONID_CACHE, req.fresh_connection ? 0L : 1L);

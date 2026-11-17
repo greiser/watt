@@ -1,5 +1,6 @@
 #include "core/grpc_client.h"
 #include "core/grpc_wire_repair.h"
+#include "core/http_client.h"
 
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -65,6 +66,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cmath>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
@@ -1875,6 +1877,458 @@ void no_tls_exit_wait() {
 #endif
 }
 
+// Walks the reflection service through `exchange` (one stream per batch of requests): optionally
+// list_services, then file_containing_symbol for each service, then file_by_filename for missing
+// dependencies until the closure is complete. Shared by the gRPC and the gRPC-Web transport.
+using ReflExchange = std::function<grpc::Status(const std::vector<std::string>&, std::vector<ReflResponse>&)>;
+grpc::Status reflect_walk(const ReflExchange& exchange, bool list,
+                          std::map<std::string, pb::FileDescriptorProto>& files, std::vector<std::string>& services,
+                          std::string& err) {
+  auto add_files = [&](const ReflResponse& r) {
+    for (const auto& bytes : r.files) {
+      pb::FileDescriptorProto fdp;
+      if (fdp.ParseFromString(bytes) && !files.count(fdp.name())) files.emplace(fdp.name(), std::move(fdp));
+    }
+  };
+  std::vector<ReflResponse> resp;
+  if (list) {
+    std::string req;
+    put_len_field(req, 7, "*");  // list_services
+    grpc::Status st = exchange({req}, resp);
+    if (!st.ok()) return st;
+    if (resp[0].is_error) {
+      err = "list_services: " + resp[0].error_message;
+      return grpc::Status(static_cast<grpc::StatusCode>(resp[0].error_code), resp[0].error_message);
+    }
+    for (auto& name : resp[0].services) {
+      if (name == "grpc.reflection.v1.ServerReflection" || name == "grpc.reflection.v1alpha.ServerReflection")
+        continue;
+      services.push_back(name);
+    }
+  }
+
+  std::vector<std::string> reqs;
+  for (const auto& svc : services) {
+    std::string r;
+    put_len_field(r, 4, svc);  // file_containing_symbol
+    reqs.push_back(std::move(r));
+  }
+  std::set<std::string> requested;
+  while (!reqs.empty()) {
+    resp.clear();
+    grpc::Status st = exchange(reqs, resp);
+    if (!st.ok()) return st;
+    for (const auto& r : resp) {
+      if (r.is_error && !err.empty()) err += "\n";
+      if (r.is_error) err += r.error_message;
+      add_files(r);
+    }
+    // Transitive dependencies the server has not sent yet (servers usually send them all, so
+    // this normally costs nothing; linked-in well-known types are never fetched).
+    reqs.clear();
+    for (const auto& [name, fdp] : files) {
+      for (const auto& dep : fdp.dependency()) {
+        if (files.count(dep) || requested.count(dep)) continue;
+        requested.insert(dep);
+        if (pb::DescriptorPool::generated_pool()->FindFileByName(dep)) continue;
+        std::string r;
+        put_len_field(r, 3, dep);  // file_by_filename
+        reqs.push_back(std::move(r));
+      }
+    }
+  }
+  return grpc::Status::OK;
+}
+
+// ------------------------------------------------------------------ gRPC-Web transport
+
+// gRPC-Web (https://github.com/grpc/grpc/blob/master/doc/PROTOCOL-WEB.md) over watt::HttpClient:
+// one POST per call whose body is the length-prefixed request message(s); the response body is a
+// sequence of frames, 1 flag byte + 4-byte big-endian length: data frames (0x00) carry messages,
+// the trailer frame (0x80) carries "key: value\r\n" lines with grpc-status / grpc-message /
+// trailing metadata. A trailers-only response puts grpc-status in the HTTP headers instead. With
+// -text the bodies are base64, possibly as several padded segments (one per frame).
+
+std::string web_url(const GrpcTarget& t, const std::string& path) {
+  std::string a = t.address;
+  while (!a.empty() && a.front() == ' ') a.erase(0, 1);
+  while (!a.empty() && (a.back() == '/' || a.back() == ' ')) a.pop_back();
+  bool https = t.tls;
+  for (const char* scheme : {"https://", "grpcs://"}) {
+    const size_t n = std::char_traits<char>::length(scheme);
+    if (a.size() > n && a.compare(0, n, scheme) == 0) {
+      a.erase(0, n);
+      https = true;
+    }
+  }
+  for (const char* scheme : {"http://", "grpc://"}) {
+    const size_t n = std::char_traits<char>::length(scheme);
+    if (a.size() > n && a.compare(0, n, scheme) == 0) a.erase(0, n);
+  }
+  std::string p = path;
+  if (p.empty() || p.front() != '/') p.insert(0, "/");
+  return (https ? "https://" : "http://") + a + p;
+}
+
+// The call's metadata as HTTP headers, validated like apply_metadata. "-bin" values travel as
+// base64: a value that already is base64 is sent as is, anything else is encoded.
+bool web_metadata(const Metadata& md, std::vector<Header>& out, std::string& err) {
+  for (const auto& [k0, v] : md) {
+    std::string k = k0;
+    while (!k.empty() && k.back() == ' ') k.pop_back();
+    while (!k.empty() && k.front() == ' ') k.erase(0, 1);
+    if (k.empty()) continue;
+    std::transform(k.begin(), k.end(), k.begin(), [](unsigned char c) { return char(std::tolower(c)); });
+    for (char c : k) {
+      if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.')) {
+        err = "invalid metadata key '" + k0 + "' (allowed: a-z 0-9 - _ .)";
+        return false;
+      }
+    }
+    if (k.size() > 4 && k.compare(k.size() - 4, 4, "-bin") == 0) {
+      std::string raw;
+      out.emplace_back(k, b64_decode(v, raw) ? v : b64_encode(v));
+      continue;
+    }
+    for (unsigned char c : v) {
+      if (c < 0x20 || c > 0x7E) {
+        err = "metadata value for '" + k + "' must be printable ASCII (use a -bin key for binary)";
+        return false;
+      }
+    }
+    out.emplace_back(k, v);
+  }
+  return true;
+}
+
+// What a target cannot do over gRPC-Web; empty when it can be called.
+std::string web_unsupported(const GrpcTarget& t) {
+  if (!t.client_cert_pem.empty() || !t.client_key_pem.empty())
+    return "client certificates (mTLS) are not supported for gRPC-Web targets; use a native gRPC target";
+  if (!t.server_name.empty())
+    return "a TLS server name override is not supported for gRPC-Web targets (put that name in the address)";
+  return {};
+}
+
+std::string percent_decode(std::string_view s) {
+  std::string out;
+  out.reserve(s.size());
+  auto hexv = [](char c) -> int {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+  };
+  for (size_t i = 0; i < s.size(); ++i) {
+    if (s[i] == '%' && i + 2 < s.size() && hexv(s[i + 1]) >= 0 && hexv(s[i + 2]) >= 0) {
+      out += char(hexv(s[i + 1]) * 16 + hexv(s[i + 2]));
+      i += 2;
+    } else {
+      out += s[i];
+    }
+  }
+  return out;
+}
+
+// gRPC's HTTP-to-status mapping for responses without a grpc-status
+// (https://github.com/grpc/grpc/blob/master/doc/http-grpc-status-mapping.md).
+grpc::StatusCode http_to_grpc(long http) {
+  switch (http) {
+    case 400: return grpc::StatusCode::INTERNAL;
+    case 401: return grpc::StatusCode::UNAUTHENTICATED;
+    case 403: return grpc::StatusCode::PERMISSION_DENIED;
+    case 404: return grpc::StatusCode::UNIMPLEMENTED;
+    case 429:
+    case 502:
+    case 503:
+    case 504: return grpc::StatusCode::UNAVAILABLE;
+    default: return grpc::StatusCode::UNKNOWN;
+  }
+}
+
+// Incremental frame reader over the response body chunks (decoding base64 for -text).
+class WebReader {
+ public:
+  explicit WebReader(bool text) : text_(text) {}
+  // Appends a body chunk; complete data frames go to on_msg, trailer frames are collected.
+  // False (with error()) on a frame this client cannot read or that breaks max_bytes, or when
+  // on_msg returned false (error() empty).
+  template <class F>
+  bool feed(const char* p, size_t n, size_t max_bytes, F&& on_msg) {
+    if (text_) {
+      for (size_t i = 0; i < n; ++i) {
+        const char c = p[i];
+        if (c == '\r' || c == '\n' || c == ' ' || c == '\t') continue;
+        quad_ += c;
+        if (quad_.size() < 4) continue;
+        if (!decode_quad()) return fail("malformed base64 in the application/grpc-web-text response");
+        quad_.clear();
+      }
+    } else {
+      buf_.append(p, n);
+    }
+    while (buf_.size() - off_ >= 5) {
+      const auto* h = reinterpret_cast<const unsigned char*>(buf_.data() + off_);
+      const uint32_t len = (uint32_t(h[1]) << 24) | (uint32_t(h[2]) << 16) | (uint32_t(h[3]) << 8) | h[4];
+      const uint8_t flag = h[0];
+      if (!(flag & 0x80) && max_bytes > 0 && len > max_bytes) {
+        code_ = grpc::StatusCode::RESOURCE_EXHAUSTED;
+        return fail("received message larger than max (" + std::to_string(len) + " vs. " +
+                    std::to_string(max_bytes) + ")");
+      }
+      if (buf_.size() - off_ - 5 < len) break;
+      if (flag & 0x80) {
+        trailer_.append(buf_, off_ + 5, len);
+        saw_trailer_ = true;
+      } else if (flag & 0x01) {
+        return fail("the server sent a compressed gRPC-Web frame, which this client did not ask for");
+      } else {
+        std::string msg = buf_.substr(off_ + 5, len);
+        off_ += 5 + len;
+        if (!on_msg(msg)) return false;
+        continue;
+      }
+      off_ += 5 + len;
+    }
+    if (off_ > 0 && (off_ == buf_.size() || off_ > (size_t(1) << 16))) {
+      buf_.erase(0, off_);
+      off_ = 0;
+    }
+    return true;
+  }
+  bool leftover() const { return buf_.size() > off_ || !quad_.empty(); }
+  bool saw_trailer() const { return saw_trailer_; }
+  const std::string& trailer() const { return trailer_; }
+  const std::string& error() const { return error_; }
+  grpc::StatusCode error_code() const { return code_; }
+
+ private:
+  bool fail(std::string e) {
+    error_ = std::move(e);
+    return false;
+  }
+  bool decode_quad() {
+    auto val = [](char c) -> int {
+      if (c >= 'A' && c <= 'Z') return c - 'A';
+      if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+      if (c >= '0' && c <= '9') return c - '0' + 52;
+      if (c == '+' || c == '-') return 62;
+      if (c == '/' || c == '_') return 63;
+      return -1;
+    };
+    int v[4];
+    int pad = 0;
+    for (int i = 0; i < 4; ++i) {
+      if (quad_[i] == '=') {
+        if (i < 2) return false;
+        v[i] = 0;
+        ++pad;
+      } else {
+        if (pad) return false;
+        if ((v[i] = val(quad_[i])) < 0) return false;
+      }
+    }
+    const uint32_t x = (uint32_t(v[0]) << 18) | (uint32_t(v[1]) << 12) | (uint32_t(v[2]) << 6) | uint32_t(v[3]);
+    buf_ += char(x >> 16);
+    if (pad < 2) buf_ += char((x >> 8) & 0xFF);
+    if (pad < 1) buf_ += char(x & 0xFF);
+    return true;
+  }
+  bool text_;
+  std::string quad_;
+  std::string buf_;
+  size_t off_ = 0;
+  std::string trailer_;
+  bool saw_trailer_ = false;
+  std::string error_;
+  grpc::StatusCode code_ = grpc::StatusCode::INTERNAL;
+};
+
+// The outcome of one gRPC-Web POST.
+struct WebResult {
+  grpc::StatusCode code = grpc::StatusCode::OK;
+  std::string message;
+  std::string details;            // grpc-status-details-bin, decoded
+  Metadata headers, trailers;
+  HttpResponse http;
+  bool transport_failed = false;  // no HTTP response at all (refused, TLS failure, DNS, ...)
+  Clock::time_point t_send{}, t_return{};
+  grpc::Status status() const { return grpc::Status(code, message, details); }
+};
+
+bool web_reserved(std::string_view k) {
+  static const char* names[] = {"content-type", "content-length", "transfer-encoding", "connection", "keep-alive",
+                                "date", "server", "vary", "grpc-status", "grpc-message",
+                                "grpc-status-details-bin", "grpc-encoding", "grpc-accept-encoding",
+                                "content-encoding", "alt-svc"};
+  for (const char* n : names)
+    if (k == n) return true;
+  return k.substr(0, 15) == "access-control-";
+}
+
+// One "key: value" of a trailer frame or of the HTTP headers: status fields go to r, metadata to md.
+void web_take(WebResult& r, std::string key, std::string_view value, Metadata& md, bool& have_status) {
+  std::transform(key.begin(), key.end(), key.begin(), [](unsigned char c) { return char(std::tolower(c)); });
+  if (key == "grpc-status") {
+    bool num = !value.empty() && value.size() < 4;
+    for (char c : value) num = num && c >= '0' && c <= '9';
+    const int code = num ? std::atoi(std::string(value).c_str()) : 2;
+    r.code = static_cast<grpc::StatusCode>(code <= 16 ? code : 2);
+    have_status = true;
+  } else if (key == "grpc-message") {
+    r.message = percent_decode(value);
+  } else if (key == "grpc-status-details-bin") {
+    std::string raw;
+    if (b64_decode(value, raw)) r.details = std::move(raw);
+  } else if (!web_reserved(key)) {
+    md.emplace_back(std::move(key), std::string(value));
+  }
+}
+
+// Performs one gRPC-Web exchange. frames: the request messages, already length-prefixed.
+// on_msg(message, arrival) runs on this thread for each data frame as it arrives; returning
+// false aborts the call with CANCELLED. timeout_ms 0 = none.
+WebResult web_exchange(HttpClient& hc, const GrpcTarget& t, const std::string& path, const std::string& frames,
+                       const std::vector<Header>& md, long timeout_ms,
+                       const std::function<bool(std::string&, Clock::time_point)>& on_msg) {
+  WebResult r;
+  HttpRequest req;
+  req.method = "POST";
+  req.url = web_url(t, path);
+  req.body = t.web_text ? b64_encode(frames) : frames;
+  req.timeout_ms = timeout_ms;
+  req.follow_redirects = false;
+  req.verify_tls = !t.insecure_skip_verify;
+  req.ca_pem = t.root_cert_pem;
+  req.keep_body = false;
+  const char* ctype = t.web_text ? "application/grpc-web-text" : "application/grpc-web+proto";
+  req.headers.reserve(md.size() + 8);
+  req.headers.emplace_back("Content-Type", ctype);
+  req.headers.emplace_back("Accept", ctype);
+  req.headers.emplace_back("X-Grpc-Web", "1");
+  req.headers.emplace_back("X-User-Agent", "grpc-web-watt/0.1");
+  if (!t.user_agent.empty()) req.headers.emplace_back("User-Agent", t.user_agent);
+  if (!t.authority.empty()) req.headers.emplace_back("Host", t.authority);
+  if (timeout_ms > 0) {
+    // At most 8 digits (gRPC over HTTP/2 spec): milliseconds, or seconds beyond ~27 hours.
+    req.headers.emplace_back("grpc-timeout", timeout_ms <= 99999999 ? std::to_string(timeout_ms) + "m"
+                                                                     : std::to_string(timeout_ms / 1000) + "S");
+  }
+  for (const auto& h : md) req.headers.push_back(h);
+
+  WebReader reader(t.web_text);
+  const size_t max_bytes = t.max_message_bytes > 0 ? static_cast<size_t>(t.max_message_bytes) : 0;
+  bool aborted = false, reader_failed = false;
+  auto on_chunk = [&](const char* p, size_t n) {
+    if (aborted) return;
+    const auto at = Clock::now();
+    const bool ok = reader.feed(p, n, max_bytes, [&](std::string& m) { return on_msg(m, at); });
+    if (!ok) {
+      aborted = true;
+      reader_failed = !reader.error().empty();
+      hc.cancel();
+    }
+  };
+  r.t_send = Clock::now();
+  r.http = hc.send(req, on_chunk);
+  r.t_return = Clock::now();
+  const HttpResponse& h = r.http;
+
+  if (reader_failed) {
+    r.code = reader.error_code();
+    r.message = reader.error();
+  } else if (aborted) {
+    r.code = grpc::StatusCode::CANCELLED;
+    r.message = "cancelled";
+  } else if (!h.ok) {
+    if (h.error == "cancelled") {
+      r.code = grpc::StatusCode::CANCELLED;
+      r.message = "cancelled";
+    } else if (h.error.find("timed out") != std::string::npos || h.error.find("Timeout") != std::string::npos) {
+      r.code = grpc::StatusCode::DEADLINE_EXCEEDED;
+      r.message = "deadline exceeded after " + std::to_string(timeout_ms) + " ms";
+    } else {
+      r.code = grpc::StatusCode::UNAVAILABLE;
+      r.message = "gRPC-Web request to " + req.url + " failed: " + h.error;
+      r.transport_failed = h.status == 0;
+    }
+  }
+  if (h.status == 0) return r;
+
+  // Initial metadata (trailers-only: everything) from the HTTP headers.
+  const bool settled = h.ok && !aborted;  // the body is complete: the status comes from the response
+  Metadata from_headers;
+  WebResult hs;
+  bool header_status = false;
+  for (const auto& [k, v] : h.headers) web_take(hs, std::string(k), v, from_headers, header_status);
+  bool have_status = false;
+  if (header_status && !reader.saw_trailer()) {  // trailers-only
+    r.trailers = std::move(from_headers);
+    if (settled) {
+      r.code = hs.code;
+      r.message = std::move(hs.message);
+      r.details = std::move(hs.details);
+    }
+    have_status = true;
+  } else {
+    r.headers = std::move(from_headers);
+  }
+  if (reader.saw_trailer()) {
+    WebResult ts;
+    std::string_view rest = reader.trailer();
+    while (!rest.empty()) {
+      const size_t e = rest.find("\r\n");
+      const std::string_view line = rest.substr(0, e);
+      rest = e == std::string_view::npos ? std::string_view{} : rest.substr(e + 2);
+      const size_t colon = line.find(':');
+      if (colon == std::string_view::npos) continue;
+      std::string_view v = line.substr(colon + 1);
+      while (!v.empty() && (v.front() == ' ' || v.front() == '\t')) v.remove_prefix(1);
+      while (!v.empty() && (v.back() == ' ' || v.back() == '\t')) v.remove_suffix(1);
+      web_take(ts, std::string(line.substr(0, colon)), v, r.trailers, have_status);
+    }
+    if (settled && have_status) {
+      r.code = ts.code;
+      r.message = std::move(ts.message);
+      r.details = std::move(ts.details);
+    } else if (settled) {
+      r.code = grpc::StatusCode::INTERNAL;
+      r.message = "the gRPC-Web trailer frame has no grpc-status";
+      have_status = true;
+    }
+  }
+  if (settled && !have_status) {
+    const std::string ct(h.headers.get("content-type"));
+    if (h.status != 200) {
+      r.code = http_to_grpc(h.status);
+      r.message = "HTTP " + std::to_string(h.status) + (h.status_text.empty() ? "" : " " + h.status_text) +
+                  " from " + req.url + " (no grpc-status; is this a gRPC-Web endpoint?)";
+    } else if (ct.rfind("application/grpc-web", 0) != 0) {
+      r.code = grpc::StatusCode::UNKNOWN;
+      r.message = "the response is not gRPC-Web (Content-Type: " + (ct.empty() ? std::string("none") : ct) +
+                  "); is this a gRPC-Web endpoint?";
+    } else {
+      r.code = grpc::StatusCode::INTERNAL;
+      r.message = reader.leftover() ? "the gRPC-Web response ended in the middle of a frame"
+                                    : "the gRPC-Web response ended without a trailer frame (no grpc-status)";
+    }
+  }
+  return r;
+}
+
+void put_web_frame(std::string& out, std::string_view msg) {
+  const uint32_t n = static_cast<uint32_t>(msg.size());
+  const char h[5] = {0, char(n >> 24), char(n >> 16), char(n >> 8), char(n)};
+  out.append(h, 5);
+  out.append(msg.data(), msg.size());
+}
+
+// Milliseconds left until deadline (at least 1), 0 for none.
+long web_remaining(Clock::time_point deadline) {
+  if (deadline == Clock::time_point::max()) return 0;
+  return std::max<long>(1, static_cast<long>(std::ceil(ms_between(Clock::now(), deadline))));
+}
+
 }  // namespace
 
 // ================================================================== Impl
@@ -1898,7 +2352,42 @@ struct GrpcClient::Impl {
 
   std::mutex call_mu;  // active contexts for cancel()
   std::vector<grpc::ClientContext*> active;
+  std::vector<HttpClient*> active_web;  // gRPC-Web transfers in flight
   uint64_t cancel_gen = 0;
+
+  // gRPC-Web: idle HTTP clients, most recently used last, so a call right after its
+  // auto-reflection (or after an earlier call) finds that connection, DNS entry and TLS session.
+  std::mutex web_mu;
+  std::vector<std::unique_ptr<HttpClient>> web_idle;
+  std::unique_ptr<HttpClient> web_acquire() {
+    {
+      std::lock_guard lk(web_mu);
+      if (!web_idle.empty()) {
+        auto c = std::move(web_idle.back());
+        web_idle.pop_back();
+        return c;
+      }
+    }
+    return std::make_unique<HttpClient>();
+  }
+  void web_release(std::unique_ptr<HttpClient> c) {
+    std::lock_guard lk(web_mu);
+    web_idle.push_back(std::move(c));
+    if (web_idle.size() > 8) web_idle.erase(web_idle.begin());
+  }
+  // RAII registration of a gRPC-Web transfer so cancel() reaches it.
+  struct WebActive {
+    Impl& im;
+    HttpClient* hc;
+    WebActive(Impl& i, HttpClient* c) : im(i), hc(c) {
+      std::lock_guard lk(im.call_mu);
+      im.active_web.push_back(c);
+    }
+    ~WebActive() {
+      std::lock_guard lk(im.call_mu);
+      im.active_web.erase(std::remove(im.active_web.begin(), im.active_web.end(), hc), im.active_web.end());
+    }
+  };
 
   // Background worker for preconnects and post-load warm-ups, started on first use.
   std::mutex job_mu;
@@ -2202,6 +2691,7 @@ struct GrpcClient::Impl {
   }
 
   void preconnect(const GrpcTarget& t) {
+    if (t.web) return;  // gRPC-Web: no channel; the first call's HTTP client connects
     auto slot = slot_for(t);
     post([this, slot] {
       bool built = false;
@@ -2258,6 +2748,27 @@ struct GrpcClient::Impl {
   // v1alpha) that worked for t before.
   bool fetch_symbol(const GrpcTarget& t, const Metadata& md, const std::string& symbol,
                     std::map<std::string, pb::FileDescriptorProto>& files);
+  // gRPC-Web reflection: each batch of reflection requests is one POST on the bidi reflection
+  // method with every request in the body (proxies that forward a complete body, as Envoy and
+  // grpcwebproxy do, serve it like a server stream). conn receives the first POST's connection
+  // phases, so a call can report them as connect time rather than reflection time.
+  struct WebConn {
+    bool set = false;
+    bool reused = false;
+    bool transport_failed = false;
+    double dns_ms = 0, connect_ms = 0, tls_ms = 0;
+  };
+  grpc::Status web_reflect_once(HttpClient& hc, const GrpcTarget& t, const char* method, Clock::time_point deadline,
+                                const std::vector<Header>& hdrs, bool list,
+                                std::map<std::string, pb::FileDescriptorProto>& files,
+                                std::vector<std::string>& services, std::string& err, WebConn* conn);
+  GrpcSchema reflect_web(const GrpcTarget& t, Clock::time_point t0, long deadline_ms, const Metadata& md,
+                         const std::vector<std::string>& symbols, uint64_t gen, grpc::Status* status = nullptr,
+                         WebConn* conn = nullptr);
+  // The schema of a successful reflection walk: builds the pool, publishes it, lists the methods.
+  GrpcSchema build_reflected(const GrpcTarget& t, bool list, const std::vector<std::string>& symbols,
+                             std::map<std::string, pb::FileDescriptorProto>& files,
+                             const std::vector<std::string>& services, std::string& err, Clock::time_point t0);
   // The status a call fails with on a channel whose connection failed (UNAVAILABLE + gRPC's reason).
   grpc::Status connect_error(const std::shared_ptr<grpc::Channel>& ch, const ConnWatch& w);
 
@@ -2298,16 +2809,10 @@ grpc::Status GrpcClient::Impl::reflect_once(const std::shared_ptr<grpc::Channel>
                                             std::vector<std::string>& services, std::string& err,
                                             ConnWatch* watch) {
   const auto deadline = std::chrono::system_clock::now() + std::chrono::milliseconds(deadline_ms);
-  auto add_files = [&](const ReflResponse& r) {
-    for (const auto& bytes : r.files) {
-      pb::FileDescriptorProto fdp;
-      if (fdp.ParseFromString(bytes) && !files.count(fdp.name())) files.emplace(fdp.name(), std::move(fdp));
-    }
-  };
   // One stream per batch of requests, the last of which carries END_STREAM: the server closes the
   // stream right after its last response, so no extra round trip waits for the trailers. Only the
   // first stream can be waiting for the connection.
-  auto exchange = [&](const std::vector<std::string>& reqs, std::vector<ReflResponse>& out) -> grpc::Status {
+  ReflExchange exchange = [&](const std::vector<std::string>& reqs, std::vector<ReflResponse>& out) -> grpc::Status {
     SyncStream s(ch, method, watch);
     watch = nullptr;
     if (deadline_ms > 0) s.ctx.set_deadline(deadline);
@@ -2333,54 +2838,102 @@ grpc::Status GrpcClient::Impl::reflect_once(const std::shared_ptr<grpc::Channel>
     return s.finish();
   };
 
-  std::vector<ReflResponse> resp;
-  if (list) {
-    std::string req;
-    put_len_field(req, 7, "*");  // list_services
-    grpc::Status st = exchange({req}, resp);
-    if (!st.ok()) return st;
-    if (resp[0].is_error) {
-      err = "list_services: " + resp[0].error_message;
-      return grpc::Status(static_cast<grpc::StatusCode>(resp[0].error_code), resp[0].error_message);
-    }
-    for (auto& name : resp[0].services) {
-      if (name == "grpc.reflection.v1.ServerReflection" || name == "grpc.reflection.v1alpha.ServerReflection")
-        continue;
-      services.push_back(name);
-    }
-  }
+  return reflect_walk(exchange, list, files, services, err);
+}
 
-  std::vector<std::string> reqs;
-  for (const auto& svc : services) {
-    std::string r;
-    put_len_field(r, 4, svc);  // file_containing_symbol
-    reqs.push_back(std::move(r));
-  }
-  std::set<std::string> requested;
-  while (!reqs.empty()) {
-    resp.clear();
-    grpc::Status st = exchange(reqs, resp);
-    if (!st.ok()) return st;
-    for (const auto& r : resp) {
-      if (r.is_error && !err.empty()) err += "\n";
-      if (r.is_error) err += r.error_message;
-      add_files(r);
+grpc::Status GrpcClient::Impl::web_reflect_once(HttpClient& hc, const GrpcTarget& t, const char* method,
+                                                Clock::time_point deadline, const std::vector<Header>& hdrs, bool list,
+                                                std::map<std::string, pb::FileDescriptorProto>& files,
+                                                std::vector<std::string>& services, std::string& err,
+                                                WebConn* conn) {
+  ReflExchange exchange = [&](const std::vector<std::string>& reqs, std::vector<ReflResponse>& out) -> grpc::Status {
+    std::string frames;
+    for (const auto& r : reqs) put_web_frame(frames, r);
+    bool malformed = false;
+    WebResult wr = web_exchange(hc, t, method, frames, hdrs, web_remaining(deadline),
+                                [&](std::string& bytes, Clock::time_point) {
+                                  ReflResponse rr;
+                                  if (!parse_refl_response(bytes, rr)) {
+                                    malformed = true;
+                                    return false;
+                                  }
+                                  out.push_back(std::move(rr));
+                                  return true;
+                                });
+    if (conn && !conn->set) {
+      const HttpResponse& h = wr.http;
+      conn->set = true;
+      conn->reused = h.timing.connection_reused;
+      conn->transport_failed = wr.transport_failed;
+      conn->dns_ms = h.timing.dns_ms;
+      conn->connect_ms = h.socket_ms + h.timing.connect_ms;
+      conn->tls_ms = h.timing.tls_ms;
     }
-    // Transitive dependencies the server has not sent yet (servers usually send them all, so
-    // this normally costs nothing; linked-in well-known types are never fetched).
-    reqs.clear();
-    for (const auto& [name, fdp] : files) {
-      for (const auto& dep : fdp.dependency()) {
-        if (files.count(dep) || requested.count(dep)) continue;
-        requested.insert(dep);
-        if (pb::DescriptorPool::generated_pool()->FindFileByName(dep)) continue;
-        std::string r;
-        put_len_field(r, 3, dep);  // file_by_filename
-        reqs.push_back(std::move(r));
+    if (malformed) {
+      err = "malformed reflection response";
+      return grpc::Status(grpc::StatusCode::INTERNAL, err);
+    }
+    if (wr.code == grpc::StatusCode::OK && out.size() < reqs.size()) {
+      err = "the reflection stream ended after " + std::to_string(out.size()) + " of " +
+            std::to_string(reqs.size()) + " responses";
+      return grpc::Status(grpc::StatusCode::INTERNAL, err);
+    }
+    return wr.status();
+  };
+  return reflect_walk(exchange, list, files, services, err);
+}
+
+GrpcSchema GrpcClient::Impl::reflect_web(const GrpcTarget& t, Clock::time_point t0, long deadline_ms,
+                                         const Metadata& md, const std::vector<std::string>& symbols, uint64_t gen,
+                                         grpc::Status* status, WebConn* conn) {
+  static const char* kV1 = "/grpc.reflection.v1.ServerReflection/ServerReflectionInfo";
+  static const char* kV1alpha = "/grpc.reflection.v1alpha.ServerReflection/ServerReflectionInfo";
+  GrpcSchema out;
+  auto fail = [&](const grpc::Status& st, const std::string& detail) {
+    if (status) *status = st;
+    out.error = std::string("reflection failed: ") + status_name(st.error_code()) + ": " + st.error_message();
+    if (!detail.empty() && detail != st.error_message()) out.error += " (" + detail + ")";
+    if (st.error_code() == grpc::StatusCode::UNIMPLEMENTED)
+      out.error += "; the gRPC-Web endpoint does not serve reflection: load the service's .proto files instead";
+    out.load_ms = ms_between(t0, Clock::now());
+    return out;
+  };
+  if (const std::string why = web_unsupported(t); !why.empty())
+    return fail(grpc::Status(grpc::StatusCode::UNIMPLEMENTED, why), {});
+  std::vector<Header> hdrs;
+  std::string err;
+  if (!web_metadata(md, hdrs, err)) return fail(grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, err), {});
+  const auto deadline = deadline_ms > 0 ? t0 + std::chrono::milliseconds(deadline_ms) : Clock::time_point::max();
+  const bool list = symbols.empty();
+  const std::string key = "web:" + normalize_address(t.address);
+  bool alpha;
+  {
+    std::lock_guard lk(mu);
+    alpha = refl_v1alpha.count(key) && refl_v1alpha[key];
+  }
+  if (cancelled_since(gen)) return fail(grpc::Status(grpc::StatusCode::CANCELLED, "cancelled"), {});
+  auto hc = web_acquire();
+  std::map<std::string, pb::FileDescriptorProto> files;
+  std::vector<std::string> services = symbols;
+  grpc::Status st;
+  {
+    WebActive reg(*this, hc.get());
+    st = web_reflect_once(*hc, t, alpha ? kV1alpha : kV1, deadline, hdrs, list, files, services, err, conn);
+    if (st.error_code() == grpc::StatusCode::UNIMPLEMENTED && !cancelled_since(gen)) {
+      files.clear();
+      services = symbols;
+      err.clear();
+      alpha = !alpha;
+      st = web_reflect_once(*hc, t, alpha ? kV1alpha : kV1, deadline, hdrs, list, files, services, err, nullptr);
+      if (st.ok()) {
+        std::lock_guard lk(mu);
+        refl_v1alpha[key] = alpha;
       }
     }
   }
-  return grpc::Status::OK;
+  web_release(std::move(hc));
+  if (!st.ok()) return fail(st, err);
+  return build_reflected(t, list, symbols, files, services, err, t0);
 }
 
 bool GrpcClient::Impl::fetch_symbol(const GrpcTarget& t, const Metadata& md, const std::string& symbol,
@@ -2388,6 +2941,35 @@ bool GrpcClient::Impl::fetch_symbol(const GrpcTarget& t, const Metadata& md, con
   static const char* kV1 = "/grpc.reflection.v1.ServerReflection/ServerReflectionInfo";
   static const char* kV1alpha = "/grpc.reflection.v1alpha.ServerReflection/ServerReflectionInfo";
   const uint64_t gen = generation();
+  if (t.web) {
+    std::vector<Header> hdrs;
+    std::string err;
+    if (!web_unsupported(t).empty() || !web_metadata(md, hdrs, err)) return false;
+    const std::string key = "web:" + normalize_address(t.address);
+    bool alpha;
+    {
+      std::lock_guard lk(mu);
+      alpha = refl_v1alpha.count(key) && refl_v1alpha[key];
+    }
+    auto hc = web_acquire();
+    bool ok = false;
+    {
+      WebActive reg(*this, hc.get());
+      const auto deadline = Clock::now() + std::chrono::milliseconds(5000);
+      for (int attempt = 0; attempt < 2 && !cancelled_since(gen); ++attempt, alpha = !alpha) {
+        files.clear();
+        std::vector<std::string> services{symbol};
+        err.clear();
+        grpc::Status st =
+            web_reflect_once(*hc, t, alpha ? kV1alpha : kV1, deadline, hdrs, false, files, services, err, nullptr);
+        if (st.error_code() == grpc::StatusCode::UNIMPLEMENTED) continue;
+        ok = st.ok() && !files.empty();
+        break;
+      }
+    }
+    web_release(std::move(hc));
+    return ok;
+  }
   Clock::time_point tc;
   Lease l = begin_connect(t, tc);
   const std::string key = normalize_address(t.address);
@@ -2467,6 +3049,14 @@ GrpcSchema GrpcClient::Impl::reflect(const GrpcTarget& t, const std::shared_ptr<
     return out;
   }
 
+  return build_reflected(t, list, symbols, files, services, err, t0);
+}
+
+GrpcSchema GrpcClient::Impl::build_reflected(const GrpcTarget& t, bool list, const std::vector<std::string>& symbols,
+                                             std::map<std::string, pb::FileDescriptorProto>& files,
+                                             const std::vector<std::string>& services, std::string& err,
+                                             Clock::time_point t0) {
+  GrpcSchema out;
   auto set = std::make_shared<SchemaSet>();
   set->from_reflection = true;
   set->target = t;
@@ -2488,6 +3078,7 @@ GrpcSchema GrpcClient::Impl::reflect(const GrpcTarget& t, const std::shared_ptr<
 
 GrpcSchema GrpcClient::Impl::reflect(const GrpcTarget& t, long deadline_ms, const Metadata& md) {
   const uint64_t gen = generation();
+  if (t.web) return reflect_web(t, Clock::now(), deadline_ms, md, {}, gen);
   Clock::time_point t0;
   Lease l = begin_connect(t, t0);
   if (l.reused) return reflect(t, l.ch, t0, deadline_ms, md, {}, gen);
@@ -2513,6 +3104,45 @@ GrpcClient::Impl::Prepared GrpcClient::Impl::prepare(const GrpcTarget& t, const 
   std::tie(p.schema, p.method) = lookup(t, svc, mname);
   if (p.method) return p;
 
+  Metadata reflect_md = opts.metadata;
+  reflect_md.insert(reflect_md.end(), opts.reflect_metadata.begin(), opts.reflect_metadata.end());
+  if (t.web) {
+    // gRPC-Web: reflect over HTTP. Its first POST opened the connection the call then reuses, so
+    // that POST's DNS / connect / TLS phases are reported as the call's, the rest as reflect_ms.
+    const auto tc = Clock::now();
+    long budget = opts.deadline_ms > 0 ? std::min<long>(opts.deadline_ms, 10000) : 10000;
+    budget = std::max<long>(1, budget - static_cast<long>(ms_between(t0, tc)));
+    WebConn conn;
+    grpc::Status rst;
+    GrpcSchema s = reflect_web(t, tc, budget, reflect_md, {svc}, gen, &rst, &conn);
+    const double wall = ms_between(tc, Clock::now());
+    const grpc::StatusCode code = rst.error_code();
+    if (conn.set) {
+      p.have_lease = true;
+      p.lease.reused = conn.reused;
+      p.lease.dns_ms = conn.dns_ms;
+      p.lease.connect_ms = conn.connect_ms;
+      p.lease.tls_ms = conn.tls_ms;
+    }
+    if (conn.transport_failed) {
+      // Never got an HTTP response: the call fails the way it would have without reflection.
+      p.lease.connect_ms = std::max(0.0, wall - p.lease.dns_ms - p.lease.tls_ms);
+      p.code = code;
+      p.error = rst.error_message();
+      return p;
+    }
+    p.reflect_ms = std::max(0.0, wall - p.lease.dns_ms - p.lease.connect_ms - p.lease.tls_ms);
+    std::tie(p.schema, p.method) = lookup(t, svc, mname);
+    if (!p.method) {
+      bool own = code == grpc::StatusCode::UNAVAILABLE || code == grpc::StatusCode::DEADLINE_EXCEEDED ||
+                 code == grpc::StatusCode::CANCELLED || code == grpc::StatusCode::UNAUTHENTICATED ||
+                 code == grpc::StatusCode::PERMISSION_DENIED || code == grpc::StatusCode::INVALID_ARGUMENT;
+      p.code = own ? code : grpc::StatusCode::NOT_FOUND;
+      p.error = "method " + full_path + " not found: " + (s.ok ? "the server does not define it" : s.error);
+    }
+    return p;
+  }
+
   // First use of this service on this target: fetch only the file that defines the service. On a
   // channel that is not connected yet, the reflection request goes out with wait_for_ready right
   // away, so building and sending it overlaps the handshake. connect_ms runs until READY and
@@ -2533,8 +3163,6 @@ GrpcClient::Impl::Prepared GrpcClient::Impl::prepare(const GrpcTarget& t, const 
     watch = &w;
   }
   grpc::Status rst;
-  Metadata reflect_md = opts.metadata;
-  reflect_md.insert(reflect_md.end(), opts.reflect_metadata.begin(), opts.reflect_metadata.end());
   GrpcSchema s = reflect(t, p.lease.ch, tc, budget, reflect_md, {svc}, gen, watch, &rst);
   const grpc::StatusCode code = rst.error_code();
   const auto tr = Clock::now();
@@ -2617,6 +3245,27 @@ struct GrpcCall::Core {
   size_t pending_left = 0;     // docs not yet queued (guarded by m)
   std::string encode_error;    // a later message failed to encode: the call was cancelled
   std::string decode_failure;  // the first response message that could not be decoded (call: INTERNAL)
+
+  // gRPC-Web (target.web): no gRPC stream; once the send side is closed the queued message goes
+  // out as one POST (run_web) and response frames are decoded as they arrive.
+  bool web = false;
+  GrpcTarget web_target;
+  std::vector<Header> web_headers;  // the call's metadata
+  Clock::time_point web_deadline = Clock::time_point::max();
+  uint64_t web_gen = 0;
+  bool web_cancel = false;
+  bool web_pre_connected = false;   // auto-reflection opened the connection (its phases are in resp.timing)
+  HttpClient* web_http = nullptr;   // the transfer in flight (guarded by m)
+  std::condition_variable send_cv;  // enqueue / close_send / cancel wake run_web
+
+  void cancel() {
+    ctx.TryCancel();
+    if (!web) return;
+    std::lock_guard lk(m);
+    web_cancel = true;
+    if (web_http) web_http->cancel();
+    send_cv.notify_all();
+  }
 
   void produce() {
     std::string err;
@@ -2723,6 +3372,7 @@ struct GrpcCall::Core {
     queue.push_back(std::move(bb));
     if (!method->client_streaming()) closed = true;  // unary/server-stream: one message, then half-close
     pump_writes();
+    if (web) send_cv.notify_all();
     return true;
   }
 
@@ -2730,9 +3380,108 @@ struct GrpcCall::Core {
     std::lock_guard lk(m);
     closed = true;
     pump_writes();
+    if (web) send_cv.notify_all();
+  }
+
+  // gRPC-Web: waits for the send side to close, then POSTs the request and decodes each data
+  // frame the moment its last byte arrives.
+  void run_web() {
+    std::unique_lock lk(m);
+    while (!closed && !web_cancel && !impl->cancelled_since(web_gen))
+      send_cv.wait_for(lk, std::chrono::milliseconds(20));  // GrpcClient::cancel() does not notify
+    half_closed = true;
+    std::string frames;
+    for (const auto& bb : queue) put_web_frame(frames, byte_buffer_to_string(bb));
+    queue.clear();
+    rmsg.reset(schema->prototype(method->output_type())->New());
+    t_start = Clock::now();
+    WebResult wr;
+    bool sent = false;
+    if (web_cancel || impl->cancelled_since(web_gen)) {
+      wr.code = grpc::StatusCode::CANCELLED;
+      wr.message = "cancelled";
+    } else if (web_deadline != Clock::time_point::max() && t_start >= web_deadline) {
+      wr.code = grpc::StatusCode::DEADLINE_EXCEEDED;
+      wr.message = "deadline exceeded before the request was sent";
+    } else {
+      auto hc = impl->web_acquire();
+      web_http = hc.get();
+      lk.unlock();
+      {
+        GrpcClient::Impl::WebActive reg(*impl, hc.get());
+        wr = web_exchange(*hc, web_target, path, frames, web_headers, web_remaining(web_deadline),
+                          [this](std::string& bytes, Clock::time_point at) { return on_web_message(bytes, at); });
+      }
+      lk.lock();
+      web_http = nullptr;
+      impl->web_release(std::move(hc));
+      sent = true;
+    }
+    t_end = sent ? wr.t_return : Clock::now();
+    complete_web(wr, sent);
+    finished = true;
+    done_cv.notify_all();
+  }
+
+  bool on_web_message(std::string& bytes, Clock::time_point at) {
+    std::unique_lock lk(m);
+    if (t_first_msg == Clock::time_point{}) t_first_msg = at;
+    GrpcMessageEvent ev;
+    ev.at_ms = ms_between(t0, at);
+    ev.wire_bytes = bytes.size() + 5;
+    grpc::ByteBuffer bb = string_to_byte_buffer(bytes);
+    decode(bb, ev);
+    if (on_message) {
+      lk.unlock();  // the callback may cancel() or take its time
+      on_message(ev);
+      lk.lock();
+    }
+    resp.messages.push_back(std::move(ev));
+    return true;
+  }
+
+  // m held. Status, metadata and timing of a gRPC-Web call. The HTTP phases map 1:1 (socket setup
+  // counts as connect); the HTTP-only phases around the transfer (prepare, curl's queue, process)
+  // are queue time, so the phases add up to total_ms as for a native call.
+  void complete_web(const WebResult& wr, bool sent) {
+    status = wr.status();
+    if (!decode_failure.empty() && status.ok()) status = grpc::Status(grpc::StatusCode::INTERNAL, decode_failure);
+    resp.ok = status.ok();
+    resp.status_code = static_cast<int>(status.error_code());
+    resp.status_name = status_name(resp.status_code);
+    resp.status_message = status.error_message();
+    resp.error_details = decode_status_details(status.error_details(), schema.get(), any_fetch ? &any_fetch : nullptr);
+    resp.headers = wr.headers;
+    resp.trailers = wr.trailers;
+
+    Timing& tm = resp.timing;
+    const double pre = tm.dns_ms + tm.connect_ms + tm.tls_ms;  // auto-reflection's connection
+    const double any_fetch_post_ms = std::max(0.0, double(any_fetch_ns.load()) / 1e6 - any_fetch_pre_ms);
+    if (sent) {
+      const HttpResponse& h = wr.http;
+      tm.dns_ms += h.timing.dns_ms;
+      tm.connect_ms += h.socket_ms + h.timing.connect_ms;
+      tm.tls_ms += h.timing.tls_ms;
+      tm.send_ms = h.timing.send_ms;
+      tm.ttfb_ms = h.timing.ttfb_ms;
+      tm.download_ms = std::max(0.0, h.timing.download_ms - any_fetch_post_ms);
+      tm.connection_reused = !web_pre_connected && h.timing.connection_reused;
+      tm.bytes_sent = h.timing.bytes_sent;
+      tm.bytes_received = h.timing.bytes_received;
+      tm.queue_ms = std::max(0.0, ms_between(t0, wr.t_send) - resp.reflect_ms - pre - any_fetch_pre_ms) +
+                    h.prepare_ms + h.timing.queue_ms + h.redirect_ms + h.process_ms;
+    } else {
+      tm.queue_ms = std::max(0.0, ms_between(t0, t_end) - resp.reflect_ms - pre - any_fetch_pre_ms);
+    }
+    resp.reflect_ms += any_fetch_pre_ms + any_fetch_post_ms;
+    tm.total_ms = ms_between(t0, t_end);
   }
 
   void run() {
+    if (web) {
+      run_web();
+      return;
+    }
     std::unique_lock lk(m);
     t_start = Clock::now();
     apply_call_authority(lease_channel, ctx);
@@ -3209,6 +3958,7 @@ void GrpcClient::cancel() {
   std::lock_guard lk(impl_->call_mu);
   ++impl_->cancel_gen;
   for (auto* c : impl_->active) c->TryCancel();
+  for (auto* h : impl_->active_web) h->cancel();
 }
 
 namespace {
@@ -3228,6 +3978,10 @@ std::shared_ptr<GrpcCall::Core> make_core(const std::shared_ptr<GrpcClient::Impl
   };
   const auto deadline =
       opts.deadline_ms > 0 ? t0 + std::chrono::milliseconds(opts.deadline_ms) : Clock::time_point::max();
+  if (target.web) {
+    if (const std::string why = web_unsupported(target); !why.empty())
+      return local_fail(grpc::StatusCode::UNIMPLEMENTED, why);
+  }
   auto p = impl->prepare(target, full_path, opts, t0, deadline, gen);
   resp.reflect_ms = p.reflect_ms;
   if (p.have_lease) {
@@ -3237,6 +3991,13 @@ std::shared_ptr<GrpcCall::Core> make_core(const std::shared_ptr<GrpcClient::Impl
     resp.timing.connection_reused = p.lease.reused;
   }
   if (!p.method) return local_fail(p.code, p.error);
+  if (target.web && p.method->client_streaming()) {
+    return local_fail(grpc::StatusCode::UNIMPLEMENTED,
+                      std::string(p.method->server_streaming() ? "bidi" : "client") + " streaming (" + full_path +
+                          ") is not possible over gRPC-Web: the protocol sends the whole request as one HTTP body "
+                          "before the response starts, so only unary and server-streaming methods can be called. "
+                          "Turn gRPC-Web off to call it over native gRPC.");
+  }
 
   auto core = std::make_shared<GrpcCall::Core>();
   core->impl = impl;
@@ -3281,6 +4042,16 @@ std::shared_ptr<GrpcCall::Core> make_core(const std::shared_ptr<GrpcClient::Impl
   if (!filled) {
     resp.reflect_ms += core->any_fetch_pre_ms;
     return local_fail(grpc::StatusCode::INVALID_ARGUMENT, err);
+  }
+  if (target.web) {
+    if (!web_metadata(opts.metadata, core->web_headers, err) || !web_metadata(opts.rpc_metadata, core->web_headers, err))
+      return local_fail(grpc::StatusCode::INVALID_ARGUMENT, err);
+    core->web = true;
+    core->web_target = target;
+    core->web_deadline = deadline;
+    core->web_gen = gen;
+    core->web_pre_connected = p.have_lease && !p.lease.reused;
+    return core;
   }
   if (!apply_metadata(core->ctx, opts.metadata, err) || !apply_metadata(core->ctx, opts.rpc_metadata, err))
     return local_fail(grpc::StatusCode::INVALID_ARGUMENT, err);
@@ -3475,7 +4246,7 @@ void GrpcCall::close_send() {
 }
 
 void GrpcCall::cancel() {
-  if (core_->method) core_->ctx.TryCancel();
+  if (core_->method) core_->cancel();
 }
 
 bool GrpcCall::done() const {

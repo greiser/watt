@@ -578,6 +578,16 @@ TEST_CASE("gRPC request save/load round-trip", "[request]") {
   const std::string text = slurp(r.file);
   CHECK(text.find("\"http\"") == std::string::npos);
   CHECK_THAT(text, ContainsSubstring("\"grpc\": {"));
+  // gRPC-Web flags: absent from the file while off (existing files unchanged), kept when on.
+  CHECK(text.find("\"web\"") == std::string::npos);
+  r.grpc_target.web = true;
+  r.grpc_target.web_text = true;
+  REQUIRE(ws.save_request(r));
+  auto web = ws.load_request(r.file);
+  REQUIRE(web);
+  CHECK(web->grpc_target.web);
+  CHECK(web->grpc_target.web_text);
+  CHECK(web->grpc_target == r.grpc_target);
 }
 
 TEST_CASE(".req.json is stable, pretty, key-ordered and diff-friendly", "[request]") {

@@ -79,6 +79,10 @@ struct SavedRequest {
   // ~Header or Postman's disabled header): saved in place in the .req.json, left out by
   // http_to_send() and to_curl_command(SavedRequest).
   std::set<size_t> disabled_headers;
+  // Query params kept but not sent (an unchecked row in the Params table, like Postman's disabled
+  // param or Bruno's ~param): decoded key / value as shown. http.url holds only the sent ones, so
+  // nothing on the send path reads these.
+  std::vector<std::pair<std::string, std::string>> disabled_params;
   // multipart/form-data parts. When not empty they replace http.body: the body is built from
   // them (files read) at send time, see Workspace::http_to_send(). Stored in the .req.json with
   // file parts as path references.
