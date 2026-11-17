@@ -2049,6 +2049,7 @@ grpc::StatusCode http_to_grpc(long http) {
 // Incremental frame reader over the response body chunks (decoding base64 for -text).
 class WebReader {
  public:
+  static constexpr uint32_t kMaxTrailerBytes = 64 * 1024;
   explicit WebReader(bool text) : text_(text) {}
   // Appends a body chunk; complete data frames go to on_msg, trailer frames are collected.
   // False (with error()) on a frame this client cannot read or that breaks max_bytes, or when
@@ -2075,6 +2076,16 @@ class WebReader {
         code_ = grpc::StatusCode::RESOURCE_EXHAUSTED;
         return fail("received message larger than max (" + std::to_string(len) + " vs. " +
                     std::to_string(max_bytes) + ")");
+      }
+      // Trailers are metadata: gRPC itself caps metadata at 8-16 KiB. Judge the frame header
+      // before buffering its body, so a hostile server cannot make us hold an unbounded trailer.
+      if (flag & 0x80) {
+        if (saw_trailer_) return fail("the server sent a second gRPC-Web trailer frame");
+        if (len > kMaxTrailerBytes) {
+          code_ = grpc::StatusCode::RESOURCE_EXHAUSTED;
+          return fail("gRPC-Web trailer frame of " + std::to_string(len) + " bytes is larger than the " +
+                      std::to_string(kMaxTrailerBytes) + "-byte metadata limit");
+        }
       }
       if (buf_.size() - off_ - 5 < len) break;
       if (flag & 0x80) {

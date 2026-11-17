@@ -1616,6 +1616,86 @@ TEST_CASE("a 12 MB response decodes in well under the transfer time", "[grpc][la
 }
 
 // ---------------------------------------------------------------- gRPC-Web (tools/testserver/grpcweb.cpp)
+namespace {
+// One-shot fake gRPC-Web server: answers the first request with `frames` as the body (chunked),
+// then keeps the connection open for `hold_ms`, as a hostile server would.
+struct HostileWebServer {
+  SOCKET ls = INVALID_SOCKET;
+  int port = 0;
+  std::thread th;
+  HostileWebServer(std::string frames, int hold_ms) {
+    WSADATA w;
+    WSAStartup(MAKEWORD(2, 2), &w);
+    ls = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    sockaddr_in a{};
+    a.sin_family = AF_INET;
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    bind(ls, reinterpret_cast<sockaddr*>(&a), sizeof a);
+    int n = sizeof a;
+    getsockname(ls, reinterpret_cast<sockaddr*>(&a), &n);
+    port = ntohs(a.sin_port);
+    listen(ls, 1);
+    th = std::thread([this, frames = std::move(frames), hold_ms] {
+      SOCKET c = accept(ls, nullptr, nullptr);
+      if (c == INVALID_SOCKET) return;
+      char buf[8192];
+      recv(c, buf, sizeof buf, 0);  // the request: contents do not matter
+      char hex[16];
+      std::snprintf(hex, sizeof hex, "%zx\r\n", frames.size());
+      std::string resp = "HTTP/1.1 200 OK\r\nContent-Type: application/grpc-web+proto\r\nTransfer-Encoding: chunked\r\n\r\n";
+      resp += hex + frames + "\r\n";
+      send(c, resp.data(), static_cast<int>(resp.size()), 0);
+      std::this_thread::sleep_for(std::chrono::milliseconds(hold_ms));
+      closesocket(c);
+    });
+  }
+  ~HostileWebServer() {
+    closesocket(ls);
+    if (th.joinable()) th.join();
+  }
+};
+std::string web_frame(uint8_t flag, uint32_t len, const std::string& body) {
+  std::string f(5, '\0');
+  f[0] = static_cast<char>(flag);
+  f[1] = static_cast<char>(len >> 24);
+  f[2] = static_cast<char>(len >> 16);
+  f[3] = static_cast<char>(len >> 8);
+  f[4] = static_cast<char>(len);
+  return f + body;
+}
+}  // namespace
+
+TEST_CASE("gRPC-Web trailer frames are capped before they are buffered", "[grpc][web][security]") {
+  GrpcClient c;
+  REQUIRE(c.load_proto_files({(proto_dir() / "test.proto").string()}, {}).ok);
+  GrpcCallOptions o;
+  o.deadline_ms = 10000;
+  SECTION("a 1 GiB trailer header fails at once, without waiting for (or holding) the body") {
+    HostileWebServer s(web_frame(0x80, 1u << 30, "grpc-status: 0\r\n"), 4000);
+    GrpcTarget t;
+    t.address = "127.0.0.1:" + std::to_string(s.port);
+    t.web = true;
+    const auto t0 = std::chrono::steady_clock::now();
+    auto r = c.invoke(t, "/watt.test.Echo/Say", R"({"message":"x"})", o);
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    INFO(r.status_message);
+    CHECK_FALSE(r.ok);
+    CHECK(r.status_code == static_cast<int>(grpc::StatusCode::RESOURCE_EXHAUSTED));
+    CHECK(ms < 2000);  // the server holds the connection for 4 s
+  }
+  SECTION("a second trailer frame is refused") {
+    const std::string tr = "grpc-status: 0\r\n";
+    HostileWebServer s(web_frame(0x80, static_cast<uint32_t>(tr.size()), tr) + web_frame(0x80, static_cast<uint32_t>(tr.size()), tr), 300);
+    GrpcTarget t;
+    t.address = "127.0.0.1:" + std::to_string(s.port);
+    t.web = true;
+    auto r = c.invoke(t, "/watt.test.Echo/Say", R"({"message":"x"})", o);
+    INFO(r.status_message);
+    CHECK_FALSE(r.ok);
+    CHECK(r.status_message.find("second gRPC-Web trailer") != std::string::npos);
+  }
+}
+
 TEST_CASE("gRPC-Web unary: message, metadata both ways, trailers (binary and base64 text)", "[grpc][web]") {
   for (bool text : {false, true}) {
     INFO((text ? "application/grpc-web-text" : "application/grpc-web+proto"));
