@@ -10,7 +10,27 @@ if(MSVC)
   add_compile_definitions(_WIN32_WINNT=0x0A00 NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE)
 endif()
 
-find_package(CURL CONFIG REQUIRED)
+# libcurl. build.ps1 installs watt's pinned build (ports/curl overlay: 8.22, static, release,
+# Schannel + nghttp2) into build/_curl822 and passes WATT_CURL_ROOT; 8.22 skips the per-reuse
+# liveness poll that 8.20 runs on every warm request. Without it (a hand-made configure) the
+# vcpkg-wide CURL package is used.
+set(WATT_CURL_ROOT "" CACHE PATH "Install prefix of watt's pinned static libcurl (see build.ps1)")
+if(WATT_CURL_ROOT)
+  if(NOT EXISTS "${WATT_CURL_ROOT}/lib/libcurl.lib")
+    message(FATAL_ERROR "WATT_CURL_ROOT=${WATT_CURL_ROOT} has no lib/libcurl.lib; run build.ps1 once")
+  endif()
+  add_library(watt_curl INTERFACE)
+  target_include_directories(watt_curl BEFORE INTERFACE "${WATT_CURL_ROOT}/include")
+  target_compile_definitions(watt_curl INTERFACE CURL_STATICLIB)
+  target_link_libraries(watt_curl INTERFACE
+    "${WATT_CURL_ROOT}/lib/libcurl.lib" "${WATT_CURL_ROOT}/lib/nghttp2.lib"
+    "${WATT_CURL_ROOT}/lib/zs.lib" bcrypt advapi32 crypt32 secur32 ws2_32 iphlpapi)
+  message(STATUS "watt: pinned static libcurl from ${WATT_CURL_ROOT}")
+else()
+  find_package(CURL CONFIG REQUIRED)
+  add_library(watt_curl INTERFACE)
+  target_link_libraries(watt_curl INTERFACE CURL::libcurl)
+endif()
 find_package(gRPC CONFIG REQUIRED)
 find_package(protobuf CONFIG REQUIRED)
 find_package(RapidJSON CONFIG REQUIRED)
@@ -36,7 +56,7 @@ foreach(part http grpc model)
   add_library(watt_${part} STATIC ${CORE_${P}_SRC})
   target_include_directories(watt_${part} PUBLIC src)
 endforeach()
-target_link_libraries(watt_http PUBLIC CURL::libcurl)
+target_link_libraries(watt_http PUBLIC watt_curl)
 target_link_libraries(watt_grpc PUBLIC gRPC::grpc++ gRPC::grpc++_reflection protobuf::libprotobuf rapidjson)
 target_link_libraries(watt_model PUBLIC rapidjson)
 add_library(watt_core INTERFACE)
@@ -56,6 +76,9 @@ if(TESTSERVER_SRC)
   add_executable(watt_testserver ${TESTSERVER_SRC} ${TESTSERVER_PROTO})
   target_link_libraries(watt_testserver PRIVATE gRPC::grpc++ gRPC::grpc++_reflection protobuf::libprotobuf rapidjson)
   target_include_directories(watt_testserver PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/gen)
+  if(MSVC)
+    target_compile_options(watt_testserver PRIVATE /wd4267 /wd4244)  # protoc-generated code
+  endif()
   protobuf_generate(TARGET watt_testserver LANGUAGE cpp
     IMPORT_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/tools/testserver
     PROTOC_OUT_DIR ${CMAKE_CURRENT_BINARY_DIR}/gen)

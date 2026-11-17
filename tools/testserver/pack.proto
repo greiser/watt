@@ -1,0 +1,29 @@
+// google.protobuf.Any round trips. This file imports only any.proto, so every type packed into
+// these Anys lives outside the service's own file closure (like the critic's anyk.proto).
+syntax = "proto3";
+
+package watt.test;
+
+import "google/protobuf/any.proto";
+
+message PackRequest {
+  // What PackResponse.result holds:
+  //   "note"     watt.extra.Note (extra.proto, imported by nothing) with text "packed"
+  //   "duration" google.protobuf.Duration 2s
+  //   "unknown"  type.googleapis.com/foo.Unknown, defined nowhere, value bytes 08 02
+  //   "nested"   a Note whose attachment is a Duration 2s
+  //   "nested_unknown" a Note whose attachment is foo.Unknown
+  //   anything else: result unset
+  string kind = 1;
+  repeated google.protobuf.Any items = 2;  // echoed back in PackResponse.items
+}
+
+message PackResponse {
+  google.protobuf.Any result = 1;
+  repeated google.protobuf.Any items = 2;
+  map<string, google.protobuf.Any> by_name = 3;  // "result" -> result as well, when set
+}
+
+service Packer {
+  rpc Pack(PackRequest) returns (PackResponse);
+}

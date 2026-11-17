@@ -1,0 +1,14 @@
+// A message no service file imports: clients only learn it from an Any (watt.test.Packer).
+// Over reflection it is reachable only by file_containing_symbol, as with google.longrunning
+// Operation.metadata or error details defined in other files.
+syntax = "proto3";
+
+package watt.extra;
+
+import "google/protobuf/any.proto";
+
+message Note {
+  string text = 1;
+  int32 priority = 2;
+  google.protobuf.Any attachment = 3;  // Packer nests a second Any here
+}

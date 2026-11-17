@@ -1,0 +1,140 @@
+// watt test service: covers every call kind and every proto feature the engine must handle.
+syntax = "proto3";
+
+package watt.test;
+
+import "google/protobuf/any.proto";
+import "google/protobuf/duration.proto";
+import "google/protobuf/empty.proto";
+import "google/protobuf/struct.proto";
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/wrappers.proto";
+
+enum Level {
+  LEVEL_UNSPECIFIED = 0;
+  LEVEL_LOW = 1;
+  LEVEL_HIGH = 2;
+}
+
+message Inner {
+  string name = 1;
+  Level level = 2;
+  Inner child = 3;               // recursion: template generation must guard against it
+  repeated Inner children = 4;
+}
+
+// Every field kind in one message. Everything.Echo returns it unchanged.
+message Kitchen {
+  double f_double = 1;
+  float f_float = 2;
+  int32 f_int32 = 3;
+  int64 f_int64 = 4;
+  uint32 f_uint32 = 5;
+  uint64 f_uint64 = 6;
+  sint32 f_sint32 = 7;
+  sint64 f_sint64 = 8;
+  fixed32 f_fixed32 = 9;
+  fixed64 f_fixed64 = 10;
+  sfixed32 f_sfixed32 = 11;
+  sfixed64 f_sfixed64 = 12;
+  bool f_bool = 13;
+  string f_string = 14;
+  bytes f_bytes = 15;
+  Level level = 16;
+  Inner inner = 17;
+  repeated string tags = 18;
+  repeated Inner items = 19;
+  repeated Level levels = 20;
+  map<string, int32> counts = 21;
+  map<int32, Inner> by_id = 22;
+  oneof choice {
+    string text = 23;
+    int64 number = 24;
+    Inner nested = 25;
+  }
+  optional int32 maybe = 26;
+  google.protobuf.Timestamp ts = 27;
+  google.protobuf.Duration dur = 28;
+  google.protobuf.Struct meta = 29;
+  google.protobuf.Value value = 30;
+  google.protobuf.Int32Value wrapped = 31;
+  google.protobuf.Empty nothing = 32;
+}
+
+message EchoRequest {
+  string message = 1;
+  int32 repeat = 2;              // response message = message repeated N times (>=1)
+}
+
+message EchoResponse {
+  string message = 1;
+  map<string, string> metadata = 2;   // request metadata the server saw
+  google.protobuf.Timestamp received_at = 3;
+}
+
+message CountRequest {
+  int32 count = 1;
+  int32 interval_ms = 2;
+}
+
+message CountResponse {
+  int32 index = 1;
+}
+
+message SumRequest {
+  int64 value = 1;
+}
+
+message SumResponse {
+  int64 total = 1;
+  int32 count = 2;
+}
+
+message ChatMessage {
+  string text = 1;
+  int32 seq = 2;
+}
+
+message FailRequest {
+  int32 code = 1;                // grpc::StatusCode to return (default 0 -> INTERNAL)
+  string message = 2;
+  bool with_details = 3;         // attach a google.rpc.Status with ErrorDetail + ErrorInfo
+}
+
+message SlowRequest {
+  int32 delay_ms = 1;
+}
+
+// Rich error detail packed into google.rpc.Status.details by Echo.Fail.
+message ErrorDetail {
+  string reason = 1;
+  string field = 2;
+  int32 retry_after_ms = 3;
+}
+
+// Wire-compatible mirrors of google.rpc.Status / google.rpc.ErrorInfo, so the server can encode
+// standard rich errors without depending on googleapis protos.
+message RpcStatusMirror {
+  int32 code = 1;
+  string message = 2;
+  repeated google.protobuf.Any details = 3;
+}
+
+message ErrorInfoMirror {
+  string reason = 1;
+  string domain = 2;
+  map<string, string> metadata = 3;
+}
+
+service Echo {
+  rpc Say(EchoRequest) returns (EchoResponse);
+  rpc Count(CountRequest) returns (stream CountResponse);
+  rpc Sum(stream SumRequest) returns (SumResponse);
+  rpc Chat(stream ChatMessage) returns (stream ChatMessage);
+  rpc Fail(FailRequest) returns (EchoResponse);
+  rpc Slow(SlowRequest) returns (EchoResponse);
+}
+
+service Everything {
+  rpc Echo(Kitchen) returns (Kitchen);
+}
