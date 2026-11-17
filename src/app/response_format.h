@@ -74,7 +74,21 @@ size_t longest_line(std::string_view text);
 // Copies text, inserting newlines so no line exceeds max bytes: after the last "}," / "]," in the
 // final 1 KB before the limit, else the last ',' / space / '>' / ';', else at the limit.
 // Returns how many breaks were inserted.
-size_t break_long_lines(std::string_view text, std::string& out, size_t max);
+// breaks (optional): the offset in `text` before which each line break was inserted, ascending.
+size_t break_long_lines(std::string_view text, std::string& out, size_t max, std::vector<size_t>* breaks = nullptr);
+// One pass over `text`: its line count (newlines + 1) and the longest line in characters (as
+// longest_line_chars counts them).
+struct LineStats {
+  size_t lines = 0;
+  size_t longest = 0;
+};
+LineStats line_stats(std::string_view text);
+// Styles and fold levels of `src` (style_json) carried over to the copy break_long_lines made
+// with `breaks`: an inserted break takes the style of the byte before it (a string stays a string
+// on its continuation line), and the pieces of a broken line share its fold level, with the
+// header flag on the last one.
+void expand_styles_for_breaks(std::string_view src, const std::vector<size_t>& breaks, std::string& styles,
+                              std::vector<int>& levels);
 
 // "512 B", "1.5 KB", "9.87 MB".
 std::string human_bytes(uint64_t b);
@@ -82,5 +96,8 @@ std::string human_bytes(uint64_t b);
 std::string ms(double v);
 // Signed delta: "+0.12 ms" / "-3.4 ms".
 std::string delta_ms(double v);
+// A run-to-run difference too small to colour as better / worse: under 2 ms, or under 25% of
+// the larger of the two (CDN and scheduler jitter on a ~10 ms request is not a regression).
+bool delta_is_noise(double d, double scale);
 
 }  // namespace watt::app::fmt

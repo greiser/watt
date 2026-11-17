@@ -39,7 +39,7 @@ wxBitmap render(int which, double scale) {
     if (!gc) return wxBitmap(img);
     // The context draws into img when it is destroyed (end of this scope / reset()).
     gc->SetAntialiasMode(wxANTIALIAS_DEFAULT);
-    if (which == kImgFolder || which == kImgFolderOpen) {
+    if (which == kImgFolder || which == kImgFolderOpen || which == kImgFolderEmpty) {
       // A quiet outline in the text colour (not a yellow Explorer folder), as in Bruno / VS Code.
       const wxColour c = mix(window_colour(), text_colour(), 0.62);
       const double s = scale;
@@ -57,8 +57,9 @@ wxBitmap render(int which, double scale) {
       gc->SetBrush(wxBrush(wxColour(c.Red(), c.Green(), c.Blue(), which == kImgFolderOpen ? 70 : 0)));
       gc->DrawPath(p);
       // The expand chevron is part of the image (the tree has no native buttons): it sits
-      // right next to the folder instead of a button column ~40 px to the left.
-      {
+      // right next to the folder instead of a button column ~40 px to the left. An empty
+      // folder has none (there is nothing to open).
+      if (which != kImgFolderEmpty) {
         const wxColour cc = mix(window_colour(), text_colour(), 0.6);
         gc->SetPen(wxPen(cc, std::max(1, static_cast<int>(std::lround(1.3 * s)))));
         gc->SetBrush(*wxTRANSPARENT_BRUSH);
@@ -91,16 +92,27 @@ wxBitmap render(int which, double scale) {
     if (which == kImgUnknown) {
       label = "\xE2\x80\xA2\xE2\x80\xA2\xE2\x80\xA2";  // three bullets: badge not read yet
       col = dim_colour();
+    } else if (which >= kImgGrpcServer && which <= kImgGrpcBidi) {
+      label = "gRPC" + grpc_kind_glyph(which - kImgGrpcServer + 1);
+      col = badge_colour(RequestKind::Grpc, "");
     } else {
       const auto& k = kinds[which - kImgGet];
       label = badge_label(k.kind, k.method);
       col = badge_colour(k.kind, k.method);
     }
-    wxGraphicsFont f = gc->CreateFont(9.6 * scale, "Segoe UI", wxFONTFLAG_BOLD, col);
+    double size = 9.6;
+    wxGraphicsFont f = gc->CreateFont(size * scale, "Segoe UI", wxFONTFLAG_BOLD, col);
     gc->SetFont(f);
     double tw = 0, th = 0, desc = 0, lead = 0;
     const wxString s = wxString::FromUTF8(label);
     gc->GetTextExtent(s, &tw, &th, &desc, &lead);
+    // A longer label ("gRPC" + arrow) shrinks to fit the chip instead of being clipped.
+    while (tw + 5.0 * scale > w - 1.0 * scale && size > 7.0) {
+      size -= 0.4;
+      f = gc->CreateFont(size * scale, "Segoe UI", wxFONTFLAG_BOLD, col);
+      gc->SetFont(f);
+      gc->GetTextExtent(s, &tw, &th, &desc, &lead);
+    }
     // Right-aligned on a dark (light) chip: the name follows the badge closely, and the label
     // stays readable on the tree's grey selection fill.
     const double pw = std::min<double>(w - 1.0 * scale, tw + 6.0 * scale);
@@ -197,6 +209,34 @@ wxFont badge_font(const wxWindow* w) {
   return f;
 }
 
+int grpc_tree_image(int call_kind) {
+  switch (call_kind) {
+    case 1: return kImgGrpcServer;
+    case 2: return kImgGrpcClient;
+    case 3: return kImgGrpcBidi;
+    default: return kImgGrpc;
+  }
+}
+
+std::string grpc_kind_name(int call_kind) {
+  switch (call_kind) {
+    case 0: return "unary";
+    case 1: return "server streaming";
+    case 2: return "client streaming";
+    case 3: return "bidi streaming";
+    default: return {};
+  }
+}
+
+std::string grpc_kind_glyph(int call_kind) {
+  switch (call_kind) {
+    case 1: return "\xE2\x86\x93";  // down arrow
+    case 2: return "\xE2\x86\x91";  // up arrow
+    case 3: return "\xE2\x86\x95";  // up-down arrow
+    default: return {};
+  }
+}
+
 int tree_image(RequestKind kind, std::string_view method) {
   if (kind == RequestKind::Grpc) return kImgGrpc;
   const std::string m = upper(method);
@@ -223,11 +263,14 @@ std::vector<wxBitmapBundle> tree_images(const wxWindow* w) {
   return out;
 }
 
-int draw_badge(wxDC& dc, const wxWindow* w, RequestKind kind, std::string_view method, int x, int y, int h) {
+int draw_badge(wxDC& dc, const wxWindow* w, RequestKind kind, std::string_view method, int x, int y, int h,
+               int call_kind) {
   const wxFont old = dc.GetFont();
   dc.SetFont(badge_font(w));
   dc.SetTextForeground(badge_colour(kind, method));
-  const wxString s = wxString::FromUTF8(badge_label(kind, method));
+  std::string label = badge_label(kind, method);
+  if (kind == RequestKind::Grpc) label += grpc_kind_glyph(call_kind);
+  const wxString s = wxString::FromUTF8(label);
   const wxSize sz = dc.GetTextExtent(s);
   dc.DrawText(s, x, y + (h - sz.y) / 2);
   dc.SetFont(old);

@@ -33,6 +33,8 @@ namespace watt::app::rv {
 
 class ChipBar;
 class BodyWorker;
+enum class Tone;
+class JsonTable;
 
 class BodyView : public wxPanel {
  public:
@@ -63,6 +65,14 @@ class BodyView : public wxPanel {
   size_t messages_shown() const { return msg_pos_.size(); }
 
   void show_find();
+  // A short note in the body's bar (e.g. "saved as example").
+  void note(const std::string& text, Tone tone);
+  // The JSONPath filter row (Ctrl+Shift+F): created on first use.
+  void show_filter();
+  // The filter applied ("" = none), and setting one without moving the focus ("" removes it and
+  // hides the row). The response view keeps one per request.
+  const std::string& filter_text() const { return filter_; }
+  void set_filter(const std::string& expr);
   // A new request is in flight: the body shown is the previous response, drawn dimmed and labelled
   // so it is not read as the new answer. Cleared by the next result (and by set_stale(false)).
   void set_stale(bool stale);
@@ -72,7 +82,15 @@ class BodyView : public wxPanel {
   // lays out every line of a 10 MB document on the UI thread), used for Wrap on big Raw bodies.
   // Outline: "Fold all" of a very large JSON body, built on the worker (one line per top-level
   // value) instead of hundreds of thousands of Scintilla folds.
-  enum Mode { Pretty = 0, Raw = 1, Hex = 2, Preview = 3, RawWrap = 4, Outline = 5, kModes = 6 };
+  // Filter: the result of the JSONPath filter (response_filter.h) over a JSON body, shown in
+  // place of Pretty while a filter is set.
+  // Table: a JSON array as rows and columns (JsonTable), Postman's Visualize without a script.
+  // Wrapped: Pretty / Filter / Preview / Raw of a heavy document (over 1 MB or 100k lines) with
+  // Wrap on and a line wider than the pane: its lines broken at the pane width on the worker,
+  // rebuilt after a width change. Heavy documents never get Scintilla's own wrap (it lays out
+  // every line up to the target on the UI thread: 170-330 ms for Ctrl+End on 1.3M lines).
+  enum Mode { Pretty = 0, Raw = 1, Hex = 2, Preview = 3, RawWrap = 4, Outline = 5, Filter = 6, Table = 7, Wrapped = 8,
+              kModes = 9 };
   struct Doc {
     void* doc = nullptr;                // Scintilla document (our reference)
     std::shared_ptr<const void> owner;  // keeps `text` alive
@@ -85,6 +103,17 @@ class BodyView : public wxPanel {
     bool display_breaks = false;                     // long lines were broken for display
     std::shared_ptr<const std::vector<int>> levels;  // fold levels when prestyled
     std::shared_ptr<const std::vector<int>> line_map;  // Outline: line -> line of the Pretty document
+    bool heavy = false;   // over 1 MB or 100k lines: no Scintilla wrap
+    size_t longest = 0;   // longest line in characters (heavy documents)
+    // Wrapped / RawWrap: what the document was built from and for.
+    int src = -1;
+    void* src_doc = nullptr;
+    int cols = 0;
+    // Wrapped, RawWrap and display_breaks: offsets in `full` (the text before the breaks) of the
+    // inserted breaks.
+    std::shared_ptr<const std::vector<size_t>> breaks;
+    std::shared_ptr<const void> full_owner;
+    std::string_view full;
   };
   struct Built;
 
@@ -106,6 +135,24 @@ class BodyView : public wxPanel {
   void on_margin_click(wxStyledTextEvent& e);
   void auto_wrap(const Doc& d);
   int shown_mode() const;
+  int base_mode() const;   // shown_mode() before Wrap of a heavy document is applied
+  int on_screen() const;   // the docs_ index the control shows (-1: none of them)
+  int pane_cols() const;   // text columns that fit the pane (0: not laid out yet)
+  // Brings the document on screen in line with Wrap and the pane width (worker-built wrap for
+  // heavy documents); called after a document is shown, on the Wrap toggle and after a resize.
+  void sync_wrap();
+  bool wrap_stale(int k) const;
+  // Positions between a Wrapped document and its source.
+  int wrapped_pos(int src_pos) const;
+  int source_pos(int wrapped_pos) const;
+  struct Keep {
+    int src = -1;  // the source mode the positions are in (-1: nothing kept)
+    int top = 0, caret = 0, anchor = 0;
+    double ratio = -1;  // RawWrap <-> Raw: the first visible line as a share of the document
+  };
+  Keep keep_;
+  uint64_t wrap_seq_ = 0;  // bumps when a Wrapped / RawWrap document is dropped: its build drops out
+  wxTimer wrap_timer_;
   void fold_level1();
   void unfold_all();
   void open_outline_line(int line);  // Outline -> the full document at that value
@@ -118,7 +165,11 @@ class BodyView : public wxPanel {
   void update_margin();
   void display_break_note(const Doc& d);
   void do_reveal(int mode);
-  void select_found(int at, int len, bool exact, const std::string& label, const std::string& what);
+  // why: the reason a path was not found (json_path_miss), shown under the line.
+  void select_found(int at, int len, bool exact, const std::string& label, const std::string& what,
+                    const std::string& why = {});
+  int miss_line_ = -1;           // line carrying the "not found" explanation box
+  void* miss_doc_ = nullptr;     // ... in this document
   struct Reveal {
     std::vector<PathStep> path;
     std::string label;
@@ -129,6 +180,23 @@ class BodyView : public wxPanel {
   void start_styling();
   void style_slice();
 
+  // table (created on first use; the model is built on the worker)
+  void show_table();
+  JsonTable* table_ = nullptr;
+  wxWindow* table_win_ = nullptr;  // the same control (usable where JsonTable is incomplete)
+  uint64_t table_gen_ = ~0ull, table_fseq_ = ~0ull;  // what the table shows (body, filter)
+
+  // filter
+  void close_filter();
+  void show_filter_row();  // creates / shows the row (no focus change)
+  void apply_filter();  // the text in the filter box changed (debounced)
+  wxPanel* filterbar_ = nullptr;
+  wxTextCtrl* filter_text_ = nullptr;
+  ChipBar* filter_chips_ = nullptr;
+  wxTimer filter_timer_;
+  std::string filter_;       // the expression applied ("" = none)
+  uint64_t filter_seq_ = 0;  // bumps with every new expression: older results drop out
+
   // search
   void find_from(bool forward, bool from_selection_start);
   void show_match(int at, int len);  // at < 0: no match
@@ -136,11 +204,15 @@ class BodyView : public wxPanel {
   void schedule_count();
   void highlight_visible();
   void close_find();
+  // Hides the find bar and drops its count / note (the query stays for the next Ctrl+F): a new
+  // response, a message page or the Table view has nothing the old count was about.
+  void reset_find();
 
   wxStyledTextCtrl* stc_ = nullptr;
   // Hidden control that only creates documents: Scintilla's CreateLoader / CreateDocument reset the
   // calling view's fold (contraction) state, so they must not be called on the visible one.
   wxStyledTextCtrl* factory_ = nullptr;
+  wxStyledTextCtrl* factory();  // creates it on first use
   ChipBar* bar_ = nullptr;
   wxPanel* findbar_ = nullptr;
   wxTextCtrl* find_text_ = nullptr;

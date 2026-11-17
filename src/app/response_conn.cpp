@@ -217,7 +217,7 @@ class InfoPopup : public wxPopupTransientWindow {
     // Footer: hint or the last copy.
     dc.SetFont(small);
     dc.SetTextForeground(note_.empty() ? th.dim : th.ok);
-    dc.DrawText(note_.empty() ? wxString::FromUTF8("Click a row to copy its value \xC2\xB7 Ctrl+C copies all")
+    dc.DrawText(note_.empty() ? wxString::FromUTF8("Click or \xE2\x86\x91\xE2\x86\x93 Enter copies a row \xC2\xB7 Ctrl+C copies all \xC2\xB7 Esc closes")
                               : W(note_),
                 pad_, height_ - pad_ / 2 - ch);
   }
@@ -230,7 +230,39 @@ class InfoPopup : public wxPopupTransientWindow {
       return;
     }
     if (e.GetModifiers() == wxMOD_CONTROL && (e.GetKeyCode() == 'C' || e.GetKeyCode() == WXK_INSERT)) return copy_all();
+    // Keyboard row cursor (the same highlight as the mouse): Up/Down/Home/End move it, Enter or
+    // Space copies that row's value.
+    const int k = e.GetKeyCode();
+    if (e.GetModifiers() == 0) {
+      if (k == WXK_DOWN || k == WXK_UP || k == WXK_HOME || k == WXK_END || k == WXK_TAB) {
+        move_cursor(k == WXK_UP ? -1 : k == WXK_HOME ? -2 : k == WXK_END ? 2 : 1);
+        return;
+      }
+      if ((k == WXK_RETURN || k == WXK_NUMPAD_ENTER || k == WXK_SPACE) && hover_ >= 0) {
+        to_clipboard(rows_[static_cast<size_t>(hover_)].value);
+        flash("Copied " + rows_[static_cast<size_t>(hover_)].key);
+        return;
+      }
+    }
+    if (e.GetModifiers() == wxMOD_SHIFT && k == WXK_TAB) return move_cursor(-1);
     e.Skip();
+  }
+  // by: +1 / -1 next / previous value row, -2 first, +2 last.
+  void move_cursor(int by) {
+    std::vector<int> rows;
+    for (size_t i = 0; i < rows_.size(); ++i)
+      if (!rows_[i].section) rows.push_back(static_cast<int>(i));
+    if (rows.empty()) return;
+    auto at = std::find(rows.begin(), rows.end(), hover_);
+    int i = at == rows.end() ? -1 : static_cast<int>(at - rows.begin());
+    const int n = static_cast<int>(rows.size());
+    if (by == -2) i = 0;
+    else if (by == 2) i = n - 1;
+    else if (i < 0) i = by > 0 ? 0 : n - 1;
+    else i = (i + by + n) % n;
+    hover_ = rows[static_cast<size_t>(i)];
+    hover_copy_ = false;
+    Refresh(false);
   }
   void unhook() {
     if (top_) top_->Unbind(wxEVT_CHAR_HOOK, &InfoPopup::on_key, this);

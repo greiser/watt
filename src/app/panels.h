@@ -45,6 +45,10 @@ class EditorHost {
   // Workspace for {{var}} highlighting / completion and the environment list. May be null until
   // the workspace has been opened (in the background at start-up). Do not keep the pointer.
   virtual const Workspace* workspace() const = 0;
+  // The file whose folders this request inherits from (folder.json auth, headers, vars, asserts,
+  // scripts): its own file; for a history snapshot the saved request it came from; for an unsaved
+  // request the folder its first save goes to. Empty: the collection only.
+  virtual std::filesystem::path inherit_file() const { return {}; }
 
   // gRPC only ---------------------------------------------------------------
   // Load the schema for r (reflection when r.proto_files is empty, else .proto / .protoset files)
@@ -76,6 +80,9 @@ class RequestEditorPanel {
   virtual void set_in_flight(bool in_flight) = 0;
   // Ctrl+L: focus and select the URL / target field.
   virtual void focus_url() = 0;
+  // The workspace opened, or its environment / variables changed: refresh what shows resolved
+  // {{variables}} (the HTTP editor's "Sent as" line).
+  virtual void vars_changed() {}
 };
 
 class HttpEditorPanel : public RequestEditorPanel {};
@@ -104,6 +111,19 @@ struct SentHttp {
   std::shared_ptr<const ScriptRun> pre_script;
   std::shared_ptr<const ScriptRun> post_script;
   bool scripts_skipped_untrusted = false;  // the request has scripts but the user did not trust them
+  // OAuth 2.0 (own or inherited auth): the token step before the request, on the worker. Its time
+  // is inside timing.queue_ms; the response view shows it as its own "Auth / token" phase.
+  struct TokenStep {
+    bool ok = false;
+    bool from_cache = false;
+    bool refreshed = false;
+    double ms = 0;
+    std::string grant;      // "client credentials", ...
+    std::string token_url;  // expanded
+    std::string from;       // where the auth is set: "Request", "api", "Collection"
+    std::string error;
+  };
+  std::shared_ptr<const TokenStep> token;
 };
 
 class ResponsePanel {
@@ -130,9 +150,39 @@ class ResponsePanel {
   virtual void show_cancelled(double after_ms) = 0;
   // Could not send at all (bad URL, blocked upload file, no method selected, ...).
   virtual void show_error(const std::string& message) = 0;
+  // The next restored show_http / show_grpc (one without show_sending) is a history entry's
+  // response received at `when_iso` (UTC ISO); empty: a tab's response from an earlier session.
+  virtual void set_history_when(const std::string& when_iso) { (void)when_iso; }
 };
 
 ResponsePanel* make_response_view(wxWindow* parent);
+
+// A gRPC request's name as tabs and history show it. A name of the form "<Service>.<Method>" for
+// the same service as `method` (what watt names a new gRPC request) whose method is not the one
+// called any more (Say switched to Count) reads "Echo.Say -> Count": the row and the tab
+// never claim a call that is not the one sent. Any other name is shown as it is.
+inline std::string grpc_display_name(const std::string& name, const std::string& method) {
+  const size_t slash = method.rfind('/');
+  if (name.empty() || slash == std::string::npos) return name;
+  const std::string m = method.substr(slash + 1);
+  std::string svc = method.substr(0, slash);
+  if (const size_t dot = svc.rfind('.'); dot != std::string::npos) svc.erase(0, dot + 1);
+  if (m.empty() || svc.empty()) return name;
+  // A bare method name (what saving an unnamed gRPC tab names it: "Say") that is not the method
+  // called any more reads "Say -> Count" too.
+  auto ident = [](const std::string& s) {
+    if (s.empty() || s[0] < 'A' || s[0] > 'Z') return false;
+    for (char c : s)
+      if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_')) return false;
+    return true;
+  };
+  if (ident(name)) return name == m || name == svc ? name : name + " \xE2\x86\x92 " + m;
+  if (name.size() <= svc.size() + 1 || name.compare(0, svc.size(), svc) != 0 || name[svc.size()] != '.')
+    return name;
+  const std::string named = name.substr(svc.size() + 1);
+  if (named == m || named.find_first_of(" ./") != std::string::npos) return name;
+  return name + " \xE2\x86\x92 " + m;
+}
 
 // ------------------------------------------------------------------ sidebar
 
@@ -155,6 +205,9 @@ class SidebarHost {
   // "Run folder": opens the collection runner (runner_view.h) for every request under folder
   // (empty = the whole workspace; a .req.json file runs alone), or raises the one already open.
   virtual void run_folder(const std::filesystem::path& folder) { (void)folder; }
+  // A folder's / the collection's settings (folder.json) were saved from the sidebar: open tabs
+  // refresh what they inherit.
+  virtual void folder_settings_changed() {}
 };
 
 class SidebarPanel {
@@ -177,6 +230,14 @@ class SidebarPanel {
   virtual void select_file(const std::filesystem::path& file) = 0;
   // Ctrl+Shift+F / a search box shortcut: focus the sidebar filter. Optional.
   virtual void focus_filter() {}
+  // A history snapshot tab (<ws>/.watt/snapshots/...): the saved request it was sent as (by the
+  // snapshot map, else by the request id), so it keeps inheriting that request's folder settings.
+  // Empty for any other file, or when the origin is unknown.
+  virtual std::filesystem::path snapshot_origin(const std::filesystem::path& file, const std::string& id) const {
+    (void)file;
+    (void)id;
+    return {};
+  }
 };
 
 SidebarPanel* make_sidebar(wxWindow* parent, SidebarHost* host);

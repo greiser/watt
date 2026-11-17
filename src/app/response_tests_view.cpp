@@ -2,12 +2,14 @@
 
 #include <wx/button.h>
 #include <wx/choice.h>
+#include <wx/clipbrd.h>
 #include <wx/combobox.h>
 #include <wx/listctrl.h>
 #include <wx/menu.h>
 #include <wx/sizer.h>
 #include <wx/stattext.h>
 #include <wx/textctrl.h>
+#include <wx/wupdlock.h>
 
 #include <algorithm>
 #include <cmath>
@@ -91,12 +93,16 @@ class TestList : public wxListCtrl {
       fit_pending_ = true;
       CallAfter([this] {
         fit_pending_ = false;
-        // Result fixed; the rest shares the width: target 30%, check 20%, actual 26%, note 24%.
+        // Result fixed; the rest shares the width: target 24%, check 17%, actual 21%, and the note
+        // (why a check failed) the most, 38%.
         const int r = FromDIP(64);
         const int w = std::max(FromDIP(300), GetClientSize().x - r - 2);
-        const int widths[] = {r, w * 30 / 100, w * 20 / 100, w * 26 / 100, w - w * 30 / 100 - w * 20 / 100 - w * 26 / 100};
+        const int widths[] = {r, w * 24 / 100, w * 17 / 100, w * 21 / 100, w - w * 24 / 100 - w * 17 / 100 - w * 21 / 100};
+        // Frozen: every SetColumnWidth repaints the list at once otherwise (~50 ms each).
+        Freeze();
         for (int c = 0; c < 5; ++c)
           if (GetColumnWidth(c) != widths[c]) SetColumnWidth(c, widths[c]);
+        Thaw();
       });
     });
   }
@@ -115,7 +121,7 @@ class TestList : public wxListCtrl {
     switch (col) {
       case 0: {
         if (!a.enabled) return "off";
-        if (!r) return v_->running_ ? wxString::FromUTF8("\xE2\x80\xA6") : wxString("\xE2\x80\x94");
+        if (!r) return v_->running_ ? wxString::FromUTF8("\xE2\x80\xA6") : wxString::FromUTF8("\xE2\x80\x94");
         switch (r->state) {
           case TestRow::Pass: return wxString::FromUTF8("\xE2\x9C\x93 pass");
           case TestRow::Fail: return wxString::FromUTF8("\xE2\x9C\x97 FAIL");
@@ -143,6 +149,13 @@ class TestList : public wxListCtrl {
       }
       default:
         if (!r) return {};
+        if (r->message.empty() && (r->state == TestRow::Pass || r->state == TestRow::Fail) && r->eval_us > 0)
+          return U("eval " + fmt::ms(r->eval_us / 1000.0));
+        // "expected res.body[3].name to equal nope, got item 3": the target is the row's own
+        // Target column, so the note starts after it ("to equal nope, got item 3") and fits.
+        if (const std::string head = "expected " + a.target + " ";
+            r->state == TestRow::Fail && r->message.size() > head.size() && r->message.compare(0, head.size(), head) == 0)
+          return U(r->message.substr(head.size()));
         return U(r->message);
     }
   }
@@ -165,71 +178,47 @@ class TestList : public wxListCtrl {
 
 // ------------------------------------------------------------------ view
 
-TestsView::TestsView(wxWindow* parent) : wxPanel(parent, wxID_ANY) {
+TestsView::TestsView(wxWindow* parent) : wxPanel(parent, wxID_ANY) { SetBackgroundColour(Theme::get().bg); }
+
+void TestsView::ensure_built() {
+  if (list_) return;
   const Theme& th = Theme::get();
-  SetBackgroundColour(th.bg);
+  wxWindowUpdateLocker lock(this);
   bar_ = new ChipBar(this, [this](int id) { on_chip(id); });
   bar_->add(kAdd, "+ Add", "Add a check (Insert). Checks are saved with the request and run on every response.", -1,
             true);
   bar_->add(kEdit, "Edit", "Change the selected check (F2 or double-click)", -1, true);
   bar_->add(kToggle, "On/Off", "Enable or disable the selected check (Space)", -1, true);
   bar_->add(kDelete, "Delete", "Delete the selected check (Del)", -1, true);
-  bar_->add(kHintStatus, "+ status 2xx", "", -1, true);
-  bar_->add(kHintTime, "+ time", "", -1, true);
-  bar_->add(kHintType, "+ Content-Type", "", -1, true);
-  bar_->add(kHintJson, "+ body is JSON", "res.body isJson", -1, true);
-
-  editor_ = new wxPanel(this, wxID_ANY);
-  editor_->SetBackgroundColour(th.bg);
-  target_ = new wxComboBox(editor_, wxID_ANY, "", wxDefaultPosition, FromDIP(wxSize(280, -1)), 0, nullptr,
-                           wxTE_PROCESS_ENTER);
-  target_->SetHint("res.body.items[0].id");
-  wxArrayString ops;
-  for (const OpDef& o : kOps) ops.Add(U(std::string(o.shown) + "   (" + o.id + ")"));
-  op_ = new wxChoice(editor_, wxID_ANY, wxDefaultPosition, wxDefaultSize, ops);
-  op_->SetSelection(0);
-  value_ = new wxTextCtrl(editor_, wxID_ANY, "", wxDefaultPosition, FromDIP(wxSize(200, -1)), wxTE_PROCESS_ENTER);
-  value_->SetHint("200, \"text\", 10, 20 ... ({{var}} ok)");
-  auto* save = new wxButton(editor_, wxID_ANY, "Save", wxDefaultPosition, wxDefaultSize, wxBU_EXACTFIT);
-  auto* cancel = new wxButton(editor_, wxID_ANY, "Cancel", wxDefaultPosition, wxDefaultSize, wxBU_EXACTFIT);
-  edit_err_ = new wxStaticText(editor_, wxID_ANY, "");
-  edit_err_->SetForegroundColour(th.err);
-  auto* es = new wxBoxSizer(wxHORIZONTAL);
-  es->Add(target_, 0, wxALIGN_CENTER_VERTICAL | wxLEFT, FromDIP(8));
-  es->Add(op_, 0, wxALIGN_CENTER_VERTICAL | wxLEFT, FromDIP(6));
-  es->Add(value_, 1, wxALIGN_CENTER_VERTICAL | wxLEFT, FromDIP(6));
-  es->Add(save, 0, wxALIGN_CENTER_VERTICAL | wxLEFT, FromDIP(6));
-  es->Add(cancel, 0, wxALIGN_CENTER_VERTICAL | wxLEFT | wxRIGHT, FromDIP(6));
-  auto* ev = new wxBoxSizer(wxVERTICAL);
-  ev->Add(es, 0, wxEXPAND | wxTOP, FromDIP(4));
-  ev->Add(edit_err_, 0, wxLEFT | wxTOP | wxBOTTOM, FromDIP(8));
-  editor_->SetSizer(ev);
-  editor_->Hide();
+  // Suggestions sit on their own row, left-aligned, and a used one is greyed out rather than
+  // removed: the chip under the cursor never moves after a click.
+  hints_ = new ChipBar(this, [this](int id) { on_chip(id); });
+  hints_->add(kHintStatus, "+ status 2xx", "Add: the status is in this response's class");
+  hints_->add(kHintTime, "+ time", "Add: response time below ~3x this response's");
+  hints_->add(kHintType, "+ Content-Type", "Add: the Content-Type contains this response's type");
+  hints_->add(kHintJson, "+ body is JSON", "Add: res.body isJson");
+  hints_->Hide();
 
   list_ = new TestList(this);
   empty_ = new wxStaticText(this, wxID_ANY, "");
   empty_->SetForegroundColour(th.dim);
+  caps_title_ = new wxStaticText(this, wxID_ANY, "Captures");
+  caps_title_->SetForegroundColour(th.dim);
+  caps_title_->SetFont(caps_title_->GetFont().Bold());
+  caps_title_->Hide();
 
   auto* sz = new wxBoxSizer(wxVERTICAL);
   sz->Add(bar_, 0, wxEXPAND);
-  sz->Add(editor_, 0, wxEXPAND);
+  sz->Add(hints_, 0, wxEXPAND);
   sz->Add(empty_, 0, wxALL, FromDIP(12));
   sz->Add(list_, 1, wxEXPAND);
+  sz->Add(caps_title_, 0, wxLEFT | wxTOP | wxBOTTOM, FromDIP(8));
   SetSizer(sz);
-
-  save->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) { commit_edit(); });
-  cancel->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) { cancel_edit(); });
-  target_->Bind(wxEVT_TEXT_ENTER, [this](wxCommandEvent&) { commit_edit(); });
-  value_->Bind(wxEVT_TEXT_ENTER, [this](wxCommandEvent&) { commit_edit(); });
-  target_->Bind(wxEVT_TEXT, [this](wxCommandEvent&) { edit_err_->SetLabel(""); });
-  op_->Bind(wxEVT_CHOICE, [this](wxCommandEvent&) {
-    const int i = op_->GetSelection();
-    value_->Enable(i < 0 || kOps[i].value);
-  });
-  editor_->Bind(wxEVT_CHAR_HOOK, [this](wxKeyEvent& e) {
-    if (e.GetKeyCode() == WXK_ESCAPE) return cancel_edit();
+  Bind(wxEVT_SIZE, [this](wxSizeEvent& e) {
     e.Skip();
+    if (empty_->IsShown()) CallAfter([this] { wrap_empty(); });
   });
+
   list_->Bind(wxEVT_LIST_ITEM_ACTIVATED, [this](wxListEvent& e) {
     const int i = static_cast<int>(e.GetIndex());
     const TestRow* r = static_cast<size_t>(i) < rows_.size() ? &rows_[static_cast<size_t>(i)] : nullptr;
@@ -310,14 +299,472 @@ TestsView::TestsView(wxWindow* parent) : wxPanel(parent, wxID_ANY) {
     else if (id == 6) move_selected(-1);
     else if (id == 7) move_selected(1);
   });
+  list_->refresh_rows();
   update_summary();
   update_chips();
+  if (!cap_rows_.empty()) apply_captures();
+  if (script_.any_script || script_.skipped_untrusted || !script_.rows.empty()) apply_script();
+  if (!inh_.empty()) apply_inherited();
+  Layout();
 }
 
-int TestsView::selected() const { return static_cast<int>(list_->GetNextItem(-1, wxLIST_NEXT_ALL, wxLIST_STATE_SELECTED)); }
+// The add / edit form: created the first time a check is added or edited.
+void TestsView::build_editor() {
+  if (editor_) return;
+  const Theme& th = Theme::get();
+  editor_ = new wxPanel(this, wxID_ANY);
+  editor_->SetBackgroundColour(th.bg);
+  target_ = new wxComboBox(editor_, wxID_ANY, "", wxDefaultPosition, FromDIP(wxSize(160, -1)), 0, nullptr,
+                           wxTE_PROCESS_ENTER);
+  target_->SetHint("res.body.items[0].id");
+  wxArrayString ops;
+  for (const OpDef& o : kOps) ops.Add(U(std::string(o.shown) + "   (" + o.id + ")"));
+  op_ = new wxChoice(editor_, wxID_ANY, wxDefaultPosition, wxDefaultSize, ops);
+  op_->SetSelection(0);
+  value_ = new wxTextCtrl(editor_, wxID_ANY, "", wxDefaultPosition, FromDIP(wxSize(160, -1)), wxTE_PROCESS_ENTER);
+  value_->SetHint("200, \"text\", 10, 20 ... ({{var}} ok)");
+  auto* save = new wxButton(editor_, wxID_ANY, "Save", wxDefaultPosition, wxDefaultSize, wxBU_EXACTFIT);
+  auto* cancel = new wxButton(editor_, wxID_ANY, "Cancel", wxDefaultPosition, wxDefaultSize, wxBU_EXACTFIT);
+  edit_err_ = new wxStaticText(editor_, wxID_ANY, "");
+  edit_err_->SetForegroundColour(th.err);
+  // Two rows, so each field keeps a usable width in a narrow response pane:
+  //   Target   [res.body.items[0].name        ] [equals (eq)  v]
+  //   Expected ["item 9"                      ] [Save] [Cancel]
+  auto label = [&](const char* t) {
+    auto* l = new wxStaticText(editor_, wxID_ANY, t);
+    l->SetForegroundColour(th.dim);
+    return l;
+  };
+  auto* lt = label("Target");
+  auto* lv = label("Expected");
+  const int lw = std::max(lt->GetBestSize().x, lv->GetBestSize().x);
+  lt->SetMinSize(wxSize(lw, -1));
+  lv->SetMinSize(wxSize(lw, -1));
+  auto* es = new wxBoxSizer(wxHORIZONTAL);
+  es->Add(lt, 0, wxALIGN_CENTER_VERTICAL | wxLEFT, FromDIP(10));
+  es->Add(target_, 1, wxALIGN_CENTER_VERTICAL | wxLEFT, FromDIP(6));
+  es->Add(op_, 0, wxALIGN_CENTER_VERTICAL | wxLEFT | wxRIGHT, FromDIP(6));
+  auto* es2 = new wxBoxSizer(wxHORIZONTAL);
+  es2->Add(lv, 0, wxALIGN_CENTER_VERTICAL | wxLEFT, FromDIP(10));
+  es2->Add(value_, 1, wxALIGN_CENTER_VERTICAL | wxLEFT, FromDIP(6));
+  es2->Add(save, 0, wxALIGN_CENTER_VERTICAL | wxLEFT, FromDIP(6));
+  es2->Add(cancel, 0, wxALIGN_CENTER_VERTICAL | wxLEFT | wxRIGHT, FromDIP(6));
+  auto* ev = new wxBoxSizer(wxVERTICAL);
+  ev->Add(es, 0, wxEXPAND | wxTOP, FromDIP(4));
+  ev->Add(es2, 0, wxEXPAND | wxTOP, FromDIP(4));
+  ev->Add(edit_err_, 0, wxLEFT | wxTOP | wxBOTTOM, FromDIP(8));
+  editor_->SetSizer(ev);
+  editor_->Hide();
+  GetSizer()->Insert(2, editor_, 0, wxEXPAND);
+
+  save->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) { commit_edit(); });
+  cancel->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) { cancel_edit(); });
+  target_->Bind(wxEVT_TEXT_ENTER, [this](wxCommandEvent&) { commit_edit(); });
+  value_->Bind(wxEVT_TEXT_ENTER, [this](wxCommandEvent&) { commit_edit(); });
+  target_->Bind(wxEVT_TEXT, [this](wxCommandEvent&) { edit_err_->SetLabel(""); });
+  op_->Bind(wxEVT_CHOICE, [this](wxCommandEvent&) {
+    const int i = op_->GetSelection();
+    value_->Enable(i < 0 || kOps[i].value);
+  });
+  editor_->Bind(wxEVT_CHAR_HOOK, [this](wxKeyEvent& e) {
+    if (e.GetKeyCode() == WXK_ESCAPE) return cancel_edit();
+    e.Skip();
+  });
+  fill_targets();
+}
+
+// The capture table: created with the first capture to show.
+void TestsView::apply_captures() {
+  if (!list_) return;
+  const Theme& th = Theme::get();
+  if (!caps_) {
+    caps_ = new wxListCtrl(this, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxLC_REPORT | wxLC_SINGLE_SEL | wxBORDER_NONE);
+    caps_->AppendColumn("Result", wxLIST_FORMAT_LEFT, FromDIP(64));
+    caps_->AppendColumn("Variable", wxLIST_FORMAT_LEFT, FromDIP(120));
+    caps_->AppendColumn("Scope", wxLIST_FORMAT_LEFT, FromDIP(80));
+    caps_->AppendColumn("From", wxLIST_FORMAT_LEFT, FromDIP(160));
+    caps_->AppendColumn("Value / why not", wxLIST_FORMAT_LEFT, FromDIP(220));
+    caps_->SetBackgroundColour(th.bg);
+    caps_->SetForegroundColour(th.fg);
+    caps_->Bind(wxEVT_SIZE, [this](wxSizeEvent& e) {
+      e.Skip();
+      if (caps_fit_pending_) return;
+      caps_fit_pending_ = true;
+      CallAfter([this] {
+        caps_fit_pending_ = false;
+        const int r = FromDIP(64);
+        const int w = std::max(FromDIP(300), caps_->GetClientSize().x - r - 2);
+        const int widths[] = {r, w * 22 / 100, w * 13 / 100, w * 28 / 100, w - w * 22 / 100 - w * 13 / 100 - w * 28 / 100};
+        caps_->Freeze();  // (each width change would repaint the list at once)
+        for (int i = 0; i < 5; ++i)
+          if (caps_->GetColumnWidth(i) != widths[i]) caps_->SetColumnWidth(i, widths[i]);
+        caps_->Thaw();
+      });
+    });
+    // Ctrl+C / double-click copies the selected capture's value.
+    auto copy_cap = [this] {
+      const long i = caps_->GetNextItem(-1, wxLIST_NEXT_ALL, wxLIST_STATE_SELECTED);
+      if (i < 0) return;
+      const wxString v = caps_->GetItemText(i, 4);
+      if (wxTheClipboard->Open()) {
+        wxTheClipboard->SetData(new wxTextDataObject(v));
+        wxTheClipboard->Close();
+      }
+    };
+    caps_->Bind(wxEVT_LIST_ITEM_ACTIVATED, [copy_cap](wxListEvent&) { copy_cap(); });
+    caps_->Bind(wxEVT_KEY_DOWN, [copy_cap](wxKeyEvent& e) {
+      if (e.GetModifiers() == wxMOD_CONTROL && e.GetKeyCode() == 'C') return copy_cap();
+      e.Skip();
+    });
+    GetSizer()->Add(caps_, 0, wxEXPAND);
+  }
+  const std::vector<CaptureRow>& rows = cap_rows_;
+  caps_->Freeze();
+  caps_->DeleteAllItems();
+  int stored = 0, failed = 0;
+  for (size_t i = 0; i < rows.size(); ++i) {
+    const CaptureRow& r = rows[i];
+    const long at = static_cast<long>(i);
+    std::string res = !r.enabled ? "off"
+                      : r.state == CaptureRow::Stored    ? "\xE2\x9C\x93 set"
+                      : r.state == CaptureRow::Failed    ? "\xE2\x9C\x97 not set"
+                      : r.state == CaptureRow::Previewed ? "preview"
+                                                         : "\xE2\x80\x94";
+    caps_->InsertItem(at, U(res));
+    caps_->SetItem(at, 1, U("{{" + r.var + "}}"));
+    caps_->SetItem(at, 2, U(r.scope));
+    caps_->SetItem(at, 3, U(r.target));
+    std::string v = r.state == CaptureRow::Failed ? r.message : r.value;
+    if (r.state == CaptureRow::Previewed) v += "   (earlier run: not stored)";
+    if (v.size() > 300) v = v.substr(0, 300) + "\xE2\x80\xA6";
+    caps_->SetItem(at, 4, U(v));
+    const wxColour c = !r.enabled ? th.dim
+                       : r.state == CaptureRow::Stored ? th.ok
+                       : r.state == CaptureRow::Failed ? th.err
+                                                       : th.dim;
+    caps_->SetItemTextColour(at, c);
+    stored += r.state == CaptureRow::Stored;
+    failed += r.state == CaptureRow::Failed;
+  }
+  caps_->Thaw();
+  const bool show = !rows.empty();
+  std::string title = "Captures";
+  if (stored || failed) {
+    title += "  \xC2\xB7  " + std::to_string(stored) + " set";
+    if (failed) title += ", " + std::to_string(failed) + " not set";
+  }
+  caps_title_->SetLabel(U(title));
+  caps_title_->SetToolTip("Captures copy response values into {{variables}} for the next requests.\n"
+                          "Double-click a row or press Ctrl+C to copy its value.");
+  caps_title_->SetForegroundColour(failed ? th.warn : th.dim);
+  const int rh = FromDIP(22);
+  caps_->SetMinSize(wxSize(-1, rh * (std::min<int>(static_cast<int>(rows.size()), 6) + 1) + FromDIP(4)));
+  caps_title_->Show(show);
+  caps_->Show(show);
+  Layout();
+}
+
+// The Script group: created with the first script result to show, between the assertions and
+// the captures.
+void TestsView::apply_script() {
+  if (!list_) return;
+  const Theme& th = Theme::get();
+  const ScriptResults& sr = script_;
+  const bool show = sr.any_script || sr.skipped_untrusted || !sr.rows.empty();
+  if (!show && !script_list_) return;
+  if (!script_title_) {
+    script_title_ = new wxStaticText(this, wxID_ANY, "Script");
+    script_title_->SetFont(script_title_->GetFont().Bold());
+    script_title_->SetToolTip("Results of the request's scripts: test() / pm.test() calls and uncaught errors "
+                              "(Scripts tab of the request). Their console output is in the Log tab.");
+    script_list_ = new wxListCtrl(this, wxID_ANY, wxDefaultPosition, wxDefaultSize,
+                                  wxLC_REPORT | wxLC_SINGLE_SEL | wxBORDER_NONE);
+    script_list_->AppendColumn("Result", wxLIST_FORMAT_LEFT, FromDIP(64));
+    script_list_->AppendColumn("Test", wxLIST_FORMAT_LEFT, FromDIP(240));
+    script_list_->AppendColumn("Script", wxLIST_FORMAT_LEFT, FromDIP(100));
+    script_list_->AppendColumn("Message", wxLIST_FORMAT_LEFT, FromDIP(300));
+    script_list_->SetBackgroundColour(th.bg);
+    script_list_->SetForegroundColour(th.fg);
+    script_list_->Bind(wxEVT_SIZE, [this](wxSizeEvent& e) {
+      e.Skip();
+      if (script_fit_pending_) return;
+      script_fit_pending_ = true;
+      CallAfter([this] {
+        script_fit_pending_ = false;
+        const int r = FromDIP(64);
+        const int w = std::max(FromDIP(300), script_list_->GetClientSize().x - r - 2);
+        const int ph = FromDIP(104);  // "post-response"
+        const int rest = std::max(FromDIP(200), w - ph);
+        const int widths[] = {r, rest * 40 / 100, ph, rest - rest * 40 / 100};
+        script_list_->Freeze();  // (each width change would repaint the list at once)
+        for (int i = 0; i < 4; ++i)
+          if (script_list_->GetColumnWidth(i) != widths[i]) script_list_->SetColumnWidth(i, widths[i]);
+        script_list_->Thaw();
+      });
+    });
+    // The full message of the row under the mouse (the column cuts it); Ctrl+C copies it.
+    script_list_->Bind(wxEVT_MOTION, [this](wxMouseEvent& e) {
+      e.Skip();
+      int flags = 0;
+      const long i = script_list_->HitTest(e.GetPosition(), flags);
+      if (i < 0 || static_cast<size_t>(i) >= script_.rows.size()) return script_list_->UnsetToolTip();
+      const ScriptTestRow& r = script_.rows[static_cast<size_t>(i)];
+      script_list_->SetToolTip(
+          U(r.name + " (" + r.phase + " script)" + (r.message.empty() ? std::string() : "\n" + r.message)));
+    });
+    script_list_->Bind(wxEVT_KEY_DOWN, [this](wxKeyEvent& e) {
+      if (e.GetModifiers() == wxMOD_CONTROL && e.GetKeyCode() == 'C') {
+        const long i = script_list_->GetNextItem(-1, wxLIST_NEXT_ALL, wxLIST_STATE_SELECTED);
+        if (i >= 0 && static_cast<size_t>(i) < script_.rows.size() && wxTheClipboard->Open()) {
+          const ScriptTestRow& r = script_.rows[static_cast<size_t>(i)];
+          wxTheClipboard->SetData(new wxTextDataObject(U(r.name + (r.message.empty() ? "" : ": " + r.message))));
+          wxTheClipboard->Close();
+        }
+        return;
+      }
+      e.Skip();
+    });
+    // After the assertion list, before the captures.
+    wxSizer* sz = GetSizer();
+    size_t at = sz->GetItemCount();
+    for (size_t i = 0; i < sz->GetItemCount(); ++i)
+      if (sz->GetItem(i)->GetWindow() == caps_title_) at = i;
+    sz->Insert(at, script_list_, 0, wxEXPAND);
+    sz->Insert(at, script_title_, 0, wxLEFT | wxTOP | wxBOTTOM, FromDIP(8));
+  }
+  script_list_->Freeze();
+  script_list_->DeleteAllItems();
+  const size_t n = std::min<size_t>(sr.rows.size(), 1000);
+  for (size_t i = 0; i < n; ++i) {
+    const ScriptTestRow& r = sr.rows[i];
+    const long at = static_cast<long>(i);
+    script_list_->InsertItem(at, U(r.state == ScriptTestRow::Pass   ? "\xE2\x9C\x93 pass"
+                                   : r.state == ScriptTestRow::Fail ? "\xE2\x9C\x97 FAIL"
+                                                                    : "\xE2\x9C\x97 error"));
+    std::string msg = r.message;
+    if (msg.size() > 400) msg = msg.substr(0, 400) + "\xE2\x80\xA6";
+    for (char& c : msg)
+      if (c == '\n' || c == '\r' || c == '\t') c = ' ';
+    script_list_->SetItem(at, 1, U(r.name));
+    script_list_->SetItem(at, 2, U(r.phase));
+    script_list_->SetItem(at, 3, U(msg));
+    script_list_->SetItemTextColour(at, r.state == ScriptTestRow::Pass ? th.fg : th.err);
+    if (r.state != ScriptTestRow::Pass) script_list_->SetItemFont(at, script_list_->GetFont().Bold());
+  }
+  script_list_->Thaw();
+  std::string title = "Script";
+  wxColour colour = th.dim;
+  if (sr.skipped_untrusted) {
+    title += "  \xC2\xB7  not run (workspace not trusted)";
+    colour = th.warn;
+  } else if (sr.rows.empty()) {
+    title += "  \xC2\xB7  no test() calls";
+  } else {
+    title += "  \xC2\xB7  " + std::to_string(script_pass_) + " of " + std::to_string(script_pass_ + script_fail_) +
+             " passed";
+    if (script_fail_) title += ", " + std::to_string(script_fail_) + " failed";
+    colour = script_fail_ ? th.err : th.ok;
+  }
+  if (!sr.note.empty()) title += "  \xC2\xB7  " + sr.note;
+  script_title_->SetLabel(U(title));
+  script_title_->SetForegroundColour(colour);
+  const int rh = FromDIP(22);
+  const int visible = std::clamp<int>(static_cast<int>(n), 1, 10);
+  script_list_->SetMinSize(wxSize(-1, rh * (visible + 1) + FromDIP(4)));
+  script_title_->Show(show);
+  script_list_->Show(show && n > 0);
+  update_summary();
+}
+
+// The inherited group: the folders' / collection's checks, read-only, with their origin. Created
+// with the first inherited check, right under the request's own list.
+void TestsView::apply_inherited() {
+  if (!list_) return;
+  const Theme& th = Theme::get();
+  const bool show = !inh_.empty();
+  if (!show && !inh_list_) return;
+  if (!inh_list_) {
+    inh_title_ = new wxStaticText(this, wxID_ANY, "From folders");
+    inh_title_->SetFont(inh_title_->GetFont().Bold());
+    inh_title_->SetToolTip("Checks set on a folder or the collection (folder.json). They run on every response "
+                           "of the requests below it, next to the request's own checks, in the runner and "
+                           "watt --run too. Edit them in the folder's settings.");
+    inh_link_ = new wxStaticText(this, wxID_ANY, wxString::FromUTF8("Edit folder settings\xE2\x80\xA6"));
+    inh_link_->SetForegroundColour(th.accent);
+    inh_link_->SetCursor(wxCursor(wxCURSOR_HAND));
+    inh_link_->SetToolTip("Open the settings of the folder these checks come from (auth, headers, variables, "
+                          "assertions, scripts)");
+    inh_link_->Bind(wxEVT_LEFT_UP, [this](wxMouseEvent&) {
+      if (inh_.empty() || !on_edit_folder) return;
+      long i = inh_list_ ? inh_list_->GetNextItem(-1, wxLIST_NEXT_ALL, wxLIST_STATE_SELECTED) : -1;
+      if (i < 0 || static_cast<size_t>(i) >= inh_.size()) i = static_cast<long>(inh_.size()) - 1;  // nearest folder
+      const std::filesystem::path f = inh_[static_cast<size_t>(i)].folder;
+      CallAfter([this, f] {
+        if (on_edit_folder) on_edit_folder(f);
+      });
+    });
+    inh_list_ = new wxListCtrl(this, wxID_ANY, wxDefaultPosition, wxDefaultSize,
+                               wxLC_REPORT | wxLC_SINGLE_SEL | wxBORDER_NONE);
+    inh_list_->AppendColumn("Result", wxLIST_FORMAT_LEFT, FromDIP(64));
+    inh_list_->AppendColumn("Check", wxLIST_FORMAT_LEFT, FromDIP(260));
+    inh_list_->AppendColumn("Actual", wxLIST_FORMAT_LEFT, FromDIP(200));
+    inh_list_->AppendColumn("From", wxLIST_FORMAT_LEFT, FromDIP(120));
+    inh_list_->SetBackgroundColour(th.bg);
+    inh_list_->SetForegroundColour(th.fg);
+    inh_list_->Bind(wxEVT_SIZE, [this](wxSizeEvent& e) {
+      e.Skip();
+      if (inh_fit_pending_) return;
+      inh_fit_pending_ = true;
+      CallAfter([this] {
+        inh_fit_pending_ = false;
+        const int r = FromDIP(64);
+        const int w = std::max(FromDIP(300), inh_list_->GetClientSize().x - r - 2);
+        const int widths[] = {r, w * 42 / 100, w * 38 / 100, w - w * 42 / 100 - w * 38 / 100};
+        inh_list_->Freeze();
+        for (int i = 0; i < 4; ++i)
+          if (inh_list_->GetColumnWidth(i) != widths[i]) inh_list_->SetColumnWidth(i, widths[i]);
+        inh_list_->Thaw();
+      });
+    });
+    inh_list_->Bind(wxEVT_LIST_ITEM_ACTIVATED, [this](wxListEvent& e) {
+      const long i = e.GetIndex();
+      if (i < 0 || static_cast<size_t>(i) >= inh_.size() || !on_edit_folder) return;
+      const std::filesystem::path f = inh_[static_cast<size_t>(i)].folder;
+      CallAfter([this, f] {
+        if (on_edit_folder) on_edit_folder(f);
+      });
+    });
+    inh_list_->Bind(wxEVT_MOTION, [this](wxMouseEvent& e) {
+      e.Skip();
+      int flags = 0;
+      const long i = inh_list_->HitTest(e.GetPosition(), flags);
+      if (i < 0 || static_cast<size_t>(i) >= inh_.size()) return inh_list_->UnsetToolTip();
+      const InheritedCheck& c = inh_[static_cast<size_t>(i)];
+      std::string t = c.a.target + " " + op_label(c.a.op) + (c.a.value.empty() ? std::string() : " " + c.a.value) +
+                      "\nfrom " + c.from + " (read-only here: double-click to edit the folder's settings)";
+      if (static_cast<size_t>(i) < inh_rows_.size()) {
+        const TestRow& r = inh_rows_[static_cast<size_t>(i)];
+        if (r.state == TestRow::Pass || r.state == TestRow::Fail)
+          t += std::string(r.state == TestRow::Pass ? "\npassed" : "\nFAILED") + "\nactual: " +
+               (r.actual.empty() ? std::string("(undefined)") : r.actual) + (r.message.empty() ? "" : "\n" + r.message);
+      }
+      inh_list_->SetToolTip(U(t));
+    });
+    // Right under the request's own list.
+    wxSizer* sz = GetSizer();
+    size_t at = sz->GetItemCount();
+    for (size_t i = 0; i < sz->GetItemCount(); ++i)
+      if (sz->GetItem(i)->GetWindow() == list_) at = i + 1;
+    auto* head = new wxBoxSizer(wxHORIZONTAL);
+    head->Add(inh_title_, 0, wxALIGN_CENTER_VERTICAL);
+    head->AddSpacer(FromDIP(14));
+    head->Add(inh_link_, 0, wxALIGN_CENTER_VERTICAL);
+    sz->Insert(at, inh_list_, 0, wxEXPAND);
+    sz->Insert(at, head, 0, wxLEFT | wxTOP | wxBOTTOM, FromDIP(8));
+  }
+  inh_list_->Freeze();
+  inh_list_->DeleteAllItems();
+  for (size_t i = 0; i < inh_.size(); ++i) {
+    const InheritedCheck& c = inh_[i];
+    const TestRow* r = i < inh_rows_.size() ? &inh_rows_[i] : nullptr;
+    const long at = static_cast<long>(i);
+    const bool on = c.a.enabled && !c.a.target.empty();
+    const char* res = !on                                 ? "off"
+                      : running_                          ? "\xE2\x80\xA6"
+                      : !r || r->state == TestRow::NotRun ? "\xE2\x80\x94"
+                      : r->state == TestRow::Pass         ? "\xE2\x9C\x93 pass"
+                                                          : "\xE2\x9C\x97 FAIL";
+    inh_list_->InsertItem(at, U(res));
+    inh_list_->SetItem(at, 1, U(c.a.target + "  " + op_label(c.a.op) + (c.a.value.empty() ? "" : "  " + c.a.value)));
+    std::string act;
+    if (r && (r->state == TestRow::Pass || r->state == TestRow::Fail)) {
+      act = r->state == TestRow::Fail && !r->message.empty() ? r->message
+                                                              : (r->actual.empty() ? std::string("(undefined)") : r->actual);
+      if (act.size() > 300) act = act.substr(0, 300) + "\xE2\x80\xA6";
+      for (char& ch : act)
+        if (ch == '\n' || ch == '\r' || ch == '\t') ch = ' ';
+    }
+    inh_list_->SetItem(at, 2, U(act));
+    inh_list_->SetItem(at, 3, U(c.from));
+    const bool fail = on && r && r->state == TestRow::Fail;
+    inh_list_->SetItemTextColour(at, !on ? th.dim : fail ? th.err : th.fg);
+    if (fail) inh_list_->SetItemFont(at, inh_list_->GetFont().Bold());
+  }
+  inh_list_->Thaw();
+  std::string title = "From folders";
+  wxColour colour = th.dim;
+  if (inh_pass_ + inh_fail_ > 0) {
+    title += "  \xC2\xB7  " + std::to_string(inh_pass_) + " of " + std::to_string(inh_pass_ + inh_fail_) + " passed";
+    if (inh_fail_) title += ", " + std::to_string(inh_fail_) + " failed";
+    colour = inh_fail_ ? th.err : th.ok;
+  } else {
+    title += "  \xC2\xB7  " + std::to_string(inh_.size()) + (inh_.size() == 1 ? " check" : " checks") + ", read-only";
+  }
+  inh_title_->SetLabel(U(title));
+  inh_title_->SetForegroundColour(colour);
+  const int rh = FromDIP(22);
+  const int visible = std::clamp<int>(static_cast<int>(inh_.size()), 1, 8);
+  inh_list_->SetMinSize(wxSize(-1, rh * (visible + 1) + FromDIP(4)));
+  inh_title_->Show(show);
+  inh_link_->Show(show && static_cast<bool>(on_edit_folder));
+  inh_list_->Show(show);
+  update_summary();
+}
+
+void TestsView::set_inherited(std::vector<InheritedCheck> c) {
+  if (c == inh_) return;
+  inh_ = std::move(c);
+  inh_rows_.clear();
+  inh_pass_ = inh_fail_ = 0;
+  apply_inherited();
+}
+
+void TestsView::set_inherited_results(std::vector<TestRow> rows) {
+  inh_rows_ = std::move(rows);
+  inh_pass_ = inh_fail_ = 0;
+  for (size_t i = 0; i < inh_.size() && i < inh_rows_.size(); ++i) {
+    if (!inh_[i].a.enabled) continue;
+    if (inh_rows_[i].state == TestRow::Pass) ++inh_pass_;
+    else if (inh_rows_[i].state == TestRow::Fail) ++inh_fail_;
+  }
+  apply_inherited();
+}
+
+void TestsView::set_script(ScriptResults s) {
+  script_pass_ = script_fail_ = 0;
+  for (const ScriptTestRow& r : s.rows) (r.state == ScriptTestRow::Pass ? script_pass_ : script_fail_)++;
+  const bool was = script_.any_script || script_.skipped_untrusted || !script_.rows.empty();
+  script_ = std::move(s);
+  const bool now = script_.any_script || script_.skipped_untrusted || !script_.rows.empty();
+  if (!was && !now) return;
+  apply_script();
+}
+
+int TestsView::selected() const {
+  return list_ ? static_cast<int>(list_->GetNextItem(-1, wxLIST_NEXT_ALL, wxLIST_STATE_SELECTED)) : -1;
+}
+
+// Target suggestions for this kind of request.
+void TestsView::fill_targets() {
+  if (!target_) return;
+  wxArrayString t;
+  for (const char* s : grpc_ ? std::initializer_list<const char*>{"res.status", "res.statusMessage", "res.responseTime",
+                                                                  "res.timing.ttfb", "res.body", "res.body.",
+                                                                  "res.messages.length", "res.messages[0].",
+                                                                  "res.trailers.", "res.metadata."}
+                             : std::initializer_list<const char*>{"res.status", "res.responseTime", "res.timing.ttfb",
+                                                                  "res.timing.connect", "res.headers.content-type",
+                                                                  "res.headers.", "res.body", "res.body.",
+                                                                  "res.body.length", "res.size", "res.url"})
+    t.Add(s);
+  const wxString keep = target_->GetValue();
+  target_->Set(t);
+  target_->ChangeValue(keep);
+}
 
 void TestsView::set_asserts(const std::vector<Assertion>& a, bool editable, bool grpc) {
   const bool same = a == asserts_;
+  const bool kind_changed = grpc != grpc_;
   editable_ = editable;
   grpc_ = grpc;
   if (!same) {
@@ -325,20 +772,9 @@ void TestsView::set_asserts(const std::vector<Assertion>& a, bool editable, bool
     rows_.clear();
     if (editing_ >= 0) cancel_edit();
   }
-  // Target suggestions for this kind of request.
-  wxArrayString t;
-  for (const char* s : grpc ? std::initializer_list<const char*>{"res.status", "res.statusMessage", "res.responseTime",
-                                                                   "res.timing.ttfb", "res.body", "res.body.",
-                                                                   "res.messages.length", "res.messages[0].",
-                                                                   "res.trailers.", "res.metadata."}
-                            : std::initializer_list<const char*>{"res.status", "res.responseTime", "res.timing.ttfb",
-                                                                   "res.timing.connect", "res.headers.content-type",
-                                                                   "res.headers.", "res.body", "res.body.",
-                                                                   "res.body.length", "res.size", "res.url"})
-    t.Add(s);
-  const wxString keep = target_->GetValue();
-  target_->Set(t);
-  target_->ChangeValue(keep);
+  if (kind_changed) fill_targets();
+  count_results();
+  if (!list_) return;
   list_->refresh_rows();
   update_summary();
   update_chips();
@@ -347,14 +783,25 @@ void TestsView::set_asserts(const std::vector<Assertion>& a, bool editable, bool
 void TestsView::set_running() {
   running_ = true;
   have_response_ = true;
+  no_resp_reason_.clear();
+  count_results();
+  if (!list_) return;
   update_summary();
   list_->Refresh();
 }
 
-void TestsView::set_no_response() {
+void TestsView::set_no_response(std::string reason) {
   running_ = false;
   have_response_ = false;
+  no_resp_reason_ = std::move(reason);
   rows_.clear();
+  // Inherited results belong to the response they ran on: never keep them past it.
+  const bool had_inh = !inh_rows_.empty() || inh_pass_ + inh_fail_ > 0;
+  inh_rows_.clear();
+  inh_pass_ = inh_fail_ = 0;
+  count_results();
+  if (had_inh) apply_inherited();
+  if (!list_) return;
   list_->refresh_rows();
   update_summary();
 }
@@ -362,11 +809,20 @@ void TestsView::set_no_response() {
 void TestsView::set_results(std::vector<TestRow> rows, double total_ms, double parse_ms) {
   running_ = false;
   have_response_ = true;
+  no_resp_reason_.clear();
   rows_ = std::move(rows);
   total_ms_ = total_ms;
   parse_ms_ = parse_ms;
+  count_results();
+  if (!list_) return;
   list_->refresh_rows();
   update_summary();
+}
+
+void TestsView::set_captures(std::vector<CaptureRow> rows) {
+  if (rows.empty() && cap_rows_.empty()) return;
+  cap_rows_ = std::move(rows);
+  apply_captures();
 }
 
 void TestsView::set_hints(long status, double total_ms, const std::string& content_type, bool body_json) {
@@ -374,26 +830,48 @@ void TestsView::set_hints(long status, double total_ms, const std::string& conte
   hint_ms_ = total_ms;
   hint_ctype_ = content_type;
   hint_json_ = body_json;
-  update_chips();
+  if (list_) update_chips();
+}
+
+void TestsView::count_results() {
+  passed_ = failed_ = 0;
+  for (size_t i = 0; i < asserts_.size() && i < rows_.size(); ++i) {
+    if (!asserts_[i].enabled) continue;
+    if (rows_[i].state == TestRow::Pass) ++passed_;
+    else if (rows_[i].state == TestRow::Fail) ++failed_;
+  }
 }
 
 void TestsView::update_summary() {
-  passed_ = failed_ = 0;
+  count_results();
+  if (!list_) return;
   int off = 0;
-  for (size_t i = 0; i < asserts_.size(); ++i) {
-    if (!asserts_[i].enabled) {
-      ++off;
-      continue;
-    }
-    if (i < rows_.size()) {
-      if (rows_[i].state == TestRow::Pass) ++passed_;
-      else if (rows_[i].state == TestRow::Fail) ++failed_;
-    }
-  }
+  for (const Assertion& a : asserts_) off += !a.enabled;
   const int on = static_cast<int>(asserts_.size()) - off;
   std::string note;
   Tone tone = Tone::Dim;
-  if (asserts_.empty()) {
+  const bool scripted = !script_.rows.empty() || script_.skipped_untrusted;
+  const bool inherited = !inh_.empty();
+  const int all_on = on + static_cast<int>(std::count_if(inh_.begin(), inh_.end(), [](const InheritedCheck& c) {
+                       return c.a.enabled && !c.a.target.empty();
+                     }));
+  if (!running_ && !no_resp_reason_.empty() && all_on > 0) {
+    // The send failed before a response: no check ran (watt --run and the runner count it failed).
+    note = std::to_string(all_on) + (all_on == 1 ? " check" : " checks") + " not run \xC2\xB7 " + no_resp_reason_;
+    tone = Tone::Err;
+  } else if (asserts_.empty() && inherited && !scripted) {
+    note = running_ ? std::string("checking\xE2\x80\xA6")
+           : inh_pass_ + inh_fail_ == 0
+               ? std::to_string(inh_.size()) + " inherited " + (inh_.size() == 1 ? "check" : "checks")
+               : "No own checks \xC2\xB7 folders " + std::to_string(inh_pass_) + " of " +
+                     std::to_string(inh_pass_ + inh_fail_) + " passed";
+    tone = running_ ? Tone::Accent : inh_fail_ ? Tone::Err : inh_pass_ ? Tone::Ok : Tone::Dim;
+  } else if (asserts_.empty() && scripted) {
+    note = script_.skipped_untrusted ? std::string("No assertion rows \xC2\xB7 scripts not run (workspace not trusted)")
+                                     : "No assertion rows \xC2\xB7 script " + std::to_string(script_pass_) + " of " +
+                                           std::to_string(script_pass_ + script_fail_) + " passed";
+    tone = script_.skipped_untrusted ? Tone::Warn : script_fail_ ? Tone::Err : Tone::Ok;
+  } else if (asserts_.empty()) {
     note = "No checks yet";
   } else if (running_) {
     note = "checking " + std::to_string(on) + (on == 1 ? " assertion\xE2\x80\xA6" : " assertions\xE2\x80\xA6");
@@ -402,52 +880,100 @@ void TestsView::update_summary() {
     note = std::to_string(on) + (on == 1 ? " check" : " checks") + " \xC2\xB7 run on the next response";
   } else {
     note = std::to_string(passed_) + " of " + std::to_string(on) + " passed";
+    if (rechecked_) note = "checked now against the restored run: " + note;
     if (failed_) note += " \xC2\xB7 " + std::to_string(failed_) + " failed";
     if (off) note += " \xC2\xB7 " + std::to_string(off) + " off";
+    if (inh_pass_ + inh_fail_ > 0)
+      note += " \xC2\xB7 folders " + std::to_string(inh_pass_) + "/" + std::to_string(inh_pass_ + inh_fail_);
+    if (script_pass_ + script_fail_ > 0)
+      note += " \xC2\xB7 script " + std::to_string(script_pass_) + "/" + std::to_string(script_pass_ + script_fail_);
     note += " \xC2\xB7 " + fmt::ms(total_ms_);
     if (parse_ms_ > 0.05) note += " (JSON parse " + fmt::ms(parse_ms_) + ")";
     note += ", off the UI thread";
-    tone = failed_ ? Tone::Err : Tone::Ok;
+    tone = failed_ || script_fail_ || inh_fail_ ? Tone::Err : Tone::Ok;
   }
   if (!editable_) note += " \xC2\xB7 edit them in the request's Asserts tab";
   bar_->set_note(note, tone);
   const bool empty = asserts_.empty();
-  if (empty) {
-    empty_->SetLabel(editable_
-                         ? wxString::FromUTF8(
-                               "Checks run on every response, off the UI thread, and are saved with the request "
-                               "(Ctrl+S).\nAdd one with + Add or a suggestion above, e.g.  res.status == 200,  "
-                               "res.body.items[0].id exists,  res.responseTime < 500,  res.headers.content-type "
-                               "contains json.")
-                         : wxString("No checks for this request."));
+  // No assertion rows but script results: the long hint would push them down; one short line.
+  if (empty && inherited) {
+    empty_text_ = editable_ ? "No own checks (+ Add, or a suggestion above). Inherited from folders:"
+                            : "No own checks. Inherited from folders:";
+  } else if (empty && scripted) {
+    empty_text_ = editable_ ? "No assertion rows (+ Add, or a suggestion above). Script results:" : "Script results:";
+  } else if (empty) {
+    empty_text_ = editable_ ? "Checks run on every response, off the UI thread, and are saved with the request "
+                              "(Ctrl+S).\nAdd one with + Add or a suggestion above, e.g.  res.status == 200,  "
+                              "res.body.items[0].id exists,  res.responseTime < 500,  res.headers.content-type "
+                              "contains json."
+                            : "No checks for this request.";
   }
   empty_->Show(empty);
   list_->Show(!empty);
+  fit_list();
+  if (empty) wrap_empty();
+  else Layout();
+}
+
+// With a Script group below, the assertion list is only as tall as its rows (the script results
+// sit right under it, not at the bottom of the pane); alone it takes the whole height.
+void TestsView::fit_list() {
+  wxSizerItem* it = list_ ? GetSizer()->GetItem(list_) : nullptr;
+  if (!it) return;
+  const bool below = (script_title_ && script_title_->IsShown()) || !inh_.empty();
+  if (below) {
+    const int rows = std::clamp(static_cast<int>(asserts_.size()), 1, 12);
+    list_->SetMinSize(wxSize(-1, FromDIP(19) * rows + FromDIP(30)));
+    it->SetProportion(0);
+  } else {
+    list_->SetMinSize(wxSize(-1, -1));
+    it->SetProportion(1);
+  }
+}
+
+// The empty-state text wraps at the pane width (a static text does not wrap by itself).
+void TestsView::wrap_empty() {
+  const int w = GetClientSize().x - FromDIP(24);
+  empty_->SetLabel(U(empty_text_));
+  if (w >= FromDIP(80)) empty_->Wrap(w);
   Layout();
 }
 
 void TestsView::update_chips() {
+  if (!list_) return;
   const int sel = selected();
+  // Always the same chips while editable (greyed without a selection): selecting a row never
+  // moves the chip under the cursor.
   bar_->set_visible(kAdd, editable_);
-  bar_->set_visible(kEdit, editable_ && sel >= 0);
-  bar_->set_visible(kToggle, editable_ && sel >= 0);
-  bar_->set_visible(kDelete, editable_ && sel >= 0);
-  // Suggestions from the shown response, only those not already there.
+  for (int id : {kEdit, kToggle, kDelete}) {
+    bar_->set_visible(id, editable_);
+    bar_->set_enabled(id, editable_ && sel >= 0);
+  }
+  bar_->Refresh();
+  // Suggestions from the shown response. Which ones apply depends on the response only; one
+  // already in the list is greyed (and ticked) in place.
   auto has = [&](const std::string& target) {
     return std::any_of(asserts_.begin(), asserts_.end(), [&](const Assertion& a) { return a.target == target; });
   };
-  // Suggestions while the list is short (they would crowd out the summary otherwise).
-  const bool hints = editable_ && have_response_ && sel < 0 && asserts_.size() < 3;
-  bar_->set_visible(kHintStatus, hints && hint_status_ > 0 && !has("res.status"));
-  bar_->set_label(kHintStatus, grpc_ ? "+ status OK" : "+ status " + std::to_string(hint_status_ / 100) + "xx");
-  const double lim = hint_ms_ <= 0 ? 1000 : std::max(50.0, std::ceil(hint_ms_ * 3 / 50.0) * 50.0);
-  bar_->set_visible(kHintTime, hints && hint_ms_ > 0 && !has("res.responseTime"));
-  bar_->set_label(kHintTime, "+ time < " + std::to_string(static_cast<long>(lim)) + " ms");
   const std::string ct = hint_ctype_.substr(0, hint_ctype_.find(';'));
-  bar_->set_visible(kHintType, hints && !grpc_ && !ct.empty() && !has("res.headers.content-type"));
-  bar_->set_label(kHintType, "+ Content-Type " + ct);
-  bar_->set_visible(kHintJson, hints && hint_json_ && !has("res.body"));
-  bar_->Refresh();
+  const bool s_ok = hint_status_ > 0, t_ok = hint_ms_ > 0, c_ok = !grpc_ && !ct.empty(), j_ok = hint_json_;
+  const bool row = editable_ && have_response_ && (s_ok || t_ok || c_ok || j_ok);
+  auto chip = [&](int id, bool applies, bool used, const std::string& text) {
+    hints_->set_visible(id, applies);
+    hints_->set_enabled(id, !used);
+    hints_->set_label(id, (used ? "\xE2\x9C\x93 " : "+ ") + text);
+  };
+  chip(kHintStatus, s_ok, has("res.status"), grpc_ ? "status OK" : "status " + std::to_string(hint_status_ / 100) + "xx");
+  const double lim = hint_ms_ <= 0 ? 1000 : std::max(50.0, std::ceil(hint_ms_ * 3 / 50.0) * 50.0);
+  chip(kHintTime, t_ok, has("res.responseTime"), "time < " + std::to_string(static_cast<long>(lim)) + " ms");
+  chip(kHintType, c_ok, has("res.headers.content-type"), "Content-Type " + ct);
+  chip(kHintJson, j_ok, has("res.body"), "body is JSON");
+  hints_->set_note("suggested");
+  if (hints_->IsShown() != row) {
+    hints_->Show(row);
+    Layout();
+  }
+  hints_->Refresh();
 }
 
 void TestsView::on_chip(int id) {
@@ -478,6 +1004,8 @@ void TestsView::on_chip(int id) {
 
 void TestsView::begin_edit(int row) {
   if (!editable_) return;
+  ensure_built();
+  build_editor();
   if (row >= static_cast<int>(asserts_.size())) row = -1;
   editing_ = row;
   if (row >= 0) {
@@ -535,6 +1063,7 @@ void TestsView::commit_edit() {
 
 void TestsView::cancel_edit() {
   editing_ = -2;
+  if (!editor_) return;
   editor_->Hide();
   Layout();
   list_->SetFocus();
@@ -570,6 +1099,7 @@ void TestsView::move_selected(int by) {
 }
 
 void TestsView::edited() {
+  if (!list_) return;
   list_->refresh_rows();
   update_summary();
   update_chips();

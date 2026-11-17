@@ -9,6 +9,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "core/model.h"
 
@@ -46,5 +47,20 @@ std::optional<SavedRequest> create_request(Workspace& ws, const std::filesystem:
 // URL. Used to pick the request Enter opens.
 int filter_rank(std::string_view query_lower, std::string_view name, std::string_view folder_path,
                 std::string_view rest);
+// The same with every argument already lower-case (no allocation: a keystroke ranks 2000).
+int filter_rank_lower(std::string_view query, std::string_view name, std::string_view folder_path,
+                      std::string_view rest);
+
+// An environment file (<root>/environments/*.json) the workspace skips because it does not
+// parse: most often a UTF-8 byte order mark (Windows PowerShell 5 `Set-Content -Encoding utf8`,
+// Notepad's "UTF-8 with BOM"), which JSON does not allow. The sidebar says so instead of
+// silently showing the old values.
+struct UnreadableEnv {
+  std::filesystem::path file;
+  bool bom = false;  // starts with EF BB BF and parses without it: remove_utf8_bom() fixes it
+};
+std::vector<UnreadableEnv> unreadable_env_files(const std::filesystem::path& root);
+// Rewrites `file` without its leading UTF-8 BOM (atomically). False with *err if it could not.
+bool remove_utf8_bom(const std::filesystem::path& file, std::string* err);
 
 }  // namespace watt::app::sidebar

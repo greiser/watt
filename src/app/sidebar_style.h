@@ -54,15 +54,27 @@ enum TreeImage {
   kImgHead,
   kImgOptions,
   kImgOther,
-  kImgGrpc,
-  kImgUnknown,  // badge not read yet
+  kImgGrpc,        // unary, or a gRPC request whose call kind is not known yet
+  kImgUnknown,     // badge not read yet
+  kImgGrpcServer,  // server streaming: "gRPC" with a down arrow (messages come down)
+  kImgGrpcClient,  // client streaming: up arrow
+  kImgGrpcBidi,    // bidirectional: up-down arrow
+  kImgFolderEmpty,  // a folder with nothing in it: no expand chevron
   kImgCount
 };
 int tree_image(RequestKind kind, std::string_view method);
+// The gRPC image for a call kind (GrpcCallKind as int; < 0: not known -> kImgGrpc).
+int grpc_tree_image(int call_kind);
+// "unary", "server streaming", "client streaming", "bidi streaming" ("" for < 0).
+std::string grpc_kind_name(int call_kind);
+// The arrow drawn after "gRPC" in badges: none (unary), down, up, up-down (UTF-8).
+std::string grpc_kind_glyph(int call_kind);
 // Bundles for wxTreeCtrl::SetImages(), rendered for w's current DPI scale.
 std::vector<wxBitmapBundle> tree_images(const wxWindow* w);
 
 // Draws the badge text at (x, y) (top-left of a box of height h), left aligned. Returns width used.
-int draw_badge(wxDC& dc, const wxWindow* w, RequestKind kind, std::string_view method, int x, int y, int h);
+// call_kind: for gRPC, the call kind's arrow follows the label (see grpc_kind_glyph).
+int draw_badge(wxDC& dc, const wxWindow* w, RequestKind kind, std::string_view method, int x, int y, int h,
+               int call_kind = -1);
 
 }  // namespace watt::app::sidebar

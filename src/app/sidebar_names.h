@@ -23,7 +23,14 @@ struct ReqMeta {
   std::string id;    // the request's id (history entries store it: they map back by id)
 };
 
-using MetaMap = std::map<std::filesystem::path, ReqMeta>;
+// Ordered by the native string: fs::path's own operator< parses both paths per compare, and a
+// filter keystroke looks up every request (2000 lookups were ~8 ms).
+struct NativePathLess {
+  bool operator()(const std::filesystem::path& a, const std::filesystem::path& b) const {
+    return a.native() < b.native();
+  }
+};
+using MetaMap = std::map<std::filesystem::path, ReqMeta, NativePathLess>;
 
 class NameCache {
  public:

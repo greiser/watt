@@ -12,13 +12,16 @@
 #include <rapidjson/writer.h>
 
 #include <atomic>
+#include <cctype>
 #include <condition_variable>
 #include <deque>
 #include <map>
 #include <mutex>
 #include <thread>
 
+#include "app/history_summary.h"
 #include "app/main_frame.h"        // startup::
+#include "core/oauth2.h"
 #include "app/response_widgets.h"  // rv::Theme (the placeholder's colour)
 
 #include <windows.h>
@@ -26,6 +29,20 @@
 namespace watt::app {
 
 namespace {
+
+// A tab opened from a history row is named "Protected @ 15:57" (the snapshot's send time). A
+// fresh send from it shows a new response: the old time is dropped so the title never names a
+// run that is not the one on screen. True when the name changed.
+bool drop_snapshot_time(SavedRequest& q) {
+  if (q.file.empty() || q.file.parent_path().filename() != "snapshots") return false;
+  std::string& n = q.name;
+  const size_t at = n.rfind(" @ ");
+  if (at == std::string::npos || n.size() < at + 8 || n[n.size() - 3] != ':' ||
+      !std::isdigit(static_cast<unsigned char>(n.back())))
+    return false;
+  n.resize(at);
+  return true;
+}
 
 // Workspace::append_history from several tab workers: serialize the appends.
 std::mutex& history_mutex() {
@@ -75,6 +92,8 @@ bool needs_workspace(const SavedRequest& r) {
   if (!r.form.empty() || !r.body_file.empty() || !r.body_data.empty() || !r.header_files.empty() ||
       !r.cookie_files.empty() || r.basic_auth.enabled || !r.disabled_headers.empty())
     return true;
+  // CA / client certificate / proxy files are read (and checked) there too.
+  if (!r.network.empty()) return true;
   // Digest/NTLM/Negotiate/SigV4/OAuth2 are applied (and the Windows-logon check enforced) only
   // in http_to_send; scripts may change the request or set the variables it uses.
   if (r.auth.type != HttpAuth::Type::None || !r.pre_script.empty() || !r.post_script.empty()) return true;
@@ -104,6 +123,43 @@ bool confirm_env_vars(const Workspace& ws, const SavedRequest& r, wxWindow* pare
   return true;
 }
 
+// One workspace-sourced network item (Workspace::blocked_network_settings): says exactly what is
+// trusted and why it matters. Default No.
+bool confirm_network_item(const Workspace::NetworkItem& it, wxWindow* parent) {
+  using K = Workspace::NetworkItem::Kind;
+  wxString msg;
+  const wxString where = wxString::FromUTF8(it.level);
+  if (!it.file_blocked.empty()) {
+    wxString files;
+    for (const auto& f : it.file_blocked) files += wxString("    ") + wxString(f.wstring()) + "\n";
+    msg = wxString::Format("The workspace settings (%s) want watt to read\n\n%s\nfrom outside the workspace as a %s. "
+                           "Allow reading it?",
+                           where, files, it.kind == K::Ca ? "CA certificate" : "client certificate / key");
+  } else if (it.kind == K::Proxy) {
+    msg = wxString::Format("The workspace settings (%s) send all requests in this workspace through the proxy\n\n"
+                           "    %s%s\n\nThe proxy sees every plain HTTP request, including Authorization headers "
+                           "and secrets, and every host you connect to. Only allow a proxy you trust. Allow it for "
+                           "this workspace?",
+                           where, wxString::FromUTF8(it.proxy_origin),
+                           it.proxy_credentials ? "\n    (the proxy URL carries credentials)" : "");
+  } else if (it.kind == K::Ca) {
+    wxString who;
+    for (const auto& s : it.subjects) who += "    " + wxString::FromUTF8(s) + "\n";
+    if (who.empty()) who = "    (no certificate found in the file)\n";
+    msg = wxString::Format("The workspace settings (%s) make watt trust certificates signed by\n\n%s\n"
+                           "    file %s\n    SHA-256 %s\n\nWhoever holds this CA's key can read and change all "
+                           "HTTPS traffic of this workspace, including Authorization headers and secrets. Only "
+                           "allow a CA you know. Trust it for this workspace?",
+                           where, who, it.file.wstring(), wxString::FromUTF8(it.fingerprint));
+  } else {
+    msg = wxString::Format("The workspace settings (%s) present the client certificate\n\n    %s%s\n\nto servers "
+                           "that ask for one (it identifies you to them). Allow it for this workspace?",
+                           where, it.file.wstring(),
+                           it.key_file.empty() ? wxString() : wxString("\n    key ") + wxString(it.key_file.wstring()));
+  }
+  return wxMessageBox(msg, "watt", wxYES_NO | wxNO_DEFAULT | wxICON_WARNING, parent) == wxYES;
+}
+
 bool grpc_has_vars(const SavedRequest& r) {
   auto has_var = [](const std::string& s) { return s.find("{{") != std::string::npos; };
   if (has_var(r.grpc_target.address) || has_var(r.grpc_target.authority) || has_var(r.grpc_method) ||
@@ -113,6 +169,26 @@ bool grpc_has_vars(const SavedRequest& r) {
     for (const auto& [k, v] : *md)
       if (has_var(k) || has_var(v)) return true;
   return false;
+}
+
+// gRPC-Web sent to a native gRPC (HTTP/2) port: the server answers with an HTTP/2 frame that
+// libcurl reads as "HTTP/0.9". Said in plain words, with the likely gRPC-Web port.
+std::string web_port_hint(const GrpcTarget& t, const std::string& error) {
+  if (!t.web || error.find("HTTP/0.9") == std::string::npos) return {};
+  std::string hint = ": " + t.address +
+                     " looks like a native gRPC (HTTP/2) port, not a gRPC-Web endpoint. Turn gRPC-Web off to call it "
+                     "directly, or use the server's gRPC-Web address";
+  const size_t colon = t.address.rfind(':');
+  if (colon != std::string::npos && t.address.find(']', colon) == std::string::npos) {
+    const std::string port = t.address.substr(colon + 1);
+    if (!port.empty() && port.size() <= 5 && port.find_first_not_of("0123456789") == std::string::npos) {
+      const int p = std::stoi(port);
+      if (p > 0 && p < 65535)
+        hint += " (a proxy such as Envoy, or watt_testserver's " + t.address.substr(0, colon + 1) +
+                std::to_string(p + 1) + ")";
+    }
+  }
+  return hint + ".";
 }
 
 std::string url_tail(const std::string& url) {
@@ -413,6 +489,55 @@ std::map<std::string, std::shared_ptr<const GrpcSchema>>& known_schemas() {
   static std::map<std::string, std::shared_ptr<const GrpcSchema>> m;
   return m;
 }
+// HTTP clients shared by every tab. A send borrows an idle one, preferably the one that last
+// talked to the same origin, and gives it back after the response: its pooled connection, TLS
+// session and DNS entry then serve the next send to that host from any tab (as Postman's and
+// Bruno's shared agents do, and as the runner's single client does), instead of every new tab
+// paying a fresh TCP + TLS handshake. Sends in flight at the same time each hold their own
+// client; at most kIdle stay parked.
+class SharedClients {
+ public:
+  static SharedClients& get() {
+    static SharedClients s;
+    return s;
+  }
+  std::unique_ptr<HttpClient> take(const std::string& origin) {
+    std::lock_guard lk(m_);
+    if (idle_.empty()) return std::make_unique<HttpClient>();
+    size_t pick = idle_.size() - 1;  // the most recently used one
+    for (size_t i = idle_.size(); i-- > 0;)
+      if (idle_[i].first == origin) {
+        pick = i;
+        break;
+      }
+    auto c = std::move(idle_[pick].second);
+    idle_.erase(idle_.begin() + static_cast<std::ptrdiff_t>(pick));
+    return c;
+  }
+  void give(std::unique_ptr<HttpClient> c, const std::string& origin) {
+    std::unique_ptr<HttpClient> drop;
+    std::lock_guard lk(m_);
+    idle_.emplace_back(origin, std::move(c));
+    if (idle_.size() > kIdle) {
+      drop = std::move(idle_.front().second);  // destroyed after the lock is released
+      idle_.erase(idle_.begin());
+    }
+  }
+  // Start-up: one client ready before the first send.
+  void warm() {
+    {
+      std::lock_guard lk(m_);
+      if (!idle_.empty()) return;
+    }
+    give(std::make_unique<HttpClient>(), std::string());
+  }
+
+ private:
+  static constexpr size_t kIdle = 6;
+  std::mutex m_;
+  std::vector<std::pair<std::string, std::unique_ptr<HttpClient>>> idle_;
+};
+
 }  // namespace
 
 // ------------------------------------------------------------------ worker
@@ -427,7 +552,7 @@ struct TabWorker : std::enable_shared_from_this<TabWorker> {
   RequestTab* tab = nullptr;  // null once the tab is gone
 
   std::mutex http_m;
-  std::unique_ptr<HttpClient> http;  // created and used on the worker thread
+  std::unique_ptr<HttpClient> http;  // borrowed from SharedClients for one send (worker thread)
 
   std::mutex call_m;
   std::shared_ptr<GrpcCall> call;
@@ -484,10 +609,20 @@ struct TabWorker : std::enable_shared_from_this<TabWorker> {
     RequestTab* t = tab;
     t->CallAfter([t, fn = std::forward<F>(fn)]() mutable { fn(*t); });
   }
-  HttpClient& http_client() {
+  // Borrows a shared client for one send; give_back() returns it (see SharedClients).
+  HttpClient& lease_client(const std::string& origin) {
+    auto c = SharedClients::get().take(origin);
     std::lock_guard lk(http_m);
-    if (!http) http = std::make_unique<HttpClient>();
+    http = std::move(c);
     return *http;
+  }
+  void give_back(const std::string& origin) {
+    std::unique_ptr<HttpClient> c;
+    {
+      std::lock_guard lk(http_m);
+      c = std::move(http);
+    }
+    if (c) SharedClients::get().give(std::move(c), origin);
   }
   void cancel(uint64_t gen) {
     cancelled_gen.store(gen);
@@ -620,9 +755,23 @@ void RequestTab::realize() {
     e.Skip();
     user_sash_ = true;
   });
+  // wxAuiNotebook sizes every page when the window is resized, the hidden ones too: laying out
+  // each tab's editor and response view made one resize step O(tabs) (67-105 ms with 12-25
+  // tabs). A hidden tab only notes it; it lays itself out when it is shown again.
   Bind(wxEVT_SIZE, [this](wxSizeEvent& e) {
+    if (!IsShown()) {
+      layout_pending_ = true;
+      return;  // no Skip: no Layout() now
+    }
     e.Skip();
     if (!user_sash_ && GetClientSize().x > 0) CallAfter([this] { center_sash(); });
+  });
+  Bind(wxEVT_SHOW, [this](wxShowEvent& e) {
+    e.Skip();
+    if (!e.IsShown() || !layout_pending_) return;
+    layout_pending_ = false;
+    Layout();
+    if (!user_sash_) center_sash();
   });
   center_sash();  // realized after the page was laid out (a restored tab)
   Bind(wxEVT_IDLE, &RequestTab::on_idle, this);
@@ -688,8 +837,7 @@ ResponsePanel* RequestTab::response() {
     resp_->window()->Layout();
     if (last_pending_) {
       last_pending_ = false;
-      if (last_.http) resp_->show_http(last_.http, last_.sent);
-      else if (last_.grpc) resp_->show_grpc(last_.grpc);
+      show_last();
     }
   }
   startup::mark("response_view");
@@ -772,14 +920,19 @@ const SavedRequest& RequestTab::request() const {
 
 std::wstring RequestTab::title() const {
   std::string t;
-  if (!req_.name.empty()) {
-    t = req_.name;
+  // "Untitled" is what an unsaved tab used to be named when it was sent: a history entry or a
+  // restored tab of it is titled by what it calls (Echo/Chat), not "gRPC Untitled".
+  if (!req_.name.empty() && req_.name != "Untitled") {
+    t = req_.kind == RequestKind::Grpc ? grpc_display_name(req_.name, req_.grpc_method) : req_.name;
   } else if (req_.kind == RequestKind::Http) {
     t = req_.http.url.empty() ? "Untitled" : url_tail(req_.http.url);
   } else {
-    const auto& m = req_.grpc_method;
-    const auto s = m.rfind('/');
-    t = m.empty() ? "Untitled" : m.substr(s == std::string::npos ? 0 : s + 1);
+    // "/watt.test.Echo/Chat" -> "Echo/Chat", as the method picker shows it.
+    std::string m = req_.grpc_method;
+    if (!m.empty() && m[0] == '/') m.erase(0, 1);
+    if (const auto sl = m.find('/'); sl != std::string::npos)
+      if (const auto dot = m.rfind('.', sl); dot != std::string::npos) m.erase(0, dot + 1);
+    t = m.empty() ? "Untitled" : m;
   }
   std::string prefix = req_.kind == RequestKind::Http ? req_.http.method : std::string("gRPC");
   return wxString::FromUTF8(prefix + " " + t).ToStdWstring() + (dirty_ ? L" \u25CF" : L"");
@@ -816,22 +969,61 @@ void RequestTab::set_request(SavedRequest req, bool preview) {
   if (on_title_changed) on_title_changed(this);
 }
 
+std::string RequestTab::suggested_name() const {
+  store();
+  std::string s;
+  if (req_.kind == RequestKind::Http) {
+    s = req_.http.url;
+    if (const auto p = s.find("://"); p != std::string::npos) s = s.substr(p + 3);
+    s = s.substr(0, s.find_first_of("?#"));
+  } else {
+    s = req_.grpc_method;
+  }
+  // Drop {{variables}} ("{{base}}/echo" -> "/echo"), then take the last non-empty segment.
+  for (size_t a; (a = s.find("{{")) != std::string::npos;) {
+    const size_t b = s.find("}}", a + 2);
+    s.erase(a, b == std::string::npos ? std::string::npos : b + 2 - a);
+  }
+  while (!s.empty() && s.back() == '/') s.pop_back();
+  if (const auto p = s.rfind('/'); p != std::string::npos) {
+    std::string last = s.substr(p + 1);
+    // An id alone says nothing ("{{base}}/json/3" -> "3"): name it with the segment before it
+    // ("json 3", "users 42", "orders :id").
+    const bool id = !last.empty() && (last.find_first_not_of("0123456789") == std::string::npos || last[0] == ':' ||
+                                      (last.size() >= 8 && last.find_first_not_of("0123456789abcdefABCDEF-") ==
+                                                               std::string::npos));
+    std::string head = s.substr(0, p);
+    while (!head.empty() && head.back() == '/') head.pop_back();
+    const auto q = head.rfind('/');
+    std::string prev = q == std::string::npos ? std::string() : head.substr(q + 1);
+    if (q == std::string::npos && req_.kind == RequestKind::Http) prev.clear();  // the host: not a name
+    s = id && !prev.empty() ? prev + " " + last : last;
+  }
+  for (char& c : s)
+    if (c == '\\' || c == ':' || c == '?' || c == '*' || c == '"' || c == '<' || c == '>' || c == '|' || c == '{' ||
+        c == '}')
+      c = '_';
+  if (s.empty() && !req_.name.empty() && req_.name.find("{{") == std::string::npos) s = req_.name;
+  return s.empty() ? std::string("request") : s;
+}
+
 bool RequestTab::save(Workspace& ws, std::string* err) {
   store();
-  if (req_.name.empty()) {
-    if (req_.kind == RequestKind::Http) {
-      req_.name = url_tail(req_.http.url);
-    } else {
-      const auto s = req_.grpc_method.rfind('/');
-      req_.name = s == std::string::npos ? req_.grpc_method : req_.grpc_method.substr(s + 1);
+  if (!save_name_.empty()) req_.name = save_name_;
+  if (req_.name.empty()) req_.name = suggested_name();
+  if (req_.file.empty()) {
+    // A free file name in the chosen folder (never over an existing request); the name itself
+    // keeps what the user typed, the file name drops {{variables}} and reserved characters.
+    std::string base = req_.name;
+    for (size_t a; (a = base.find("{{")) != std::string::npos;) {
+      const size_t b = base.find("}}", a + 2);
+      base.erase(a, b == std::string::npos ? std::string::npos : b + 2 - a);
     }
-    for (char& c : req_.name)
-      if (c == '/' || c == '\\' || c == ':' || c == '?' || c == '*' || c == '"' || c == '<' || c == '>' || c == '|') c = '_';
-    if (req_.name.empty()) req_.name = "request";
+    if (base.find_first_not_of(" _-.") == std::string::npos) base = suggested_name();
+    req_.file = ws.new_request(req_.kind, base, save_folder_.empty() ? ws.root() : save_folder_).file;
   }
-  if (req_.file.empty() && !save_folder_.empty())
-    req_.file = save_folder_ / wxString::FromUTF8(req_.name + ".req.json").ToStdWstring();
   if (!ws.save_request(req_, err)) return false;
+  save_name_.clear();
   dirty_ = false;
   preview_ = false;
   if (on_title_changed) on_title_changed(this);
@@ -849,9 +1041,15 @@ void RequestTab::restore_response(LastResponse r) {
   last_pending_ = true;
   if (resp_) {
     last_pending_ = false;
-    if (last_.http) resp_->show_http(last_.http, last_.sent);
-    else resp_->show_grpc(last_.grpc);
+    show_last();
   }
+}
+
+void RequestTab::show_last() {
+  resp_->set_history_when(last_.when_iso);
+  if (last_.http) resp_->show_http(last_.http, last_.sent);
+  else if (last_.grpc) resp_->show_grpc(last_.grpc);
+  resp_->set_history_when({});
 }
 
 std::shared_ptr<const GrpcSchema> RequestTab::session_schema() const {
@@ -882,7 +1080,7 @@ void RequestTab::mark_dirty() {
 
 void RequestTab::warm_up() {
   auto w = worker_;
-  w->push([w] { w->http_client(); });
+  w->push([] { SharedClients::get().warm(); });
 }
 
 void RequestTab::file_moved(const std::filesystem::path& to) {
@@ -921,6 +1119,23 @@ void RequestTab::switch_kind(RequestKind kind) {
 }
 
 const Workspace* RequestTab::workspace() const { return ctx_.workspace ? ctx_.workspace() : nullptr; }
+
+std::filesystem::path RequestTab::inherit_file() const {
+  if (!req_.file.empty()) {
+    if (ctx_.snapshot_origin)
+      if (std::filesystem::path o = ctx_.snapshot_origin(req_); !o.empty()) return o;
+    return req_.file;
+  }
+  // Unsaved: it inherits from the folder its first save goes to (as Bruno's new request does).
+  if (!save_folder_.empty()) return save_folder_ / L"(unsaved).req.json";
+  return {};
+}
+
+SavedRequest RequestTab::for_inheritance(const SavedRequest& req) const {
+  SavedRequest r = req;
+  r.file = inherit_file();
+  return r;
+}
 
 void RequestTab::send() {
   const auto click = Clock::now();
@@ -963,6 +1178,10 @@ void RequestTab::send_http(Clock::time_point click) {
     response()->show_error("Enter a URL first.");
     return;
   }
+  // What is checked and sent: the tab's request, inheriting from its folders (a history snapshot
+  // from the folders of the request it came from; an unsaved one from the folder it will be saved in).
+  auto rq_p = std::make_shared<SavedRequest>(for_inheritance(req_));
+  const SavedRequest& rq = *rq_p;
   // Files from outside the workspace and OS environment variables need the user's consent
   // (Workspace::blocked_files / blocked_env_vars). http_to_send() refuses them regardless, so
   // this is the prompt, not the gate. Only requests that go through http_to_send can reach them.
@@ -971,14 +1190,14 @@ void RequestTab::send_http(Clock::time_point click) {
   bool prompted = false;
   // Folder / collection settings (folder.json) add headers, auth, vars and scripts that only
   // http_to_send applies: such a request never takes the fast path.
-  const bool inherited = ws && ws->has_inherited_settings(req_);
-  if (ws && (needs_workspace(req_) || inherited)) {
-    prompted = !ws->blocked_env_vars(req_).empty();
-    if (std::string err; !confirm_env_vars(*ws, req_, this, &err)) {
+  const bool inherited = ws && ws->has_inherited_settings(rq);
+  if (ws && (needs_workspace(rq) || inherited)) {
+    prompted = !ws->blocked_env_vars(rq).empty();
+    if (std::string err; !confirm_env_vars(*ws, rq, this, &err)) {
       response()->show_error(err);
       return;
     }
-    for (const auto& p : ws->blocked_files(req_)) {
+    for (const auto& p : ws->blocked_files(rq)) {
       prompted = true;
       const auto ans = wxMessageBox(
           wxString::Format("This request wants to upload\n\n%s\n\nfrom outside the workspace. Allow it?",
@@ -992,13 +1211,13 @@ void RequestTab::send_http(Clock::time_point click) {
     }
     // NTLM / Negotiate with no user name signs in as the current Windows user: a cloned
     // workspace could aim that at a hostile host, so each host needs the user's consent.
-    for (const auto& host : ws->blocked_sso_hosts(req_)) {
+    for (const auto& host : ws->blocked_sso_hosts(rq)) {
       prompted = true;
       const auto ans = wxMessageBox(
           wxString::Format("This request signs in to\n\n%s\n\nwith your Windows account (%s, no user name "
                            "given). Only allow this for servers you trust. Allow it for this workspace?",
                            wxString::FromUTF8(host),
-                           req_.auth.type == HttpAuth::Type::Ntlm ? "NTLM" : "Negotiate"),
+                           rq.auth.type == HttpAuth::Type::Ntlm ? "NTLM" : "Negotiate"),
           "watt", wxYES_NO | wxNO_DEFAULT | wxICON_WARNING, this);
       std::string err;
       if (ans != wxYES || !ws->allow_sso_host(host, &err)) {
@@ -1006,11 +1225,31 @@ void RequestTab::send_http(Clock::time_point click) {
         return;
       }
     }
+    // Proxy / CA / client certificate from workspace files (a cloned repo could route every
+    // request through its proxy and make watt trust its CA: a silent MITM of HTTPS). A CA file
+    // outside the workspace is first allowed to be read, then its content is asked about: at
+    // most a few rounds.
+    for (int round = 0; round < 3; ++round) {
+      const auto items = ws->blocked_network_settings(rq);
+      if (items.empty()) break;
+      for (const auto& it : items) {
+        prompted = true;
+        if (!confirm_network_item(it, this)) {
+          response()->show_error("Not sent: " + it.text + " (set in the " + it.level + ") is not allowed.");
+          return;
+        }
+        std::string err;
+        if (!ws->allow_network_item(it, &err)) {
+          response()->show_error(err.empty() ? "Not allowed: " + it.text : err);
+          return;
+        }
+      }
+    }
   }
   // Scripts are code from the workspace (possibly a cloned repo): ask once per workspace.
   bool run_scripts = false, scripts_skipped = false, has_pre = false, has_post = false;
   if (ws) {  // the request's own scripts plus those inherited from its folders / collection
-    const auto eff = ws->effective_settings(req_);
+    const auto eff = ws->effective_settings(rq);
     has_pre = !eff.pre_scripts.empty();
     has_post = !eff.post_scripts.empty();
   }
@@ -1033,12 +1272,37 @@ void RequestTab::send_http(Clock::time_point click) {
   const uint64_t gen = ++gen_;
   in_flight_ = true;
   sent_at_ = click;
+  if (drop_snapshot_time(req_) && on_title_changed) on_title_changed(this);
   // The job is queued before any UI update, so the worker starts while the UI repaints.
-  auto saved = std::make_shared<const SavedRequest>(req_);
+  std::shared_ptr<const SavedRequest> saved = std::move(rq_p);
   auto wsc = ws ? std::make_shared<Workspace>(*ws) : nullptr;
   auto w = worker_;
   w->push([w, gen, click, saved, wsc, run_scripts, scripts_skipped, has_pre, has_post, inherited] {
     if (w->is_cancelled(gen)) return;
+    // Every send that got as far as the network (or failed on its way there: an OAuth token step)
+    // is a history row; status 0 is a failed one.
+    auto record_history = [&](long status, double total_ms) {
+      if (!wsc) return;
+      HistoryEntry e;
+      e.when_iso = now_iso();
+      e.kind = RequestKind::Http;
+      // What was sent (vars resolved now, on the worker, with the workspace copy the request
+      // was built from), not the template alone: the history row must say where it went even
+      // after the environment is switched (history_summary.h). The URL as written, expanded,
+      // not the final request URL, so an OAuth / API key query parameter is not recorded.
+      e.summary = make_history_summary(saved->http.method + " " + saved->http.url,
+                                       wsc->expand(saved->http.url, *saved), wsc->active_env);
+      e.status = status;
+      e.total_ms = total_ms;
+      e.request = *saved;
+      {
+        std::lock_guard lk(history_mutex());
+        wsc->append_history(e);
+      }
+      w->post([e = std::move(e)](RequestTab& t) {
+        if (t.ctx_.history_added) t.ctx_.history_added(e);
+      });
+    };
     auto sent = std::make_shared<SentHttp>();
     sent->scripts_skipped_untrusted = scripts_skipped;
     // Pre-request script: edits a copy of the request; its variable writes apply to this
@@ -1054,6 +1318,33 @@ void RequestTab::send_http(Clock::time_point click) {
       }
       apply_script_vars(*wsc, *pre, false);
     }
+    // OAuth 2.0: get the token here (cached, refreshed or fetched), timed, so the response shows
+    // it as its own phase; http_to_send() below then finds it in the cache.
+    if (wsc && (toSend->auth.type == HttpAuth::Type::OAuth2 || (inherited && toSend->auth.type == HttpAuth::Type::Inherit))) {
+      const EffectiveSettings eff = wsc->effective_settings(*toSend);
+      if (eff.auth.type == HttpAuth::Type::OAuth2) {
+        auto step = std::make_shared<SentHttp::TokenStep>();
+        const OAuth2Result t = oauth2_get_token(*wsc, *toSend);
+        step->ok = t.ok;
+        step->from_cache = t.from_cache;
+        step->refreshed = t.refreshed;
+        step->ms = t.elapsed_ms;
+        step->error = t.error;
+        const OAuth2Config& oc = eff.auth.oauth2;
+        step->grant = oc.grant == OAuth2Config::Grant::ClientCredentials ? "client credentials"
+                      : oc.grant == OAuth2Config::Grant::Password        ? "password"
+                                                                         : "authorization code";
+        step->token_url = wsc->expand(oc.token_url, *toSend);
+        step->from = eff.auth_from.label;
+        sent->token = step;
+        if (!t.ok) {  // the same message http_to_send() would give, without a second token call
+          const std::string err = "OAuth 2.0: " + t.error + ": request not sent.";
+          w->post([gen, err](RequestTab& t) { t.on_error(gen, err); });
+          record_history(0, ms_between(click, Clock::now()));
+          return;
+        }
+      }
+    }
     if (wsc && (needs_workspace(*toSend) || inherited)) {
       std::string err;
       auto r = wsc->http_to_send(*toSend, &err);
@@ -1065,8 +1356,9 @@ void RequestTab::send_http(Clock::time_point click) {
     } else {
       sent->request = toSend->http;
     }
-    HttpClient& client = w->http_client();
     if (w->is_cancelled(gen)) return;
+    const std::string origin = Workspace::url_origin(sent->request.url);
+    HttpClient& client = w->lease_client(origin);
     // Progress: at most every 50 ms.
     uint64_t got = 0;
     auto last = Clock::now();
@@ -1082,7 +1374,12 @@ void RequestTab::send_http(Clock::time_point click) {
     };
     const auto start = Clock::now();
     const double ui_queue = ms_between(click, start);
+    if (w->is_cancelled(gen)) {  // cancelled while the client was being borrowed
+      w->give_back(origin);
+      return;
+    }
     auto resp = std::make_shared<HttpResponse>(client.send(sent->request, on_chunk));
+    w->give_back(origin);
     resp->timing.queue_ms += ui_queue;
     resp->timing.total_ms += ui_queue;
     if (run_scripts && has_post && resp->ok) {
@@ -1107,22 +1404,7 @@ void RequestTab::send_http(Clock::time_point click) {
       t.on_http_done(gen, cresp, csent);
     });
 
-    if (wsc && !(resp->error == "cancelled")) {
-      HistoryEntry e;
-      e.when_iso = now_iso();
-      e.kind = RequestKind::Http;
-      e.summary = saved->http.method + " " + saved->http.url;
-      e.status = resp->status;
-      e.total_ms = resp->timing.total_ms;
-      e.request = *saved;
-      {
-        std::lock_guard lk(history_mutex());
-        wsc->append_history(e);
-      }
-      w->post([e = std::move(e)](RequestTab& t) {
-        if (t.ctx_.history_added) t.ctx_.history_added(e);
-      });
-    }
+    if (!(resp->error == "cancelled")) record_history(resp->status, resp->timing.total_ms);
   });
   editor()->set_in_flight(true);
   response()->show_sending(RequestKind::Http);
@@ -1134,10 +1416,12 @@ void RequestTab::send_grpc(Clock::time_point click) {
     return;
   }
   Workspace* ws = ctx_.workspace ? ctx_.workspace() : nullptr;
-  const bool grpc_inherited = ws && ws->has_inherited_settings(req_);  // folder metadata / vars
-  if (ws && (grpc_has_vars(req_) || grpc_inherited)) {
-    const bool prompted = !ws->blocked_env_vars(req_).empty();
-    if (std::string err; !confirm_env_vars(*ws, req_, this, &err)) {
+  auto rq_p = std::make_shared<SavedRequest>(for_inheritance(req_));  // inherits as send_http's
+  const SavedRequest& rq = *rq_p;
+  const bool grpc_inherited = ws && ws->has_inherited_settings(rq);  // folder metadata / vars
+  if (ws && (grpc_has_vars(rq) || grpc_inherited)) {
+    const bool prompted = !ws->blocked_env_vars(rq).empty();
+    if (std::string err; !confirm_env_vars(*ws, rq, this, &err)) {
       response()->show_error(err);
       return;
     }
@@ -1146,6 +1430,7 @@ void RequestTab::send_grpc(Clock::time_point click) {
   const uint64_t gen = ++gen_;
   in_flight_ = true;
   sent_at_ = click;
+  if (drop_snapshot_time(req_) && on_title_changed) on_title_changed(this);
   {
     std::lock_guard lk(worker_->msg_m);
     worker_->msgs.clear();
@@ -1153,7 +1438,7 @@ void RequestTab::send_grpc(Clock::time_point click) {
     worker_->msg_gen = gen;
   }
 
-  auto saved = std::make_shared<const SavedRequest>(req_);
+  std::shared_ptr<const SavedRequest> saved = std::move(rq_p);
   auto wsc = ws ? std::make_shared<Workspace>(*ws) : nullptr;
   const bool interactive = grpc_ && grpc_->interactive();
   auto w = worker_;
@@ -1200,7 +1485,8 @@ void RequestTab::send_grpc(Clock::time_point click) {
       HistoryEntry e;
       e.when_iso = now_iso();
       e.kind = RequestKind::Grpc;
-      e.summary = saved->grpc_method + " @ " + saved->grpc_target.address;
+      e.summary = make_history_summary(saved->grpc_method + " @ " + saved->grpc_target.address,
+                                       r.grpc_target.address, wsc->active_env);
       e.status = resp->status_code;
       e.total_ms = resp->timing.total_ms;
       e.request = *saved;
@@ -1263,6 +1549,12 @@ void RequestTab::on_grpc_done(uint64_t gen, std::shared_ptr<const GrpcResponse> 
   if (gen != gen_ || !in_flight_) return;
   on_grpc_messages(gen);
   finish(gen);
+  if (r && !r->ok)
+    if (std::string hint = web_port_hint(req_.grpc_target, r->status_message + " " + r->error_details); !hint.empty()) {
+      auto c = std::make_shared<GrpcResponse>(*r);
+      c->status_message += hint;
+      r = std::move(c);
+    }
   last_ = LastResponse{nullptr, nullptr, r};
   last_pending_ = false;
   response()->show_grpc(std::move(r));
@@ -1396,6 +1688,7 @@ void RequestTab::load_schema_now(const SavedRequest& r) {
       Metadata md = req->grpc_opts.metadata;
       md.insert(md.end(), req->grpc_opts.reflect_metadata.begin(), req->grpc_opts.reflect_metadata.end());
       s = client->load_via_reflection(req->grpc_target, 5000, md);
+      if (!s.ok) s.error += web_port_hint(req->grpc_target, s.error);
     } else {
       s = client->load_proto_files(req->proto_files, req->import_dirs);
     }

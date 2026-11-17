@@ -54,6 +54,10 @@ struct EnvModel {
   std::string name;
   std::string orig_name;  // empty for a new environment
   bool globals = false;
+  // The session's runtime variables (Workspace::runtime_vars: captures, scripts, pre-request
+  // variables). Memory only: Save sets them, nothing is written to disk.
+  bool runtime = false;
+  bool fixed() const { return globals || runtime; }  // no name, no delete, no secrets
   std::vector<VarRow> vars;
   size_t unreadable() const {
     size_t n = 0;
@@ -180,7 +184,7 @@ class EnvDialog : public wxDialog {
     int first = 0;
     const std::string want = select.empty() ? ws_.active_env : select;
     for (size_t i = 0; i < envs_.size(); ++i)
-      if (!envs_[i].globals && envs_[i].name == want) first = static_cast<int>(i);
+      if (!envs_[i].fixed() && envs_[i].name == want) first = static_cast<int>(i);
     refresh_list();
     list_->SetSelection(first);
     show_env(first);
@@ -205,6 +209,11 @@ class EnvDialog : public wxDialog {
     g.globals = true;
     for (const auto& [k, v] : ws_.globals) g.vars.push_back({k, v, false, false, {}});
     envs_.push_back(std::move(g));
+    EnvModel rt;
+    rt.name = "Runtime";
+    rt.runtime = true;
+    for (const auto& [k, v] : ws_.runtime_vars) rt.vars.push_back({k, v, false, false, {}});
+    envs_.push_back(std::move(rt));
     for (const auto& e : ws_.environments()) {
       EnvModel m;
       m.name = m.orig_name = e.name;
@@ -260,6 +269,14 @@ class EnvDialog : public wxDialog {
     namerow->Add(name_, 1, wxALIGN_CENTER_VERTICAL | wxRIGHT, FromDIP(16));
     namerow->Add(show_, 0, wxALIGN_CENTER_VERTICAL);
     right->Add(namerow, 0, wxEXPAND | wxBOTTOM, FromDIP(8));
+    runtime_note_ = new wxStaticText(this, wxID_ANY,
+                                     "Set this session by captures, scripts and pre-request variables (e.g. a captured "
+                                     "{{tok}}). Highest precedence, above the environment. Kept in memory only: "
+                                     "never written to disk; edits here apply until watt closes.");
+    runtime_note_->SetForegroundColour(dim_colour());
+    runtime_note_->Wrap(FromDIP(560));
+    runtime_note_->Hide();
+    right->Add(runtime_note_, 0, wxEXPAND | wxBOTTOM, FromDIP(8));
 
     grid_ = new wxGrid(this, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxBORDER_THEME);
     grid_->CreateGrid(0, 3);
@@ -343,7 +360,7 @@ class EnvDialog : public wxDialog {
     });
     // One click toggles "Secret" (the default needs a click to select, another to edit).
     grid_->Bind(wxEVT_GRID_CELL_LEFT_CLICK, [this](wxGridEvent& e) {
-      if (e.GetCol() != kColSecret || envs_[cur_].globals) {
+      if (e.GetCol() != kColSecret || envs_[cur_].fixed()) {
         e.Skip();
         return;
       }
@@ -354,7 +371,7 @@ class EnvDialog : public wxDialog {
     grid_->Bind(wxEVT_GRID_EDITOR_SHOWN, [this](wxGridEvent& e) {
       if (e.GetCol() == kColSecret) {
         e.Veto();
-        if (!envs_[cur_].globals) set_secret(e.GetRow(), !row_secret(e.GetRow()));
+        if (!envs_[cur_].fixed()) set_secret(e.GetRow(), !row_secret(e.GetRow()));
       } else {
         e.Skip();
       }
@@ -373,7 +390,7 @@ class EnvDialog : public wxDialog {
         delete_rows();
         return;
       }
-      if (e.GetKeyCode() == WXK_SPACE && grid_->GetGridCursorCol() == kColSecret && !envs_[cur_].globals) {
+      if (e.GetKeyCode() == WXK_SPACE && grid_->GetGridCursorCol() == kColSecret && !envs_[cur_].fixed()) {
         const int r = grid_->GetGridCursorRow();
         set_secret(r, !row_secret(r));
         return;
@@ -384,7 +401,7 @@ class EnvDialog : public wxDialog {
       const int r = e.GetRow();
       if (!grid_->IsInSelection(r, 0)) grid_->SelectRow(r);
       wxMenu m;
-      if (!envs_[cur_].globals) m.Append(1, row_secret(r) ? "Make not secret" : "Make secret");
+      if (!envs_[cur_].fixed()) m.Append(1, row_secret(r) ? "Make not secret" : "Make secret");
       m.Append(2, "Delete variable");
       const int id = GetPopupMenuSelectionFromUser(m);
       if (id == 1) set_secret(r, !row_secret(r));
@@ -401,7 +418,9 @@ class EnvDialog : public wxDialog {
   }
 
   wxString list_label(const EnvModel& m) const {
-    wxString s = wxString::FromUTF8(m.globals ? "Globals" : (m.name.empty() ? "(unnamed)" : m.name));
+    wxString s = wxString::FromUTF8(m.globals    ? std::string("Globals")
+                                    : m.runtime ? "Runtime \xC2\xB7 " + std::to_string(m.vars.size()) + " (session)"
+                                                : (m.name.empty() ? std::string("(unnamed)") : m.name));
     if (m.unreadable()) s += wxString::FromUTF8("  \xE2\x9A\xA0");
     return s;
   }
@@ -420,11 +439,15 @@ class EnvDialog : public wxDialog {
     cur_ = i;
     loading_ = true;
     const EnvModel& m = envs_[i];
-    name_->ChangeValue(wxString::FromUTF8(m.globals ? "Globals" : m.name));
-    name_->Enable(!m.globals);
-    del_env_->Enable(!m.globals);
+    name_->ChangeValue(wxString::FromUTF8(m.globals ? "Globals" : m.runtime ? "Runtime (this session only)" : m.name));
+    name_->Enable(!m.fixed());
+    del_env_->Enable(!m.fixed());
     grid_->ShowCol(kColSecret);
-    if (m.globals) grid_->HideCol(kColSecret);
+    if (m.fixed()) grid_->HideCol(kColSecret);
+    if (runtime_note_) {
+      runtime_note_->Show(m.runtime);
+      Layout();
+    }
     grid_->ClearGrid();
     if (grid_->GetNumberRows() > 0) grid_->DeleteRows(0, grid_->GetNumberRows());
     grid_->AppendRows(static_cast<int>(m.vars.size()) + 1);
@@ -504,7 +527,7 @@ class EnvDialog : public wxDialog {
       VarRow v;
       v.name = trim(grid_->GetCellValue(r, kColName).utf8_string());
       v.value = grid_->GetCellValue(r, kColValue).utf8_string();
-      v.secret = !m.globals && row_secret(r);
+      v.secret = !m.fixed() && row_secret(r);
       v.unreadable = row_unreadable(r) && v.value.empty();
       if (v.unreadable) v.stored = stored_[r];
       if (v.name.empty() && v.value.empty() && !v.unreadable) continue;
@@ -561,7 +584,7 @@ class EnvDialog : public wxDialog {
     std::string name = base;
     for (int n = 2;; ++n) {
       bool clash = false;
-      for (const auto& e : envs_) clash = clash || (!e.globals && e.name == name);
+      for (const auto& e : envs_) clash = clash || (!e.fixed() && e.name == name);
       if (!clash) break;
       name = base + " " + std::to_string(n);
     }
@@ -602,7 +625,7 @@ class EnvDialog : public wxDialog {
     std::set<std::string> names;
     for (size_t i = 0; i < envs_.size(); ++i) {
       const auto& m = envs_[i];
-      if (!m.globals) {
+      if (!m.fixed()) {
         const std::string n = trim(m.name);
         if (n.empty()) return fail(static_cast<int>(i), "An environment needs a name.");
         if (!names.insert(n).second)
@@ -615,13 +638,17 @@ class EnvDialog : public wxDialog {
           return fail(static_cast<int>(i), wxString::FromUTF8("The variable \"" + v.name + "\" is defined twice."));
       }
     }
-    std::map<std::string, std::string> globals;
+    std::map<std::string, std::string> globals, runtime;
     std::vector<Environment> out;
     std::string active = ws_.active_env;
     bool active_found = active.empty();
     for (const auto& m : envs_) {
       if (m.globals) {
         for (const auto& v : m.vars) globals[v.name] = v.value;
+        continue;
+      }
+      if (m.runtime) {
+        for (const auto& v : m.vars) runtime[v.name] = v.value;
         continue;
       }
       Environment e;
@@ -659,6 +686,7 @@ class EnvDialog : public wxDialog {
                    wxOK | wxICON_ERROR, this);
       return false;
     }
+    ws_.runtime_vars = std::move(runtime);  // memory only
     saved = true;
     return true;
   }
@@ -673,6 +701,7 @@ class EnvDialog : public wxDialog {
 
   wxStaticText* banner_ = nullptr;
   EnvList* list_ = nullptr;
+  wxStaticText* runtime_note_ = nullptr;
   wxButton* del_env_ = nullptr;
   wxStaticText* name_label_ = nullptr;
   wxTextCtrl* name_ = nullptr;

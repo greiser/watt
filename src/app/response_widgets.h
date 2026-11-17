@@ -75,6 +75,9 @@ struct Phase {
   bool reused = false;  // 0 because the connection was reused (drawn as "reused", not a bar)
   bool has_value = true;  // false: "n/a" (e.g. TLS on plaintext, a phase a failed request never reached)
   bool failed = false;    // the phase the request failed in (drawn in the error colour)
+  // Parts of this phase (the hops of "Redirects"): shown as rows under it when the user expands
+  // it (click the row), each bar where it ran inside the phase.
+  std::vector<Phase> sub;
 };
 
 struct TimingModel {
@@ -82,6 +85,9 @@ struct TimingModel {
   std::string kind;  // "http" / "grpc": deltas only compare like with like
   std::vector<Phase> phases;
   double total = 0;
+  // Phases drawn after the total (the post-response script: it runs once the response is
+  // complete, so it is not part of the response time). The last phases add up to it.
+  double after = 0;
   double server_wait = 0;  // the TTFB / wait phase
   // total = server_wait + network + client: network is DNS, connect, TLS, upload, download (and
   // the non-server part of redirects), client is watt's own time (queue, prepare, process).
@@ -116,6 +122,13 @@ class Waterfall : public wxWindow {
   // to come (faint) with a live elapsed clock and a moving bar, instead of empty space. Ends
   // with set() / clear().
   void set_waiting(Clock::time_point since);
+  // What is known while waiting, before the engine's breakdown arrives: the first byte / message
+  // came at first_ms after the send (< 0: nothing yet), with `bytes` body bytes (HTTP) or `msgs`
+  // messages (gRPC) so far. The phases before it are drawn as done, the transfer as running.
+  void set_live(double first_ms, uint64_t bytes, size_t msgs);
+  // The request was cancelled: the reserved rows stay (nothing below moves) and say so; the
+  // figures of an earlier run are not shown under a cancelled request. Ends with set() / clear().
+  void set_cancelled(double after_ms);
   bool has_figures() const { return cur_.valid; }
   // The connection pill in the header was clicked (screen rectangle of the pill). Set: the pill
   // is drawn with a drop-down mark and a hand cursor.
@@ -126,6 +139,8 @@ class Waterfall : public wxWindow {
   void on_paint();
   void on_motion(const wxPoint& p);
   int row_h() const { return FromDIP(18); }
+  int row_count(const TimingModel& m) const;  // phase rows, plus the sub rows when expanded
+  bool expand_sub_ = false;                   // sub rows (redirect hops) shown
   int header_h() const { return FromDIP(22); }
   int footer_h() const { return FromDIP(24); }
   TimingModel cur_;
@@ -139,7 +154,12 @@ class Waterfall : public wxWindow {
   int hover_ = -2;
   wxRect pill_;  // connection pill as last drawn (empty: none)
   bool waiting_ = false;
+  bool cancelled_ = false;
+  double cancel_ms_ = 0;
   Clock::time_point wait_since_{};
+  double live_first_ms_ = -1;
+  uint64_t live_bytes_ = 0;
+  size_t live_msgs_ = 0;
   wxTimer wait_timer_;
   void paint_waiting(wxDC& dc);
   std::function<void(const wxRect&)> on_conn_;
@@ -202,8 +222,11 @@ class ChipBar : public wxWindow {
     std::string label, tip;
     int group;
     bool right, on = false, enabled = true, visible = true;
+    bool folded = false;  // no room on the bar: listed under the "more" chip instead
     wxRect rect;
   };
+  wxRect more_rect_;  // the "more" chip (right chips that did not fit), empty when all fit
+  void more_menu();
   Chip* find(int id);
   void on_paint();
   std::vector<Chip> chips_;

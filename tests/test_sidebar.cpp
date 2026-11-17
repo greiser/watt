@@ -4,12 +4,17 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <chrono>
+#include <fstream>
+#include <set>
 #include <filesystem>
+#include <algorithm>
 #include <string>
+#include <vector>
 
 // No wx dependency: compiled into this test directly.
 #include "app/sidebar_files.cpp"
 #include "app/sidebar_fuzzy.cpp"
+#include "app/sidebar_import.cpp"
 
 namespace fs = std::filesystem;
 using namespace watt;
@@ -144,6 +149,26 @@ TEST_CASE("filter rank: exact name before folder path matches", "[sidebar]") {
   CHECK(filter_rank("order", "List orders", "orders", "") > filter_rank("order", "Get user", "orders", ""));
 }
 
+TEST_CASE("filter rank on lower-case keys matches filter_rank and stays cheap", "[sidebar]") {
+  // The sidebar ranks every hit of a keystroke with pre-lowered keys (no allocation).
+  CHECK(filter_rank_lower("create order", "create order", "orders", "post {{base}}/orders") ==
+        filter_rank("create order", "Create order", "orders", "POST {{base}}/orders"));
+  CHECK(filter_rank_lower("ref  order", "create refund", "orders/refunds", "post") ==
+        filter_rank("ref  order", "Create refund", "orders/refunds", "POST"));
+  CHECK(filter_rank_lower("", "a", "b", "c") < 0);
+  CHECK(filter_rank_lower("   ", "a", "b", "c") < 0);
+  CHECK(filter_rank_lower("zzz", "a", "b", "c") < 0);
+  // 10k hits (a keystroke in a 10k-request workspace) in a few ms.
+  std::vector<std::string> names;
+  for (int i = 0; i < 10000; ++i) names.push_back("endpoint " + std::to_string(i));
+  const auto t0 = std::chrono::steady_clock::now();
+  int best = -1;
+  for (const auto& n : names) best = std::max(best, filter_rank_lower("endpoint 77", n, "bulk/group 07", "get /json/77"));
+  const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+  CHECK(best >= 10000);  // the exact name wins
+  CHECK(ms < 25);
+}
+
 TEST_CASE("natural order: numbers by value, case-insensitive", "[sidebar]") {
   CHECK(natural_less("endpoint 17-2", "endpoint 17-10"));
   CHECK_FALSE(natural_less("endpoint 17-10", "endpoint 17-2"));
@@ -152,4 +177,793 @@ TEST_CASE("natural order: numbers by value, case-insensitive", "[sidebar]") {
   CHECK(natural_less("a", "a1"));
   CHECK(natural_less("v007", "v8"));
   CHECK_FALSE(natural_less("same", "same"));
+}
+
+// ------------------------------------------------------------------ history store
+
+#include "core/model_history_store.h"
+
+namespace {
+HistoryEntry entry(const std::string& when, const std::string& summary, long status, double ms) {
+  HistoryEntry e;
+  e.when_iso = when;
+  e.summary = summary;
+  e.status = status;
+  e.total_ms = ms;
+  return e;
+}
+}  // namespace
+
+TEST_CASE("history: a kept response is found again from the listed entry", "[sidebar][history]") {
+  TempWs t;
+  HistoryEntry live = entry("2026-11-17T10:00:00Z", "GET http://127.0.0.1:18080/json", 200, 1.5412345678901234);
+  live.request.name = "Get json";
+  live.request.http.url = "http://127.0.0.1:18080/json";
+  t.ws.append_history(live);
+  REQUIRE(save_history_response(t.dir, live, "{\"kind\":\"http\",\"status\":200}"));
+  // What Workspace::history() reads back (a restart) maps to the same file.
+  auto listed = t.ws.history(10);
+  REQUIRE(listed.size() == 1);
+  CHECK(history_entry_key(listed[0]) == history_entry_key(live));
+  auto j = load_history_response(t.dir, listed[0]);
+  REQUIRE(j);
+  CHECK(*j == "{\"kind\":\"http\",\"status\":200}");
+  // Another send of the same request in the same second is another entry.
+  CHECK(history_entry_key(entry(live.when_iso, live.summary, 200, 1.6)) != history_entry_key(live));
+  // Kept under .watt only.
+  CHECK(history_response_file(t.dir, live).parent_path() == t.dir / ".watt" / "responses");
+}
+
+TEST_CASE("history: delete and clear hide entries and drop their responses", "[sidebar][history]") {
+  TempWs t;
+  std::vector<HistoryEntry> all;
+  for (int i = 0; i < 5; ++i) {
+    HistoryEntry e = entry("2026-11-17T10:00:0" + std::to_string(i) + "Z", "GET http://h/health", 200, 1.0 + i);
+    t.ws.append_history(e);
+    save_history_response(t.dir, e, "{}");
+    all.insert(all.begin(), e);  // newest first
+  }
+  REQUIRE(hide_history_entries(t.dir, {all[1]}));
+  CHECK(!load_history_response(t.dir, all[1]));
+  CHECK(load_history_response(t.dir, all[0]));
+  auto listed = t.ws.history(100);
+  filter_hidden_history(load_history_hidden(t.dir), listed);
+  CHECK(listed.size() == 4);
+
+  REQUIRE(clear_history(t.dir, all));
+  CHECK(!load_history_response(t.dir, all[0]));
+  listed = t.ws.history(100);
+  filter_hidden_history(load_history_hidden(t.dir), listed);
+  CHECK(listed.empty());
+  // A send after the clear (same second as the newest cleared one) shows.
+  HistoryEntry later = entry(all[0].when_iso, "GET http://h/health", 200, 9.0);
+  t.ws.append_history(later);
+  listed = t.ws.history(100);
+  filter_hidden_history(load_history_hidden(t.dir), listed);
+  REQUIRE(listed.size() == 1);
+  CHECK(listed[0].total_ms == 9.0);
+}
+
+TEST_CASE("history: hidden filter keeps listing 10k entries fast", "[sidebar][history]") {
+  TempWs t;
+  std::vector<HistoryEntry> hide;
+  for (int i = 0; i < 10000; ++i) {
+    char when[32];
+    std::snprintf(when, sizeof when, "2026-11-17T%02d:%02d:%02dZ", i / 3600, (i / 60) % 60, i % 60);
+    HistoryEntry e = entry(when, "GET http://127.0.0.1:18080/json/" + std::to_string(i), 200, 0.5 + i * 0.001);
+    t.ws.append_history(e);
+    if (i % 10 == 0) hide.push_back(e);
+  }
+  REQUIRE(hide_history_entries(t.dir, hide));
+  t.ws.history(10);  // warm the segment handles, as the app's first listing does
+  const auto t0 = std::chrono::steady_clock::now();
+  auto listed = t.ws.history(10000);
+  const auto t1 = std::chrono::steady_clock::now();
+  const HistoryHidden h = load_history_hidden(t.dir);
+  filter_hidden_history(h, listed);
+  const auto t2 = std::chrono::steady_clock::now();
+  CHECK(listed.size() == 9000);
+  const double list_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+  const double filter_ms = std::chrono::duration<double, std::milli>(t2 - t1).count();
+  CHECK(filter_ms < 20.0);  // the sidebar filters ~1500 entries, not 10k
+  WARN("list 10k: " << list_ms << " ms, hidden filter (1000 keys): " << filter_ms << " ms");
+  // What the sidebar lists: the newest 500 plus room for the hidden ones.
+  const auto t3 = std::chrono::steady_clock::now();
+  auto shown = t.ws.history(500 + h.keys.size());
+  filter_hidden_history(load_history_hidden(t.dir), shown);
+  const double side_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t3).count();
+  CHECK(shown.size() >= 500);
+  CHECK(side_ms < 30.0);
+  WARN("sidebar listing (1500 read, filtered): " << side_ms << " ms");
+}
+
+TEST_CASE("history: prune keeps the newest response files", "[sidebar][history]") {
+  TempWs t;
+  for (int i = 0; i < 10; ++i) save_history_response(t.dir, entry("2026-11-17T10:00:00Z", "x", i, 1), std::string(1000, 'a'));
+  prune_history_responses(t.dir, 4, 1ull << 30);
+  size_t n = 0;
+  for (const auto& e : fs::directory_iterator(t.dir / ".watt" / "responses")) n += e.is_regular_file();
+  CHECK(n == 4);
+}
+
+// ------------------------------------------------------------------ collection import
+
+namespace {
+
+// A Postman v2.1 export as the app writes it (Collection > Export > v2.1): ids, the schema URL,
+// folder auth and scripts, disabled headers / params, every body mode, collection variables.
+const char* kPostmanV21 = R"PM({
+	"info": {
+		"_postman_id": "8c3e2b5f-1f0a-4c7d-9a43-2d1f6b8e9c10",
+		"name": "Shop API",
+		"description": "Orders and users",
+		"schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
+		"_exporter_id": "31415926"
+	},
+	"item": [
+		{
+			"name": "Users",
+			"item": [
+				{
+					"name": "Get user",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"exec": [
+									"pm.test(\"status 200\", function () {",
+									"    pm.response.to.have.status(200);",
+									"});"
+								],
+								"type": "text/javascript",
+								"packages": {}
+							}
+						}
+					],
+					"request": {
+						"method": "GET",
+						"header": [
+							{ "key": "Accept", "value": "application/json", "type": "text" },
+							{ "key": "X-Debug", "value": "1", "type": "text", "disabled": true }
+						],
+						"url": {
+							"raw": "{{baseUrl}}/users/:id?expand=orders",
+							"host": [ "{{baseUrl}}" ],
+							"path": [ "users", ":id" ],
+							"query": [
+								{ "key": "expand", "value": "orders" },
+								{ "key": "trace", "value": "true", "disabled": true }
+							],
+							"variable": [ { "key": "id", "value": "42" } ]
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "Admin",
+					"item": [
+						{
+							"name": "Create user",
+							"request": {
+								"auth": {
+									"type": "basic",
+									"basic": [
+										{ "key": "password", "value": "{{adminPass}}", "type": "string" },
+										{ "key": "username", "value": "admin", "type": "string" }
+									]
+								},
+								"method": "POST",
+								"header": [],
+								"body": {
+									"mode": "raw",
+									"raw": "{\n    \"name\": \"Ada\"\n}",
+									"options": { "raw": { "language": "json" } }
+								},
+								"url": {
+									"raw": "{{baseUrl}}/users",
+									"host": [ "{{baseUrl}}" ],
+									"path": [ "users" ]
+								}
+							},
+							"response": []
+						}
+					]
+				}
+			],
+			"auth": {
+				"type": "bearer",
+				"bearer": [ { "key": "token", "value": "{{token}}", "type": "string" } ]
+			},
+			"event": [
+				{ "listen": "prerequest", "script": { "type": "text/javascript", "exec": [ "console.log('users folder');" ] } }
+			],
+			"variable": [ { "key": "userId", "value": "42" } ]
+		},
+		{
+			"name": "Login (form)",
+			"request": {
+				"auth": { "type": "noauth" },
+				"method": "POST",
+				"header": [],
+				"body": {
+					"mode": "urlencoded",
+					"urlencoded": [
+						{ "key": "user", "value": "ada lovelace", "type": "text" },
+						{ "key": "debug", "value": "1", "type": "text", "disabled": true }
+					]
+				},
+				"url": { "raw": "https://shop.example.com/login", "protocol": "https", "host": [ "shop", "example", "com" ], "path": [ "login" ] }
+			},
+			"response": []
+		},
+		{
+			"name": "Upload avatar",
+			"request": {
+				"method": "PUT",
+				"header": [],
+				"body": {
+					"mode": "formdata",
+					"formdata": [
+						{ "key": "file", "type": "file", "src": "/Users/ada/avatar.png" },
+						{ "key": "caption", "value": "me", "type": "text" }
+					]
+				},
+				"url": { "raw": "{{baseUrl}}/avatar", "host": [ "{{baseUrl}}" ], "path": [ "avatar" ] }
+			},
+			"response": []
+		},
+		{
+			"name": "Legacy FTP",
+			"request": { "method": "GET", "header": [], "url": { "raw": "ftp://files.example.com/a.txt" } },
+			"response": []
+		}
+	],
+	"auth": {
+		"type": "apikey",
+		"apikey": [
+			{ "key": "value", "value": "{{apiKey}}", "type": "string" },
+			{ "key": "key", "value": "X-Api-Key", "type": "string" }
+		]
+	},
+	"event": [
+		{ "listen": "prerequest", "script": { "type": "text/javascript", "packages": {}, "exec": [ "" ] } },
+		{ "listen": "test", "script": { "type": "text/javascript", "packages": {}, "exec": [ "" ] } }
+	],
+	"variable": [
+		{ "key": "baseUrl", "value": "https://shop.example.com/api", "type": "string" },
+		{ "key": "token", "value": "", "type": "string" }
+	]
+})PM";
+
+const SavedRequest* find_req(const ImportFolder& f, const std::string& name) {
+  for (const auto& r : f.requests)
+    if (r.name == name) return &r;
+  for (const auto& sub : f.folders)
+    if (const SavedRequest* r = find_req(sub, name)) return r;
+  return nullptr;
+}
+
+std::string header(const SavedRequest& r, const std::string& name) {
+  for (const auto& h : r.http.headers)
+    if (h.first == name) return h.second;
+  return "<none>";
+}
+
+void put_file(const fs::path& p, const std::string& s) { std::ofstream(p, std::ios::binary) << s; }
+
+std::string folder_var(const ImportFolder& f, const std::string& name) {
+  for (const auto& v : f.vars)
+    if (v.name == name) return v.enabled ? v.value : "<disabled>";
+  return "<none>";
+}
+
+}  // namespace
+
+TEST_CASE("import: a Postman v2.1 export becomes folders, requests and collection variables", "[sidebar][import]") {
+  std::string err;
+  auto r = parse_collection_text(kPostmanV21, &err);
+  REQUIRE(r);
+  CHECK(r->format == "Postman Collection v2.1");
+  CHECK(r->root.name == "Shop API");
+  REQUIRE(r->root.folders.size() == 1);
+  CHECK(r->root.folders[0].name == "Users");
+  REQUIRE(r->root.folders[0].folders.size() == 1);
+  CHECK(r->root.folders[0].folders[0].name == "Admin");
+
+  const SavedRequest* get = find_req(r->root, "Get user");
+  REQUIRE(get);
+  CHECK(get->http.method == "GET");
+  CHECK(get->http.url == "{{baseUrl}}/users/:id?expand=orders");
+  CHECK(get->disabled_params == std::vector<std::pair<std::string, std::string>>{{"trace", "true"}});
+  CHECK(get->path_params == std::vector<std::pair<std::string, std::string>>{{"id", "42"}});
+  CHECK(header(*get, "Accept") == "application/json");
+  REQUIRE(get->http.headers.size() == 3);  // Accept, X-Debug (disabled), Authorization (folder bearer)
+  CHECK(get->disabled_headers == std::set<size_t>{1});
+  CHECK(header(*get, "Authorization") == "Bearer {{token}}");  // folder auth wins over collection apikey
+  CHECK(header(*get, "X-Api-Key") == "<none>");
+  CHECK(get->pre_script == "console.log('users folder');");
+  CHECK(get->post_script.find("pm.response.to.have.status(200)") != std::string::npos);
+
+  const SavedRequest* create = find_req(r->root, "Create user");
+  REQUIRE(create);
+  CHECK(create->http.method == "POST");
+  CHECK(create->basic_auth.enabled);
+  CHECK(create->basic_auth.user == "admin");
+  CHECK(create->basic_auth.password == "{{adminPass}}");
+  CHECK(header(*create, "Content-Type") == "application/json");
+  CHECK(create->http.body.find("\"Ada\"") != std::string::npos);
+
+  const SavedRequest* login = find_req(r->root, "Login (form)");
+  REQUIRE(login);
+  CHECK(login->http.body == "user=ada%20lovelace");
+  CHECK(header(*login, "Content-Type") == "application/x-www-form-urlencoded");
+  CHECK(header(*login, "X-Api-Key") == "<none>");  // noauth
+
+  const SavedRequest* up = find_req(r->root, "Upload avatar");
+  REQUIRE(up);
+  REQUIRE(up->form.size() == 2);
+  CHECK(up->form[0].kind == FormPart::Kind::File);
+  CHECK(up->form[0].value == "/Users/ada/avatar.png");  // a reference, read (with consent) at send
+  CHECK(header(*up, "X-Api-Key") == "{{apiKey}}");       // collection auth inherited
+
+  CHECK(find_req(r->root, "Legacy FTP") == nullptr);
+  REQUIRE(r->skipped.size() == 1);
+  CHECK(r->skipped[0].find("ftp://") != std::string::npos);
+
+  // Collection variables are the collection folder's variables, folder ones the folder's: they
+  // resolve under whatever environment is active (no new, inactive environment).
+  CHECK(r->envs.empty());
+  CHECK(folder_var(r->root, "baseUrl") == "https://shop.example.com/api");
+  CHECK(folder_var(r->root, "token") == "");
+  CHECK(folder_var(r->root.folders[0], "userId") == "42");
+
+  // Written into the workspace: one folder per collection folder, .req.json per request.
+  TempWs t;
+  const fs::path dest = t.dir / "imports";
+  fs::create_directories(dest);
+  auto w = write_import(t.ws, dest, *r);
+  CHECK(w.requests == 4);
+  CHECK(w.folders == 3);
+  CHECK(w.top == dest / "Shop API");
+  CHECK(fs::exists(dest / "Shop API" / "Users" / "Admin" / "create-user.req.json"));
+  CHECK(fs::exists(dest / "Shop API" / "Users" / "get-user.req.json"));
+  auto back = t.ws.load_request(dest / "Shop API" / "Users" / "get-user.req.json");
+  REQUIRE(back);
+  CHECK(back->http.url == "{{baseUrl}}/users/:id?expand=orders");
+  CHECK(back->disabled_headers == std::set<size_t>{1});
+  CHECK(back->post_script == get->post_script);
+  CHECK(w.vars == 3);
+  {
+    auto fs_top = t.ws.folder_settings(dest / "Shop API");
+    REQUIRE(fs_top);
+    REQUIRE(fs_top->vars.size() == 2);
+    CHECK(fs_top->vars[0].name == "baseUrl");
+    auto fs_users = t.ws.folder_settings(dest / "Shop API" / "Users");
+    REQUIRE(fs_users);
+    REQUIRE(fs_users->vars.size() == 1);
+    // An unrelated active environment does not hide them.
+    Environment local;
+    local.name = "local";
+    local.vars["other"] = "1";
+    t.ws.environments().push_back(local);
+    t.ws.active_env = "local";
+    CHECK(t.ws.expand(back->http.url, *back) == "https://shop.example.com/api/users/:id?expand=orders");
+    CHECK(t.ws.expand("{{userId}}", *back) == "42");
+  }
+  REQUIRE(w.order.count(dest / "Shop API"));
+  CHECK(w.order[dest / "Shop API"].front() == L"Users");
+  const std::string summary = import_summary(*r, w);
+  INFO(summary);
+  CHECK(summary.find("Imported 4 requests, 3 folders, 1 skipped (1 ftp:// URL") == 0);
+
+  // A second import does not overwrite the first.
+  auto r2 = parse_collection_text(kPostmanV21, &err);
+  REQUIRE(r2);
+  auto w2 = write_import(t.ws, dest, *r2);
+  CHECK(w2.top == dest / "Shop API 2");
+
+  // Environments merge: a new one is added, an existing one only gains the vars it lacks.
+  std::vector<Environment> envs(1);
+  envs[0].name = "Shop API";
+  envs[0].vars["baseUrl"] = "http://localhost:8080";
+  std::vector<Environment> imported(1);
+  imported[0].name = "Shop API";
+  imported[0].vars = {{"baseUrl", "https://shop.example.com/api"}, {"userId", "42"}};
+  CHECK(merge_import_envs(envs, imported) == 1);
+  CHECK(envs[0].vars["baseUrl"] == "http://localhost:8080");
+  CHECK(envs[0].vars["userId"] == "42");
+}
+
+TEST_CASE("import: hostile names stay inside the workspace", "[sidebar][import]") {
+  const char* coll = R"({"info":{"name":"..","schema":"https://schema.getpostman.com/json/collection/v2.1.0/collection.json"},
+    "item":[{"name":"../../escape","item":[{"name":"..\\..\\x","request":{"method":"GET","url":"http://a/"}}]},
+            {"name":"CON","item":[{"name":"r","request":{"method":"G T","url":"http://a/"}}]},
+            {"name":"file","request":{"method":"GET","url":"file:///c:/windows/win.ini"}}]})";
+  std::string err;
+  auto r = parse_collection_text(coll, &err);
+  REQUIRE(r);
+  CHECK(r->skipped.size() == 2);  // the method with a space, the file: URL
+  TempWs t;
+  auto w = write_import(t.ws, t.dir, *r);
+  CHECK(w.requests == 1);
+  for (fs::recursive_directory_iterator it(t.dir), end; it != end; ++it) {
+    const std::string rel = it->path().lexically_relative(t.dir).generic_string();
+    CHECK(rel.find("..") != 0);
+  }
+  CHECK(fs::exists(w.top));
+  CHECK(w.top.parent_path() == t.dir);
+  // Outside the workspace: nothing is written.
+  auto w2 = write_import(t.ws, t.dir.parent_path(), *r);
+  CHECK(w2.requests == 0);
+}
+
+TEST_CASE("import: Insomnia v4 export", "[sidebar][import]") {
+  const char* ins = R"({"_type":"export","__export_format":4,"__export_source":"insomnia.desktop.app:v8.6.1","resources":[
+    {"_id":"wrk_1","parentId":null,"name":"Petstore","_type":"workspace"},
+    {"_id":"fld_1","parentId":"wrk_1","name":"Pets","_type":"request_group","metaSortKey":-1},
+    {"_id":"req_1","parentId":"fld_1","name":"List pets","method":"GET","url":"{{ _.base_url }}/pets",
+     "headers":[{"name":"Accept","value":"application/json"},{"name":"X-Off","value":"1","disabled":true}],
+     "parameters":[{"name":"limit","value":"10"},{"name":"tag","value":"dog","disabled":true}],
+     "authentication":{"type":"bearer","token":"{{ _.token }}"},"body":{},"_type":"request","metaSortKey":-2},
+    {"_id":"req_2","parentId":"wrk_1","name":"Add pet","method":"POST","url":"{{base_url}}/pets",
+     "body":{"mimeType":"application/json","text":"{\"name\":\"Rex\"}"},"headers":[],"authentication":{},"_type":"request"},
+    {"_id":"grpc_1","parentId":"wrk_1","name":"Say hello","url":"grpcs://localhost:50051","protoMethodName":"/hello.Greeter/SayHello",
+     "body":{"text":"{\"name\":\"x\"}"},"metadata":[],"_type":"grpc_request"},
+    {"_id":"env_base","parentId":"wrk_1","name":"Base Environment","data":{"base_url":"http://localhost:3000","auth":{"user":"a"}},"_type":"environment"},
+    {"_id":"env_prod","parentId":"env_base","name":"Production","data":{"base_url":"https://petstore.example.com"},"_type":"environment"}]})";
+  std::string err;
+  auto r = parse_collection_text(ins, &err);
+  REQUIRE(r);
+  CHECK(r->format == "Insomnia v4");
+  CHECK(r->root.name == "Petstore");
+  REQUIRE(r->root.folders.size() == 1);
+  CHECK(r->root.folders[0].name == "Pets");
+  const SavedRequest* list = find_req(r->root, "List pets");
+  REQUIRE(list);
+  CHECK(list->http.url == "{{base_url}}/pets?limit=10");
+  CHECK(list->disabled_params.size() == 1);
+  CHECK(header(*list, "Authorization") == "Bearer {{token}}");
+  CHECK(list->disabled_headers == std::set<size_t>{1});
+  const SavedRequest* add = find_req(r->root, "Add pet");
+  REQUIRE(add);
+  CHECK(header(*add, "Content-Type") == "application/json");
+  const SavedRequest* hello = find_req(r->root, "Say hello");
+  REQUIRE(hello);
+  CHECK(hello->kind == RequestKind::Grpc);
+  CHECK(hello->grpc_target.tls);
+  CHECK(hello->grpc_target.address == "localhost:50051");
+  // The base environment: the workspace folder's variables, except base_url, which the
+  // Production sub-environment overrides (an environment ranks below folder variables).
+  CHECK(folder_var(r->root, "auth.user") == "a");
+  CHECK(folder_var(r->root, "base_url") == "<none>");
+  REQUIRE(r->envs.size() == 1);
+  CHECK(r->envs[0].name == "Production");
+  CHECK(r->envs[0].vars.at("base_url") == "https://petstore.example.com");
+  CHECK(r->envs[0].vars.count("auth.user") == 0);
+}
+
+TEST_CASE("import: OpenAPI 3 in YAML, one request per operation, tags as folders", "[sidebar][import]") {
+  const char* yaml = R"(openapi: 3.0.3
+info:
+  title: Pet Store   # comment
+  version: "1.0"
+servers:
+  - url: https://{env}.example.com/v1
+    variables:
+      env:
+        default: api
+tags:
+  - name: pets
+    description: Pets
+security:
+  - bearerAuth: []
+paths:
+  /pets:
+    get:
+      tags: [pets]
+      summary: List pets
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, default: 20 }
+        - $ref: '#/components/parameters/TraceId'
+      responses:
+        '200':
+          description: OK
+    post:
+      tags:
+      - pets
+      operationId: createPet
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Pet'
+      responses:
+        '201': { description: Created }
+  /pets/{petId}:
+    parameters:
+      - name: petId
+        in: path
+        required: true
+        schema:
+          type: string
+          example: "007"
+    delete:
+      summary: >
+        Delete a
+        pet
+      responses: {}
+  /health:
+    get:
+      security: []
+      description: |
+        Liveness.
+        Second line.
+      responses: {}
+components:
+  parameters:
+    TraceId:
+      name: X-Trace
+      in: header
+      required: true
+      schema: { type: string, example: abc }
+  schemas:
+    Pet:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string, example: Rex }
+        age: { type: integer }
+        tags:
+          type: array
+          items: { type: string }
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+)";
+  std::string err;
+  auto r = parse_collection_text(yaml, &err);
+  INFO(err);
+  REQUIRE(r);
+  CHECK(r->format == "OpenAPI 3.0.3");
+  CHECK(r->root.name == "Pet Store");
+  REQUIRE(r->root.folders.size() == 1);
+  CHECK(r->root.folders[0].name == "pets");
+  CHECK(r->root.folders[0].requests.size() == 2);
+  CHECK(r->root.requests.size() == 2);  // untagged: delete, health
+  const SavedRequest* list = find_req(r->root, "List pets");
+  REQUIRE(list);
+  CHECK(list->http.url == "{{baseUrl}}/pets");
+  CHECK(list->disabled_params == std::vector<std::pair<std::string, std::string>>{{"limit", "20"}});
+  CHECK(header(*list, "X-Trace") == "abc");
+  CHECK(header(*list, "Authorization") == "Bearer {{token}}");
+  const SavedRequest* create = find_req(r->root, "createPet");
+  REQUIRE(create);
+  CHECK(create->http.method == "POST");
+  CHECK(create->http.body.find("\"name\": \"Rex\"") != std::string::npos);
+  CHECK(create->http.body.find("\"tags\": [") != std::string::npos);
+  const SavedRequest* del = find_req(r->root, "Delete a pet");
+  REQUIRE(del);
+  CHECK(del->http.url == "{{baseUrl}}/pets/:petId");
+  CHECK(del->path_params == std::vector<std::pair<std::string, std::string>>{{"petId", "007"}});
+  const SavedRequest* health = find_req(r->root, "GET /health");
+  REQUIRE(health);
+  CHECK(header(*health, "Authorization") == "<none>");
+  CHECK(health->docs == "Liveness.\nSecond line.\n");
+  CHECK(folder_var(r->root, "baseUrl") == "https://api.example.com/v1");
+  REQUIRE(r->envs.size() == 1);  // the credential placeholders
+  CHECK(r->envs[0].vars.count("baseUrl") == 0);
+  CHECK(r->envs[0].secrets.count("token"));
+}
+
+TEST_CASE("import: a Bruno collection folder", "[sidebar][import]") {
+  TempWs src;
+  const fs::path c = src.dir / "bruno-coll";
+  fs::create_directories(c / "Users");
+  fs::create_directories(c / "environments");
+  put_file(c / "bruno.json", R"({"version":"1","name":"My API","type":"collection"})");
+  put_file(c / "collection.bru",
+           "headers {\n  X-Client: watt\n}\n\nauth {\n  mode: bearer\n}\n\nauth:bearer {\n  token: {{token}}\n}\n\n"
+           "vars:pre-request {\n  apiVersion: v2\n  baseUrl: http://collection\n}\n");
+  put_file(c / "Users" / "folder.bru", "meta {\n  name: People\n  seq: 1\n}\n\nvars:pre-request {\n  team: core\n}\n");
+  put_file(c / "Users" / "create.bru", R"(meta {
+  name: Create user
+  type: http
+  seq: 2
+}
+
+post {
+  url: {{baseUrl}}/users?x=1
+  body: json
+  auth: inherit
+}
+
+params:query {
+  x: 1
+  ~debug: true
+}
+
+headers {
+  ~X-Off: 1
+}
+
+body:json {
+  {
+    "name": "Ada"
+  }
+}
+
+assert {
+  res.status: eq 201
+}
+
+vars:post-response {
+  userId: res.body.id
+}
+
+script:post-response {
+  bru.setVar("x", 1);
+}
+
+tests {
+  test("ok", function() {});
+}
+)");
+  put_file(c / "Users" / "get.bru",
+           "meta {\n  name: Get user\n  seq: 1\n}\n\nget {\n  url: {{baseUrl}}/users/:id\n  body: none\n  auth: basic\n}\n\n"
+           "params:path {\n  id: 7\n}\n\nauth:basic {\n  username: u\n  password: p\n}\n");
+  put_file(c / "environments" / "Local.bru", "vars {\n  baseUrl: http://localhost:3000\n  ~off: 1\n}\nvars:secret [\n  token\n]\n");
+  std::string err;
+  auto r = parse_collection_file(c, &err);
+  INFO(err);
+  REQUIRE(r);
+  CHECK(r->format == "Bruno");
+  CHECK(r->root.name == "My API");
+  REQUIRE(r->root.folders.size() == 1);
+  CHECK(r->root.folders[0].name == "People");
+  REQUIRE(r->root.folders[0].requests.size() == 2);
+  CHECK(r->root.folders[0].requests[0].name == "Get user");  // seq order
+  const SavedRequest& cr = r->root.folders[0].requests[1];
+  CHECK(cr.http.method == "POST");
+  CHECK(cr.http.url == "{{baseUrl}}/users?x=1");
+  CHECK(cr.disabled_params.size() == 1);
+  CHECK(cr.http.body == "{\n  \"name\": \"Ada\"\n}");
+  CHECK(header(cr, "Authorization") == "Bearer {{token}}");
+  CHECK(header(cr, "X-Client") == "watt");
+  CHECK(header(cr, "Content-Type") == "application/json");
+  REQUIRE(cr.asserts.size() == 1);
+  CHECK(cr.asserts[0].target == "res.status");
+  CHECK(cr.asserts[0].op == "eq");
+  CHECK(cr.asserts[0].value == "201");
+  REQUIRE(cr.captures.size() == 1);
+  CHECK(cr.captures[0].var == "userId");
+  CHECK(cr.post_script.find("bru.setVar") != std::string::npos);
+  CHECK(cr.post_script.find("test(\"ok\"") != std::string::npos);
+  const SavedRequest& g = r->root.folders[0].requests[0];
+  CHECK(g.basic_auth.enabled);
+  CHECK(g.path_params == std::vector<std::pair<std::string, std::string>>{{"id", "7"}});
+  CHECK(folder_var(r->root, "apiVersion") == "v2");
+  CHECK(folder_var(r->root, "baseUrl") == "<none>");  // Local defines it: the environment keeps winning
+  CHECK(folder_var(r->root.folders[0], "team") == "core");
+  REQUIRE(r->envs.size() == 1);
+  CHECK(r->envs[0].name == "Local");
+  CHECK(r->envs[0].vars.at("baseUrl") == "http://localhost:3000");
+  CHECK(r->envs[0].vars.count("off") == 0);
+  CHECK(r->envs[0].secrets.count("token"));
+}
+
+TEST_CASE("import: a 2000-request Postman collection parses fast", "[sidebar][import]") {
+  std::string coll = R"({"info":{"name":"Big","schema":"https://schema.getpostman.com/json/collection/v2.1.0/collection.json"},"item":[)";
+  for (int f = 0; f < 20; ++f) {
+    coll += std::string(f ? "," : "") + R"({"name":"Folder )" + std::to_string(f) + R"(","item":[)";
+    for (int i = 0; i < 100; ++i)
+      coll += std::string(i ? "," : "") + R"({"name":"Req )" + std::to_string(i) +
+              R"(","request":{"method":"PATCH","url":{"raw":"{{base}}/items/)" + std::to_string(i) + R"("}}})";
+    coll += "]}";
+  }
+  coll += "]}";
+  const auto t0 = std::chrono::steady_clock::now();
+  std::string err;
+  auto r = parse_collection_text(coll, &err);
+  REQUIRE(r);
+  const double parse_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+  CHECK(parse_ms < 200);
+  TempWs t;
+  const auto t1 = std::chrono::steady_clock::now();
+  auto w = write_import(t.ws, t.dir, *r);
+  const double write_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t1).count();
+  WARN("2000 requests written in " << write_ms << " ms");
+  CHECK(w.requests == 2000);
+  CHECK(w.folders == 21);
+  // Every file is there once, in collection order.
+  const fs::path f0 = w.top / "Folder 0";
+  REQUIRE(w.order.count(f0));
+  REQUIRE(w.order[f0].size() == 100);
+  CHECK(w.order[f0][0] == L"req-0.req.json");
+  CHECK(w.order[f0][99] == L"req-99.req.json");
+  size_t files = 0;
+  for (fs::recursive_directory_iterator it(w.top), end; it != end; ++it) files += it->path().extension() == ".json";
+  CHECK(files == 2000);
+}
+
+TEST_CASE("import: YAML subset", "[sidebar][import]") {
+  std::string err;
+  auto j = yaml_to_json("a: 1\nb:\n  - x\n  - y: 2\n    z: 'it''s'\nc: \"q\\n\"\nd: {e: [1, 2], f: null}\ng: 007\n", &err);
+  INFO(err);
+  REQUIRE(j);
+  CHECK(*j == R"({"a":1,"b":["x",{"y":2,"z":"it's"}],"c":"q\n","d":{"e":[1,2],"f":null},"g":"007"})");
+  CHECK_FALSE(parse_collection_text("just: yaml\n", &err));
+  CHECK_FALSE(parse_collection_text("{\"not\": \"a collection\"}", &err));
+}
+
+TEST_CASE("export: a folder as a Postman v2.1 collection imports back the same requests", "[sidebar][import]") {
+  std::string err;
+  auto r = parse_collection_text(kPostmanV21, &err);
+  REQUIRE(r);
+  TempWs t;
+  auto w = write_import(t.ws, t.dir, *r);
+  REQUIRE(w.requests == 4);
+  const auto ex = export_postman(t.ws, w.top, "Shop API", &w.order);
+  CHECK(ex.requests == 4);
+  CHECK(ex.folders == 2);
+  auto back = parse_collection_text(ex.text, &err);
+  INFO(err);
+  REQUIRE(back);
+  CHECK(back->format == "Postman Collection v2.1");
+  REQUIRE(back->root.folders.size() == 1);
+  CHECK(back->root.folders[0].name == "Users");
+  CHECK(back->root.requests.size() == 2);
+  CHECK(back->root.requests[0].name == "Login (form)");  // collection order kept
+  for (const char* name : {"Get user", "Create user", "Login (form)", "Upload avatar"}) {
+    const SavedRequest* a = find_req(r->root, name);
+    const SavedRequest* b = find_req(back->root, name);
+    REQUIRE(a);
+    REQUIRE(b);
+    INFO(name);
+    CHECK(b->http.method == a->http.method);
+    CHECK(b->http.url == a->http.url);
+    CHECK(b->http.headers == a->http.headers);
+    CHECK(b->disabled_headers == a->disabled_headers);
+    CHECK(b->disabled_params == a->disabled_params);
+    CHECK(b->path_params == a->path_params);
+    CHECK(b->http.body == a->http.body);
+    CHECK(b->form == a->form);
+    CHECK(b->basic_auth == a->basic_auth);
+    CHECK(b->pre_script == a->pre_script);
+    CHECK(b->post_script == a->post_script);
+  }
+  // As curl commands, each under its folder / name.
+  const auto cu = export_curl(t.ws, w.top, CurlShell::Bash, &w.order);
+  CHECK(cu.requests == 4);
+  CHECK(cu.text.find("# Users/Get user\n") != std::string::npos);
+  CHECK(cu.text.find("curl") != std::string::npos);
+}
+
+TEST_CASE("environment files: a UTF-8 BOM is read, broken JSON is reported", "[sidebar][env]") {
+  TempWs t;
+  fs::create_directories(t.dir / "environments");
+  const std::string body = R"({"name":"local","seq":0,"vars":{"grpc":"127.0.0.1:50999"}})";
+  std::ofstream(t.dir / "environments" / "ok.json", std::ios::binary) << R"({"name":"ok","vars":{}})";
+  // Windows PowerShell 5 Set-Content -Encoding utf8 writes a BOM: the workspace reads it anyway.
+  std::ofstream(t.dir / "environments" / "local.json", std::ios::binary) << "\xEF\xBB\xBF" << body;
+  std::ofstream(t.dir / "environments" / "broken.json", std::ios::binary) << "{\"name\": ";
+  auto bad = unreadable_env_files(t.dir);
+  REQUIRE(bad.size() == 1);
+  CHECK(bad[0].file.filename() == "broken.json");
+  CHECK(!bad[0].bom);
+  auto ws = Workspace::open(t.dir);
+  REQUIRE(ws);
+  bool found = false;
+  for (const auto& e : ws->environments())
+    if (e.name == "local") found = e.vars.count("grpc") && e.vars.at("grpc") == "127.0.0.1:50999";
+  CHECK(found);
+  // remove_utf8_bom drops only the mark.
+  REQUIRE(remove_utf8_bom(t.dir / "environments" / "local.json", nullptr));
+  std::ifstream in(t.dir / "environments" / "local.json", std::ios::binary);
+  const std::string after((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+  CHECK(after == body);
+  CHECK(remove_utf8_bom(t.dir / "environments" / "ok.json", nullptr));
 }

@@ -1196,7 +1196,55 @@ size_t longest_line(std::string_view text) {
   return best;
 }
 
-size_t break_long_lines(std::string_view text, std::string& out, size_t max) {
+LineStats line_stats(std::string_view text) {
+  LineStats st;
+  st.lines = 1;
+  size_t cur = 0;
+  for (const char ch : text) {
+    const unsigned char c = static_cast<unsigned char>(ch);
+    if (c == '\n') {
+      ++st.lines;
+      if (cur > st.longest) st.longest = cur;
+      cur = 0;
+    } else if (c == '\t') {
+      cur += 4;
+    } else if ((c & 0xC0) != 0x80) {
+      ++cur;
+    }
+  }
+  if (cur > st.longest) st.longest = cur;
+  return st;
+}
+
+void expand_styles_for_breaks(std::string_view src, const std::vector<size_t>& breaks, std::string& styles,
+                              std::vector<int>& levels) {
+  if (breaks.empty()) return;
+  std::string st;
+  st.reserve(styles.size() + breaks.size());
+  std::vector<int> extra(levels.size(), 0);  // breaks inside each source line
+  size_t from = 0, line = 0;
+  for (const size_t b : breaks) {
+    if (b > styles.size() || b < from) break;
+    line += static_cast<size_t>(std::count(src.begin() + static_cast<ptrdiff_t>(from), src.begin() + static_cast<ptrdiff_t>(b), '\n'));
+    st.append(styles, from, b - from);
+    st.push_back(b > 0 ? styles[b - 1] : '\0');
+    if (line < extra.size()) ++extra[line];
+    from = b;
+  }
+  st.append(styles, from, std::string::npos);
+  styles.swap(st);
+  if (levels.empty()) return;
+  constexpr int kNumberMask = 0x0FFF;
+  std::vector<int> lv;
+  lv.reserve(levels.size() + breaks.size());
+  for (size_t l = 0; l < levels.size(); ++l) {
+    for (int i = 0; i < extra[l]; ++i) lv.push_back(levels[l] & kNumberMask);
+    lv.push_back(levels[l]);
+  }
+  levels.swap(lv);
+}
+
+size_t break_long_lines(std::string_view text, std::string& out, size_t max, std::vector<size_t>* breaks_at) {
   out.clear();
   out.reserve(text.size() + text.size() / max + 16);
   size_t breaks = 0;
@@ -1223,6 +1271,7 @@ size_t break_long_lines(std::string_view text, std::string& out, size_t max) {
       while (cut > p + 1 && (static_cast<unsigned char>(*cut) & 0xC0) == 0x80) --cut;
       out.append(p, static_cast<size_t>(cut - p));
       out.push_back('\n');
+      if (breaks_at) breaks_at->push_back(static_cast<size_t>(cut - text.data()));
       ++breaks;
       p = cut;
     }
@@ -1257,5 +1306,7 @@ std::string delta_ms(double v) {
   if (v >= 0) s.insert(s.begin(), '+');
   return s;
 }
+
+bool delta_is_noise(double d, double scale) { return std::fabs(d) < 2.0 || std::fabs(d) < 0.25 * std::fabs(scale); }
 
 }  // namespace watt::app::fmt

@@ -381,6 +381,7 @@ class GrpcEditor : public wxPanel, public GrpcEditorPanel {
     ctor_times_ = "ctor top " + elapsed_text(ms_between(t0, t1)) + ", schema pane " + elapsed_text(ms_between(t1, t2)) +
                   ", request pane " + elapsed_text(ms_between(t2, t3)) + ", total " + elapsed_text(ms_between(t0, Clock::now()));
     maybe_self_test();
+    maybe_type_test();
   }
 
   ~GrpcEditor() override {
@@ -1019,6 +1020,13 @@ class GrpcEditor : public wxPanel, public GrpcEditorPanel {
       if (!loading_ && redo_doc_.doc && (e.GetModificationType() & wxSTC_PERFORMED_USER) &&
           (e.GetModificationType() & (wxSTC_MOD_INSERTTEXT | wxSTC_MOD_DELETETEXT)))
         drop_doc(redo_doc_);
+      // "Replaced your text with the example" is about that replacement only: the user's next
+      // edit makes it stale, the method's own note comes back.
+      if (!loading_ && replaced_note_ && (e.GetModificationType() & wxSTC_PERFORMED_USER) &&
+          (e.GetModificationType() & (wxSTC_MOD_INSERTTEXT | wxSTC_MOD_DELETETEXT))) {
+        replaced_note_ = false;
+        notes_->SetLabel(replaced_before_);
+      }
       if (plain_ || loading_) return;
       // A big insert (a context-menu paste, drag and drop): drop the lexer before Scintilla
       // styles the new text for the caret line.
@@ -1051,16 +1059,19 @@ class GrpcEditor : public wxPanel, public GrpcEditorPanel {
       if (k == '"' && at_key_position(body_->GetCurrentPos() - 1)) show_completion(false);
     });
     // Typing a closer right before the same closer steps over it (the pair auto_close()
-    // inserted), as Ace / VS Code do.
+    // inserted), as Ace / VS Code do. No modifier check: '"' and '}' are Shift+' and Shift+]
+    // on a US keyboard (Shift+2 / AltGr+0 on a German one). A closer typed while the key list
+    // is open ends the key: the list closes first, so it never takes or completes the key.
     body_->Bind(wxEVT_CHAR, [this](wxKeyEvent& e) {
       const int k = static_cast<int>(e.GetUnicodeKey());
-      if (!plain_ && (k == '}' || k == ']' || k == '"') && e.GetModifiers() == wxMOD_NONE &&
-          body_->GetSelectionStart() == body_->GetSelectionEnd()) {
+      if (!plain_ && (k == '}' || k == ']' || k == '"')) {
+        if (body_->AutoCompActive()) body_->AutoCompCancel();
+      }
+      if (!plain_ && (k == '}' || k == ']' || k == '"') && body_->GetSelectionStart() == body_->GetSelectionEnd()) {
         const int pos = body_->GetCurrentPos();
         if (body_->GetCharAt(pos) == k) {
           const int in = string_state(pos);
           if (in >= 0 && ((k == '"') == (in == 1))) {
-            if (body_->AutoCompActive()) body_->AutoCompCancel();
             body_->GotoPos(pos + 1);
             return;
           }
@@ -2019,6 +2030,7 @@ class GrpcEditor : public wxPanel, public GrpcEditorPanel {
     tree_->set_web(web_->checked());
     update_send_label();
     if (web_blocks()) {
+      replaced_note_ = false;
       notes_->SetForegroundColour(th_.error);
       notes_->SetLabel("gRPC-Web has no client or bidi streaming: switch gRPC-Web off to call this method");
     } else if (notes_->GetForegroundColour() == th_.error) {
@@ -2144,6 +2156,7 @@ class GrpcEditor : public wxPanel, public GrpcEditorPanel {
   }
 
   void show_notes(const GrpcMethodInfo& m) {
+    replaced_note_ = false;
     std::vector<std::string> notes;
     host_->grpc_client().example_request(m.full_path, &notes);
     if (notes.empty()) notes = m.template_notes;
@@ -2178,6 +2191,8 @@ class GrpcEditor : public wxPanel, public GrpcEditorPanel {
         ++body_gen_;
         json_timer_.StartOnce(50);
         show_notes(m);
+        replaced_before_ = notes_->GetLabel();
+        replaced_note_ = true;
         notes_->SetLabel(wxString::FromUTF8("Replaced your text with the example  (Ctrl+Z restores it)"));
         return;
       }
@@ -3032,7 +3047,10 @@ class GrpcEditor : public wxPanel, public GrpcEditorPanel {
   void copy_grpcurl() {
     SavedRequest r = base_;
     store(r);
-    if (const Workspace* ws = host_->workspace()) r = ws->expanded(r);
+    if (const Workspace* ws = host_->workspace()) {
+      if (std::filesystem::path f = host_->inherit_file(); !f.empty()) r.file = f;  // its folders' metadata / vars
+      r = ws->expanded(r);
+    }
     const std::string cmd = to_grpcurl_command(r);
     if (wxTheClipboard->Open()) {
       wxTheClipboard->SetData(new wxTextDataObject(wxString::FromUTF8(cmd)));
@@ -3170,6 +3188,110 @@ class GrpcEditor : public wxPanel, public GrpcEditorPanel {
     }
   }
 
+  // WATT_GRPCED_TYPETEST=<file>: real keystrokes (SendInput, Shift held for '"', '{', '}', ':',
+  // '_') type {"count": 5, "interval_ms": 50} into the message at 50, 90 and 200 ms per key,
+  // through auto-close, step-over and the key list; the buffer must equal it exactly and parse.
+  // Run it on a workspace whose first gRPC tab has a method with a loaded schema (so the key list
+  // opens) and keep the window in the foreground. PASS / FAIL lines to <file>, then exit 0 / 1.
+  void maybe_type_test() {
+    wxString out;
+    if (!wxGetEnv("WATT_GRPCED_TYPETEST", &out) || out.empty()) return;
+    st_out_ = out.ToStdWstring();
+    st_log_.clear();
+    st_fail_ = 0;
+    tt_wait_ = 0;
+    tt_timer_.Bind(wxEVT_TIMER, [this](wxTimerEvent&) { tt_tick(); });
+    tt_timer_.StartOnce(300);
+  }
+
+  static void tt_send_key(int ch) {
+    const SHORT s = ::VkKeyScanW(static_cast<wchar_t>(ch));
+    const bool shift = (s >> 8) & 1;
+    const WORD vk = static_cast<WORD>(s & 0xff);
+    INPUT in[4]{};
+    int n = 0;
+    auto add = [&](WORD k, bool up) {
+      in[n].type = INPUT_KEYBOARD;
+      in[n].ki.wVk = k;
+      in[n].ki.wScan = static_cast<WORD>(::MapVirtualKeyW(k, MAPVK_VK_TO_VSC));
+      in[n].ki.dwFlags = up ? KEYEVENTF_KEYUP : 0;
+      ++n;
+    };
+    if (shift) add(VK_SHIFT, false);
+    add(vk, false);
+    add(vk, true);
+    if (shift) add(VK_SHIFT, true);
+    ::SendInput(static_cast<UINT>(n), in, sizeof(INPUT));
+  }
+
+  void tt_tick() {
+    static const std::string want = "{\"count\": 5, \"interval_ms\": 50}";
+    static const int speeds[] = {50, 90, 200};
+    // Every gRPC editor waits; the first one on screen with a loaded method (the key list needs
+    // its fields) runs the test.
+    static bool claimed = false;
+    if (tt_run_ < 0) {
+      if (claimed) return;
+      const bool ready = IsShownOnScreen() && find_method(method_);
+      if (!ready && ++tt_wait_ < 150) {
+        tt_timer_.StartOnce(100);
+        return;
+      }
+      claimed = true;
+      st_check(ready, "a gRPC tab on screen with a loaded method: " + method_);
+      tt_run_ = 0;
+      tt_pos_ = -1;
+    }
+    if (tt_run_ >= static_cast<int>(std::size(speeds))) {
+      st_finish();
+      return;
+    }
+    if (tt_pos_ < 0) {  // start a run: foreground, focus, empty message
+      if (wxWindow* top = wxGetTopLevelParent(this)) {
+        const HWND h = static_cast<HWND>(top->GetHWND());
+        if (::GetForegroundWindow() != h && ++tt_wait_ < 200) {  // SendInput goes to the foreground
+          // An Alt tap lets SetForegroundWindow succeed while another app is in front.
+          INPUT alt[2]{};
+          alt[0].type = alt[1].type = INPUT_KEYBOARD;
+          alt[0].ki.wVk = alt[1].ki.wVk = VK_MENU;
+          alt[1].ki.dwFlags = KEYEVENTF_KEYUP;
+          ::SendInput(2, alt, sizeof(INPUT));
+          top->Raise();
+          ::SetForegroundWindow(h);
+          tt_timer_.StartOnce(100);
+          return;
+        }
+      }
+      body_->SetFocus();
+      body_->SelectAll();
+      body_->Clear();
+      tt_popup_ = false;
+      tt_pos_ = 0;
+      tt_timer_.StartOnce(150);
+      return;
+    }
+    if (body_->AutoCompActive()) tt_popup_ = true;
+    if (tt_pos_ < static_cast<int>(want.size())) {
+      tt_send_key(static_cast<unsigned char>(want[static_cast<size_t>(tt_pos_++)]));
+      tt_timer_.StartOnce(speeds[tt_run_]);
+      return;
+    }
+    if (tt_pos_ == static_cast<int>(want.size())) {  // let the last keys land
+      ++tt_pos_;
+      tt_timer_.StartOnce(400);
+      return;
+    }
+    const std::string got = body_text();
+    const std::string ms = std::to_string(speeds[tt_run_]) + " ms/key";
+    st_check(got == want, ms + ": typed text exact: " + got);
+    size_t at = std::string::npos;
+    st_check(json_problem(got, &at).empty(), ms + ": parses");
+    st_check(tt_popup_, ms + ": key list opened while typing");
+    ++tt_run_;
+    tt_pos_ = -1;
+    tt_timer_.StartOnce(100);
+  }
+
   void st_finish() {
     st_log_ += "INFO " + load_times_ + "\n";
     st_log_ += st_fail_ ? "RESULT FAIL\n" : "RESULT PASS\n";
@@ -3303,6 +3425,8 @@ class GrpcEditor : public wxPanel, public GrpcEditorPanel {
   int cur_ = 0;
   std::map<std::string, std::string> body_by_method_;
   std::string last_template_;
+  bool replaced_note_ = false;  // notes_ says "Replaced your text with the example"
+  wxString replaced_before_;    // the method's note it replaced
   uint64_t body_gen_ = 0;
   bool brace_lit_ = false;
 
@@ -3332,6 +3456,9 @@ class GrpcEditor : public wxPanel, public GrpcEditorPanel {
   std::string ctor_times_, load_times_;  // construction / load() cost (self test INFO lines)
 
   wxTimer load_timer_, json_timer_, pump_timer_, flash_timer_;
+  wxTimer tt_timer_;  // typing test (WATT_GRPCED_TYPETEST)
+  int tt_run_ = -1, tt_pos_ = -1, tt_wait_ = 0;
+  bool tt_popup_ = false;
 };
 
 }  // namespace

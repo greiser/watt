@@ -9,6 +9,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace watt::app::http_editor {
@@ -103,6 +104,9 @@ struct VarSpan {
 };
 // {{name}} spans in s (same rules as Workspace::expand: "{{{" emits a literal brace).
 std::vector<VarSpan> find_vars(std::string_view s);
+// A {{var}} typed wrong ("{{user", "{{d}", "{userId}}", "Id}}"): what is wrong, "" when the
+// braces balance. Only brace pairs next to a name count, so JSON such as {"a":{"b":1}} passes.
+std::string brace_problem(std::string_view s);
 
 // First syntax error of a JSON body, or nullopt when it is valid (or empty). Lenient where the
 // editor is: // and /* */ comments are allowed, and a {{var}} may stand for a value or a key.
@@ -119,6 +123,30 @@ std::string reindent_json(std::string_view in);
 // Removes the whitespace between JSON tokens (strings, {{vars}} and comments kept as written; a
 // line comment keeps its line break). minify_json(reindent_json(s)) == s for minified s.
 std::string minify_json(std::string_view in);
+
+// Find bar: how many times needle occurs in hay (non-overlapping, ASCII case folding unless
+// match_case), and how many of them start before `before` (the "3 of 120" index). Stops after
+// `limit` matches (the count is then a lower bound). ~10 ms per 10 MB.
+struct MatchCount {
+  size_t total = 0;
+  size_t before = 0;
+  bool capped = false;
+};
+MatchCount count_matches(std::string_view hay, std::string_view needle, bool match_case, size_t before,
+                         size_t limit = 1000000);
+// The match the find bar goes to: forward, the first at or after `from`; backward, the last
+// that starts before `from`; either wraps around the end. npos when there is none.
+size_t find_match(std::string_view hay, std::string_view needle, bool match_case, size_t from, bool forward);
+// Every non-overlapping occurrence of needle in hay replaced by with (same rules as
+// count_matches); *n is the number replaced.
+std::string replace_all(std::string_view hay, std::string_view needle, std::string_view with, bool match_case,
+                        size_t* n = nullptr);
+
+// The Docs tab's preview: a small Markdown subset (# headings, paragraphs, - / 1. lists, > quotes,
+// ``` fences, `code`, **bold**, *italic*, [text](https://link), ---) as HTML for wxHtmlWindow.
+// Everything else is text: raw HTML is escaped (a cloned workspace's docs cannot inject markup),
+// and only http(s) links become links.
+std::string markdown_to_html(std::string_view md);
 
 std::string_view trim(std::string_view s);
 bool iequals(std::string_view a, std::string_view b);
@@ -152,5 +180,56 @@ struct TypingModel {
     for (char c : keys) type(c);
   }
 };
+
+// Row descriptions (the Description column of Params and Headers): notes saved with the request
+// and never sent. They travel in SavedRequest::docs as a trailing HTML comment, invisible when the
+// Markdown is rendered and stripped from the Docs editor:
+//   <!-- watt:descriptions
+//   param<TAB>key<TAB>text        (a path variable's key is ":name")
+//   header<TAB>Name<TAB>text
+//   -->
+// Fields escape backslash, tab, CR, LF and '>' as \ \t \r \n \g, so no text can end the comment.
+//   pre<TAB>var<TAB>expression<TAB>scope<TAB>on|off   (a pre-request variable, http_editor_pre.h)
+//   auth<TAB>field<TAB>value      (OAuth 2.0 settings: type, grant, token_url, client_id, ...)
+// (SavedRequest has no field for the last two yet; they move to the model once it has.)
+struct PreRow {
+  std::string var, expr, scope;  // scope: "runtime" / "environment" / "globals"
+  bool enabled = true;
+  bool operator==(const PreRow&) const = default;
+};
+struct RowDocs {
+  std::vector<std::pair<std::string, std::string>> params;
+  std::vector<std::pair<std::string, std::string>> headers;
+  std::vector<PreRow> pre;
+  std::vector<std::pair<std::string, std::string>> auth;
+  bool empty() const { return params.empty() && headers.empty() && pre.empty() && auth.empty(); }
+  bool operator==(const RowDocs&) const = default;
+};
+// The docs as the user wrote them, and the descriptions found at their end (if any).
+std::string split_row_docs(std::string_view docs, RowDocs& out);
+// docs with the descriptions appended (docs unchanged when there are none).
+std::string join_row_docs(std::string_view docs, const RowDocs& d);
+
+// The cookies of a Cookie header value ("a=1; b=2"), in order; a part without '=' has an empty
+// value.
+std::vector<std::pair<std::string, std::string>> parse_cookie_header(std::string_view v);
+
+// A curl import's URL without the "http://" curl's parser put in front of a URL that starts with
+// a {{variable}} ("{{base}}/echo" -> "http://{{base}}/echo"): the variable holds the scheme, so
+// the request would go to "http://http://host". Unchanged when the command itself wrote it.
+std::string strip_curl_default_scheme(std::string_view url, std::string_view cmd);
+// True when an expanded URL starts with two schemes ("http://https://host/..."), as a
+// {{base}} that holds one behind a typed "http://" gives.
+bool doubled_scheme(std::string_view url);
+
+// GraphQL over HTTP (Postman / Insomnia / Bruno's GraphQL body): the JSON body
+// {"query": "...", "variables": {...}} from the two editors. The variables text goes in as
+// written (it may hold {{vars}} that make it JSON only once expanded); empty: no "variables".
+std::string graphql_body(std::string_view query, std::string_view variables, std::string_view operation_name = {});
+// The other way, for a saved body: true when it is a JSON object with a string "query" and at
+// most "variables" (object or null) and "operationName" (string) besides; variables come back
+// pretty printed (2 spaces), operation_name empty when there is none.
+bool split_graphql_body(std::string_view body, std::string& query, std::string& variables,
+                        std::string* operation_name = nullptr);
 
 }  // namespace watt::app::http_editor

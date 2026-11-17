@@ -133,6 +133,34 @@ struct CurlData {
   bool operator==(const CurlData&) const = default;
 };
 
+// TLS identity and network path of HTTP requests: a CA bundle, a client certificate (mutual
+// TLS) and a proxy (Postman's Settings > Certificates / Proxy, Insomnia's Certificates, Bruno's
+// collection client certificates and proxy). Set on the collection / a folder (folder.json
+// "network") or on one request (its .req.json "http.network"); each part is inherited on its own:
+// an empty file / Proxy::Inherit takes the nearest outer level's value (Workspace::
+// effective_settings() says which level), and at the top the defaults apply (system trust store,
+// no client certificate, Env proxy). File paths are relative to the workspace root (or absolute)
+// and may hold {{vars}}; they are read at send time under the upload policy (blocked_files()).
+// A proxy URL, CA file or client certificate is used only after the user approved it per user
+// (Workspace::blocked_network_settings()); a literal password in proxy_url is refused (use a
+// secret {{var}}).
+// The key / PKCS#12 passphrase is never in these files: it is sealed in .watt/secrets.json
+// (Workspace::cert_passphrase()).
+struct NetworkSettings {
+  std::string ca_file;    // PEM bundle trusted instead of the Windows roots (a private CA)
+  std::string cert_file;  // client certificate: PEM (certificate + chain) or PKCS#12 (.pfx / .p12)
+  std::string key_file;   // PEM private key for a PEM cert_file ("" when cert_file holds it)
+  bool cert_off = false;  // send no client certificate here, even if an outer level sets one
+  bool ca_off = false;    // use the Windows roots here, even if an outer level sets a CA
+  // Inherit: the outer level's; at the top HttpRequest::Proxy::Env. The others as HttpRequest.
+  enum class Proxy { Inherit, Env, System, Off, Url };
+  Proxy proxy = Proxy::Inherit;
+  std::string proxy_url;  // Url: "http://host:port" (may hold {{vars}}, e.g. credentials)
+  std::string no_proxy;   // Url / System: hosts that go direct, comma separated
+  bool empty() const { return *this == NetworkSettings{}; }
+  bool operator==(const NetworkSettings&) const = default;
+};
+
 struct SavedRequest {
   std::string id;                 // stable uuid
   std::string name;
@@ -184,6 +212,11 @@ struct SavedRequest {
   // Digest / NTLM / Negotiate / AWS SigV4 / OAuth 2.0 (HTTP only); saved as "http.auth_scheme"
   // only when type is not None.
   HttpAuth auth;
+  // CA / client certificate / proxy of this request (HTTP), over its folders' (NetworkSettings).
+  // After resolved() / expanded(): the effective values, with cert_from_key naming the level
+  // whose passphrase applies (Workspace::cert_passphrase()).
+  NetworkSettings network;
+  std::string cert_from_key;
   // JavaScript run before the request is sent / after the response arrived (Postman's
   // Pre-request Script and Tests, Bruno's script:pre-request / script:post-response), in a
   // sandbox; see core/script.h. They run only once the user trusted this workspace's scripts
@@ -229,6 +262,7 @@ struct FolderSettings {
   std::vector<SettingsRow> vars;
   std::vector<Assertion> asserts;
   std::string pre_script, post_script;
+  NetworkSettings network;  // CA, client certificate, proxy (HTTP)
   bool empty() const { return *this == FolderSettings{}; }
   bool operator==(const FolderSettings&) const = default;
 };
@@ -271,6 +305,11 @@ struct EffectiveSettings {
   std::vector<Script> pre_scripts;   // run order
   std::vector<Script> post_scripts;  // run order
   std::vector<Check> asserts;        // the request's own, then collection, then folders outermost first
+  // CA / client certificate / proxy as they apply (Inherit resolved: proxy is never Inherit, an
+  // off switch clears the files), and the level each part comes from (Request when the request
+  // sets it; Collection with an empty label "" when nothing sets it: the default).
+  NetworkSettings network;
+  SettingsOrigin ca_from, cert_from, proxy_from;
   // folder.json files that could not be used (unreadable, invalid JSON, outside the workspace):
   // "<path>: <why>". http_to_send() refuses to send while there is one.
   std::vector<std::string> errors;
@@ -478,6 +517,48 @@ class Workspace {
   // "scheme://host:port" of an http(s) URL (or of an origin), lower case with the default port;
   // "" if it is not one.
   static std::string url_origin(const std::string& url);
+  // Network trust (NetworkSettings): every CA bundle, client certificate and proxy URL comes from
+  // a workspace file (folder.json / .req.json, usually git-tracked), so a cloned repository could
+  // route all requests through its proxy and make watt trust its CA: a silent MITM of every
+  // HTTPS request, Authorization headers and secrets included. Each such item is used only after
+  // the user approved it for this workspace, in the per-user <user_config_dir()>/
+  // allowed_network.json ({version, workspaces: {resolved root: [keys]}}; never read from the
+  // workspace). The Env / System / Off proxy modes use the user's own settings: no approval.
+  //   Proxy       key "proxy <origin>" (proxy_origin(): "http://10.0.0.5:8080"; credentials in
+  //               the URL do not change it)
+  //   Ca          key "ca sha256:<hex> <resolved path>": bound to the file's content, so changing
+  //               the file revokes the approval
+  //   ClientCert  key "cert <resolved cert path>[ key <resolved key path>]"
+  // CA / certificate / key files are read under the upload policy (inside the workspace or
+  // allow_file()d; UNC / device paths judged from their text, never touched before approval).
+  // An item whose file is not readable yet has file_blocked set and no fingerprint: approving it
+  // only allows the file (allow_file), and the next blocked_network_settings() call reads it and
+  // asks about its content. http_to_send() refuses to send while any item is blocked, naming it.
+  struct NetworkItem {
+    enum class Kind { Proxy, Ca, ClientCert };
+    Kind kind = Kind::Proxy;
+    std::string key;    // allowlist entry (above)
+    std::string text;   // what is trusted, for the prompt: "the proxy http://10.0.0.5:8080 (with credentials)"
+    std::string level;  // where it is set: "request", "collection", "folder api/users"
+    std::string proxy_origin;      // Proxy
+    bool proxy_credentials = false;  // Proxy: the URL carries a user name / password
+    std::filesystem::path file;    // Ca / ClientCert: the resolved CA / certificate file
+    std::filesystem::path key_file;  // ClientCert: the resolved key file, if any
+    std::string fingerprint;       // Ca: SHA-256 of the file, "AB:CD:..." ("" while file_blocked)
+    std::vector<std::string> subjects;  // Ca: certificate subjects in the bundle
+    std::vector<std::filesystem::path> file_blocked;  // files to allow (allow_file) before reading
+  };
+  std::vector<NetworkItem> blocked_network_settings(const SavedRequest& r) const;
+  bool allow_network_item(const NetworkItem& item, std::string* err = nullptr) const;
+  bool disallow_network_item(const NetworkItem& item, std::string* err = nullptr) const;
+  std::vector<std::string> allowed_network_items() const;
+  // "scheme://host:port" of a proxy URL as libcurl will use it (http / https / socks5 / socks5h
+  // only; no scheme means http; lower case, default port filled in: 1080 for SOCKS), "" if it is
+  // not a valid proxy URL (other scheme, backslash, control characters or spaces). *normalized
+  // gets the URL to hand to libcurl, rebuilt from the parsed parts (scheme://[user:pass@]host:
+  // port), so the host that is connected to is exactly the one shown.
+  static std::string proxy_origin(const std::string& proxy_url, bool* has_credentials = nullptr,
+                                  std::string* normalized = nullptr);
   // Request scripts (SavedRequest::pre_script / post_script) are code from whoever wrote the
   // workspace, often a cloned repository: they run only after the user trusted this workspace.
   // The decision is stored per user, outside every workspace, in
@@ -486,6 +567,14 @@ class Workspace {
   // .watt/trusted_scripts.json or a watt.json key) can trust it. Until trusted, the run
   // functions in core/script.h return without running and say why (the UI asks once).
   bool scripts_trusted() const;
+  // Passphrase of the client certificate key / PKCS#12 set at a level (NetworkSettings): sealed
+  // (DPAPI on Windows) in .watt/secrets.json under "watt:cert_passphrases", never in a file
+  // that goes to git. The level key is passphrase_key(origin): "" for the collection, the folder
+  // path relative to the root ("api/users"), or "request:<id>". cert_passphrase() reads the file
+  // (call it off the UI thread); "" when none is set. set_cert_passphrase("") removes it.
+  static std::string passphrase_key(const SettingsOrigin& level, const std::string& request_id = {});
+  std::string cert_passphrase(const std::string& key) const;
+  bool set_cert_passphrase(const std::string& key, const std::string& passphrase, std::string* err = nullptr) const;
   bool trust_scripts(bool trusted, std::string* err = nullptr) const;
   static std::filesystem::path user_config_dir();
   static void set_user_config_dir(const std::filesystem::path& dir);

@@ -1,6 +1,8 @@
 #include "app/response_body.h"
+#include "app/response_filter.h"
 
 #include <wx/app.h>
+#include <wx/dcbuffer.h>
 #include <wx/filedlg.h>
 #include <wx/html/htmlwin.h>
 #include <wx/menu.h>
@@ -232,8 +234,8 @@ void post_ui(const std::shared_ptr<bool>& alive, std::function<void()> fn) {
   });
 }
 
-enum ChipId { kPretty = 1, kRaw, kHex, kPreview, kViewAs = 6, kWrap = 10, kFold, kUnfold, kFind, kCopy, kSave,
-              kCase = 20, kPrev, kNext, kClose };
+enum ChipId { kPretty = 1, kRaw, kHex, kPreview, kTable, kViewAs = 6, kWrap = 10, kFold, kUnfold, kFind, kCopy, kSave,
+              kFilter, kCase = 20, kPrev, kNext, kClose, kFilterClose = 30, kFilterHelp };
 
 int lexer_for(fmt::BodyKind k) {
   switch (k) {
@@ -384,7 +386,39 @@ struct BodyView::Built {
   std::shared_ptr<const std::vector<int>> levels;
   std::shared_ptr<const std::vector<int>> line_map;
   std::string note;
+  uint64_t fseq = 0;  // Filter: the expression this was built for
+  uint64_t wseq = 0;  // Wrapped / RawWrap: wrap_seq_ when the build started
+  bool heavy = false;
+  size_t longest = 0;
+  std::shared_ptr<const std::vector<size_t>> breaks;
+  std::shared_ptr<const void> full_owner;  // the text before the breaks were inserted
+  std::string_view full;
 };
+
+namespace {
+// Position p of a text -> its position once `breaks` (offsets in that text) were inserted.
+int past_breaks(const std::vector<size_t>& b, int p) {
+  if (p < 0) return p;
+  return p + static_cast<int>(std::upper_bound(b.begin(), b.end(), static_cast<size_t>(p)) - b.begin());
+}
+
+// The inverse: position w of the text with the breaks -> position in the text without them.
+int before_breaks(const std::vector<size_t>& b, int w) {
+  if (w < 0) return w;
+  // Break i sits at offset b[i] + i of the broken text; count those before w.
+  size_t lo = 0, hi = b.size();
+  while (lo < hi) {
+    const size_t mid = (lo + hi) / 2;
+    if (b[mid] + mid < static_cast<size_t>(w)) lo = mid + 1;
+    else hi = mid;
+  }
+  return w - static_cast<int>(lo);
+}
+
+// A document this big gets no Scintilla wrap (see BodyView::Mode::Wrapped).
+constexpr size_t kHeavyBytes = 1u << 20;
+constexpr size_t kHeavyLines = 100000;
+}  // namespace
 
 // ------------------------------------------------------------------ view
 
@@ -392,6 +426,7 @@ BodyView::BodyView(wxWindow* parent)
     : wxPanel(parent, wxID_ANY),
       find_timer_(this),
       style_timer_(this),
+      filter_timer_(this),
       worker_(std::make_unique<BodyWorker>()),
       gen_(std::make_shared<std::atomic<uint64_t>>(0)),
       alive_(std::make_shared<bool>(true)) {
@@ -402,12 +437,16 @@ BodyView::BodyView(wxWindow* parent)
   bar_->add(kRaw, "Raw", "Exactly the bytes received (after content decoding)", 0);
   bar_->add(kHex, "Hex", "Hex dump of the body", 0);
   bar_->add(kPreview, "Preview", "The page rendered like a browser (Edge WebView2): no scripts run and nothing is fetched (images, stylesheets and links stay local)", 0);
+  bar_->add(kTable, "Table", "Visualize the JSON as a table: an array of objects as rows and columns (the largest "
+                            "array in the body, or the Filter's result). Click a column header to sort.", 0);
   bar_->add(kViewAs, "JSON \xE2\x96\xBE",
             "View as: the format the body is shown in, detected from Content-Type and the content. Click to show it "
             "as JSON, XML, HTML or plain text instead (for a wrong or missing Content-Type).");
   bar_->add(kWrap, "Wrap", "Wrap long lines (on by itself for small bodies whose lines do not fit)", -1, true);
   bar_->add(kFold, "Fold", "Collapse everything below the top level", -1, true);
   bar_->add(kUnfold, "Unfold", "Expand all folds", -1, true);
+  bar_->add(kFilter, "Filter", "Filter the JSON body with a JSONPath query, e.g. $.items[*].name or $..id "
+                              "(Ctrl+Shift+F). Copy and Save then take the result.", -1, true);
   bar_->add(kFind, "Find", "Search the body (Ctrl+F, F3 / Shift+F3)", -1, true);
   bar_->add(kCopy, "Copy", "Copy the whole body (Raw: the bytes exactly as received; gRPC: the message JSON without "
                           "the #n annotations, a stream as a JSON array). Ctrl+C copies a selection.", -1, true);
@@ -431,8 +470,9 @@ BodyView::BodyView(wxWindow* parent)
 
   stc_ = new wxStyledTextCtrl(this, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxBORDER_NONE);
   setup_stc();
-  factory_ = new wxStyledTextCtrl(this, wxID_ANY, wxDefaultPosition, wxSize(1, 1), wxBORDER_NONE);
-  factory_->Hide();
+  // The document factory is created in an idle moment after the view is up (or by the first
+  // body that needs it, whichever comes first): not part of the view's build.
+  CallAfter([this] { factory(); });
 
   auto* sz = new wxBoxSizer(wxVERTICAL);
   sz->Add(bar_, 0, wxEXPAND);
@@ -448,9 +488,22 @@ BodyView::BodyView(wxWindow* parent)
     find_from(true, true);
   }, find_timer_.GetId());
   Bind(wxEVT_TIMER, [this](wxTimerEvent&) { style_slice(); }, style_timer_.GetId());
+  Bind(wxEVT_TIMER, [this](wxTimerEvent&) { apply_filter(); }, filter_timer_.GetId());
+  // Wrap of a heavy document follows the pane width once a resize settles (a worker rebuild).
+  wrap_timer_.SetOwner(this);
+  Bind(wxEVT_TIMER, [this](wxTimerEvent&) { sync_wrap(); }, wrap_timer_.GetId());
+  stc_->Bind(wxEVT_SIZE, [this](wxSizeEvent& e) {
+    e.Skip();
+    if (!wrap_ || !resp_ || grpc_) return;
+    const int cur = on_screen();
+    if (cur >= 0 && docs_[cur].heavy) wrap_timer_.StartOnce(150);
+  });
   Bind(wxEVT_CHAR_HOOK, [this](wxKeyEvent& e) {
     const int k = e.GetKeyCode();
+    if (k == 'F' && e.GetModifiers() == (wxMOD_CONTROL | wxMOD_SHIFT)) return show_filter();
     if (k == 'F' && e.GetModifiers() == wxMOD_CONTROL) return show_find();
+    if (k == WXK_ESCAPE && filterbar_ && filterbar_->IsShown() && wxWindow::FindFocus() == filter_text_)
+      return close_filter();
     if (k == WXK_F3) {
       if (!findbar_->IsShown()) return show_find();
       find_from(!e.ShiftDown(), false);
@@ -470,6 +523,14 @@ BodyView::BodyView(wxWindow* parent)
   });
 
   set_mode_chips();
+}
+
+wxStyledTextCtrl* BodyView::factory() {
+  if (!factory_) {
+    factory_ = new wxStyledTextCtrl(this, wxID_ANY, wxDefaultPosition, wxSize(1, 1), wxBORDER_NONE);
+    factory_->Hide();
+  }
+  return factory_;
 }
 
 BodyView::~BodyView() {
@@ -631,19 +692,111 @@ void BodyView::apply_styles(int lexer) {
 }
 
 void BodyView::release_docs() {
+  keep_ = Keep{};
+  ++wrap_seq_;
   for (Doc& d : docs_) {
     if (d.doc) stc_->ReleaseDocument(d.doc);
     d = Doc{};
   }
 }
 
-int BodyView::shown_mode() const {
+int BodyView::base_mode() const {
+  if (mode_ == Pretty && !filter_.empty() && resp_ && kind_ == fmt::BodyKind::Json) return Filter;
   if (mode_ == Pretty && outline_) return Outline;
   if (mode_ == Raw && wrap_ && resp_ && resp_->body.size() > kWrapNative) return RawWrap;
   return mode_;
 }
 
+int BodyView::shown_mode() const {
+  const int k = base_mode();
+  if (wrap_ && resp_ && wrap_cols_ > 0 && (k == Pretty || k == Filter || k == Preview || k == Raw)) {
+    const Doc& s = docs_[k];
+    if (s.doc && s.heavy && s.longest > static_cast<size_t>(wrap_cols_)) return Wrapped;
+  }
+  return k;
+}
+
+int BodyView::on_screen() const {
+  void* p = stc_->GetDocPointer();
+  if (!p) return -1;
+  for (int i = 0; i < kModes; ++i)
+    if (docs_[i].doc == p) return i;
+  return -1;
+}
+
+int BodyView::pane_cols() const {
+  const int cw = std::max(1, stc_->TextWidth(wxSTC_STYLE_DEFAULT, "0"));
+  const int w = stc_->GetClientSize().x;
+  if (w < FromDIP(120)) return 0;
+  const int text_w = w - stc_->GetMarginWidth(0) - stc_->GetMarginWidth(2) - stc_->GetMarginLeft() - FromDIP(16);
+  return std::max(40, text_w / cw);
+}
+
+bool BodyView::wrap_stale(int k) const {
+  const Doc& d = docs_[k];
+  if (!d.doc && !d.building) return false;
+  // A few columns of slack: the line-number margin grows with the line count of the wrapped
+  // document, which would otherwise rebuild it once more for one column.
+  const int want = std::max(wrap_cols_, 40);
+  if (d.cols > want || d.cols + 3 < want) return true;
+  if (k == Wrapped) return d.src != base_mode() || d.src_doc != docs_[d.src].doc;
+  return false;
+}
+
+// The Wrapped document is built from its source's full text (without the source's own display
+// breaks): positions go source document -> full text -> wrapped document, and back.
+int BodyView::wrapped_pos(int p) const {
+  const Doc& w = docs_[Wrapped];
+  if (w.src < 0) return p;
+  const Doc& s = docs_[w.src];
+  if (s.full_owner && s.breaks) p = before_breaks(*s.breaks, p);
+  return w.breaks ? past_breaks(*w.breaks, p) : p;
+}
+
+int BodyView::source_pos(int p) const {
+  const Doc& w = docs_[Wrapped];
+  if (w.src < 0) return p;
+  if (w.breaks) p = before_breaks(*w.breaks, p);
+  const Doc& s = docs_[w.src];
+  return s.full_owner && s.breaks ? past_breaks(*s.breaks, p) : p;
+}
+
+void BodyView::sync_wrap() {
+  if (!resp_ || grpc_ || !stc_->IsShown()) return;
+  const int base = base_mode();
+  if (base == Hex || base == Table || base == Outline) return;
+  if (const int c = pane_cols(); c > 0) wrap_cols_ = c;
+  const int want = shown_mode();
+  const int cur = on_screen();
+  if ((want == Wrapped || want == RawWrap) && wrap_stale(want)) {
+    // Rebuilt for the new width: keep the place (in source positions) for when it is swapped in.
+    if (cur == Wrapped && keep_.src < 0) {
+      const int top = stc_->PositionFromLine(stc_->DocLineFromVisible(stc_->GetFirstVisibleLine()));
+      keep_ = Keep{};
+      keep_.src = docs_[Wrapped].src;
+      keep_.top = source_pos(top);
+      keep_.caret = source_pos(stc_->GetCurrentPos());
+      keep_.anchor = source_pos(stc_->GetAnchor());
+    } else if (cur == RawWrap && keep_.src < 0) {
+      keep_ = Keep{};
+      keep_.src = Raw;
+      keep_.ratio = static_cast<double>(stc_->GetFirstVisibleLine()) / std::max(1, stc_->GetLineCount());
+    }
+    Doc& d = docs_[want];
+    if (d.doc) stc_->ReleaseDocument(d.doc);  // the control keeps its own reference while shown
+    d = Doc{};
+    ++wrap_seq_;
+  }
+  if (cur != want || !docs_[want].doc) {
+    if (!docs_[want].building) request_mode(mode_);
+  } else {
+    update_margin();
+    update_note();
+  }
+}
+
 void BodyView::show_message(const std::string& text) {
+  reset_find();
   ++*gen_;
   hide_html_preview();
   resp_.reset();
@@ -675,6 +828,7 @@ void BodyView::set_http(std::shared_ptr<const HttpResponse> r) {
     bar_->set_note("No body", Tone::Dim);
     return;
   }
+  reset_find();
   ++*gen_;
   grpc_ = false;
   grpc_resp_.reset();
@@ -860,20 +1014,30 @@ bool BodyView::show_html_preview() {
 void BodyView::hide_html_preview() {
   const bool html = html_ && html_->IsShown();
   const bool web = web_ && web_->IsShown();
-  if (!html && !web) return;
+  const bool table = table_win_ && table_win_->IsShown();
+  if (!html && !web && !table) return;
   if (html) html_->Hide();
   if (web) web_->Hide();
+  if (table) table_win_->Hide();
   stc_->Show();
   Layout();
 }
 
 void BodyView::request_mode(int m) {
   if (m != Pretty) outline_ = false;
+  if (m == Table) reset_find();  // the table has its own Filter; the find bar searches the text views
   mode_ = m;
   set_mode_chips();
   if (m == Preview && show_html_preview()) return;
+  if (m == Table && resp_) return show_table();
   hide_html_preview();
   const int k = shown_mode();
+  if ((k == Wrapped || k == RawWrap) && wrap_stale(k)) {
+    Doc& w = docs_[k];
+    if (w.doc) stc_->ReleaseDocument(w.doc);
+    w = Doc{};
+    ++wrap_seq_;
+  }
   Doc& d = docs_[k];
   if (d.doc) return show_doc(k);
   if (d.building || !resp_) return update_note();
@@ -888,7 +1052,7 @@ void BodyView::build(int m) {
   // No size hint: preallocating would zero-fill the buffer here on the UI thread (~5 ms for
   // 16 MB); the worker's AddData grows it instead.
   auto box = std::make_shared<LoaderBox>();
-  box->l = static_cast<SciLoader*>(factory_->CreateLoader(0));
+  box->l = static_cast<SciLoader*>(factory()->CreateLoader(0));
   if (!box->l) return show_message("Could not allocate a document for this body.");
   const uint64_t my = *gen_;
   const fmt::BodyKind kind = kind_;
@@ -904,10 +1068,28 @@ void BodyView::build(int m) {
     pre_levels = docs_[Pretty].levels;
     if (!pre_owner || !pre_levels) return;
   }
-  auto job = [box, r, m, kind, gen, my, cols, pre_owner, pre_text, pre_levels]() -> std::shared_ptr<Built> {
+  int src_lexer = 0;
+  if (m == Wrapped) {
+    const int src = base_mode();
+    const Doc& s = docs_[src];
+    if (!s.doc || !s.owner) return;
+    pre_owner = s.full_owner ? s.full_owner : s.owner;
+    pre_text = s.full_owner ? s.full : s.text;
+    src_lexer = s.lexer;
+    d.src = src;
+    d.src_doc = s.doc;
+  }
+  if (m == Wrapped || m == RawWrap) d.cols = static_cast<int>(cols);
+  const std::string filter = filter_;
+  const uint64_t fseq = filter_seq_;
+  const uint64_t wseq = wrap_seq_;
+  auto job = [box, r, m, kind, gen, my, cols, pre_owner, pre_text, pre_levels, filter, fseq, wseq,
+              src_lexer]() -> std::shared_ptr<Built> {
     if (*gen != my) return nullptr;
     auto b = std::make_shared<Built>();
     b->box = box;
+    b->fseq = fseq;
+    b->wseq = wseq;
     const std::string_view body(r->body);
     const auto t0 = Clock::now();
     b->owner = r;
@@ -931,6 +1113,24 @@ void BodyView::build(int m) {
       auto s = std::make_shared<std::string>();
       if (fmt::pretty_html(body, *s)) formatted(s, "pretty");
       else b->note = "no markup found: shown as received";
+    } else if (m == Filter) {
+      FilterResult fr = json_filter(body, filter);
+      auto s = std::make_shared<std::string>();
+      std::string note;
+      if (!fr.ok) {
+        *s = "// " + fr.error + "\n";
+        note = "filter: " + fr.error;
+      } else if (fr.matches == 0) {
+        *s = "// nothing matches " + filter + "\n";
+        note = "filter: no match";
+      } else {
+        *s = std::move(fr.json);
+        note = std::to_string(fr.matches) + (fr.matches == 1 ? " match" : " matches") +
+               (fr.truncated ? " (cut: too many)" : "");
+      }
+      formatted(s, "filtered in");
+      b->note = note + " \xC2\xB7 " + fmt::ms(ms_between(t0, Clock::now()));
+      b->lexer = wxSTC_LEX_JSON;
     } else if (m == Preview) {
       auto s = std::make_shared<std::string>();
       fmt::html_to_text(body, *s);
@@ -956,34 +1156,67 @@ void BodyView::build(int m) {
                 fmt::ms(ms_between(t0, Clock::now()));
     } else if (m == RawWrap) {
       auto s = std::make_shared<std::string>();
-      fmt::break_long_lines(body, *s, cols);
+      auto brk = std::make_shared<std::vector<size_t>>();
+      fmt::break_long_lines(body, *s, cols, brk.get());
       b->owner = s;
       b->text = *s;
+      b->breaks = brk;
       b->display_breaks = true;
       b->note = "wrapped at " + std::to_string(cols) + " columns";
-    }
-    // Scintilla lays out a whole line to paint any of it (a 10 MB minified line: ~0.9 s per
-    // layout), so text shown as received gets display line breaks every kDisplayLine bytes.
-    if (m != Hex && b->text.data() == body.data() && fmt::longest_line(body) > kDisplayLine) {
+    } else if (m == Wrapped) {
       auto s = std::make_shared<std::string>();
-      const size_t breaks = fmt::break_long_lines(body, *s, kDisplayLine);
+      auto brk = std::make_shared<std::vector<size_t>>();
+      fmt::break_long_lines(pre_text, *s, cols, brk.get());
       b->owner = s;
       b->text = *s;
+      b->breaks = brk;
+      if (src_lexer != wxSTC_LEX_JSON) b->lexer = src_lexer;
+      b->note = "wrapped at " + std::to_string(cols) + " columns on the worker \xC2\xB7 " +
+                fmt::ms(ms_between(t0, Clock::now()));
+    }
+    // Scintilla lays out a whole line to paint any of it (a 10 MB minified line: ~0.9 s per
+    // layout), so text with a line over kDisplayLine bytes (as received, or a long string in the
+    // pretty form) gets display line breaks every kDisplayLine bytes.
+    if (m == Wrapped) {
+      b->full_owner = pre_owner;
+      b->full = pre_text;
+    } else if (m == RawWrap) {
+      b->full_owner = r;
+      b->full = body;
+    } else if (m != Hex && m != Outline && fmt::longest_line(b->text) > kDisplayLine) {
+      b->full_owner = b->owner;
+      b->full = b->text;
+      auto s = std::make_shared<std::string>();
+      auto brk = std::make_shared<std::vector<size_t>>();
+      const size_t breaks = fmt::break_long_lines(b->full, *s, kDisplayLine, brk.get());
+      b->owner = s;
+      b->text = *s;
+      b->breaks = brk;
       b->display_breaks = true;
       if (!b->note.empty()) b->note += "; ";
       b->note += "lines over " + fmt::human_bytes(kDisplayLine) + " broken for display (" + std::to_string(breaks) +
                  "x, Copy / Save keep the exact bytes)";
     }
+    // Heavy documents get no Scintilla wrap: Wrap on them is a Wrapped document when a line is
+    // wider than the pane (one pass here, off the UI thread).
+    if (b->text.size() > kHeavyLines) {  // fewer bytes cannot hold that many lines
+      const fmt::LineStats st = fmt::line_stats(b->text);
+      b->heavy = b->text.size() > kHeavyBytes || st.lines > kHeavyLines;
+      b->longest = st.longest;
+    }
     const auto t_fmt = Clock::now();
     // Style JSON and hex here instead of with a Scintilla lexer on the UI thread. The styles are
     // computed on a second thread while this one fills the document (they only need the text).
-    const bool json = kind == fmt::BodyKind::Json && m != Hex;
+    const bool json = (kind == fmt::BodyKind::Json && m != Hex) || m == Filter;
     std::string styles;
     std::vector<int> levels;
     std::thread styler;
     const bool want_style = json || m == Hex;
+    // A wrapped JSON document is styled as its source (the breaks may fall inside strings, which
+    // would read as unterminated), then the styles are carried over to the inserted breaks.
+    const bool expand = json && b->breaks && b->full_owner;
     if (want_style) {
-      const std::string_view text = b->text;
+      const std::string_view text = expand ? b->full : b->text;
       styler = std::thread([&styles, &levels, text, json] {
         if (json) fmt::style_json(text, styles, levels);
         else fmt::style_hex(text, styles);
@@ -1000,6 +1233,7 @@ void BodyView::build(int m) {
       }
     }
     if (styler.joinable()) styler.join();
+    if (expand) fmt::expand_styles_for_breaks(b->full, *b->breaks, styles, levels);
     if (*gen != my) return nullptr;
     b->doc = box->l->ConvertToDocument();
     const auto t_fill = Clock::now();
@@ -1038,8 +1272,15 @@ void BodyView::build(int m) {
 
 void BodyView::apply_built(uint64_t gen, int m, Built& b) {
   if (*gen_ != gen) return;  // a newer body replaced this one; b.box releases the document
+  if (m == Filter && b.fseq != filter_seq_) return;  // the filter changed meanwhile
+  if ((m == Wrapped || m == RawWrap) && b.wseq != wrap_seq_) return;  // built for an older width / source
   Doc& d = docs_[m];
   d.building = false;
+  d.heavy = b.heavy || m == Wrapped || m == RawWrap;
+  d.longest = b.longest;
+  d.breaks = std::move(b.breaks);
+  d.full_owner = std::move(b.full_owner);
+  d.full = d.full_owner ? b.full : std::string_view();
   d.doc = b.doc;
   b.box->l = nullptr;  // the reference is ours now (released in release_docs)
   d.owner = std::move(b.owner);
@@ -1051,12 +1292,35 @@ void BodyView::apply_built(uint64_t gen, int m, Built& b) {
   d.line_map = std::move(b.line_map);
   d.note = std::move(b.note);
   d.lexer_set = false;
+  if (m == Filter && filter_chips_) filter_chips_->set_note(d.note, d.note.rfind("filter:", 0) == 0 ? Tone::Warn : Tone::Dim);
   if (shown_mode() == m) show_doc(m);
   if (pending_reveal_ && pending_reveal_->mode == m && pending_reveal_->gen == *gen_) do_reveal(m);
 }
 
 void BodyView::show_doc(int m) {
   Doc& d = docs_[m];
+  // Wrap on / off and width changes of a heavy document swap between it and its Wrapped form:
+  // keep the place (positions of the source document; Raw <-> RawWrap by share of the lines).
+  if (const int prev = on_screen(); keep_.src < 0 && prev >= 0 && prev != m) {
+    const int top = stc_->PositionFromLine(stc_->DocLineFromVisible(stc_->GetFirstVisibleLine()));
+    keep_ = Keep{};
+    if (prev == RawWrap || (prev == Raw && m == RawWrap)) {
+      keep_.src = Raw;
+      keep_.ratio = static_cast<double>(stc_->GetFirstVisibleLine()) / std::max(1, stc_->GetLineCount());
+    } else if (prev == Wrapped) {
+      keep_.src = docs_[Wrapped].src;
+      keep_.top = source_pos(top);
+      keep_.caret = source_pos(stc_->GetCurrentPos());
+      keep_.anchor = source_pos(stc_->GetAnchor());
+    } else {
+      keep_.src = prev;
+      keep_.top = top;
+      keep_.caret = stc_->GetCurrentPos();
+      keep_.anchor = stc_->GetAnchor();
+    }
+  }
+  const Keep kp = keep_;
+  keep_ = Keep{};
   stc_->SetDocPointer(d.doc);
   stc_->SetScrollWidth(1);
   if (holding_) {
@@ -1076,8 +1340,17 @@ void BodyView::show_doc(int m) {
   apply_styles(d.lexer);
   stc_->SetReadOnly(true);
   stc_->GotoPos(0);
-  auto_wrap(d);
+  if (m != Wrapped && m != RawWrap) auto_wrap(d);
   update_margin();
+  if (const int same = m == Wrapped ? d.src : m == RawWrap ? Raw : m; kp.src >= 0 && kp.src == same) {
+    if (kp.ratio >= 0) {
+      stc_->SetFirstVisibleLine(static_cast<int>(kp.ratio * stc_->GetLineCount()));
+    } else {
+      auto to = [&](int p) { return std::clamp(m == Wrapped ? wrapped_pos(p) : p, 0, stc_->GetLength()); };
+      stc_->SetSelection(to(kp.anchor), to(kp.caret));
+      stc_->SetFirstVisibleLine(stc_->LineFromPosition(to(kp.top)));
+    }
+  }
   display_break_note(d);
   update_note();
   if (findbar_->IsShown()) {
@@ -1085,6 +1358,7 @@ void BodyView::show_doc(int m) {
     highlight_visible();
   }
   start_styling();
+  if (resp_ && (wrap_ || m == Wrapped || m == RawWrap)) sync_wrap();
 }
 
 void BodyView::auto_wrap(const Doc& d) {
@@ -1144,14 +1418,14 @@ void BodyView::update_margin() {
     stc_->SetMarginWidth(2, FromDIP(14));
     stc_->SetMarginLeft(FromDIP(2));
   }
-  // Scintilla wraps on the UI thread, laying out every line: big documents with long lines get
-  // their wrap built on the worker (Raw -> RawWrap) or no wrap at all.
-  const int len = stc_->GetLength();
-  const bool long_lines = len > (1 << 20) && len / std::max(1, lines) > 512;
-  const bool worker_wrap = mode_ == Raw && resp_ && resp_->body.size() > kWrapNative;
-  bar_->set_enabled(kWrap, worker_wrap || !long_lines);
-  if (shown_mode() == RawWrap || (long_lines && !worker_wrap)) stc_->SetWrapMode(wxSTC_WRAP_NONE);
-  else stc_->SetWrapMode(wrap_ ? wxSTC_WRAP_WORD : wxSTC_WRAP_NONE);
+  // Scintilla wraps on the UI thread, laying out every line up to the one asked for (Ctrl+End on
+  // 1.3M lines: 170 ms, again after every width change): heavy documents never get its wrap.
+  // Wrap on them shows a Wrapped / RawWrap document built on the worker, or nothing to do when
+  // every line fits the pane.
+  const int cur = on_screen();
+  const bool heavy = cur >= 0 && docs_[cur].heavy;
+  bar_->set_enabled(kWrap, !(heavy && (cur == Outline || cur == Hex)));
+  stc_->SetWrapMode(wrap_ && !heavy ? wxSTC_WRAP_WORD : wxSTC_WRAP_NONE);
   stc_->SetWrapVisualFlags(wrap_ && !preview ? wxSTC_WRAPVISUALFLAG_END : wxSTC_WRAPVISUALFLAG_NONE);
 }
 
@@ -1170,6 +1444,8 @@ void BodyView::set_mode_chips() {
   bar_->set_on(kRaw, mode_ == Raw);
   bar_->set_on(kHex, mode_ == Hex);
   bar_->set_on(kPreview, mode_ == Preview);
+  bar_->set_visible(kTable, http && kind_ == fmt::BodyKind::Json);
+  bar_->set_on(kTable, mode_ == Table);
   const bool has_doc = http || grpc_;
   bar_->set_on(kWrap, wrap_ && has_doc);
   bar_->set_on(kFold, outline_);
@@ -1179,7 +1455,14 @@ void BodyView::set_mode_chips() {
   bar_->set_visible(kSave, has_doc);
   // Empty state and error text: no editor chrome at all.
   for (int id : {kWrap, kFold, kUnfold, kFind, kCopy}) bar_->set_visible(id, has_doc);
+  bar_->set_visible(kFilter, http && kind_ == fmt::BodyKind::Json);
+  bar_->set_on(kFilter, !filter_.empty());
+  bar_->set_label(kFilter, filter_.empty() ? std::string("Filter") : "Filter \xE2\x9C\x93");
   if (mode_ == Preview) bar_->set_visible(kWrap, false);  // the rendered page lays itself out
+  // The table is a grid with its own columns: wrapping, folding and finding text do not apply to
+  // it (Filter narrows its rows).
+  if (mode_ == Table)
+    for (int id : {kWrap, kFold, kUnfold, kFind}) bar_->set_visible(id, false);
 }
 
 void BodyView::update_note() {
@@ -1199,7 +1482,7 @@ void BodyView::update_note() {
     n += k == Hex       ? " \xC2\xB7 building hex dump\xE2\x80\xA6"
          : k == Pretty  ? " \xC2\xB7 pretty-printing\xE2\x80\xA6"
          : k == Preview ? " \xC2\xB7 rendering preview\xE2\x80\xA6"
-         : k == RawWrap ? " \xC2\xB7 wrapping\xE2\x80\xA6"
+         : k == RawWrap || k == Wrapped ? " \xC2\xB7 wrapping\xE2\x80\xA6"
          : k == Outline ? " \xC2\xB7 folding\xE2\x80\xA6"
                         : " \xC2\xB7 loading\xE2\x80\xA6";
     if (holding_) n += " (previous body shown faded)";
@@ -1208,6 +1491,8 @@ void BodyView::update_note() {
     n += " \xC2\xB7 " + d.note;
     if (d.note.find("not ") != std::string::npos) tone = Tone::Warn;
   }
+  if (wrap_ && !d.building && d.heavy && k != Wrapped && k != RawWrap && (k == Pretty || k == Filter || k == Raw))
+    n += " \xC2\xB7 wrap: every line fits the pane";
   if (d.doc && !d.building) n += " \xC2\xB7 " + std::to_string(stc_->GetLineCount()) + " lines";
   bar_->set_note(n, tone);
 }
@@ -1218,27 +1503,26 @@ void BodyView::on_chip(int id) {
     case kRaw: request_mode(Raw); break;
     case kHex: request_mode(Hex); break;
     case kPreview: request_mode(Preview); break;
+    case kTable: request_mode(Table); break;
     case kViewAs: view_as_menu(); break;
     case kWrap:
       wrap_ = !wrap_;
       wrap_chosen_ = true;
       bar_->set_on(kWrap, wrap_);
-      if (mode_ == Raw && resp_ && resp_->body.size() > kWrapNative) {
-        // Big Raw body: the wrapped form is its own document, built once on the worker at the
-        // pane width.
-        if (wrap_ && !docs_[RawWrap].doc && !docs_[RawWrap].building) {
-          const int cw = std::max(1, stc_->TextWidth(wxSTC_STYLE_DEFAULT, "0"));
-          const int text_w = stc_->GetClientSize().x - stc_->GetMarginWidth(0) - stc_->GetMarginWidth(2) - FromDIP(24);
-          wrap_cols_ = std::max(40, text_w / cw);
-        }
-        request_mode(Raw);
-      } else {
-        update_margin();
-      }
+      // Heavy documents: the wrapped form is its own document, built on the worker at the pane
+      // width (sync_wrap); small ones are wrapped by Scintilla.
+      update_margin();
+      sync_wrap();
       break;
     case kFold: fold_level1(); break;
     case kUnfold: unfold_all(); break;
     case kFind: findbar_->IsShown() ? close_find() : show_find(); break;
+    case kFilter: (filterbar_ && filterbar_->IsShown()) ? close_filter() : show_filter(); break;
+    case kFilterClose: close_filter(); break;
+    case kFilterHelp:
+      filter_chips_->set_note("$ body \xC2\xB7 .key ['k'] \xC2\xB7 [0] [-1] [0,2] [1:3] \xC2\xB7 [*] .* \xC2\xB7 ..key \xC2\xB7 .length · [?(@.a > 1 && @.b == 'x')]",
+                              Tone::Dim);
+      break;
     case kCopy: copy_all(); break;
     case kSave: save_body(); break;
     case kCase:
@@ -1253,6 +1537,20 @@ void BodyView::on_chip(int id) {
     case kClose: close_find(); break;
     default: break;
   }
+  // A mode chip hides the control that had the keyboard focus (Pretty -> Table): the focus then
+  // falls out of the body, and the body's own keys (Ctrl+Shift+F filter, Ctrl+F find) would go to
+  // the frame's (the sidebar filter). The content now shown takes it.
+  if (id == kPretty || id == kRaw || id == kHex || id == kTable || id == kWrap || id == kFold || id == kUnfold ||
+      id == kCopy)
+    CallAfter([this, alive = alive_] {
+      if (!*alive) return;
+      wxWindow* const foc = wxWindow::FindFocus();
+      bool inside = false;
+      for (wxWindow* f = foc; f && !inside; f = f->GetParent()) inside = f == this;
+      if (inside && foc != bar_) return;
+      if (table_win_ && table_win_->IsShown()) table_win_->SetFocus();
+      else if (stc_->IsShown()) stc_->SetFocus();
+    });
 }
 
 namespace {
@@ -1361,11 +1659,14 @@ std::pair<std::shared_ptr<const void>, std::string_view> BodyView::whole_text() 
   }
   int k = shown_mode();
   if (k == Outline) k = Pretty;  // Copy / Save of the folded view: the whole pretty text
+  const bool wrapped = k == Wrapped && docs_[Wrapped].src >= 0;
+  if (wrapped) k = docs_[Wrapped].src;  // the wrapped view copies as its source, without the breaks
   const Doc& d = docs_[k];
   // The body exactly as received for Raw (also when broken for display) and while a view is
   // still being built; otherwise exactly what the view shows (pretty / hex / preview text).
+  if (d.display_breaks && d.full_owner) return {d.full_owner, d.full};  // without the display breaks
   if (resp_ && (k == Raw || k == RawWrap || d.display_breaks || !d.doc)) return {resp_, resp_->body};
-  if (d.owner && d.doc && static_cast<int>(d.text.size()) == stc_->GetLength()) return {d.owner, d.text};
+  if (d.owner && d.doc && (wrapped || static_cast<int>(d.text.size()) == stc_->GetLength())) return {d.owner, d.text};
   const char* p = stc_->GetCharacterPointer();
   auto snap = std::make_shared<std::string>(p ? p : "", static_cast<size_t>(stc_->GetLength()));
   const std::string_view v = *snap;
@@ -1596,6 +1897,7 @@ void BodyView::fold_level1() {
 // ------------------------------------------------------------------ gRPC stream
 
 void BodyView::begin_stream() {
+  reset_find();
   ++*gen_;
   hide_html_preview();
   resp_.reset();
@@ -1613,7 +1915,7 @@ void BodyView::begin_stream() {
   stc_->SetScrollWidth(1);
   release_docs();
   Doc& d = docs_[Pretty];
-  d.doc = factory_->CreateDocument();
+  d.doc = factory()->CreateDocument();
   d.lexer = wxSTC_LEX_JSON;
   show_doc(Pretty);
   set_mode_chips();
@@ -1678,9 +1980,24 @@ void BodyView::append_messages(const GrpcMessageEvent* m, size_t n, size_t first
   start_styling();
 }
 
+namespace {
+// "// " before every line of text: a multi-line status message stays one comment.
+std::string comment_lines(const std::string& text) {
+  std::string s = "// ";
+  for (char c : text) {
+    if (c == '\r') continue;
+    s += c;
+    if (c == '\n') s += "// ";
+  }
+  while (s.size() > 3 && s.compare(s.size() - 3, 3, "// ") == 0 && s[s.size() - 4] == '\n') s.resize(s.size() - 4);
+  s += '\n';
+  return s;
+}
+}  // namespace
+
 void BodyView::append_note(const std::string& text) {
   if (!grpc_) begin_stream();
-  append_raw("// " + text + "\n");
+  append_raw(comment_lines(text));
   update_margin();
   start_styling();
 }
@@ -1709,11 +2026,11 @@ void BodyView::finish_grpc(std::shared_ptr<const GrpcResponse> r) {
 
 void BodyView::show_grpc_error(const std::string& status_line, const std::string& details) {
   begin_stream();
-  std::string s = "// " + status_line + "\n";
+  std::string s = comment_lines(status_line);
   std::string pretty;
   if (!details.empty()) {
     if (details.rfind("hex:", 0) != 0 && fmt::pretty_json(details, pretty)) s += "// details (google.rpc.Status)\n" + pretty;
-    else s += "// details: " + details + "\n";
+    else s += comment_lines("details: " + details);
   }
   append_raw(s);
   wrap_ = true;  // an error status is prose: never cut off at the pane edge
@@ -1763,8 +2080,11 @@ void BodyView::reveal_json(std::vector<PathStep> path, long message, const std::
     size_t len = 0, deep = 0;
     const size_t at = json_locate(text.substr(off), path, &len, &deep);
     const bool exact = at != std::string_view::npos;
+    const std::string why =
+        exact ? std::string() : json_path_miss(text.substr(off), path, message < 0 ? std::string("res.body")
+                                                                           : "res.messages[" + std::to_string(i) + "]");
     select_found(from + static_cast<int>(off + (exact ? at : deep)), exact ? static_cast<int>(len) : 0, exact, label,
-                 path_string(path));
+                 path_string(path), why);
     return;
   }
   if (!resp_) return;
@@ -1783,18 +2103,31 @@ void BodyView::do_reveal(int k) {
   pending_reveal_.reset();
   const Doc& d = docs_[k];
   if (!d.doc) return;
-  auto owner = d.owner;
-  const std::string_view text = d.text;
+  // Looked up in the text without display breaks (a break may cut a string), then mapped.
+  auto owner = d.full_owner ? d.full_owner : d.owner;
+  const std::string_view text = d.full_owner ? d.full : d.text;
   const std::string what = path_string(rv.path);
-  auto apply = [this, rv, what](uint64_t gen, size_t at, size_t len, size_t deep) {
+  auto apply = [this, rv, what, k](uint64_t gen, size_t at, size_t len, size_t deep, const std::string& why) {
     if (gen != *gen_) return;
     const bool exact = at != std::string_view::npos;
-    select_found(static_cast<int>(exact ? at : deep), exact ? static_cast<int>(len) : 0, exact, rv.label, what);
+    int from = static_cast<int>(exact ? at : deep);
+    int n = exact ? static_cast<int>(len) : 0;
+    if (const Doc& dk = docs_[k]; dk.full_owner && dk.breaks) {
+      const int to = past_breaks(*dk.breaks, from + n);
+      from = past_breaks(*dk.breaks, from);
+      n = to - from;
+    }
+    if (on_screen() == Wrapped && docs_[Wrapped].src == k) {  // shown wrapped: its own positions
+      const int to = wrapped_pos(from + n);
+      from = wrapped_pos(from);
+      n = to - from;
+    }
+    select_found(from, n, exact, rv.label, what, why);
   };
   if (text.size() <= kSyncBytes) {
     size_t len = 0, deep = 0;
     const size_t at = json_locate(text, rv.path, &len, &deep);
-    return apply(*gen_, at, len, deep);
+    return apply(*gen_, at, len, deep, at == std::string_view::npos ? json_path_miss(text, rv.path) : std::string());
   }
   // A big document: walk it on the worker (memory speed, but not on the UI thread).
   const uint64_t my = *gen_;
@@ -1802,11 +2135,13 @@ void BodyView::do_reveal(int k) {
   worker_->post([owner, text, path = rv.path, my, apply, alive = alive_]() {
     size_t len = 0, deep = 0;
     const size_t at = json_locate(text, path, &len, &deep);
-    post_ui(alive, [apply, my, at, len, deep] { apply(my, at, len, deep); });
+    std::string why = at == std::string_view::npos ? json_path_miss(text, path) : std::string();
+    post_ui(alive, [apply, my, at, len, deep, why = std::move(why)] { apply(my, at, len, deep, why); });
   });
 }
 
-void BodyView::select_found(int at, int len, bool exact, const std::string& label, const std::string& what) {
+void BodyView::select_found(int at, int len, bool exact, const std::string& label, const std::string& what,
+                            const std::string& why) {
   const int n = stc_->GetLength();
   at = std::clamp(at, 0, n);
   len = std::clamp(len, 0, n - at);
@@ -1823,9 +2158,28 @@ void BodyView::select_found(int at, int len, bool exact, const std::string& labe
   }
   stc_->SetFocus();
   const std::string head = label.empty() ? what : label;
-  if (exact) bar_->set_note("line " + std::to_string(line + 1) + ": " + head, Tone::Accent);
-  else bar_->set_note(what + " not found: showing the deepest part that exists (line " + std::to_string(line + 1) + ")",
-                      Tone::Warn);
+  // An earlier explanation box goes (it belongs to another check).
+  if (miss_line_ >= 0 && miss_doc_ == stc_->GetDocPointer() && miss_line_ < stc_->GetLineCount())
+    stc_->AnnotationSetText(miss_line_, wxEmptyString);
+  miss_line_ = -1;
+  if (exact) {
+    bar_->set_note("line " + std::to_string(line + 1) + ": " + head, Tone::Accent);
+    return;
+  }
+  // The chip bar has room for a short note only: the full reason goes into a box right under the
+  // line, where it cannot be cut off.
+  bar_->set_note(what + " not found (line " + std::to_string(line + 1) + ")", Tone::Warn);
+  const Theme& th = Theme::get();
+  stc_->StyleSetForeground(wxSTC_STYLE_CALLTIP, th.warn);
+  stc_->StyleSetBackground(wxSTC_STYLE_CALLTIP, stc_->StyleGetBackground(wxSTC_STYLE_DEFAULT));
+  stc_->StyleSetFont(wxSTC_STYLE_CALLTIP, stc_->StyleGetFont(wxSTC_STYLE_DEFAULT));
+  const std::string box = "\xE2\x86\x91 " + head + " not found: the deepest part that exists is selected." +
+                          (why.empty() ? std::string() : "\n  " + why);
+  stc_->AnnotationSetText(line, wxString::FromUTF8(box));
+  stc_->AnnotationSetStyle(line, wxSTC_STYLE_CALLTIP);
+  stc_->AnnotationSetVisible(wxSTC_ANNOTATION_BOXED);
+  miss_line_ = line;
+  miss_doc_ = stc_->GetDocPointer();
 }
 
 void BodyView::display_break_note(const Doc& d) {
@@ -1837,7 +2191,7 @@ void BodyView::display_break_note(const Doc& d) {
   stc_->StyleSetBackground(wxSTC_STYLE_CALLTIP, stc_->StyleGetBackground(wxSTC_STYLE_DEFAULT));
   stc_->StyleSetFont(wxSTC_STYLE_CALLTIP, stc_->StyleGetFont(wxSTC_STYLE_DEFAULT));
   bool one_line = false;
-  if (resp_) {
+  if (resp_ && (d.full.empty() || d.full.data() == resp_->body.data())) {
     const std::string_view b = resp_->body;
     // Newlines in the first 64 KB only (no per-byte work over a 10 MB body here).
     const std::string_view head = b.substr(0, 1u << 16);
@@ -1881,7 +2235,498 @@ void BodyView::set_stale(bool stale) {
 
 // ------------------------------------------------------------------ search
 
+// ------------------------------------------------------------------ table
+
+// A custom-drawn virtual grid: only the visible cells are drawn (a few hundred DrawText calls per
+// paint), unlike a native list view, whose paint asks for every cell several times over.
+class JsonTable : public wxWindow {
+ public:
+  explicit JsonTable(wxWindow* parent)
+      : wxWindow(parent, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxVSCROLL | wxHSCROLL | wxWANTS_CHARS | wxBORDER_NONE),
+        alive_(std::make_shared<bool>(true)) {
+    SetBackgroundStyle(wxBG_STYLE_PAINT);
+    const Theme& th = Theme::get();
+    bg_ = th.dark ? wxColour(30, 30, 30) : *wxWHITE;
+    SetBackgroundColour(bg_);
+    Bind(wxEVT_PAINT, [this](wxPaintEvent&) { paint(); });
+    Bind(wxEVT_SIZE, [this](wxSizeEvent& e) {
+      e.Skip();
+      update_scrollbars();
+      Refresh(false);
+    });
+    Bind(wxEVT_MOUSEWHEEL, [this](wxMouseEvent& e) {
+      const int lines = e.GetWheelRotation() / std::max(1, e.GetWheelDelta()) * std::max(1, e.GetLinesPerAction());
+      if (e.GetWheelAxis() == wxMOUSE_WHEEL_HORIZONTAL) scroll_to(top_, left_ + lines * FromDIP(40));
+      else scroll_to(top_ - lines, left_);
+    });
+    auto on_scroll = [this](wxScrollWinEvent& e) {
+      const bool v = e.GetOrientation() == wxVERTICAL;
+      const wxEventType t = e.GetEventType();
+      int pos = v ? top_ : left_;
+      const int line = v ? 1 : FromDIP(40);
+      const int page = v ? std::max(1, visible_rows() - 1) : std::max(1, GetClientSize().x - FromDIP(40));
+      if (t == wxEVT_SCROLLWIN_LINEUP) pos -= line;
+      else if (t == wxEVT_SCROLLWIN_LINEDOWN) pos += line;
+      else if (t == wxEVT_SCROLLWIN_PAGEUP) pos -= page;
+      else if (t == wxEVT_SCROLLWIN_PAGEDOWN) pos += page;
+      else if (t == wxEVT_SCROLLWIN_TOP) pos = 0;
+      else if (t == wxEVT_SCROLLWIN_BOTTOM) pos = 1 << 30;
+      else pos = e.GetPosition();
+      if (v) scroll_to(pos, left_);
+      else scroll_to(top_, pos);
+    };
+    for (wxEventType t : {wxEVT_SCROLLWIN_TOP, wxEVT_SCROLLWIN_BOTTOM, wxEVT_SCROLLWIN_LINEUP, wxEVT_SCROLLWIN_LINEDOWN,
+                          wxEVT_SCROLLWIN_PAGEUP, wxEVT_SCROLLWIN_PAGEDOWN, wxEVT_SCROLLWIN_THUMBTRACK,
+                          wxEVT_SCROLLWIN_THUMBRELEASE})
+      Bind(wxEventTypeTag<wxScrollWinEvent>(t), on_scroll);
+    Bind(wxEVT_LEFT_DOWN, [this](wxMouseEvent& e) {
+      SetFocus();
+      const wxPoint p = e.GetPosition();
+      if (p.y < head_h()) {
+        if (const int c = col_at(p.x); c >= 0) sort_by(c);
+        return;
+      }
+      const long r = top_ + (p.y - head_h()) / row_h();
+      if (m_ && r >= 0 && static_cast<size_t>(r) < m_->cells.size()) {
+        if (e.ShiftDown() && sel_a_ >= 0) sel_b_ = r;
+        else sel_a_ = sel_b_ = r;
+        Refresh(false);
+      }
+    });
+    Bind(wxEVT_MOTION, [this](wxMouseEvent& e) { hover_tip(e.GetPosition()); });
+    Bind(wxEVT_KEY_DOWN, [this](wxKeyEvent& e) {
+      const int k = e.GetKeyCode();
+      if (e.GetModifiers() == wxMOD_CONTROL && k == 'C') return copy_selected();
+      if (e.GetModifiers() == wxMOD_CONTROL && k == 'A' && m_) {
+        sel_a_ = 0;
+        sel_b_ = static_cast<long>(m_->cells.size()) - 1;
+        return Refresh(false);
+      }
+      const int page = std::max(1, visible_rows() - 1);
+      long cur = sel_b_ < 0 ? top_ : sel_b_;
+      if (k == WXK_DOWN) cur += 1;
+      else if (k == WXK_UP) cur -= 1;
+      else if (k == WXK_PAGEDOWN) cur += page;
+      else if (k == WXK_PAGEUP) cur -= page;
+      else if (k == WXK_HOME && e.ControlDown()) cur = 0;
+      else if (k == WXK_END && e.ControlDown()) cur = 1L << 30;
+      else if (k == WXK_LEFT) return scroll_to(top_, left_ - FromDIP(40));
+      else if (k == WXK_RIGHT) return scroll_to(top_, left_ + FromDIP(40));
+      else return e.Skip();
+      if (!m_ || m_->cells.empty()) return;
+      cur = std::clamp<long>(cur, 0, static_cast<long>(m_->cells.size()) - 1);
+      if (e.ShiftDown() && sel_a_ >= 0) sel_b_ = cur;
+      else sel_a_ = sel_b_ = cur;
+      if (cur < top_) scroll_to(cur, left_);
+      else if (cur >= top_ + visible_rows()) scroll_to(cur - visible_rows() + 1, left_);
+      Refresh(false);
+    });
+  }
+  ~JsonTable() override { *alive_ = false; }
+  std::function<void(const std::string&, Tone)> on_note;
+
+  void set(std::shared_ptr<const TableModel> m) {
+    m_ = std::move(m);
+    ++sort_seq_;
+    sort_col_ = 0;
+    asc_ = true;
+    perm_.clear();
+    top_ = left_ = 0;
+    sel_a_ = sel_b_ = -1;
+    // Column widths from the text lengths of the header and the first rows (character count x the
+    // average character width: no text measuring per cell).
+    const int cw = std::max(1, GetCharWidth());
+    widths_.clear();
+    size_t digits = std::to_string(m_->cells.size()).size();
+    widths_.push_back(static_cast<int>(digits + 2) * cw + FromDIP(8));
+    for (size_t c = 0; c < m_->cols.size(); ++c) {
+      size_t chars = m_->cols[c].size() + 2;
+      for (size_t r = 0; r < m_->cells.size() && r < 400; ++r)
+        if (c < m_->cells[r].size()) chars = std::max(chars, m_->cells[r][c].size());
+      widths_.push_back(std::clamp(static_cast<int>(chars) * cw + FromDIP(16), FromDIP(48), FromDIP(420)));
+    }
+    update_scrollbars();
+    Refresh(false);
+  }
+
+ private:
+  int row_h() const { return GetCharHeight() + FromDIP(5); }
+  int head_h() const { return row_h() + FromDIP(2); }
+  int visible_rows() const { return std::max(1, (GetClientSize().y - head_h()) / row_h()); }
+  int total_w() const {
+    int w = 0;
+    for (int x : widths_) w += x;
+    return w;
+  }
+  int col_at(int x) const {
+    int cx = -left_;
+    for (size_t c = 0; c < widths_.size(); ++c) {
+      if (x >= cx && x < cx + widths_[c]) return static_cast<int>(c);
+      cx += widths_[c];
+    }
+    return -1;
+  }
+  size_t row_at(long item) const {
+    return perm_.empty() ? static_cast<size_t>(item) : perm_[static_cast<size_t>(item)];
+  }
+  const std::string& cell(size_t r, size_t c) const {
+    static const std::string none;
+    const auto& row = m_->cells[r];
+    return c < row.size() ? row[c] : none;
+  }
+  void update_scrollbars() {
+    const long rows = m_ ? static_cast<long>(m_->cells.size()) : 0;
+    const int vis = visible_rows();
+    top_ = std::clamp<long>(top_, 0, std::max<long>(0, rows - vis));
+    SetScrollbar(wxVERTICAL, static_cast<int>(top_), vis, static_cast<int>(std::max<long>(rows, 1)));
+    const int cw = GetClientSize().x, tw = total_w();
+    left_ = std::clamp(left_, 0, std::max(0, tw - cw));
+    SetScrollbar(wxHORIZONTAL, left_, cw, std::max(tw, 1));
+  }
+  void scroll_to(long top, int left) {
+    const long rows = m_ ? static_cast<long>(m_->cells.size()) : 0;
+    top = std::clamp<long>(top, 0, std::max<long>(0, rows - visible_rows()));
+    left = std::clamp(left, 0, std::max(0, total_w() - GetClientSize().x));
+    if (top == top_ && left == left_) return;
+    top_ = top;
+    left_ = left;
+    SetScrollPos(wxVERTICAL, static_cast<int>(top_));
+    SetScrollPos(wxHORIZONTAL, left_);
+    Refresh(false);
+  }
+  void paint() {
+    wxAutoBufferedPaintDC dc(this);
+    const Theme& th = Theme::get();
+    const wxSize cs = GetClientSize();
+    dc.SetBackground(wxBrush(bg_));
+    dc.Clear();
+    if (!m_) return;
+    const wxColour head_bg = th.dark ? wxColour(40, 40, 44) : wxColour(244, 244, 247);
+    const wxColour zebra = th.dark ? wxColour(35, 35, 38) : wxColour(249, 249, 251);
+    const wxColour sel = th.dark ? wxColour(38, 79, 120) : wxColour(205, 228, 255);
+    const int rh = row_h(), hh = head_h(), pad = FromDIP(6);
+    const long n = static_cast<long>(m_->cells.size());
+    const long last = std::min<long>(n, top_ + visible_rows() + 1);
+    const long s0 = std::min(sel_a_, sel_b_), s1 = std::max(sel_a_, sel_b_);
+    dc.SetPen(*wxTRANSPARENT_PEN);
+    for (long i = top_; i < last; ++i) {
+      const int y = hh + static_cast<int>(i - top_) * rh;
+      const bool selected = sel_a_ >= 0 && i >= s0 && i <= s1;
+      if (selected || (i % 2)) {
+        dc.SetBrush(wxBrush(selected ? sel : zebra));
+        dc.DrawRectangle(0, y, cs.x, rh);
+      }
+    }
+    dc.SetFont(GetFont());
+    int x = -left_;
+    for (size_t c = 0; c < widths_.size(); ++c) {
+      const int w = widths_[c];
+      if (x + w > 0 && x < cs.x) {
+        dc.SetClippingRegion(x, hh, w - FromDIP(2), cs.y - hh);
+        dc.SetTextForeground(c == 0 ? th.dim : th.fg);
+        for (long i = top_; i < last; ++i) {
+          const size_t r = row_at(i);
+          const int y = hh + static_cast<int>(i - top_) * rh + (rh - dc.GetCharHeight()) / 2;
+          if (c == 0) {
+            const wxString t = wxString::Format("%zu", r);
+            dc.DrawText(t, x + w - pad - dc.GetTextExtent(t).x, y);
+          } else {
+            const std::string& v = cell(r, c - 1);
+            if (!v.empty()) dc.DrawText(wxString::FromUTF8(v.data(), std::min<size_t>(v.size(), 300)), x + pad, y);
+          }
+        }
+        dc.DestroyClippingRegion();
+      }
+      x += w;
+    }
+    // Header (drawn last: always on top), with the sort mark.
+    dc.SetBrush(wxBrush(head_bg));
+    dc.DrawRectangle(0, 0, cs.x, hh);
+    dc.SetPen(wxPen(th.grid));
+    dc.DrawLine(0, hh - 1, cs.x, hh - 1);
+    wxFont bold = GetFont().Bold();
+    dc.SetFont(bold);
+    x = -left_;
+    for (size_t c = 0; c < widths_.size(); ++c) {
+      const int w = widths_[c];
+      if (x + w > 0 && x < cs.x) {
+        wxString t = c == 0 ? wxString("#") : wxString::FromUTF8(m_->cols[c - 1]);
+        if (static_cast<int>(c) == sort_col_ && (c > 0 || !asc_))
+          t += wxString::FromUTF8(asc_ ? " \xE2\x96\xB2" : " \xE2\x96\xBC");
+        dc.SetClippingRegion(x, 0, w - FromDIP(2), hh);
+        dc.SetTextForeground(th.fg);
+        dc.DrawText(t, c == 0 ? x + w - pad - dc.GetTextExtent(t).x : x + pad, (hh - dc.GetCharHeight()) / 2);
+        dc.DestroyClippingRegion();
+        dc.SetPen(wxPen(th.grid));
+        dc.DrawLine(x + w - 1, FromDIP(4), x + w - 1, hh - FromDIP(4));
+      }
+      x += w;
+    }
+  }
+  void hover_tip(const wxPoint& p) {
+    if (!m_) return;
+    const int c = col_at(p.x);
+    const long i = p.y < head_h() ? -1 : top_ + (p.y - head_h()) / row_h();
+    const long key = c < 0 ? -2 : i * 1000 + c;
+    if (key == tip_key_) return;
+    tip_key_ = key;
+    if (c <= 0 || i < -1 || (i >= 0 && static_cast<size_t>(i) >= m_->cells.size())) return UnsetToolTip();
+    if (i < 0) return SetToolTip(wxString::FromUTF8(m_->cols[static_cast<size_t>(c - 1)] + "\nClick to sort by it."));
+    const std::string& v = cell(row_at(i), static_cast<size_t>(c - 1));
+    if (v.size() * static_cast<size_t>(GetCharWidth()) + FromDIP(12) > static_cast<size_t>(widths_[static_cast<size_t>(c)]))
+      SetToolTip(wxString::FromUTF8(v));
+    else
+      UnsetToolTip();
+  }
+  void sort_by(int col) {
+    if (!m_) return;
+    if (col == sort_col_) asc_ = !asc_;
+    else {
+      sort_col_ = col;
+      asc_ = true;
+    }
+    Refresh(false);
+    const uint64_t seq = ++sort_seq_;
+    auto m = m_;
+    const bool asc = asc_;
+    auto work = [m, col, asc] {
+      std::vector<uint32_t> p(m->cells.size());
+      for (size_t i = 0; i < p.size(); ++i) p[i] = static_cast<uint32_t>(i);
+      if (col > 0) {
+        const size_t c = static_cast<size_t>(col - 1);
+        static const std::string none;
+        auto at = [&](uint32_t r) -> const std::string& { return c < m->cells[r].size() ? m->cells[r][c] : none; };
+        std::stable_sort(p.begin(), p.end(), [&](uint32_t a, uint32_t b) {
+          return asc ? table_cell_less(at(a), at(b)) : table_cell_less(at(b), at(a));
+        });
+      } else if (!asc) {
+        std::reverse(p.begin(), p.end());
+      }
+      return p;
+    };
+    if (m->cells.size() <= 20000) {
+      perm_ = work();
+      sel_a_ = sel_b_ = -1;
+      Refresh(false);
+      return;
+    }
+    // A big table sorts off the UI thread.
+    if (on_note) on_note("sorting " + std::to_string(m->cells.size()) + " rows\xE2\x80\xA6", Tone::Accent);
+    std::thread([work, seq, alive = alive_, this] {
+      auto p = std::make_shared<std::vector<uint32_t>>(work());
+      if (!wxTheApp) return;
+      wxTheApp->CallAfter([alive, this, seq, p] {
+        if (!*alive || seq != sort_seq_) return;
+        perm_ = std::move(*p);
+        sel_a_ = sel_b_ = -1;
+        Refresh(false);
+        if (on_note) on_note("sorted", Tone::Dim);
+      });
+    }).detach();
+  }
+  void copy_selected() {
+    if (!m_ || sel_a_ < 0) return;
+    std::string s;
+    for (size_t c = 0; c < m_->cols.size(); ++c) s += (c ? "\t" : "") + m_->cols[c];
+    s += "\n";
+    const long a = std::min(sel_a_, sel_b_), b = std::max(sel_a_, sel_b_);
+    for (long i = a; i <= b && static_cast<size_t>(i) < m_->cells.size(); ++i) {
+      const auto& row = m_->cells[row_at(i)];
+      for (size_t c = 0; c < row.size(); ++c) s += (c ? "\t" : "") + row[c];
+      s += "\n";
+    }
+    if (wxTheClipboard->Open()) {
+      wxTheClipboard->SetData(new wxTextDataObject(wxString::FromUTF8(s)));
+      wxTheClipboard->Close();
+      if (on_note) on_note("copied " + std::to_string(b - a + 1) + (b == a ? " row" : " rows") + " (tab-separated)", Tone::Ok);
+    }
+  }
+  std::shared_ptr<const TableModel> m_;
+  std::vector<uint32_t> perm_;
+  std::vector<int> widths_;  // "#" first
+  wxColour bg_;
+  long top_ = 0;
+  int left_ = 0;
+  long sel_a_ = -1, sel_b_ = -1;
+  long tip_key_ = -3;
+  int sort_col_ = 0;
+  bool asc_ = true;
+  uint64_t sort_seq_ = 0;
+  std::shared_ptr<bool> alive_;
+};
+
+void BodyView::show_table() {
+  if (!table_) {
+    table_ = new JsonTable(this);
+    table_win_ = table_;
+    table_->on_note = [this](const std::string& n, Tone t) { bar_->set_note(n, t); };
+    table_->Hide();
+    GetSizer()->Add(table_, 1, wxEXPAND);
+  }
+  if (html_) html_->Hide();
+  if (web_) web_->Hide();
+  stc_->Hide();
+  table_->Show();
+  Layout();
+  if (table_gen_ == *gen_ && table_fseq_ == filter_seq_) return;
+  table_gen_ = *gen_;
+  table_fseq_ = filter_seq_;
+  table_->set(std::make_shared<TableModel>());
+  bar_->set_note("building the table\xE2\x80\xA6", Tone::Accent);
+  auto r = resp_;
+  const std::string filter = filter_;
+  const uint64_t gen = *gen_, fseq = filter_seq_;
+  worker_->post([r, filter, gen, fseq, alive = alive_, this] {
+    const auto t0 = Clock::now();
+    auto m = std::make_shared<TableModel>();
+    if (filter.empty()) {
+      *m = json_table(r->body);
+    } else {
+      FilterResult f = json_filter(r->body, filter);
+      if (!f.ok) m->error = "filter: " + f.error;
+      else if (f.matches == 0) m->error = "the filter matches nothing";
+      else {
+        *m = json_table(f.json, "$");
+        m->source = filter;
+      }
+    }
+    const double ms = ms_between(t0, Clock::now());
+    post_ui(alive, [this, m, gen, fseq, ms] {
+      if (gen != *gen_ || fseq != filter_seq_ || !table_) return;
+      table_->set(m);
+      if (filter_chips_ && fseq == filter_seq_ && !filter_.empty())
+        filter_chips_->set_note(m->error.empty() ? std::to_string(m->cells.size()) + " rows in the table" : m->error,
+                                m->error.empty() ? Tone::Dim : Tone::Warn);
+      if (!m->error.empty()) return bar_->set_note("Table: " + m->error, Tone::Warn);
+      std::string n = m->source + " \xC2\xB7 " + std::to_string(m->cells.size()) +
+                      (m->cells.size() == 1 ? " row" : " rows") + " \xC3\x97 " + std::to_string(m->cols.size()) +
+                      (m->cols.size() == 1 ? " column" : " columns") + (m->truncated ? " (capped)" : "") + " \xC2\xB7 " +
+                      fmt::ms(ms) + " \xC2\xB7 click a header to sort, Ctrl+C copies rows";
+      bar_->set_note(n, Tone::Dim);
+    });
+  });
+}
+
+void BodyView::note(const std::string& text, Tone tone) { bar_->set_note(text, tone); }
+
+void BodyView::show_filter() {
+  show_filter_row();
+  if (filter_text_->IsEmpty()) filter_text_->ChangeValue("$.");
+  filter_text_->SetFocus();
+  // The "$." prefix is selected: typing "$[0]" or ".items" replaces it ("$.$[0]" otherwise).
+  if (filter_text_->GetValue() == "$.") filter_text_->SelectAll();
+  else filter_text_->SetInsertionPointEnd();
+}
+
+void BodyView::show_filter_row() {
+  if (!filterbar_) {
+    const Theme& th = Theme::get();
+    filterbar_ = new wxPanel(this, wxID_ANY);
+    filterbar_->SetBackgroundColour(th.bg);
+    filter_text_ = new wxTextCtrl(filterbar_, wxID_ANY, "", wxDefaultPosition, FromDIP(wxSize(300, -1)),
+                                  wxTE_PROCESS_ENTER);
+    filter_text_->SetHint("$.items[*].name   (JSONPath)");
+    filter_chips_ = new ChipBar(filterbar_, [this](int id) { on_chip(id); });
+    filter_chips_->add(kFilterHelp, "?", "JSONPath: $ is the body; .key or ['key'] a member; [0], [-1], [0,2] elements; "
+                                         "[1:3] a slice; [*] or .* everything; ..key at any depth; .length a size; "
+                                         "[?(@.price < 10 && @.name =~ /^a/i)] the elements a condition holds for "
+                                         "(@ the element, $ the body; == != < <= > >= && || !).", -1,
+                       true);
+    filter_chips_->add(kFilterClose, "Close", "Remove the filter and show the whole body (Esc)", -1, true);
+    auto* fs = new wxBoxSizer(wxHORIZONTAL);
+    fs->Add(filter_text_, 0, wxALIGN_CENTER_VERTICAL | wxLEFT, FromDIP(8));
+    fs->Add(filter_chips_, 1, wxEXPAND);
+    filterbar_->SetSizer(fs);
+    filterbar_->Hide();
+    GetSizer()->Insert(1, filterbar_, 0, wxEXPAND | wxBOTTOM, FromDIP(2));
+    filter_text_->Bind(wxEVT_TEXT, [this](wxCommandEvent&) { filter_timer_.StartOnce(250); });
+    filter_text_->Bind(wxEVT_TEXT_ENTER, [this](wxCommandEvent&) {
+      filter_timer_.Stop();
+      apply_filter();
+    });
+  }
+  if (!filterbar_->IsShown()) {
+    filterbar_->Show();
+    Layout();
+  }
+}
+
+void BodyView::set_filter(const std::string& expr) {
+  if (expr == filter_) return;
+  filter_timer_.Stop();
+  if (expr.empty()) {
+    if (filterbar_ && filterbar_->IsShown()) {
+      filterbar_->Hide();
+      Layout();
+    }
+    if (filter_text_) filter_text_->ChangeValue("");
+  } else {
+    show_filter_row();
+    filter_text_->ChangeValue(wxString::FromUTF8(expr));
+  }
+  filter_ = expr;
+  ++filter_seq_;
+  Doc& d = docs_[Filter];
+  if (d.doc) stc_->ReleaseDocument(d.doc);
+  d = Doc{};
+  if (filter_chips_) filter_chips_->set_note("");
+  set_mode_chips();
+  // The response on screen is the old request's (stale) until the next one arrives: it is not
+  // re-rendered for the new filter; the next set_http() builds with it.
+}
+
+void BodyView::close_filter() {
+  filter_timer_.Stop();
+  if (filterbar_) filterbar_->Hide();
+  if (filter_text_) filter_text_->ChangeValue("");
+  Layout();
+  if (!filter_.empty()) {
+    filter_.clear();
+    ++filter_seq_;
+    if (resp_) request_mode(mode_);
+  }
+  set_mode_chips();
+  stc_->SetFocus();
+}
+
+void BodyView::apply_filter() {
+  if (!filter_text_) return;
+  std::string e = filter_text_->GetValue().utf8_string();
+  while (!e.empty() && e.back() == ' ') e.pop_back();
+  // "$" or "$." alone: no filter yet.
+  const bool none = e.empty() || e == "$" || e == "$." || e == "res.body";
+  if (!none) {
+    if (const std::string err = json_filter_check(e); !err.empty()) {
+      filter_chips_->set_note(err, Tone::Err);
+      return;
+    }
+  }
+  const std::string want = none ? std::string() : e;
+  if (want == filter_) return;
+  filter_ = want;
+  ++filter_seq_;
+  Doc& d = docs_[Filter];
+  if (d.doc) {
+    stc_->ReleaseDocument(d.doc);
+  }
+  d = Doc{};
+  set_mode_chips();
+  if (!resp_ || kind_ != fmt::BodyKind::Json) {
+    filter_chips_->set_note(resp_ ? "the body is not JSON: nothing to filter" : "no body", Tone::Warn);
+    return;
+  }
+  filter_chips_->set_note(filter_.empty() ? "" : "filtering\xE2\x80\xA6", Tone::Accent);
+  outline_ = false;
+  if (mode_ == Table) return request_mode(Table);  // the table follows the filter
+  if (mode_ != Pretty) mode_ = Pretty;
+  request_mode(Pretty);
+}
+
 void BodyView::show_find() {
+  if (mode_ == Table) {
+    bar_->set_note("Find searches Pretty / Raw: use Filter to narrow the table", Tone::Dim);
+    return;
+  }
   if (!findbar_->IsShown()) {
     findbar_->Show();
     Layout();
@@ -1893,6 +2738,17 @@ void BodyView::show_find() {
   find_text_->SelectAll();
   schedule_count();
   highlight_visible();
+}
+
+void BodyView::reset_find() {
+  ++find_seq_;  // a search still running on the worker reports nothing
+  find_chips_->set_note("");
+  if (!findbar_->IsShown()) return;
+  findbar_->Hide();
+  Layout();
+  stc_->SetIndicatorCurrent(8);
+  stc_->IndicatorClearRange(0, stc_->GetLength());
+  hl_range_ = {0, 0};
 }
 
 void BodyView::close_find() {

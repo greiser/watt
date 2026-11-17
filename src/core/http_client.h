@@ -132,6 +132,30 @@ struct HttpRequest {
   // CA, e.g. a dev proxy's). Revocation is not checked for such a chain: private CAs rarely
   // publish CRLs. Empty = the system roots.
   std::string ca_pem;
+  // Client certificate for mutual TLS, presented when the server asks for one (Schannel). Either
+  //   PEM: client_cert holds the certificate (optionally followed by its chain) and client_key
+  //        its private key: PKCS#8 "PRIVATE KEY" / "ENCRYPTED PRIVATE KEY" (RSA or EC) or PKCS#1
+  //        "RSA PRIVATE KEY"; client_key may be empty when client_cert holds the key too; or
+  //   PKCS#12: client_cert holds the .pfx / .p12 bytes (DER) and client_key is empty.
+  // client_key_passphrase decrypts an encrypted key or the PKCS#12. The key never leaves the
+  // process (it is converted to an in-memory PKCS#12 once per distinct value and never persisted
+  // to a key store). A bad key or passphrase fails the send with a message saying which.
+  std::string client_cert;
+  std::string client_key;
+  std::string client_key_passphrase;
+  // Proxy (CURLOPT_PROXY / CURLOPT_NOPROXY):
+  //   Env     libcurl's default: the https_proxy / http_proxy / all_proxy / no_proxy variables
+  //   System  the Windows (Internet Options) proxy of the current user: its static proxy server
+  //           and bypass list ("<local>" = loopback and dotless names); auto-config scripts (PAC)
+  //           and auto-detection are not evaluated (the request goes direct then)
+  //   Off     always direct
+  //   Url     proxy_url: "http://host:port", "https://...", "socks5h://...", may carry
+  //           "user:password@"; no_proxy lists hosts that go direct (comma separated, curl syntax)
+  // Loopback hosts never go through a System proxy.
+  enum class Proxy { Env, System, Off, Url };
+  Proxy proxy = Proxy::Env;
+  std::string proxy_url;
+  std::string no_proxy;
   HttpVersion version = HttpVersion::Auto;
   bool fresh_connection = false;  // force a new connection (measure cold cost)
   bool keep_body = true;  // false: body is only streamed to on_chunk, never held in memory
@@ -205,6 +229,9 @@ struct TlsInfo {
   TlsCertificate leaf;
   int chain_length = 0;  // certificates in the chain the server sent, leaf included
   std::string chain;     // that chain, one "CN  (issued by CN, until YYYY-MM-DD)" per line
+  // The client certificate this side presented (mutual TLS), "" when none was sent.
+  std::string client_cert_subject;  // simple display name of it: "my-client"
+  std::string client_cert_issuer;   // its issuer's simple display name
   double read_ms = 0;    // what reading all this cost (once per connection)
 };
 
@@ -224,6 +251,10 @@ struct ConnectionInfo {
   long remote_port = 0;
   bool tls = false;       // a TLS session was established on this connection
   std::shared_ptr<const TlsInfo> tls_info;  // non-null when tls (null if it could not be read)
+  // The request went through this proxy (CURLINFO_USED_PROXY): "http://proxy.corp:8080", user
+  // name and password left out; remote_ip / remote_port are then the proxy's. Empty when direct.
+  std::string proxy;
+  bool client_cert = false;  // a client certificate was configured for the request (HttpRequest)
 };
 
 struct HttpResponse {
@@ -311,5 +342,10 @@ class HttpClient {
   struct Impl;
   std::unique_ptr<Impl> impl_;
 };
+
+// Simple display names of the subjects of the certificates in a PEM bundle, in file order (a
+// block that does not parse is skipped). For consent prompts: "watt will trust certificates
+// signed by <subject>".
+std::vector<std::string> pem_certificate_subjects(std::string_view pem);
 
 }  // namespace watt

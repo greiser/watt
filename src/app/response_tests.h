@@ -34,4 +34,14 @@ size_t json_locate(std::string_view text, const std::vector<PathStep>& path, siz
 // "$.items[3].name" for a path (for tooltips).
 std::string path_string(const std::vector<PathStep>& path);
 
+// Why `path` is not in the JSON `text`, in words: which part exists and what is there instead
+// ("res.body is an array, not an object: index it first, e.g. res.body[0].items"). Empty when the
+// path is there or the text is not JSON. root names the text ("res.body").
+std::string json_path_miss(std::string_view text, const std::vector<PathStep>& path,
+                           const std::string& root = "res.body");
+
+// Why a capture may not store into variable `name` ("" when it may): the same rules as core
+// apply_captures (length, no braces, no control characters, no outer spaces).
+std::string capture_var_problem(std::string_view name, size_t max_len);
+
 }  // namespace watt::app::rv

@@ -7,7 +7,7 @@
 // search counts) runs on the body view's worker; the UI thread only fills the strip, the
 // waterfall and virtual lists (which ask for the rows they draw).
 #include <wx/listctrl.h>
-#include <wx/textctrl.h>
+#include <wx/dcbuffer.h>
 #include <wx/panel.h>
 #include <wx/simplebook.h>
 #include <wx/sizer.h>
@@ -15,21 +15,32 @@
 #include <wx/menu.h>
 #include <wx/datetime.h>
 #include <wx/app.h>
+#include <wx/wupdlock.h>
+#include <wx/textentry.h>
+#include <wx/textdlg.h>
+#include <wx/stc/stc.h>
 
 #include <algorithm>
 #include <cctype>
 #include <cmath>
 #include <cstring>
 #include <map>
+#include <memory>
 #include <thread>
 
+#include "app/history_summary.h"
 #include "core/asserts.h"
+#include "core/model_history_store.h"
+#include "core/script.h"
 
+#include "app/http_editor_folder.h"
 #include "app/panels.h"
 #include "app/request_tab.h"
 #include "app/response_body.h"
 #include "app/response_conn.h"
+#include "app/response_examples.h"
 #include "app/response_format.h"
+#include "app/response_keep.h"
 #include "app/response_tests.h"
 #include "app/response_tests_view.h"
 #include "app/response_widgets.h"
@@ -42,13 +53,75 @@ using KV = std::vector<std::pair<std::string, std::string>>;
 
 wxString U(std::string_view s) { return wxString::FromUTF8(s.data(), s.size()); }
 
-// ------------------------------------------------------------------ virtual lists
+// WATT_RV_TRACE=<file>: appends "label ms" lines for the view's own UI-thread steps (build,
+// clear, show) so their cost can be measured in the running app. Off (one getenv) otherwise.
+FILE* trace_file() {
+  static FILE* f = [] () -> FILE* {
+    const wchar_t* p = _wgetenv(L"WATT_RV_TRACE");
+    return p && *p ? _wfopen(p, L"a") : nullptr;
+  }();
+  return f;
+}
+struct TraceScope {
+  const char* what;
+  Clock::time_point t0 = Clock::now();
+  explicit TraceScope(const char* w) : what(w) {}
+  ~TraceScope() {
+    if (FILE* f = trace_file()) {
+      std::fprintf(f, "%s %.2f\n", what, std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+      std::fflush(f);
+    }
+  }
+};
+
+// ------------------------------------------------------------------ lazy pages
+//
+// Every page but Body is created the first time it is shown (or in a short idle slice after the
+// view is up): a list control, the Tests editor or the Log editor each cost several ms to create,
+// and the view is built synchronously by the first send of a tab. A page keeps its data itself,
+// so filling it while it is not built costs nothing but the copy.
+
+class LazyPage : public wxPanel {
+ public:
+  explicit LazyPage(wxWindow* parent) : wxPanel(parent, wxID_ANY) { SetBackgroundColour(Theme::get().bg); }
+  bool built() const { return built_; }
+  void ensure() {
+    if (built_) return;
+    built_ = true;
+    wxWindow* w = make();
+    auto* s = new wxBoxSizer(wxVERTICAL);
+    s->Add(w, 1, wxEXPAND);
+    SetSizer(s);
+    Layout();
+    after_make();
+  }
+
+ protected:
+  virtual wxWindow* make() = 0;
+  virtual void after_make() {}
+
+ private:
+  bool built_ = false;
+};
+
+void to_clipboard(const wxString& s) {
+  if (wxTheClipboard->Open()) {
+    wxTheClipboard->SetData(new wxTextDataObject(s));
+    wxTheClipboard->Close();
+  }
+}
+
+struct KvData {
+  KV rows;
+  std::vector<char> dim;  // dim[i] != 0: row i is drawn dimmed (a header the HTTP stack added)
+};
 
 class KvList : public wxListCtrl {
  public:
-  KvList(wxWindow* parent, const char* c1, const char* c2)
+  KvList(wxWindow* parent, const char* c1, const char* c2, const KvData* d)
       : wxListCtrl(parent, wxID_ANY, wxDefaultPosition, wxDefaultSize,
-                   wxLC_REPORT | wxLC_VIRTUAL | wxBORDER_NONE) {
+                   wxLC_REPORT | wxLC_VIRTUAL | wxBORDER_NONE),
+        d_(d) {
     AppendColumn(c1, wxLIST_FORMAT_LEFT, FromDIP(200));
     AppendColumn(c2, wxLIST_FORMAT_LEFT, FromDIP(400));
     // Last column fills the width. Deferred: setting a column width inside the size event can
@@ -60,7 +133,11 @@ class KvList : public wxListCtrl {
       CallAfter([this] {
         fit_pending_ = false;
         const int w = GetClientSize().x - GetColumnWidth(0) - 2;
-        if (w > FromDIP(80) && w != GetColumnWidth(1)) SetColumnWidth(1, w);
+        if (w > FromDIP(80) && w != GetColumnWidth(1)) {
+          Freeze();  // (a width change repaints the list at once otherwise)
+          SetColumnWidth(1, w);
+          Thaw();
+        }
       });
     });
     Bind(wxEVT_KEY_DOWN, [this](wxKeyEvent& e) {
@@ -81,46 +158,56 @@ class KvList : public wxListCtrl {
       else if (id == 2) copy(true);
       else if (id == 3) {
         const long i = GetNextItem(-1, wxLIST_NEXT_ALL, wxLIST_STATE_SELECTED);
-        if (i >= 0) to_clipboard(U(rows_[static_cast<size_t>(i)].second));
+        if (i >= 0 && static_cast<size_t>(i) < d_->rows.size()) to_clipboard(U(d_->rows[static_cast<size_t>(i)].second));
       }
     });
+    sync();
   }
-  // dim[i] != 0: row i is drawn dimmed (e.g. a header the HTTP stack added by itself).
-  void set(KV rows, std::vector<char> dim = {}) {
-    rows_ = std::move(rows);
-    dim_ = std::move(dim);
-    dim_.resize(rows_.size(), 0);
-    SetItemCount(static_cast<long>(rows_.size()));
+  void sync() {
+    SetItemCount(static_cast<long>(d_->rows.size()));
     Refresh();
   }
-  size_t count() const { return rows_.size(); }
-  const KV& rows() const { return rows_; }
 
  private:
   wxString OnGetItemText(long item, long col) const override {
-    const auto& r = rows_[static_cast<size_t>(item)];
+    if (static_cast<size_t>(item) >= d_->rows.size()) return {};
+    const auto& r = d_->rows[static_cast<size_t>(item)];
     return U(col == 0 ? r.first : r.second);
   }
   wxItemAttr* OnGetItemAttr(long item) const override {
-    return dim_[static_cast<size_t>(item)] ? &dim_attr_ : nullptr;
-  }
-  static void to_clipboard(const wxString& s) {
-    if (wxTheClipboard->Open()) {
-      wxTheClipboard->SetData(new wxTextDataObject(s));
-      wxTheClipboard->Close();
-    }
+    return static_cast<size_t>(item) < d_->dim.size() && d_->dim[static_cast<size_t>(item)] ? &dim_attr_ : nullptr;
   }
   void copy(bool all) {
     std::string s;
-    for (size_t i = 0; i < rows_.size(); ++i)
+    for (size_t i = 0; i < d_->rows.size(); ++i)
       if (all || GetItemState(static_cast<long>(i), wxLIST_STATE_SELECTED))
-        s += rows_[i].first + ": " + rows_[i].second + "\n";
+        s += d_->rows[i].first + ": " + d_->rows[i].second + "\n";
     if (!s.empty()) to_clipboard(U(s));
   }
-  KV rows_;
-  std::vector<char> dim_;
+  const KvData* d_;
   mutable wxItemAttr dim_attr_{Theme::get().dim, wxNullColour, wxNullFont};
   bool fit_pending_ = false;
+};
+
+// Headers, Cookies, Trailers, Request: two columns of text.
+class KvPage : public LazyPage {
+ public:
+  KvPage(wxWindow* parent, const char* c1, const char* c2) : LazyPage(parent), c1_(c1), c2_(c2) {}
+  void set(KV rows, std::vector<char> dim = {}) {
+    d_.rows = std::move(rows);
+    d_.dim = std::move(dim);
+    d_.dim.resize(d_.rows.size(), 0);
+    if (list_) list_->sync();
+  }
+  size_t count() const { return d_.rows.size(); }
+  const KV& rows() const { return d_.rows; }
+
+ private:
+  wxWindow* make() override { return list_ = new KvList(this, c1_, c2_, &d_); }
+  const char* c1_;
+  const char* c2_;
+  KvData d_;
+  KvList* list_ = nullptr;
 };
 
 struct MsgRow {
@@ -131,43 +218,208 @@ struct MsgRow {
   bool error = false;
 };
 
-class MsgList : public wxListCtrl {
+// The Messages table: owner-drawn (a native list view costs 40-100 ms of UI time to paint a page
+// of rows in this theme, every time the tab is shown). Only the visible rows are drawn.
+class MsgList : public wxWindow {
  public:
-  MsgList(wxWindow* parent, std::function<void(size_t)> on_open)
-      : wxListCtrl(parent, wxID_ANY, wxDefaultPosition, wxDefaultSize,
-                   wxLC_REPORT | wxLC_VIRTUAL | wxLC_SINGLE_SEL | wxBORDER_NONE),
+  MsgList(wxWindow* parent, const std::vector<MsgRow>* rows, std::function<void(size_t)> on_open)
+      : wxWindow(parent, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxVSCROLL | wxWANTS_CHARS | wxBORDER_NONE),
+        rows_(rows),
         on_open_(std::move(on_open)) {
-    AppendColumn("#", wxLIST_FORMAT_RIGHT, FromDIP(52));
-    AppendColumn("Offset", wxLIST_FORMAT_RIGHT, FromDIP(86));
-    AppendColumn("Gap", wxLIST_FORMAT_RIGHT, FromDIP(80));
-    AppendColumn("Size", wxLIST_FORMAT_RIGHT, FromDIP(70));
-    AppendColumn("Message", wxLIST_FORMAT_LEFT, FromDIP(400));
-    err_attr_.SetTextColour(Theme::get().err);
+    SetBackgroundStyle(wxBG_STYLE_PAINT);
+    const Theme& th = Theme::get();
+    bg_ = th.dark ? wxColour(30, 30, 30) : *wxWHITE;
+    SetBackgroundColour(bg_);
+    Bind(wxEVT_PAINT, [this](wxPaintEvent&) { paint(); });
     Bind(wxEVT_SIZE, [this](wxSizeEvent& e) {
       e.Skip();
-      if (fit_pending_) return;
-      fit_pending_ = true;
-      CallAfter([this] {
-        fit_pending_ = false;
-        int used = 0;
-        for (int c = 0; c < 4; ++c) used += GetColumnWidth(c);
-        const int w = GetClientSize().x - used - 2;
-        if (w > FromDIP(80) && w != GetColumnWidth(4)) SetColumnWidth(4, w);
-      });
+      update_scrollbar();
+      Refresh(false);
     });
-    Bind(wxEVT_LIST_ITEM_ACTIVATED, [this](wxListEvent& e) {
-      if (on_open_) on_open_(static_cast<size_t>(e.GetIndex()));
+    Bind(wxEVT_MOUSEWHEEL, [this](wxMouseEvent& e) {
+      const int lines = e.GetWheelRotation() / std::max(1, e.GetWheelDelta()) * std::max(1, e.GetLinesPerAction());
+      scroll_to(top_ - lines);
+    });
+    auto on_scroll = [this](wxScrollWinEvent& e) {
+      const wxEventType t = e.GetEventType();
+      long pos = top_;
+      const long page = std::max(1, visible_rows() - 1);
+      if (t == wxEVT_SCROLLWIN_LINEUP) pos -= 1;
+      else if (t == wxEVT_SCROLLWIN_LINEDOWN) pos += 1;
+      else if (t == wxEVT_SCROLLWIN_PAGEUP) pos -= page;
+      else if (t == wxEVT_SCROLLWIN_PAGEDOWN) pos += page;
+      else if (t == wxEVT_SCROLLWIN_TOP) pos = 0;
+      else if (t == wxEVT_SCROLLWIN_BOTTOM) pos = count();
+      else pos = e.GetPosition();
+      scroll_to(pos);
+    };
+    for (wxEventType t : {wxEVT_SCROLLWIN_TOP, wxEVT_SCROLLWIN_BOTTOM, wxEVT_SCROLLWIN_LINEUP, wxEVT_SCROLLWIN_LINEDOWN,
+                          wxEVT_SCROLLWIN_PAGEUP, wxEVT_SCROLLWIN_PAGEDOWN, wxEVT_SCROLLWIN_THUMBTRACK,
+                          wxEVT_SCROLLWIN_THUMBRELEASE})
+      Bind(wxEventTypeTag<wxScrollWinEvent>(t), on_scroll);
+    Bind(wxEVT_LEFT_DOWN, [this](wxMouseEvent& e) {
+      SetFocus();
+      if (const long r = row_at(e.GetPosition().y); r >= 0) select(r);
+    });
+    Bind(wxEVT_LEFT_DCLICK, [this](wxMouseEvent& e) {
+      if (const long r = row_at(e.GetPosition().y); r >= 0 && on_open_) on_open_(static_cast<size_t>(r));
+    });
+    Bind(wxEVT_MOTION, [this](wxMouseEvent& e) {
+      const long r = row_at(e.GetPosition().y);
+      if (r == tip_row_) return;
+      tip_row_ = r;
+      if (r < 0) return UnsetToolTip();
+      const MsgRow& m = (*rows_)[static_cast<size_t>(r)];
+      SetToolTip(U("#" + std::to_string(r + 1) + "  +" + fmt::ms(m.at_ms) + "  " + fmt::human_bytes(m.bytes) + "\n" +
+                   m.preview + "\n\nDouble-click or Enter: show it in the Body."));
+    });
+    Bind(wxEVT_LEAVE_WINDOW, [this](wxMouseEvent& e) {
+      e.Skip();
+      tip_row_ = -2;
+    });
+    Bind(wxEVT_KEY_DOWN, [this](wxKeyEvent& e) {
+      const int k = e.GetKeyCode();
+      const long n = count();
+      if (e.GetModifiers() == wxMOD_CONTROL && k == 'C') {
+        if (sel_ >= 0 && sel_ < n) to_clipboard(U((*rows_)[static_cast<size_t>(sel_)].preview));
+        return;
+      }
+      if (e.GetModifiers() != 0 || n == 0) return e.Skip();
+      const long page = std::max(1, visible_rows() - 1);
+      switch (k) {
+        case WXK_UP: return select(std::max(0L, sel_ - 1));
+        case WXK_DOWN: return select(std::min(n - 1, sel_ + 1));
+        case WXK_PAGEUP: return select(std::max(0L, sel_ - page));
+        case WXK_PAGEDOWN: return select(std::min(n - 1, sel_ + page));
+        case WXK_HOME: return select(0);
+        case WXK_END: return select(n - 1);
+        case WXK_RETURN:
+        case WXK_NUMPAD_ENTER:
+          if (sel_ >= 0 && on_open_) on_open_(static_cast<size_t>(sel_));
+          return;
+        default: e.Skip();
+      }
     });
   }
+  // Before rows are appended: is the user looking at the tail?
+  bool at_end() const {
+    const long n = count();
+    return n == 0 || top_ + visible_rows() >= n;
+  }
+  void sync(bool follow) {
+    const long n = count();
+    if (sel_ >= n) sel_ = -1;
+    if (follow && n > 0) top_ = std::max(0L, n - visible_rows());
+    top_ = std::clamp(top_, 0L, std::max(0L, n - visible_rows()));
+    update_scrollbar();
+    Refresh(false);
+  }
+
+ private:
+  long count() const { return static_cast<long>(rows_->size()); }
+  int row_h() const { return GetCharHeight() + FromDIP(5); }
+  int head_h() const { return row_h() + FromDIP(2); }
+  int visible_rows() const { return std::max(1, (GetClientSize().y - head_h()) / row_h()); }
+  long row_at(int y) const {
+    if (y < head_h()) return -1;
+    const long r = top_ + (y - head_h()) / row_h();
+    return r < count() ? r : -1;
+  }
+  void select(long r) {
+    sel_ = r;
+    if (sel_ < top_) scroll_to(sel_);
+    else if (sel_ >= top_ + visible_rows()) scroll_to(sel_ - visible_rows() + 1);
+    else Refresh(false);
+  }
+  void scroll_to(long pos) {
+    pos = std::clamp(pos, 0L, std::max(0L, count() - visible_rows()));
+    if (pos == top_) return Refresh(false);
+    top_ = pos;
+    update_scrollbar();
+    Refresh(false);
+  }
+  void update_scrollbar() {
+    SetScrollbar(wxVERTICAL, static_cast<int>(top_), visible_rows(), static_cast<int>(count()));
+  }
+  void paint() {
+    wxAutoBufferedPaintDC dc(this);
+    const Theme& th = Theme::get();
+    const wxSize cs = GetClientSize();
+    dc.SetBackground(wxBrush(bg_));
+    dc.Clear();
+    const wxColour head_bg = th.dark ? wxColour(40, 40, 44) : wxColour(244, 244, 247);
+    const wxColour sel = th.dark ? wxColour(38, 79, 120) : wxColour(205, 228, 255);
+    const int rh = row_h(), hh = head_h(), pad = FromDIP(6);
+    const long n = count();
+    const long last = std::min<long>(n, top_ + visible_rows() + 1);
+    // #, Offset, Gap, Size right-aligned; the message fills the rest.
+    const int w[4] = {FromDIP(52), FromDIP(86), FromDIP(80), FromDIP(70)};
+    dc.SetFont(GetFont());
+    const int ch = dc.GetCharHeight();
+    if (sel_ >= top_ && sel_ < last) {
+      dc.SetPen(*wxTRANSPARENT_PEN);
+      dc.SetBrush(wxBrush(sel));
+      dc.DrawRectangle(0, hh + static_cast<int>(sel_ - top_) * rh, cs.x, rh);
+    }
+    for (long i = top_; i < last; ++i) {
+      const MsgRow& m = (*rows_)[static_cast<size_t>(i)];
+      const int y = hh + static_cast<int>(i - top_) * rh + (rh - ch) / 2;
+      const wxString cells[4] = {wxString::Format("%ld", i + 1), U("+" + fmt::ms(m.at_ms)), U(fmt::ms(m.gap_ms)),
+                                 U(fmt::human_bytes(m.bytes))};
+      int x = 0;
+      for (int c = 0; c < 4; ++c) {
+        dc.SetTextForeground(c == 0 ? th.dim : th.fg);
+        dc.DrawText(cells[c], x + w[c] - pad - dc.GetTextExtent(cells[c]).x, y);
+        x += w[c];
+      }
+      dc.SetTextForeground(m.error ? th.err : th.fg);
+      dc.SetClippingRegion(x, hh, std::max(0, cs.x - x), std::max(0, cs.y - hh));
+      // At most what can fit (a character is at least ~4 px wide).
+      const size_t fit = static_cast<size_t>(std::max(16, (cs.x - x) / FromDIP(4)));
+      dc.DrawText(wxString::FromUTF8(m.preview.data(), std::min(m.preview.size(), fit)), x + pad, y);
+      dc.DestroyClippingRegion();
+    }
+    dc.SetPen(*wxTRANSPARENT_PEN);
+    dc.SetBrush(wxBrush(head_bg));
+    dc.DrawRectangle(0, 0, cs.x, hh);
+    dc.SetPen(wxPen(th.grid));
+    dc.DrawLine(0, hh - 1, cs.x, hh - 1);
+    dc.SetFont(GetFont().Bold());
+    dc.SetTextForeground(th.fg);
+    static const char* kHead[] = {"#", "Offset", "Gap", "Size"};
+    int x = 0;
+    const int hy = (hh - dc.GetCharHeight()) / 2;
+    for (int c = 0; c < 4; ++c) {
+      dc.DrawText(kHead[c], x + w[c] - pad - dc.GetTextExtent(kHead[c]).x, hy);
+      x += w[c];
+      dc.DrawLine(x - 1, FromDIP(4), x - 1, hh - FromDIP(4));
+    }
+    dc.DrawText("Message", x + pad, hy);
+    if (n == 0) {
+      dc.SetFont(GetFont());
+      dc.SetTextForeground(th.dim);
+      dc.DrawText("No messages.", pad, hh + pad);
+    }
+  }
+  const std::vector<MsgRow>* rows_;
+  std::function<void(size_t)> on_open_;
+  wxColour bg_;
+  long top_ = 0;
+  long sel_ = -1;
+  long tip_row_ = -2;
+};
+
+class MsgPage : public LazyPage {
+ public:
+  MsgPage(wxWindow* parent, std::function<void(size_t)> on_open) : LazyPage(parent), on_open_(std::move(on_open)) {}
   void reset() {
     rows_.clear();
-    SetItemCount(0);
-    Refresh();
+    if (list_) list_->sync(false);
   }
   void append(const GrpcMessageEvent* m, size_t n) {
     // Follow the tail only while the user is looking at it.
-    const long count = GetItemCount();
-    const bool at_end = count == 0 || GetTopItem() + GetCountPerPage() >= count;
+    const bool follow = list_ && list_->at_end();
+    rows_.reserve(rows_.size() + n);
     for (size_t i = 0; i < n; ++i) {
       MsgRow r;
       r.at_ms = m[i].at_ms;
@@ -194,31 +446,86 @@ class MsgList : public wxListCtrl {
       if (r.error) r.preview = "decode error: " + r.preview;
       rows_.push_back(std::move(r));
     }
-    SetItemCount(static_cast<long>(rows_.size()));
-    // (Not while hidden: the page size is then meaningless and row #1 would scroll out of view.)
-    if (at_end && count > 0 && IsShownOnScreen()) EnsureVisible(static_cast<long>(rows_.size()) - 1);
-    Refresh();
+    if (list_) list_->sync(follow);
   }
   size_t count() const { return rows_.size(); }
 
  private:
-  wxString OnGetItemText(long item, long col) const override {
-    const MsgRow& r = rows_[static_cast<size_t>(item)];
-    switch (col) {
-      case 0: return wxString::Format("%ld", item + 1);
-      case 1: return U("+" + fmt::ms(r.at_ms));
-      case 2: return U(fmt::ms(r.gap_ms));
-      case 3: return U(fmt::human_bytes(r.bytes));
-      default: return U(r.preview);
-    }
-  }
-  wxItemAttr* OnGetItemAttr(long item) const override {
-    return rows_[static_cast<size_t>(item)].error ? &err_attr_ : nullptr;
-  }
+  wxWindow* make() override { return list_ = new MsgList(this, &rows_, on_open_); }
   std::vector<MsgRow> rows_;
-  bool fit_pending_ = false;
-  mutable wxItemAttr err_attr_;
+  MsgList* list_ = nullptr;
   std::function<void(size_t)> on_open_;
+};
+
+// The Log: a curl -v style transcript in a light read-only Scintilla control (a RichEdit text
+// control costs ~20 ms to create), one style per kind of line.
+class LogPage : public LazyPage {
+ public:
+  explicit LogPage(wxWindow* parent) : LazyPage(parent) {}
+  void set(std::string text) {
+    text_ = std::move(text);
+    if (stc_) fill();
+  }
+
+ private:
+  enum { kInfo = 1, kSent = 2, kRecv = 3, kConsole = 4, kAlert = 5 };
+  wxWindow* make() override {
+    const Theme& th = Theme::get();
+    stc_ = new wxStyledTextCtrl(this, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxBORDER_NONE);
+    const wxFont mono(wxFontInfo(9).Family(wxFONTFAMILY_TELETYPE).FaceName("Consolas"));
+    stc_->StyleSetFont(wxSTC_STYLE_DEFAULT, mono);
+    stc_->StyleSetBackground(wxSTC_STYLE_DEFAULT, th.bg);
+    stc_->StyleSetForeground(wxSTC_STYLE_DEFAULT, th.fg);
+    stc_->StyleClearAll();
+    stc_->StyleSetForeground(kInfo, th.dim);
+    stc_->StyleSetForeground(kSent, th.accent);
+    stc_->StyleSetForeground(kRecv, th.fg);
+    stc_->StyleSetForeground(kConsole, th.fg);
+    stc_->StyleSetForeground(kAlert, th.err);
+    stc_->SetCaretForeground(th.fg);
+    stc_->SetSelBackground(true, th.dark ? wxColour(38, 79, 120) : wxColour(173, 214, 255));
+    for (int m = 0; m < 5; ++m) stc_->SetMarginWidth(m, 0);
+    stc_->SetMarginLeft(FromDIP(6));
+    stc_->SetUndoCollection(false);
+    stc_->SetScrollWidthTracking(true);
+    stc_->SetScrollWidth(1);
+    // A transcript line (the Timing summary, a long header) wraps under its own indent instead
+    // of running off the right edge.
+    stc_->SetWrapVisualFlags(wxSTC_WRAPVISUALFLAG_END);
+    stc_->SetWrapIndentMode(wxSTC_WRAPINDENT_INDENT);
+    stc_->SetLexer(wxSTC_LEX_CONTAINER);  // styled by fill(), never by a lexer
+    stc_->Bind(wxEVT_STC_STYLENEEDED, [](wxStyledTextEvent&) {});
+    stc_->SetReadOnly(true);
+    return stc_;
+  }
+  void after_make() override { fill(); }
+  void fill() {
+    stc_->SetReadOnly(false);
+    stc_->ClearAll();
+    // Scintilla wraps on the UI thread: only a transcript of a usual size (a huge script log
+    // keeps its horizontal scroll bar).
+    stc_->SetWrapMode(text_.size() < (512u << 10) ? wxSTC_WRAP_WORD : wxSTC_WRAP_NONE);
+    stc_->AddTextRaw(text_.data(), static_cast<int>(text_.size()));
+    // One style per line, from its first character: "*" info dim, ">" sent, "<" received,
+    // "|" script console output, "!" a warning / error.
+    stc_->StartStyling(0);
+    size_t at = 0;
+    while (at < text_.size()) {
+      size_t e = text_.find('\n', at);
+      e = e == std::string::npos ? text_.size() : e + 1;
+      const char p = text_[at];
+      stc_->SetStyling(static_cast<int>(e - at), p == '>'   ? kSent
+                                                 : p == '<' ? kRecv
+                                                 : p == '|' ? kConsole
+                                                 : p == '!' ? kAlert
+                                                            : kInfo);
+      at = e;
+    }
+    stc_->SetReadOnly(true);
+    stc_->GotoPos(0);
+  }
+  std::string text_;
+  wxStyledTextCtrl* stc_ = nullptr;
 };
 
 // ------------------------------------------------------------------ timing models
@@ -279,8 +586,17 @@ Pal palette() {
                  wxColour(220, 110, 40)};
 }
 
-TimingModel http_model(const HttpResponse& r, bool plain_http) {
+std::string host_port(const std::string& ip, long port);
+
+// pre: the request's pre-request script, which ran on the worker inside the shell's Queue time:
+// shown as its own row and taken out of Queue.
+TimingModel http_model(const HttpResponse& r, bool plain_http, const ScriptRun* pre = nullptr,
+                       const ScriptRun* post = nullptr, const SentHttp::TokenStep* token = nullptr) {
   const Timing& t = r.timing;
+  const double pre_ms = pre && pre->ran ? std::clamp(pre->elapsed_us / 1000.0, 0.0, std::max(0.0, t.queue_ms)) : 0.0;
+  // The OAuth 2.0 token step ran on the worker inside Queue too: its own row, out of Queue.
+  const double tok_ms = token ? std::clamp(token->ms, 0.0, std::max(0.0, t.queue_ms - pre_ms)) : 0.0;
+  const double queue_ms = t.queue_ms - pre_ms - tok_ms;
   const Pal p = palette();
   const bool reused = t.connection_reused;
   TimingModel m;
@@ -303,7 +619,7 @@ TimingModel http_model(const HttpResponse& r, bool plain_http) {
     m.phases.push_back(std::move(ph));
   };
   add("Prepare", r.prepare_ms, tips::kPrepare, p.setup, false);
-  add("Queue", t.queue_ms, tips::kQueueHttp, p.setup, false);
+  add("Queue", queue_ms, tips::kQueueHttp, p.setup, false);
   add("DNS", t.dns_ms, tips::kDnsHttp, p.dns, true);
   add("Socket", r.socket_ms, tips::kSocket, p.socket, true);
   add("Connect", t.connect_ms, tips::kConnectHttp, p.connect, true);
@@ -320,19 +636,111 @@ TimingModel http_model(const HttpResponse& r, bool plain_http) {
              (h.connection_reused ? " (reused)" : "");
     // Insert before Prepare's successors would mislead the waterfall order: redirects happen
     // before the final request's phases, so they go first after Prepare.
+    // To keep the waterfall at its 10 reserved rows (nothing below jumps when a redirecting
+    // response arrives), Prepare and Queue share one row then: both are watt's own setup time.
+    Phase& prep = m.phases[0];
+    prep.name = "Prep+queue";
+    prep.ms = r.prepare_ms + queue_ms;
+    prep.tip = std::string("Prepare (request setup) ") + fmt::ms(r.prepare_ms) + " + Queue (UI-to-worker hand-off) " +
+               fmt::ms(queue_ms) + ".\n" + tips::kPrepare;
+    m.phases.erase(m.phases.begin() + 1);
     Phase ph{"Redirects", r.redirect_ms, tip, p.redirect};
+    // One row per hop when expanded (click the Redirects row).
+    for (size_t i = 0; i < r.hops.size(); ++i) {
+      const RedirectHop& h = r.hops[i];
+      std::string htip = std::to_string(h.status) + " " + h.url + "\n";
+      htip += h.connection_reused ? "reused connection" : "DNS " + fmt::ms(h.dns_ms) + ", connect " + fmt::ms(h.connect_ms) +
+                                                             ", TLS " + fmt::ms(h.tls_ms);
+      htip += ", send " + fmt::ms(h.send_ms) + ", wait " + fmt::ms(h.ttfb_ms) + ", download " + fmt::ms(h.download_ms);
+      if (!h.remote_ip.empty()) htip += "\n" + host_port(h.remote_ip, h.remote_port);
+      std::string path = h.url;
+      if (const size_t sch = path.find("://"); sch != std::string::npos) {
+        const size_t sl = path.find('/', sch + 3);
+        path = sl == std::string::npos ? "/" : path.substr(sl);
+      }
+      if (path.size() > 18) path = path.substr(0, 17) + "\xE2\x80\xA6";
+      Phase hp{std::to_string(h.status) + " " + path, h.total_ms, htip, p.redirect};
+      hp.reused = false;
+      ph.sub.push_back(std::move(hp));
+    }
     m.phases.insert(m.phases.begin() + 1, std::move(ph));
   }
   add("Process", r.process_ms, tips::kProcess, p.setup, false);
+  if (pre_ms > 0) {
+    // Its own row, first (it runs before the request is built). Prepare and Queue share a row
+    // then (as with redirects) so the waterfall keeps its reserved height.
+    if (m.phases.size() > 1 && m.phases[1].name == "Queue") {
+      Phase& prep = m.phases[0];
+      prep.name = "Prep+queue";
+      prep.ms = r.prepare_ms + queue_ms;
+      prep.tip = std::string("Prepare (request setup) ") + fmt::ms(r.prepare_ms) + " + Queue (UI-to-worker hand-off) " +
+                 fmt::ms(queue_ms) + ".\n" + tips::kPrepare;
+      m.phases.erase(m.phases.begin() + 1);
+    }
+    std::string tip = "The request's pre-request script (QuickJS sandbox, on the worker thread, before the request "
+                      "is built): " + fmt::ms(pre_ms) + " in all";
+    if (pre->setup_us > 0) tip += ", of which sandbox setup " + fmt::ms(pre->setup_us / 1000.0);
+    if (pre->wait_us > 0) tip += ", waiting in sendRequest / sleep " + fmt::ms(pre->wait_us / 1000.0);
+    tip += ". Its console output and tests are in the Log and Tests tabs.";
+    m.phases.insert(m.phases.begin(), Phase{"Pre-script", pre_ms, tip, wxColour(170, 110, 190)});
+  }
+  if (token) {
+    if (m.phases.size() > 1 && m.phases[1].name == "Queue") {  // keep the reserved row count
+      Phase& prep = m.phases[0];
+      prep.name = "Prep+queue";
+      prep.ms = r.prepare_ms + queue_ms;
+      prep.tip = std::string("Prepare (request setup) ") + fmt::ms(r.prepare_ms) + " + Queue (UI-to-worker hand-off) " +
+                 fmt::ms(queue_ms) + ".\n" + tips::kPrepare;
+      m.phases.erase(m.phases.begin() + 1);
+    }
+    std::string tip = "OAuth 2.0 (" + token->grant + (token->from.empty() ? std::string() : ", auth from " + token->from) +
+                      "): ";
+    tip += token->from_cache ? "the cached token, no request: " + fmt::ms(tok_ms)
+           : token->refreshed ? "refreshed the token at " + token->token_url + ": " + fmt::ms(tok_ms)
+                              : "token request to " + token->token_url + ": " + fmt::ms(tok_ms);
+    tip += ", before the request was built. Details in the Log tab.";
+    // After a pre-script row (the script runs first), else first.
+    const size_t at = !m.phases.empty() && m.phases[0].name == "Pre-script" ? 1 : 0;
+    m.phases.insert(m.phases.begin() + static_cast<std::ptrdiff_t>(at),
+                    Phase{token->from_cache ? "Auth (cached)" : "Auth / token", tok_ms, tip, wxColour(200, 150, 60)});
+  }
+  if (post && post->ran && post->elapsed_us > 0) {
+    // After the total: the response was complete when the post-response script started.
+    if (m.phases.size() > 1 && m.phases[1].name == "Queue") {  // keep the reserved row count
+      Phase& prep = m.phases[0];
+      prep.name = "Prep+queue";
+      prep.ms = r.prepare_ms + queue_ms;
+      prep.tip = std::string("Prepare (request setup) ") + fmt::ms(r.prepare_ms) + " + Queue (UI-to-worker hand-off) " +
+                 fmt::ms(queue_ms) + ".\n" + tips::kPrepare;
+      m.phases.erase(m.phases.begin() + 1);
+    }
+    const double post_ms = post->elapsed_us / 1000.0;
+    std::string tip = "The request's post-response script (QuickJS sandbox, on the worker thread), run once the "
+                      "response was complete: " + fmt::ms(post_ms) + ", not part of the response time (Total)";
+    if (post->setup_us > 0) tip += "; sandbox setup " + fmt::ms(post->setup_us / 1000.0);
+    tip += ". Its tests and console output are in the Tests and Log tabs.";
+    m.phases.push_back(Phase{"Post-script", post_ms, tip, wxColour(170, 110, 190)});
+    m.after = post_ms;
+  }
   m.client = r.prepare_ms + t.queue_ms + r.process_ms;
   m.network = std::max(0.0, t.total_ms - m.server_wait - m.client);
   m.client_tip = "watt's own time: Prepare (request setup) + Queue (UI-to-worker hand-off, libcurl's queue) + "
-                 "Process (result collection) = " + fmt::ms(r.prepare_ms) + " + " + fmt::ms(t.queue_ms) + " + " +
+                 "Process (result collection) = " + fmt::ms(r.prepare_ms) + " + " + fmt::ms(queue_ms) + " + " +
                  fmt::ms(r.process_ms) + ".";
+  if (pre_ms > 0) m.client_tip += " Plus the pre-request script, " + fmt::ms(pre_ms) + ".";
+  if (token) m.client_tip += " Plus the OAuth 2.0 token step, " + fmt::ms(tok_ms) + ".";
+  if (m.after > 0)
+    m.client_tip += " After the response: the post-response script, " + fmt::ms(m.after) + " (not in the total).";
   m.network_tip = "Time on the network: DNS, socket, TCP connect, TLS, upload and download";
   m.network_tip += r.hops.empty() ? std::string(".") : std::string(", plus all but the server wait of each redirect hop.");
   m.network_tip += " Neither watt nor the server thinking.";
   return m;
+}
+
+// UNAVAILABLE with nothing at all from a server (no messages, no response headers, no
+// trailers): the call never reached one.
+bool grpc_never_answered(const GrpcResponse& r) {
+  return r.status_code == 14 && r.messages.empty() && r.headers.empty() && r.trailers.empty();
 }
 
 TimingModel grpc_model(const GrpcResponse& r) {
@@ -371,26 +779,49 @@ TimingModel grpc_model(const GrpcResponse& r) {
   add("Download", t.download_ms, tips::kDownloadGrpc, p.down, false);
   double sum = 0;
   for (const Phase& ph : m.phases) sum += ph.ms;
-  const double other = t.total_ms - sum > 0.005 ? t.total_ms - sum : 0;
+  double other = t.total_ms - sum > 0.005 ? t.total_ms - sum : 0;
   // Always a row (0 when nothing is left over), so a failed call and an OK one have the same
   // height and the tabs below do not jump when a stream finishes.
   add("Other", other, tips::kOther, p.setup, false);
-  if (r.status_code == 14 && r.messages.empty() && t.ttfb_ms <= 0 && t.download_ms <= 0) {
-    // The call ended before the server answered (e.g. UNAVAILABLE: nothing to connect to): the
-    // phases it never reached are n/a, and the connection phase it stopped in is marked.
+  if (grpc_never_answered(r)) {
+    // The call ended before any server answered (UNAVAILABLE with no response headers: nothing
+    // to connect to, WSA 10049/10061, ...). gRPC connects lazily when the call starts, so the
+    // engine's "send" / "wait" timers really measured the connection attempt: that time goes to
+    // the connection phase the call stopped in (marked as failed), and the phases it never reached
+    // are n/a. Nothing of it is server time.
+    double moved = 0;
     for (Phase& ph : m.phases) {
-      const bool unreached = ph.name == "Wait (TTFB)" || ph.name == "Download" || (ph.name == "Send" && ph.ms <= 0);
+      const bool unreached = ph.name == "Wait (TTFB)" || ph.name == "Download" || ph.name == "Send";
       if (unreached) {
+        moved += ph.ms;
         ph.has_value = false;
+        ph.reused = false;
         ph.ms = 0;
       }
     }
-    if (!reused)
-      for (auto it = m.phases.rbegin(); it != m.phases.rend(); ++it)
-        if ((it->name == "Connect" || it->name == "TLS" || it->name == "DNS") && it->ms > 0) {
-          it->failed = true;
-          break;
-        }
+    if (!reused) {
+      Phase* fail = nullptr;
+      for (auto it = m.phases.rbegin(); it != m.phases.rend() && !fail; ++it)
+        if ((it->name == "Connect" || it->name == "TLS" || it->name == "DNS") && it->ms > 0) fail = &*it;
+      if (!fail)
+        for (Phase& ph : m.phases)
+          if (ph.name == "Connect") fail = &ph;
+      if (fail) {
+        fail->failed = true;
+        fail->has_value = true;
+        fail->reused = false;
+        fail->ms += moved;
+        fail->tip = std::string(fail->tip) + "\nThe call failed here: no server answered (the time includes the "
+                                             "connection attempt the engine timed as send / wait).";
+      }
+    } else {
+      for (Phase& ph : m.phases)
+        if (ph.name == "Other") ph.ms += moved;
+      other += moved;
+    }
+    m.server_wait = 0;
+    m.server_label = "server";
+    m.server_tip = "No server answered this call: no server time.";
     m.conn_note = reused ? "reused channel, no reply" : "no connection";
   }
   m.client = t.queue_ms + other;
@@ -419,62 +850,136 @@ std::string host_port(const std::string& ip, long port) {
   return s;
 }
 
-// "2026-01-15 23:59:59 UTC" -> whole days from now (negative: expired); false if unparsable.
+// "2026-01-15 23:59:59 UTC" or ISO "2026-01-15T23:59:59Z" -> whole days from now (negative:
+// expired); false if unparsable.
 bool days_left(const std::string& utc, long* days) {
+  std::string t = utc.substr(0, 19);
+  if (t.size() > 10 && t[10] == 'T') t[10] = ' ';
   wxDateTime d;
   wxString::const_iterator end;
-  const wxString s = wxString::FromUTF8(utc.substr(0, 19));
+  const wxString s = wxString::FromUTF8(t);
   if (!d.ParseFormat(s, "%Y-%m-%d %H:%M:%S", &end)) return false;
   d.MakeFromUTC();
   *days = static_cast<long>(std::floor((d - wxDateTime::Now()).GetSeconds().ToDouble() / 86400.0));
   return true;
 }
 
-// Rows of the connection popover for an HTTP response.
+// "2026-01-15T08:00:00Z" -> "2026-01-15 08:00 UTC" (anything else unchanged).
+std::string iso_short(const std::string& iso) {
+  if (iso.size() >= 16 && iso[10] == 'T') return iso.substr(0, 10) + " " + iso.substr(11, 5) + " UTC";
+  return iso;
+}
+
+// Rows of the connection popover for an HTTP response: HttpResponse::conn (the connection that
+// carried the final request, with its TLS session and leaf certificate), then the redirect chain.
 std::vector<InfoRow> http_conn_rows(const HttpResponse& r, const SentHttp* sent) {
   std::vector<InfoRow> rows;
+  const ConnectionInfo& c = r.conn;
   const std::string& url = r.effective_url.empty() && sent ? sent->request.url : r.effective_url;
   const bool https = url.rfind("https:", 0) == 0;
   rows.push_back({"Connection", {}, true});
   if (!r.ok) rows.push_back({"Error", r.error, false, true});
   if (!r.http_version.empty())
     rows.push_back({"Protocol", r.http_version + (https ? "  (negotiated via ALPN)" : "  (plain TCP)")});
-  if (r.ok)
-    rows.push_back({"Connection", r.timing.connection_reused ? "reused (opened by an earlier request; DNS, TCP and TLS skipped)"
-                                                             : "new (opened for this request)"});
-  if (const std::string a = host_port(r.remote_ip, r.remote_port); !a.empty()) rows.push_back({"Remote address", a});
-  if (const std::string a = host_port(r.local_ip, r.local_port); !a.empty()) rows.push_back({"Local address", a});
+  if (r.ok) {
+    std::string v = c.reused ? "reused (opened by an earlier request; DNS, TCP and TLS skipped)"
+                             : "new (opened for this request)";
+    if (c.id >= 0) v += "  \xC2\xB7  #" + std::to_string(c.id);
+    rows.push_back({"Connection", v});
+  }
+  const std::string remote = host_port(c.remote_ip.empty() ? r.remote_ip : c.remote_ip,
+                                       c.remote_ip.empty() ? r.remote_port : c.remote_port);
+  const std::string local = host_port(c.local_ip.empty() ? r.local_ip : c.local_ip,
+                                      c.local_ip.empty() ? r.local_port : c.local_port);
+  if (!c.proxy.empty())
+    rows.push_back({"Proxy", c.proxy + (https ? "  (HTTP CONNECT tunnel: TLS runs end to end through it)"
+                                              : "  (the request went to the proxy, which forwarded it)")});
+  if (!remote.empty()) rows.push_back({c.proxy.empty() ? "Remote address" : "Remote (proxy)", remote});
+  if (!local.empty()) rows.push_back({"Local address", local});
   if (!url.empty()) rows.push_back({"URL", url});
-  if (r.redirect_count > 0) rows.push_back({"Redirects", std::to_string(r.redirect_count) + " followed"});
   if (!https) {
     rows.push_back({"TLS", {}, true});
     rows.push_back({"TLS", "none: plain http://, nothing is encrypted"});
-    return rows;
-  }
-  rows.push_back({"TLS", {}, true});
-  if (r.tls_version.empty()) {
-    rows.push_back({"TLS", r.ok ? "details not available" : "no TLS session was established", false, !r.ok});
-    return rows;
-  }
-  rows.push_back({"Version", r.tls_version});
-  if (!r.tls_cipher.empty()) rows.push_back({"Cipher", r.tls_cipher});
-  if (!r.verify_result.empty())
-    rows.push_back({"Verification", r.verify_result, false, r.verify_result.rfind("verified", 0) != 0});
-  rows.push_back({"Certificate", {}, true});
-  if (!r.cert_subject.empty()) rows.push_back({"Subject", r.cert_subject});
-  if (!r.cert_san.empty()) rows.push_back({"Alt names", r.cert_san});
-  if (!r.cert_issuer.empty()) rows.push_back({"Issuer", r.cert_issuer});
-  if (!r.cert_not_after.empty()) {
-    std::string v = r.cert_not_after;
-    long d = 0;
-    bool soon = false;
-    if (days_left(r.cert_not_after, &d)) {
-      v += d < 0 ? "  (expired " + std::to_string(-d) + " days ago)" : "  (" + std::to_string(d) + " days left)";
-      soon = d < 14;
+  } else {
+    rows.push_back({"TLS", {}, true});
+    const TlsInfo* ti = c.tls_info.get();
+    if (!ti && r.tls_version.empty()) {
+      rows.push_back({"TLS", r.ok ? "details not available" : "no TLS session was established", false, !r.ok});
+    } else if (!ti) {
+      // Older engine path: only the flat mirror fields.
+      rows.push_back({"Version", r.tls_version});
+      if (!r.tls_cipher.empty()) rows.push_back({"Cipher", r.tls_cipher});
+      if (!r.verify_result.empty())
+        rows.push_back({"Verification", r.verify_result, false, r.verify_result.rfind("verified", 0) != 0});
+      if (!r.cert_subject.empty()) rows.push_back({"Subject", r.cert_subject});
+      if (!r.cert_issuer.empty()) rows.push_back({"Issuer", r.cert_issuer});
+    } else {
+      rows.push_back({"Version", ti->version});
+      if (!ti->cipher.empty()) rows.push_back({"Cipher", ti->cipher});
+      rows.push_back({"ALPN", ti->alpn.empty() ? std::string("none (server did not negotiate ALPN)") : ti->alpn});
+      if (!ti->verify_result.empty())
+        rows.push_back({"Verification", ti->verify_result, false, ti->verify_result.rfind("verified", 0) != 0});
+      if (c.reused) rows.push_back({"Handshake", "earlier, on this reused connection"});
+      if (!ti->client_cert_subject.empty())
+        rows.push_back({"Client certificate", ti->client_cert_subject + "  (issued by " + ti->client_cert_issuer +
+                                                  "; sent: mutual TLS)"});
+      else if (c.client_cert)
+        rows.push_back({"Client certificate", "set, but the server did not ask for one (not sent)"});
+      const TlsCertificate& L = ti->leaf;
+      if (!L.subject.empty() || !L.sha256_fingerprint.empty()) {
+        rows.push_back({"Certificate", {}, true});
+        if (!L.subject.empty()) rows.push_back({"Subject", L.subject});
+        if (!L.subject_alt_names.empty()) {
+          std::string sans;
+          for (size_t i = 0; i < L.subject_alt_names.size(); ++i) {
+            if (i == 24) {
+              sans += ", \xE2\x80\xA6 " + std::to_string(L.subject_alt_names.size() - 24) + " more";
+              break;
+            }
+            if (i) sans += ", ";
+            sans += L.subject_alt_names[i];
+          }
+          rows.push_back({"Alt names (" + std::to_string(L.subject_alt_names.size()) + ")", sans});
+        }
+        if (!L.issuer.empty()) rows.push_back({"Issuer", L.issuer});
+        if (!L.not_before.empty()) rows.push_back({"Valid from", iso_short(L.not_before)});
+        if (!L.not_after.empty()) {
+          std::string v = iso_short(L.not_after);
+          long d = 0;
+          bool soon = false;
+          if (days_left(L.not_after, &d)) {
+            v += d < 0 ? "  (expired " + std::to_string(-d) + " days ago)" : "  (" + std::to_string(d) + " days left)";
+            soon = d < 14;
+          }
+          rows.push_back({"Valid until", v, false, soon});
+        }
+        if (!L.serial.empty()) rows.push_back({"Serial", L.serial});
+        if (!L.sha256_fingerprint.empty()) rows.push_back({"SHA-256", L.sha256_fingerprint});
+      }
+      if (!ti->chain.empty()) {
+        rows.push_back({"Chain (" + std::to_string(ti->chain_length) + ")", {}, true});
+        size_t at = 0;
+        int n = 0;
+        while (at < ti->chain.size()) {
+          size_t e = ti->chain.find('\n', at);
+          if (e == std::string::npos) e = ti->chain.size();
+          if (e > at) rows.push_back({"#" + std::to_string(++n), ti->chain.substr(at, e - at)});
+          at = e + 1;
+        }
+      }
     }
-    rows.push_back({"Valid until", v, false, soon});
   }
-  if (!r.cert_chain.empty()) rows.push_back({"Chain", r.cert_chain});
+  if (!r.hops.empty()) {
+    rows.push_back({"Redirects (" + std::to_string(r.hops.size()) + ")", {}, true});
+    for (size_t i = 0; i < r.hops.size(); ++i) {
+      const RedirectHop& h = r.hops[i];
+      std::string v = std::to_string(h.status) + "  " + h.url + "  \xC2\xB7  " + fmt::ms(h.total_ms);
+      if (const std::string a = host_port(h.remote_ip, h.remote_port); !a.empty()) v += "  \xC2\xB7  " + a;
+      if (h.connection_reused) v += "  \xC2\xB7  reused conn.";
+      rows.push_back({"#" + std::to_string(i + 1), v});
+    }
+    rows.push_back({"Final", std::to_string(r.status) + "  " + r.effective_url});
+  }
   return rows;
 }
 
@@ -618,6 +1123,24 @@ std::string request_tag(const std::string& label) {
   return elide_middle(t, 40);
 }
 
+// Line breaks (and the indentation after them) of an error text joined into one line.
+std::string one_line(const std::string& s) {
+  std::string o;
+  o.reserve(s.size());
+  bool brk = false;
+  for (char c : s) {
+    if (c == '\r' || c == '\n') {
+      brk = true;
+      continue;
+    }
+    if (brk && (c == ' ' || c == '\t')) continue;
+    if (brk && !o.empty() && o.back() != ' ') o += ' ';
+    brk = false;
+    o += c;
+  }
+  return o;
+}
+
 std::string elide_middle(const std::string& s, size_t n) {
   if (s.size() <= n) return s;
   return s.substr(0, n / 2) + "\xE2\x80\xA6" + s.substr(s.size() - (n - n / 2 - 1));
@@ -708,30 +1231,51 @@ std::string http_transcript(const HttpResponse& r, const SentHttp* sent, const s
 
 enum Tab { kBody, kHeaders, kCookies, kTrailers, kMessages, kRequest, kTests, kLog };
 
+// The body pane before the first response: what the view will show, so its features are found.
+const char* const kEmptyHelp =
+    "Send the request (Ctrl+Enter) to see its response here.\n\n"
+    "Timing    every phase from click to last byte, vs the last run\n"
+    "Protocol  click the HTTP / TLS chip: connection, certificate\n"
+    "Body      Pretty, Raw, Table, Preview; Ctrl+F finds\n"
+    "Filter    Ctrl+Shift+F, e.g. $.items[?(@.price < 10)].name\n"
+    "Tests     assertions and script test() results, with actuals\n"
+    "Log       curl -v style transcript and script console output\n"
+    "Examples  save a response; compare later runs with it\n\n"
+    "Esc cancels a request in flight.";
+
 class ResponseView : public wxPanel, public ResponsePanel {
  public:
   explicit ResponseView(wxWindow* parent) : wxPanel(parent, wxID_ANY) {
     SetBackgroundColour(Theme::get().bg);
     status_ = new StatusStrip(this);
     wf_ = new Waterfall(this);
-    tabs_ = new TabStrip(this, [this](int i) {
-      book_->SetSelection(static_cast<size_t>(i));
-      if (i == kTests) refresh_asserts(true);
-    });
+    tabs_ = new TabStrip(this, [this](int i) { show_page(i); });
     book_ = new wxSimplebook(this, wxID_ANY);
     book_->SetBackgroundColour(Theme::get().bg);
     body_ = new BodyView(book_);
-    headers_ = new KvList(book_, "Header", "Value");
-    cookies_ = new KvList(book_, "Cookie", "Value; attributes");
-    trailers_ = new KvList(book_, "Trailer", "Value");
-    msgs_ = new MsgList(book_, [this](size_t i) {
+    // The other pages are cheap panels until first shown (see LazyPage).
+    headers_ = new KvPage(book_, "Header", "Value");
+    cookies_ = new KvPage(book_, "Cookie", "Value; attributes");
+    trailers_ = new KvPage(book_, "Trailer", "Value");
+    msgs_ = new MsgPage(book_, [this](size_t i) {
       select_tab(kBody);
       body_->goto_message(i);
     });
-    request_ = new KvList(book_, "Request", "Value");
+    request_ = new KvPage(book_, "Request", "Value");
     tests_ = new TestsView(book_);
     tests_->on_edit = [this](const std::vector<Assertion>& a) { save_asserts(a); };
     tests_->on_reveal = [this](const Assertion& a) { reveal(a); };
+    // An inherited (folder / collection) check: edited in that folder's settings, not here.
+    tests_->on_edit_folder = [this](const std::filesystem::path& folder) {
+      RequestTab* t = tab();
+      const Workspace* ws = t ? t->workspace() : nullptr;
+      if (!ws || folder.empty()) return;
+      wxWeakRef<wxWindow> self(this);
+      http_editor::edit_folder_settings(this, *ws, folder, [self, this] {
+        if (self) refresh_asserts(true);
+      });
+    };
+    log_ = new LogPage(book_);
     book_->AddPage(body_, "Body");
     book_->AddPage(headers_, "Headers");
     book_->AddPage(cookies_, "Cookies");
@@ -739,11 +1283,6 @@ class ResponseView : public wxPanel, public ResponsePanel {
     book_->AddPage(msgs_, "Messages");
     book_->AddPage(request_, "Request");
     book_->AddPage(tests_, "Tests");
-    log_ = new wxTextCtrl(book_, wxID_ANY, "", wxDefaultPosition, wxDefaultSize,
-                          wxTE_MULTILINE | wxTE_READONLY | wxTE_DONTWRAP | wxTE_RICH2 | wxBORDER_NONE);
-    log_->SetFont(wxFont(wxFontInfo(9).Family(wxFONTFAMILY_TELETYPE).FaceName("Consolas")));
-    log_->SetBackgroundColour(Theme::get().bg);
-    log_->SetForegroundColour(Theme::get().fg);
     book_->AddPage(log_, "Log");
     tabs_->add("Body");
     tabs_->add("Headers");
@@ -754,12 +1293,17 @@ class ResponseView : public wxPanel, public ResponsePanel {
     tabs_->add("Tests");
     tabs_->add("Log");
 
-    hist_ = new ChipBar(this, [this](int) { history_menu(); });
+    hist_ = new ChipBar(this, [this](int id) { id == 2 ? examples_menu() : history_menu(); });
+    hist_->add(2, "Examples \xE2\x96\xBE",
+               "Save this response as an example of the request (Postman's Save Response), or open a saved one to "
+               "look at it or check it again. Examples are kept per user, in the workspace's private .watt "
+               "folder (a response may hold tokens).", -1, true);
+    hist_->set_visible(2, false);
     hist_->add(1, "History", "Earlier responses of this tab, each labelled with its request: pick one to look at it "
                              "again (its delta compares with the run of the same request before it)", -1, true);
     hist_->set_visible(1, false);
     hist_->set_bottom_rule(true);  // the tab strip's rule runs to the pane's right edge
-    hist_->SetMinSize(wxSize(FromDIP(130), -1));
+    hist_->SetMinSize(wxSize(FromDIP(220), -1));
     auto* tabrow = new wxBoxSizer(wxHORIZONTAL);
     tabrow->Add(tabs_, 1, wxEXPAND);
     tabrow->Add(hist_, 0, wxEXPAND);
@@ -771,7 +1315,11 @@ class ResponseView : public wxPanel, public ResponsePanel {
     sz->Add(book_, 1, wxEXPAND);
     SetSizer(sz);
     wf_->set_on_conn_click([this](const wxRect& r) { open_conn(r); });
-    status_->set_on_click([this](int, const wxRect& r) { open_conn(r); });
+    status_->set_on_click([this](int id, const wxRect& r) {
+      if (id == kClickTests) return select_tab(kTests);
+      if (id == kClickLog) return select_tab(kLog);
+      open_conn(r);
+    });
 
     Bind(wxEVT_CHAR_HOOK, [this](wxKeyEvent& e) {
       if (e.GetKeyCode() == 'F' && e.GetModifiers() == wxMOD_CONTROL) {
@@ -793,23 +1341,47 @@ class ResponseView : public wxPanel, public ResponsePanel {
           e.Skip();
         });
       }
+      TraceScope ts("ctor_after");
       refresh_asserts(false);
+      refresh_examples();
+      // Esc with the focus outside the tab (the sidebar after a double-click + Ctrl+Enter) cancels
+      // the request of the tab on screen too.
+      top_ = wxGetTopLevelParent(this);
+      if (top_) top_->Bind(wxEVT_CHAR_HOOK, &ResponseView::on_top_key, this);
     });
+  }
+
+  void on_top_key(wxKeyEvent& e) {
+    e.Skip();
+    if (e.GetKeyCode() != WXK_ESCAPE || e.GetModifiers() != 0) return;
+    RequestTab* t = tab();
+    if (!t || !t->in_flight() || !t->IsShownOnScreen()) return;
+    // A text field outside the tab that holds text keeps Esc (e.g. clearing the sidebar filter).
+    if (wxWindow* f = wxWindow::FindFocus()) {
+      bool inside = false;
+      for (wxWindow* w = f; w && !inside; w = w->GetParent()) inside = w == t;
+      if (!inside)
+        if (auto* te = dynamic_cast<wxTextEntry*>(f); te && !te->IsEmpty()) return;
+    }
+    e.Skip(false);
+    t->cancel();
   }
 
   wxWindow* window() override { return this; }
 
   void clear() override {
+    TraceScope ts("clear");
     status_->set("", Tone::Plain, {{"Send a request to see the response here  (Ctrl+Enter)", "", Tone::Dim}});
     wf_->clear(false);
+    switch_filter({});
     shown_ident_.clear();
-    body_->show_message("");
+    body_->show_message(kEmptyHelp);
     headers_->set({});
     trailers_->set({});
     msgs_->reset();
     request_->set({});
     cookies_->set({});
-    log_->Clear();
+    log_->set({});
     set_kind_tabs(false, false);
     select_tab(kBody);
     runs_.clear();
@@ -817,15 +1389,138 @@ class ResponseView : public wxPanel, public ResponsePanel {
     update_history_chip();
     ++test_seq_;
     tests_->set_no_response();
+    tests_->set_script({});
+    awaiting_ = false;
     // The tab may have loaded another request: read its checks once this turn is over (the tab
     // may still be building its editor).
-    CallAfter([this] { refresh_asserts(false); });
+    const uint64_t seq = ++view_seq_;
+    help_seq_ = seq;
+    grpc_history_when_.clear();
+    // The tab may now hold a request of the other kind: an HTTP request opened after a gRPC
+    // response must not be treated as "a gRPC response is on screen".
+    showing_grpc_ = false;
+    grpc_last_.reset();
+    CallAfter([this, seq] {
+      TraceScope ts("clear_after");
+      refresh_asserts(false);
+      refresh_examples();
+      load_last_from_history(seq);
+    });
+  }
+
+  // A request opened in a tab shows its last response from the workspace history (Insomnia
+  // keeps one per request), read on a worker thread, unless something else was shown first (a
+  // send, the tab's own restored response). History snapshot tabs get theirs from the sidebar.
+  void load_last_from_history(uint64_t seq, int tries = 0) {
+    if (seq != view_seq_) return;
+    RequestTab* t = tab();
+    if (!t || t->in_flight() || t->last_response()) return;
+    const Workspace* ws = t->workspace();
+    if (!ws || ws->root().empty()) {
+      // A tab restored at start-up is built before the workspace has finished opening.
+      if (tries < 40) {
+        if (hist_timer_.GetOwner() != this) {
+          hist_timer_.SetOwner(this, wxWindow::NewControlId());
+          Bind(wxEVT_TIMER, [this](wxTimerEvent&) { load_last_from_history(hist_seq_, hist_tries_); },
+               hist_timer_.GetId());
+        }
+        hist_seq_ = seq;
+        hist_tries_ = tries + 1;
+        hist_timer_.StartOnce(250);
+      }
+      return;
+    }
+    const std::filesystem::path& file = t->file();
+    if (file.empty() || file.parent_path() == ws->root() / ".watt" / "snapshots") return;
+    SavedRequest q = t->request();
+    const RequestKind kind = q.kind;
+    const std::string summary = kind == RequestKind::Grpc ? q.grpc_method + " @ " + q.grpc_target.address
+                                                          : q.http.method + " " + q.http.url;
+    if (kind == RequestKind::Grpc ? q.grpc_method.empty() : q.http.url.empty()) return;
+    auto copy = std::make_shared<Workspace>(*ws);
+    std::thread([copy, q = std::move(q), kind, summary, seq, alive = alive_, this]() mutable {
+      std::vector<HistoryEntry> h = copy->history(200);
+      filter_hidden_history(load_history_hidden(copy->root()), h);
+      keep_runs_of(*copy, q, summary, h);
+      auto lr = std::make_shared<LastResponse>();
+      auto ex = std::make_shared<std::optional<rv::RunExtras>>();
+      auto entry = std::make_shared<HistoryEntry>();
+      std::string when;
+      if (kind == RequestKind::Http) {
+        // The newest run of this request decides: its kept response (body capped by the history)
+        // with what this view kept of it (dialog time, scripts, TLS, hops), or that alone when
+        // the body was too large to keep, or just its status and time from the history list.
+        for (const HistoryEntry& e : h) {
+          if (e.kind != kind || history_template(e) != summary) continue;
+          *entry = e;
+          when = e.when_iso;
+          *ex = rv::find_extras(copy->root(), rv::run_key(summary, e.status, e.total_ms));
+          if (auto j = load_history_response(copy->root(), e)) *lr = last_response_from_json(*j, q);
+          break;
+        }
+        if (when.empty() || !wxTheApp) return;
+      } else {
+        // The newest run of this request that has its response kept (not every entry does).
+        int looked = 0;
+        for (const HistoryEntry& e : h) {
+          if (e.kind != kind || history_template(e) != summary) continue;
+          if (++looked > 8) break;
+          if (auto j = load_history_response(copy->root(), e)) {
+            *lr = last_response_from_json(*j, q);
+            when = e.when_iso;
+            if (*lr) break;
+          }
+        }
+        if (!*lr || !wxTheApp) return;
+      }
+      wxTheApp->CallAfter([alive, this, seq, lr, ex, entry, when] {
+        TraceScope ts("history_show");
+        if (!*alive || seq != view_seq_ || !runs_.empty()) return;
+        if (RequestTab* tt = tab(); !tt || tt->in_flight() || tt->last_response()) return;
+        if (lr->grpc) {
+          grpc_history_when_ = when;
+          show_grpc(lr->grpc);
+          return;
+        }
+        history_when_ = when;
+        if (lr->http && ex->has_value()) {
+          auto [r, sent] = with_extras(*lr->http, lr->sent, **ex);
+          extras_applied_ = true;
+          show_http(std::move(r), std::move(sent));
+        } else if (lr->http) {
+          extras_applied_ = true;  // none were kept for this run (an older version, another tool)
+          show_http(lr->http, lr->sent);
+        } else if (ex->has_value() && (*ex)->head) {
+          auto [r, sent] = with_extras_head(**ex);
+          extras_applied_ = true;
+          body_not_kept_ = true;
+          not_kept_size_ = (*ex)->body_size;
+          show_http(std::move(r), std::move(sent));
+        } else {
+          show_not_kept(*entry);
+        }
+        extras_applied_ = false;
+        body_not_kept_ = false;
+        history_when_.clear();
+      });
+    }).detach();
+  }
+
+  void set_history_when(const std::string& when_iso) override {
+    history_when_ = when_iso;
+    if (!when_iso.empty()) grpc_history_when_ = when_iso;
   }
 
   void show_sending(RequestKind kind) override {
+    const bool help_shown = help_seq_ == view_seq_ && runs_.empty() && !showing_grpc_;
+    ++view_seq_;
+    grpc_history_when_.clear();
     kind_ = kind;
     live_ = false;
-    status_->set_busy(kind == RequestKind::Grpc ? "Calling\xE2\x80\xA6" : "Sending\xE2\x80\xA6", Clock::now());
+    send_t0_ = Clock::now();
+    sent_here_ = true;
+    awaiting_ = true;
+    status_->set_busy(kind == RequestKind::Grpc ? "Calling\xE2\x80\xA6" : "Sending\xE2\x80\xA6", send_t0_);
     // gRPC results carry no request: remember what this call is (target, method, body) for its
     // delta. HTTP results come with the request as sent.
     grpc_key_.clear();
@@ -835,7 +1530,7 @@ class ResponseView : public wxPanel, public ResponsePanel {
       if (auto* tab = dynamic_cast<RequestTab*>(w)) {
         const SavedRequest& q = tab->request();
         if (kind == RequestKind::Grpc) {
-          grpc_key_ = "grpc " + std::string(q.grpc_target.tls ? "tls " : "") + q.grpc_target.address + " " +
+          grpc_key_ = owner_tag() + "grpc " + std::string(q.grpc_target.tls ? "tls " : "") + q.grpc_target.address + " " +
                       q.grpc_method + body_tag(q.grpc_body);
           grpc_label_ = q.grpc_method + " @ " + q.grpc_target.address;
           const GrpcTarget& gt = q.grpc_target;
@@ -846,16 +1541,28 @@ class ResponseView : public wxPanel, public ResponsePanel {
           ident = "http " + q.http.method + " " + q.http.url;
         }
         set_asserts_from(q);
+        // The request may have been loaded into this tab after the view was built.
+        if (const Workspace* ws = tab->workspace(); ws && !q.file.empty()) {
+          if (examples_dir(ws->root(), q.id) != examples_dir_) CallAfter([this] { refresh_examples(); });
+        }
         break;
       }
     // The previous figures stay (dimmed, "previous run") only while the same request runs again:
     // Fail's timing must not sit above a Count stream.
-    if (ident.empty() || ident != shown_ident_) wf_->clear();
+    if (ident.empty() || ident != shown_ident_) {
+      wf_->clear();
+      switch_filter(ident);
+    }
     shown_ident_ = ident;
     wf_->reserve(kind == RequestKind::Grpc ? 8 : 10);
     wf_->set_stale(true);
-    wf_->set_waiting(Clock::now());
-    body_->set_stale(true);
+    first_ms_ = -1;
+    wf_->set_waiting(send_t0_);
+    // No earlier response: the empty-state help is not a "previous response" to fade.
+    waiting_msg_ = help_shown;
+    progress_shown_at_ = {};
+    if (help_shown) body_->show_message("Waiting for the response.");
+    else body_->set_stale(true);
     if (!tests_->asserts().empty()) {
       tests_->set_running();
       tabs_->set_label(kTests, "Tests", "\xE2\x80\xA6");
@@ -865,23 +1572,156 @@ class ResponseView : public wxPanel, public ResponsePanel {
 
   void show_progress(uint64_t bytes) override {
     status_->set_busy_label("Receiving " + fmt::human_bytes(bytes) + "\xE2\x80\xA6");
+    // The body area says what is arriving (not "Waiting"), a few times a second at most.
+    if (waiting_msg_ && awaiting_) {
+      const auto now = Clock::now();
+      if (progress_shown_at_ == Clock::time_point{} || ms_between(progress_shown_at_, now) > 250) {
+        progress_shown_at_ = now;
+        body_->show_message("Receiving the response: " + fmt::human_bytes(bytes) + " so far, first byte at +" +
+                            fmt::ms(first_ms_ >= 0 ? first_ms_ : ms_between(send_t0_, now)) +
+                            ".\n\nThe body is shown when it is complete (Esc cancels).");
+      }
+    }
+    if (first_ms_ < 0) first_ms_ = ms_between(send_t0_, Clock::now());
+    wf_->set_live(first_ms_, bytes, 0);
   }
 
   void show_http(std::shared_ptr<const HttpResponse> r, std::shared_ptr<const SentHttp> sent) override {
+    TraceScope ts("show_http");
+    // A response without show_sending() before it is a restored one (the tab's last response of
+    // an earlier session, or one read from the history): never "sent now".
+    const bool restored = !awaiting_;
+    if (restored && !extras_applied_ && r) {
+      // The tab's own last response: what the view kept of that run (dialog time, scripts, TLS)
+      // is in memory when it ran in this process, else on disk (read on a worker, then shown
+      // again with it).
+      const std::string key = extras_key(*r);
+      if (auto x = rv::find_extras_cached(key)) {
+        auto [rr, ss] = with_extras(*r, sent, *x);
+        extras_applied_ = true;
+        show_http(std::move(rr), std::move(ss));
+        extras_applied_ = false;
+        return;
+      }
+      if (!key.empty())
+        if (RequestTab* t = tab())
+          if (const Workspace* ws = t->workspace(); ws && !ws->root().empty()) {
+            const uint64_t want = view_seq_ + 1;  // the seq this show_http leaves
+            std::thread([root = ws->root(), key, r, sent, want, hw = history_when_, alive = alive_, this] {
+              auto x = rv::find_extras(root, key);
+              if (!x || !wxTheApp) return;
+              wxTheApp->CallAfter([alive, this, want, r, sent, x, hw] {
+                if (!*alive || want != view_seq_ || runs_.empty() || runs_.back().resp != r) return;
+                runs_.pop_back();
+                auto [rr, ss] = with_extras(*r, sent, *x);
+                extras_applied_ = true;
+                history_when_ = hw;
+                show_http(std::move(rr), std::move(ss));
+                history_when_.clear();
+                extras_applied_ = false;
+              });
+            }).detach();
+          }
+    }
+    // A body the history cut carries a note in its status text ("OK (body cut: history keeps the
+    // first 64 KB of 10.2 MB)"): the status chip shows the status, the "first ... kept" segment
+    // says the rest (from the size as received).
+    uint64_t hist_cut = 0;
+    if (restored && r) {
+      const size_t at = r->status_text.find("(body cut: history keeps the first ");
+      if (at != std::string::npos && r->sizes.response_body > r->body.size()) {
+        auto c = std::make_shared<HttpResponse>(*r);
+        c->status_text.resize(at);
+        while (!c->status_text.empty() && c->status_text.back() == ' ') c->status_text.pop_back();
+        hist_cut = c->sizes.response_body;
+        r = std::move(c);
+      }
+    }
     const bool plain = sent ? sent->request.url.rfind("http:", 0) == 0 : r->effective_url.rfind("http:", 0) == 0;
-    Run run{r, sent, http_model(*r, plain), wxDateTime::Now()};
+    const ScriptRun* pre = sent && sent->pre_script ? sent->pre_script.get() : nullptr;
+    // The shell starts its clock at the Send click, before any confirmation dialog (script trust,
+    // Windows sign-in, environment variables): the time a dialog was open is not the request's.
+    // It shows up as the shell's total exceeding the wall time since show_sending() (which comes
+    // right after the dialogs): that excess is taken out of Queue and the total, and said so.
+    double prompt_ms = 0;
+    if (awaiting_ && send_t0_ != Clock::time_point{}) {
+      const double wall = ms_between(send_t0_, Clock::now());
+      const double pre_ms = pre && pre->ran ? pre->elapsed_us / 1000.0 : 0.0;
+      // The post-response script ran after the shell's clock stopped, inside the wall time.
+      const ScriptRun* post = sent && sent->post_script ? sent->post_script.get() : nullptr;
+      const double post_ms = post && post->ran ? post->elapsed_us / 1000.0 : 0.0;
+      const double excess = r->timing.total_ms - std::max(0.0, wall - post_ms);
+      if (excess > kPromptMinMs) prompt_ms = std::min(excess, r->timing.queue_ms - pre_ms);
+      if (prompt_ms <= kPromptMinMs) prompt_ms = 0;
+    }
+    awaiting_ = false;
+    if (!restored) {
+      // Kept with this run so a restore shows it as it is shown now (see response_keep.h).
+      rv::RunExtras x;
+      x.prompt_ms = prompt_ms;
+      if (sent) {
+        x.pre = sent->pre_script;
+        x.post = sent->post_script;
+        x.scripts_skipped_untrusted = sent->scripts_skipped_untrusted;
+      }
+      x.head = rv::response_head(*r);
+      x.body_size = r->body.size();
+      const std::string key = extras_key(*r);
+      if (!key.empty()) {
+        const RequestTab* t = tab();
+        const Workspace* ws = t ? t->workspace() : nullptr;
+        rv::keep_extras(ws ? ws->root() : std::filesystem::path(), key, std::move(x));
+      }
+    }
+    if (prompt_ms > 0) {
+      auto c = std::make_shared<HttpResponse>(*r);  // rare (a dialog was shown): the copy is fine
+      c->timing.queue_ms -= prompt_ms;
+      c->timing.total_ms -= prompt_ms;
+      r = std::move(c);
+    }
+    ++view_seq_;
+    Run run{r, sent,
+            http_model(*r, plain, pre, sent ? sent->post_script.get() : nullptr, sent ? sent->token.get() : nullptr),
+            wxDateTime::Now()};
+    run.prompt_ms = prompt_ms;
+    run.restored = restored;
+    run.from_history = history_when_;
+    // A run read from the history happened when the history says (UTC there): its Log line and
+    // the History menu's "n min ago" show that time, not the moment the tab was opened.
+    if (wxDateTime dt; history_when_.size() >= 19 && dt.ParseISOCombined(wxString(history_when_.substr(0, 19))))
+      run.at = dt.FromTimezone(wxDateTime::UTC);
+    run.body_not_kept = restored && body_not_kept_;
+    run.not_kept_size = not_kept_size_;
+    if (restored) {
+      // The dialog time with_extras() took out: said so again, as it was live.
+      run.prompt_ms = extras_applied_ && extras_prompt_ms_ > kPromptMinMs ? extras_prompt_ms_ : 0;
+      run.cut_size = extras_applied_ ? extras_cut_size_ : 0;
+      if (!run.cut_size) run.cut_size = hist_cut;
+      extras_prompt_ms_ = 0;
+      extras_cut_size_ = 0;
+    }
     if (!r->ok) mark_failure(run.model, *r);
+    if (run.restored && r->tls_version.empty() && !plain && r->ok) run.model.conn_note += " \xC2\xB7 TLS";
+    if (run.restored && r->timing.connection_reused) run.model.conn_note += " (at the time)";
     if (sent) {
       run.label = sent->request.method + " " + sent->request.url;
-      run.key = "http " + run.label + body_tag(sent->request.body);
+      run.key = owner_tag() + "http " + run.label + body_tag(sent->request.body);
     }
-    // The delta compares with the previous successful run of the same request only.
-    if (const Base* b = base_for(run.key)) {
+    // The delta compares with the previous successful run of the same request only, and only for
+    // a response received now (a restored one may be that very run again: "+-0 vs previous").
+    if (const Base* b = run.restored ? nullptr : base_for(run.key)) {
       run.base = b->model;
       run.base_at = b->at;
       run.has_base = true;
     }
-    if (r->ok) remember(run.key, run.model);
+    // A restored response from an earlier session was timed by the shell, confirmation dialogs
+    // included (they cannot be told apart afterwards): a Queue that long is a dialog, not a
+    // baseline worth comparing the next run with.
+    const bool dialog_in_it = run.restored && r->timing.queue_ms > 250;
+    if (r->ok && !dialog_in_it) remember(run.key, run.model);
+    // Its captures are applied (not when an earlier run is re-shown, nor for a restored one:
+    // opening a request must not change variables).
+    fresh_response_ = !run.restored;
     // Keep the last runs of this tab (at most kRuns, and at most ~64 MB of bodies) so an earlier
     // response can be looked at again and compared with the current one.
     runs_.push_back(std::move(run));
@@ -912,6 +1752,7 @@ class ResponseView : public wxPanel, public ResponsePanel {
       const std::string where = classify_failure(*r).text;
       segs.push_back({fmt::ms(t.total_ms), "Time until the failure.", Tone::Plain, true});
       segs.push_back({r->error, where + "\n" + r->error, Tone::Err, false});
+      add_script_segs(segs, run);
       status_->set("Failed", Tone::Err, std::move(segs));
       wf_->set(model, nullptr);
       body_->show_message("Request failed: " + r->error + "\n\n" + where + "\n");
@@ -921,7 +1762,12 @@ class ResponseView : public wxPanel, public ResponsePanel {
       set_cookies(*r);
       set_request(sent.get(), r.get());
       set_log(run);
-      run_tests();
+      set_script_results(sent.get());
+      // No response: no check runs against the failed transport's figures (its responseTime is
+      // the time until the failure). watt --run and the runner count the request failed.
+      ++test_seq_;
+      tests_->set_no_response("request failed, no response");
+      update_tests_label();
       return;
     }
     std::string badge = std::to_string(r->status);
@@ -957,8 +1803,15 @@ class ResponseView : public wxPanel, public ResponsePanel {
     {
       std::string proto = r->http_version.empty() ? std::string("connection") : r->http_version;
       if (!r->tls_version.empty()) proto += " \xC2\xB7 " + r->tls_version;
+      else if (run.restored && r->effective_url.rfind("https:", 0) == 0) proto += " \xC2\xB7 TLS";
+      const TlsInfo* cti = r->conn.tls_info.get();
+      const bool mtls = cti && !cti->client_cert_subject.empty();
+      if (mtls) proto += " \xC2\xB7 mTLS";
+      if (!r->conn.proxy.empty()) proto += " \xC2\xB7 via proxy";
       std::string tip = "Protocol of the final response";
       tip += r->tls_version.empty() ? "." : " (negotiated via ALPN), " + r->tls_version + " " + r->tls_cipher + ".";
+      if (mtls) tip += "\nMutual TLS: sent the client certificate " + cti->client_cert_subject + ".";
+      if (!r->conn.proxy.empty()) tip += "\nThrough the proxy " + r->conn.proxy + ".";
       if (!remote.empty()) tip += "\nRemote " + remote;
       if (!r->local_ip.empty()) tip += ", local " + host_port(r->local_ip, r->local_port);
       tip += "\nClick for the connection and certificate details.";
@@ -972,9 +1825,31 @@ class ResponseView : public wxPanel, public ResponsePanel {
     if (!run.label.empty() && !earlier)
       segs.push_back({request_tag(run.label), "This response belongs to:\n" + run.label, Tone::Dim, false, 7});
     if (r->redirect_count > 0)
-      segs.push_back({std::to_string(r->redirect_count) + (r->redirect_count == 1 ? " redirect" : " redirects"),
-                      "Followed redirects; final URL:\n" + r->effective_url, Tone::Redirect, false, 3});
+    {
+      StatusSeg seg{std::to_string(r->redirect_count) + (r->redirect_count == 1 ? " redirect \xE2\x96\xBE" : " redirects \xE2\x96\xBE"),
+                    "Followed redirects; final URL:\n" + r->effective_url + "\nClick for each hop (status, URL, time).",
+                    Tone::Redirect, false, 3};
+      seg.click = 2;
+      segs.push_back(std::move(seg));
+    }
     if (before) add_delta(segs, model, *before, run.label, run.base_at);
+    add_script_segs(segs, run);
+    if (run.restored) segs.insert(segs.begin() + 1, run.from_history.empty() ? restored_seg() : history_seg(run.from_history));
+    if (run.cut_size > 0)
+      segs.insert(segs.begin() + 2, StatusSeg{"first " + fmt::human_bytes(r->body.size()) + " of " +
+                                                  fmt::human_bytes(run.cut_size) + " kept",
+                                              "The history keeps the start of a large body only; status, headers and "
+                                              "timing are as received.\nCtrl+Enter sends the request again.",
+                                              Tone::Dim, false, 2});
+    if (run.body_not_kept)
+      segs.insert(segs.begin() + 2, StatusSeg{"body not kept (" + fmt::human_bytes(run.not_kept_size) + ")",
+                                              "Responses over the history's size limit are kept without their body.",
+                                              Tone::Dim, false, 2});
+    if (!run.example.empty())
+      segs.insert(segs.begin() + 1, StatusSeg{"example \xC2\xB7 " + run.example,
+                                              "A saved example of this request, not a live response.\nCtrl+Enter "
+                                              "sends the request; Examples (right) lists the saved ones.",
+                                              Tone::Info, true, 0});
     status_->set(badge, http_tone(r->status), std::move(segs));
     wf_->set(model, before);
 
@@ -987,6 +1862,16 @@ class ResponseView : public wxPanel, public ResponsePanel {
     set_cookies(*r);
     set_request(sent.get(), r.get());
     set_log(run);
+    set_script_results(sent.get());
+    if (run.body_not_kept) {
+      body_->show_message("The body of this response (" + fmt::human_bytes(run.not_kept_size) +
+                          ") was too large to keep with the history: status, headers and timing are as received."
+                          "\n\nCtrl+Enter sends the request again.");
+      ++test_seq_;
+      tests_->set_no_response();
+      update_tests_label();
+      return;
+    }
     body_->set_http(std::move(r));
     run_tests();
   }
@@ -994,13 +1879,19 @@ class ResponseView : public wxPanel, public ResponsePanel {
   void append_grpc_messages(const std::vector<GrpcMessageEvent>& batch) override {
     if (batch.empty()) return;
     if (!live_) start_stream();
+    if (first_ms_ < 0) first_ms_ = batch.front().at_ms > 0 ? batch.front().at_ms : ms_between(send_t0_, Clock::now());
     body_->append_messages(batch.data(), batch.size(), msgs_->count());
     msgs_->append(batch.data(), batch.size());
+    wf_->set_live(first_ms_, 0, msgs_->count());
     tabs_->set_label(kMessages, "Messages", std::to_string(msgs_->count()));
     status_->set_busy_label("Streaming \xC2\xB7 " + std::to_string(msgs_->count()) + " messages");
   }
 
   void show_grpc(std::shared_ptr<const GrpcResponse> r) override {
+    // Without show_sending() before it: restored (earlier session / history), never "sent now".
+    const bool restored = !awaiting_;
+    awaiting_ = false;
+    ++view_seq_;
     const size_t shown = live_ ? msgs_->count() : 0;
     if (!live_) start_stream();
     if (r->messages.size() > shown) {
@@ -1010,6 +1901,7 @@ class ResponseView : public wxPanel, public ResponsePanel {
     }
     live_ = false;
     showing_grpc_ = true;
+    fresh_response_ = !restored;
     grpc_last_ = r;
     grpc_shown_meta_ = grpc_meta_;
     const Timing& t = r->timing;
@@ -1033,9 +1925,10 @@ class ResponseView : public wxPanel, public ResponsePanel {
                     "Message payload bytes received (protobuf wire size). Total on the wire: " +
                         fmt::human_bytes(t.bytes_received) + " received, " + fmt::human_bytes(t.bytes_sent) + " sent.",
                     Tone::Plain, false, 6});
-    if (!r->ok && !r->status_message.empty())
-      segs.push_back({r->status_message, r->error_details.empty() ? r->status_message : r->error_details, Tone::Err,
-                      false});
+    const std::string status_msg = one_line(r->status_message);
+    if (!r->ok && !status_msg.empty())
+      segs.push_back({status_msg, r->error_details.empty() ? r->status_message : r->error_details, Tone::Err, false});
+    if (restored) segs.insert(segs.begin() + 1, grpc_history_when_.empty() ? restored_seg() : history_seg(grpc_history_when_));
     {
       std::string text = grpc_meta_.web ? "gRPC-Web" : grpc_meta_.tls ? (grpc_meta_.mtls ? "h2 \xC2\xB7 mTLS" : "h2 \xC2\xB7 TLS")
                                                                        : "h2c";
@@ -1048,10 +1941,11 @@ class ResponseView : public wxPanel, public ResponsePanel {
     }
     // Same target, method, body and outcome only: a failing call is never compared with a
     // successful one, nor Count with Say.
-    const std::string key =
-        grpc_key_.empty() ? std::string() : grpc_key_ + " status " + std::to_string(r->status_code);
+    // A restored response is never compared (grpc_key_ is of the last call sent, if any).
+    const std::string key = restored || grpc_key_.empty() ? std::string()
+                                                          : grpc_key_ + " status " + std::to_string(r->status_code);
     const Base* base = base_for(key);
-    if (!grpc_label_.empty())
+    if (!grpc_label_.empty() && !restored)
       segs.push_back({request_tag(grpc_label_), "This response belongs to:\n" + grpc_label_, Tone::Dim, false, 7});
     if (base) add_delta(segs, model, base->model, grpc_label_, base->at);
     Tone tone = Tone::Ok;
@@ -1062,7 +1956,7 @@ class ResponseView : public wxPanel, public ResponsePanel {
     if (r->status_code != 14 && r->status_code != 4 && r->status_code != 1) remember(key, model);
     if (!r->ok) {
       std::string s = "status " + r->status_name + " (" + std::to_string(r->status_code) + ")";
-      if (!r->status_message.empty()) s += ": " + r->status_message;
+      if (!status_msg.empty()) s += ": " + status_msg;
       if (n == 0) {
         body_->show_grpc_error("gRPC " + s, r->error_details);
       } else {
@@ -1084,25 +1978,62 @@ class ResponseView : public wxPanel, public ResponsePanel {
     tabs_->set_label(kTrailers, "Trailers", std::to_string(r->trailers.size()));
     tabs_->set_label(kMessages, "Messages", std::to_string(msgs_->count()));
     set_grpc_log(*r);
+    tests_->set_script({});
     run_tests();
   }
 
   void show_cancelled(double after_ms) override {
+    ++view_seq_;
+    const bool streamed = live_ && msgs_->count() > 0;
     live_ = false;
+    awaiting_ = false;
     ++test_seq_;
     tests_->set_no_response();
+    tests_->set_script({});
     update_tests_label();
     body_->set_stale(false);
-    wf_->set_stale(false);
-    if (!wf_->has_figures()) wf_->clear(false);  // nothing to show: no empty reserved block
-    status_->set("Cancelled", Tone::Warn, {{"after " + fmt::ms(after_ms), "Cancelled by you (Esc or the Cancel button).", Tone::Plain, true}});
+    // Nothing of an earlier run is shown under "Cancelled": the timing keeps its height (the body
+    // does not jump) and says the request was cancelled; the earlier responses stay one click away
+    // in the History chip.
+    wf_->set_cancelled(after_ms);
+    std::vector<StatusSeg> segs;
+    segs.push_back({"after " + fmt::ms(after_ms), "Cancelled by you (Esc or the Cancel button).", Tone::Plain, true});
+    if (streamed) {
+      // Messages of this very call arrived before the cancel: they stay, with a note.
+      segs.push_back({std::to_string(msgs_->count()) + " messages before the cancel",
+                      "These messages arrived before you cancelled the call.", Tone::Dim, false, 3});
+      body_->append_note("cancelled by you after " + fmt::ms(after_ms));
+    } else {
+      showing_grpc_ = false;
+      grpc_last_.reset();
+      body_->show_message("Cancelled after " + fmt::ms(after_ms) + ": no response was received.\n\n" +
+                          (runs_.empty() ? std::string("Ctrl+Enter sends it again.")
+                                         : "Ctrl+Enter sends it again. Earlier responses: \"Earlier runs\" (right)."));
+      headers_->set({});
+      trailers_->set({});
+      msgs_->reset();
+      cookies_->set({});
+      request_->set({});
+      fill_log("* Cancelled by you after " + fmt::ms(after_ms) + ": no response.\n");
+      set_kind_tabs(false, false);
+      tabs_->set_label(kRequest, "Request");
+      shown_run_ = runs_.size();  // none of the kept runs is on screen
+      update_history_chip();
+    }
+    if (!runs_.empty() && !streamed)
+      segs.push_back({"previous response not shown", "The last response is kept: open it from \"Earlier runs\".",
+                      Tone::Dim, false, 4});
+    status_->set("Cancelled", Tone::Warn, std::move(segs));
   }
 
   void show_error(const std::string& message) override {
+    ++view_seq_;
     live_ = false;
+    awaiting_ = false;
     ++test_seq_;
     showing_grpc_ = false;
-    tests_->set_no_response();
+    tests_->set_no_response("not sent: " + (message.size() > 160 ? message.substr(0, 160) + "\xE2\x80\xA6" : message));
+    tests_->set_script({});
     update_tests_label();
     body_->set_stale(false);
     status_->set("Error", Tone::Err, {{message, message, Tone::Err, false}});
@@ -1127,18 +2058,48 @@ class ResponseView : public wxPanel, public ResponsePanel {
     return nullptr;
   }
 
+  // Which saved request a run belongs to, for the delta's base: two requests with the same URL
+  // (02 Items and 19 Json) never compare with each other's runs. Empty for an unsaved tab, whose
+  // runs compare by method + URL + body alone.
+  std::string owner_tag() const {
+    const RequestTab* t = tab();
+    if (!t || t->file().empty()) return {};
+    return "file " + wxString(t->file().wstring()).utf8_string() + "\n";
+  }
+
   // Checks of the request q (as the tab holds it). Editable here unless the request editor owns
   // them (see save_asserts).
   void set_asserts_from(const SavedRequest& q) {
     tests_->set_asserts(q.asserts, !asserts_owned_elsewhere_, q.kind == RequestKind::Grpc);
+    tests_->set_inherited(inherited_checks(q));
     update_tests_label();
+  }
+  // The checks q gets from its folders and the collection (folder.json asserts), with their origin:
+  // they run with its own on every response (as the runner and watt --run do). One cached stat
+  // per folder level (Workspace::has_inherited_settings), so this is cheap on the UI thread.
+  std::vector<InheritedCheck> inherited_checks(const SavedRequest& q) {
+    std::vector<InheritedCheck> out;
+    const RequestTab* t = tab();
+    const Workspace* ws = t ? t->workspace() : nullptr;
+    if (!ws || q.settings_merged) return out;
+    const SavedRequest probe = [&] {  // only what decides the inheritance: the file (its folders)
+      SavedRequest p;
+      p.kind = q.kind;
+      p.file = t->inherit_file();
+      return p;
+    }();
+    if (!ws->has_inherited_settings(probe)) return out;
+    for (const auto& c : ws->effective_settings(probe).asserts)
+      if (c.from.level != SettingsOrigin::Level::Request) out.push_back({c.assertion, c.from.label, c.from.folder});
+    return out;
   }
   void refresh_asserts(bool rerun_if_changed) {
     RequestTab* t = tab();
     if (!t) return;
     const std::vector<Assertion> before = tests_->asserts();
+    const std::vector<InheritedCheck> inh_before = tests_->inherited();
     set_asserts_from(t->request());
-    if (rerun_if_changed && before != tests_->asserts()) run_tests();
+    if (rerun_if_changed && (before != tests_->asserts() || inh_before != tests_->inherited())) run_tests();
   }
 
   // The user edited the checks in the Tests tab: they go into the tab's request (saved with it on
@@ -1163,18 +2124,36 @@ class ResponseView : public wxPanel, public ResponsePanel {
     const auto& a = tests_->asserts();
     int on = 0;
     for (const Assertion& x : a) on += x.enabled && !x.target.empty();
-    if (on == 0) {
-      tabs_->set_label(kTests, "Tests", a.empty() ? std::string() : "off");
-      tabs_->set_count_tone(kTests, Tone::Plain);
+    // Script test() results count with the assertions (Postman / Insomnia / Bruno show one total).
+    for (const InheritedCheck& x : tests_->inherited()) on += x.a.enabled && !x.a.target.empty();
+    // Script test() results count with the assertions (Postman / Insomnia / Bruno show one total),
+    // and so do the folders' / collection's checks.
+    const int sp = tests_->script_passed() + tests_->inherited_passed(),
+              sf = tests_->script_failed() + tests_->inherited_failed();
+    // The send failed before any response: the checks did not run, which counts as a failure.
+    if (!tests_->no_response_reason().empty() && on > 0) {
+      tabs_->set_label(kTests, "Tests", "not run");
+      tabs_->set_count_tone(kTests, Tone::Err);
       return;
     }
-    const int pass = tests_->passed(), fail = tests_->failed();
-    if (pass + fail == 0) {
+    if (on == 0 && sp + sf == 0) {
+      tabs_->set_label(kTests, "Tests", tests_->script_skipped() ? std::string("not run")
+                                        : a.empty()               ? std::string()
+                                                                  : std::string("off"));
+      tabs_->set_count_tone(kTests, tests_->script_skipped() ? Tone::Warn : Tone::Plain);
+      return;
+    }
+    const int pass = tests_->passed() + sp, fail = tests_->failed() + sf;
+    if (on > 0 && tests_->passed() + tests_->failed() == 0 && sp + sf == 0) {
       tabs_->set_label(kTests, "Tests", std::to_string(on));
       tabs_->set_count_tone(kTests, Tone::Plain);
       return;
     }
-    tabs_->set_label(kTests, "Tests", std::to_string(pass) + "/" + std::to_string(pass + fail));
+    // A restored run's checks were evaluated now, not when it was sent: the count says so (the
+    // Tests page spells it out).
+    const bool re = tests_->rechecked() && tests_->passed() + tests_->failed() > 0;
+    tabs_->set_label(kTests, "Tests", (re ? std::string("now ") : std::string()) + std::to_string(pass) + "/" +
+                                          std::to_string(pass + fail));
     tabs_->set_count_tone(kTests, fail ? Tone::Err : Tone::Ok);
   }
 
@@ -1183,7 +2162,19 @@ class ResponseView : public wxPanel, public ResponsePanel {
   // worker never touches the workspace.
   void run_tests() {
     const uint64_t seq = ++test_seq_;
+    const bool fresh = fresh_response_;
+    fresh_response_ = false;
+    {
+      bool re = false;
+      if (showing_grpc_) re = !grpc_history_when_.empty();
+      else if (shown_run_ < runs_.size()) re = runs_[shown_run_].restored || !runs_[shown_run_].example.empty();
+      tests_->set_rechecked(re);
+    }
     const std::vector<Assertion>& list = tests_->asserts();
+    // The request's captures: resolved on the worker with the same parsed body, stored on the UI
+    // thread (only for a response that just arrived).
+    auto caps = std::make_shared<std::vector<Capture>>();
+    if (RequestTab* t = tab()) *caps = t->request().captures;
     // Hints for the quick-add chips.
     if (showing_grpc_ && grpc_last_) {
       tests_->set_hints(grpc_last_->status_code == 0 ? 200 : 0, grpc_last_->timing.total_ms, {},
@@ -1194,42 +2185,103 @@ class ResponseView : public wxPanel, public ResponsePanel {
       tests_->set_hints(r.ok ? r.status : 0, r.timing.total_ms, ct,
                         ct.find("json") != std::string::npos);
     }
+    // A failed send has no response to check (a re-run after the checks were edited, too).
+    if (!showing_grpc_ && shown_run_ < runs_.size() && !runs_[shown_run_].resp->ok) {
+      tests_->set_no_response("request failed, no response");
+      update_tests_label();
+      return;
+    }
+    // The same for a gRPC call that never reached a server (connection refused, DNS, TLS): status
+    // UNAVAILABLE with no metadata and no message from anyone. Its checks do not run either,
+    // as for a failed HTTP request.
+    if (showing_grpc_ && grpc_last_ && grpc_last_->status_code == 14 && grpc_last_->headers.empty() &&
+        grpc_last_->trailers.empty() && grpc_last_->messages.empty()) {
+      tests_->set_no_response("call failed, no response");
+      update_tests_label();
+      return;
+    }
+    const std::vector<InheritedCheck>& inh = tests_->inherited();
     bool any = false;
     for (const Assertion& x : list) any = any || (x.enabled && !x.target.empty());
+    for (const InheritedCheck& x : inh) any = any || (x.a.enabled && !x.a.target.empty());
+    for (const Capture& c : *caps) any = any || (c.enabled && !c.var.empty());
+    if (caps->empty()) tests_->set_captures({});
     if (!any) {
       std::vector<TestRow> rows(list.size());
       for (size_t i = 0; i < list.size(); ++i) rows[i].state = list[i].enabled ? TestRow::NotRun : TestRow::Off;
       tests_->set_results(std::move(rows), 0, 0);
+      tests_->set_inherited_results({});
       update_tests_label();
       return;
     }
     auto req = std::make_shared<SavedRequest>();
     req->kind = showing_grpc_ ? RequestKind::Grpc : RequestKind::Http;
+    // The request's own checks first, then the inherited ones (rows own_n.. of the results).
+    const size_t own_n = list.size();
     req->asserts = list;
+    for (const InheritedCheck& x : inh) req->asserts.push_back(x.a);
+    // Per check: the {{variables}} its expected value still holds after expansion (not set by
+    // the environment, globals, folders or this session's captures), for the failure message:
+    // a runtime variable a capture set is gone after a restart, and "expected {{token}}" alone
+    // did not say why a check that passed before now fails.
+    auto unset = std::make_shared<std::vector<std::string>>(req->asserts.size());
     if (RequestTab* t = tab())
       if (const Workspace* ws = t->workspace())
-        for (Assertion& x : req->asserts)
-          if (x.value.find("{{") != std::string::npos) x.value = ws->expand(x.value);
+        for (size_t i = 0; i < req->asserts.size(); ++i) {
+          Assertion& x = req->asserts[i];
+          if (x.value.find("{{") == std::string::npos) continue;
+          x.value = ws->expand(x.value);
+          for (size_t a = x.value.find("{{"); a != std::string::npos; a = x.value.find("{{", a + 2)) {
+            const size_t b = x.value.find("}}", a + 2);
+            if (b == std::string::npos) break;
+            const std::string name = x.value.substr(a, b + 2 - a);
+            if ((*unset)[i].find(name) == std::string::npos) (*unset)[i] += ((*unset)[i].empty() ? "" : ", ") + name;
+          }
+        }
     std::shared_ptr<const HttpResponse> http;
     std::shared_ptr<const GrpcResponse> grpc;
     if (showing_grpc_ && grpc_last_) grpc = grpc_last_;
     else if (!runs_.empty() && shown_run_ < runs_.size()) http = runs_[shown_run_].resp;
-    if (!http && !grpc) return;
+    if (!http && !grpc) {  // nothing on screen to check: never keep an earlier response's results
+      tests_->set_no_response(tests_->no_response_reason());
+      update_tests_label();
+      return;
+    }
     tests_->set_running();
     tabs_->set_label(kTests, "Tests", "\xE2\x80\xA6");
     tabs_->set_count_tone(kTests, Tone::Plain);
-    std::thread([req, http, grpc, seq, alive = alive_, this] {
+    std::thread([req, http, grpc, seq, caps, fresh, own_n, unset, alive = alive_, this] {
       const auto t0 = Clock::now();
       std::vector<AssertResult> res;
       double parse_us = 0;
-      if (http) {
-        ResponseData d(*http);
-        res = evaluate_asserts(*req, d, nullptr);
-        parse_us = d.parse_us();
-      } else {
-        ResponseData d(*grpc);
-        res = evaluate_asserts(*req, d, nullptr);
-        parse_us = d.parse_us();
+      // Per capture: resolved value, or why not.
+      std::vector<std::pair<bool, std::string>> cvals(caps->size());
+      {
+        std::unique_ptr<ResponseData> d = http ? std::make_unique<ResponseData>(*http) : std::make_unique<ResponseData>(*grpc);
+        res = evaluate_asserts(*req, *d, nullptr);
+        for (size_t i = 0; i < caps->size(); ++i) {
+          const Capture& c = (*caps)[i];
+          if (!c.enabled || c.var.empty()) continue;
+          std::string v, err;
+          try {
+            cvals[i].first = resolve_target(c.target, *d, v, &err);
+          } catch (...) {
+            err = "internal error";
+          }
+          cvals[i].second = cvals[i].first ? std::move(v) : (err.empty() ? std::string("undefined") : err);
+          if (!cvals[i].first) {
+            std::vector<PathStep> path;
+            long msg = -1;
+            if (target_json_path(c.target, path, &msg) && !path.empty()) {
+              std::string why;
+              if (http) why = json_path_miss(http->body, path);
+              else if (grpc && !grpc->messages.empty() && static_cast<size_t>(msg < 0 ? 0 : msg) < grpc->messages.size())
+                why = json_path_miss(grpc->messages[static_cast<size_t>(msg < 0 ? 0 : msg)].json, path);
+              if (!why.empty()) cvals[i].second = why;
+            }
+          }
+        }
+        parse_us = d->parse_us();
       }
       const double ms = ms_between(t0, Clock::now());
       // Results are for the enabled checks with a target, in order: map them back to rows.
@@ -1246,14 +2298,120 @@ class ResponseView : public wxPanel, public ResponsePanel {
         row.expected = r.expected;
         row.message = r.message;
         row.eval_us = r.eval_us;
+        if (!r.pass && i < unset->size() && !(*unset)[i].empty())
+          row.message = (*unset)[i] + " is not set (no environment, global or runtime variable has it; values captured " +
+                        "at run time are kept in memory only and are gone after a restart: send the request that " +
+                        "captures it again)" + (row.message.empty() ? std::string() : " \xC2\xB7 " + row.message);
+        // A path into the body that is not there: say what is there instead, first (the column
+        // and the reveal box show the start of the note).
+        if (!r.pass && (r.actual.empty() || r.actual == "undefined")) {
+          std::vector<PathStep> path;
+          long msg = -1;
+          if (target_json_path(r.a->target, path, &msg) && !path.empty()) {
+            std::string why;
+            if (http) {
+              why = json_path_miss(http->body, path);
+            } else if (grpc && !grpc->messages.empty()) {
+              const size_t mi = msg < 0 ? 0 : static_cast<size_t>(msg);
+              if (mi < grpc->messages.size())
+                why = json_path_miss(grpc->messages[mi].json, path,
+                                     msg < 0 ? std::string("res.body") : "res.messages[" + std::to_string(mi) + "]");
+            }
+            if (!why.empty()) row.message = why + (row.message.empty() ? std::string() : " \xC2\xB7 " + row.message);
+          }
+        }
       }
       if (!wxTheApp) return;
-      wxTheApp->CallAfter([alive, this, seq, rows = std::move(rows), ms, parse_us]() mutable {
+      std::vector<TestRow> inh_rows;
+      if (rows.size() > own_n) {
+        inh_rows.assign(std::make_move_iterator(rows.begin() + static_cast<std::ptrdiff_t>(own_n)),
+                        std::make_move_iterator(rows.end()));
+        rows.resize(own_n);
+      }
+      wxTheApp->CallAfter([alive, this, seq, rows = std::move(rows), inh_rows = std::move(inh_rows), ms, parse_us, caps,
+                           cvals = std::move(cvals), fresh]() mutable {
         if (!*alive || seq != test_seq_) return;
+        tests_->set_inherited_results(std::move(inh_rows));
         tests_->set_results(std::move(rows), ms, parse_us / 1000.0);
+        if (!caps->empty()) tests_->set_captures(store_captures(*caps, cvals, fresh));
         update_tests_label();
       });
     }).detach();
+  }
+
+  // Stores the resolved capture values into the workspace (UI thread: memory only; a changed
+  // environment / globals value is saved by a worker from a copy), with the same rules as
+  // core apply_captures: valid name, no "{{" in the value, never a secret. fresh = false (an
+  // earlier run shown again): nothing is stored, the values are only shown.
+  std::vector<CaptureRow> store_captures(const std::vector<Capture>& caps,
+                                         const std::vector<std::pair<bool, std::string>>& vals, bool fresh) {
+    std::vector<CaptureRow> out;
+    Workspace* ws = nullptr;
+    if (RequestTab* t = tab()) ws = const_cast<Workspace*>(t->workspace());  // the frame's own workspace
+    Environment* env = nullptr;
+    if (ws)
+      for (Environment& e : ws->environments())
+        if (!ws->active_env.empty() && e.name == ws->active_env) env = &e;
+    bool persist = false;
+    for (size_t i = 0; i < caps.size(); ++i) {
+      const Capture& c = caps[i];
+      CaptureRow r;
+      r.var = c.var;
+      r.target = c.target;
+      r.scope = capture_scope_name(c.scope);
+      r.enabled = c.enabled && !c.var.empty();
+      if (!r.enabled || i >= vals.size()) {
+        out.push_back(std::move(r));
+        continue;
+      }
+      auto fail = [&](std::string m) {
+        r.state = CaptureRow::Failed;
+        r.message = std::move(m);
+      };
+      const std::string name_problem = capture_var_problem(c.var, kMaxVarName);
+      const bool secret = env && (env->secrets.count(c.var) || env->unreadable_secrets.count(c.var));
+      if (!vals[i].first) fail(vals[i].second);
+      else if (!name_problem.empty()) fail(name_problem);
+      else if (vals[i].second.find("{{") != std::string::npos)
+        fail("the value contains '{{', which would be expanded as a variable when sent; not captured");
+      else if (secret && c.scope != Capture::Globals)
+        fail("'" + c.var + "' is a secret variable of environment '" + env->name + "': captures never write secrets");
+      else if (!fresh) {
+        // Checks re-run on the same response (an edit), or an earlier run shown again: nothing is
+        // written. A variable that already holds this value was set by this response.
+        const std::map<std::string, std::string>* where =
+            !ws ? nullptr
+                : c.scope == Capture::Environment ? (env ? &env->vars : nullptr)
+                : c.scope == Capture::Globals     ? &ws->globals
+                                                  : &ws->runtime_vars;
+        const auto it = where ? where->find(c.var) : std::map<std::string, std::string>::const_iterator{};
+        r.state = where && it != where->end() && it->second == vals[i].second ? CaptureRow::Stored
+                                                                              : CaptureRow::Previewed;
+        r.value = vals[i].second;
+      } else if (!ws) fail("the workspace is not open yet");
+      else if (c.scope == Capture::Environment && !env) fail("no active environment to capture into");
+      else {
+        std::string& slot = c.scope == Capture::Environment ? env->vars[c.var]
+                            : c.scope == Capture::Globals   ? ws->globals[c.var]
+                                                            : ws->runtime_vars[c.var];
+        if (c.scope != Capture::Runtime && slot != vals[i].second) persist = true;
+        slot = vals[i].second;
+        r.state = CaptureRow::Stored;
+        r.value = vals[i].second;
+      }
+      out.push_back(std::move(r));
+    }
+    if (persist && ws) {
+      // Saved off the UI thread from a snapshot (the UI keeps changing the live workspace).
+      auto snap = std::make_shared<Workspace>(*ws);
+      std::thread([snap] {
+        try {
+          snap->save_settings();
+        } catch (...) {
+        }
+      }).detach();
+    }
+    return out;
   }
 
   // A failing check was clicked: show what it looked at.
@@ -1270,32 +2428,254 @@ class ResponseView : public wxPanel, public ResponsePanel {
     else if (t.rfind("res.trailers", 0) == 0 && tabs_->tab_shown(kTrailers)) select_tab(kTrailers);
   }
 
+  // ------------------------------------------------------------------ restore
+
+  // The key response_keep stores a run's extras by: the request as saved in this tab, the status
+  // and the shell's exact total (what the history entry and a kept last response carry).
+  std::string extras_key(const HttpResponse& r) const {
+    const RequestTab* t = tab();
+    if (!t) return {};
+    const SavedRequest& q = t->request();
+    if (q.kind != RequestKind::Http || q.http.url.empty()) return {};
+    return rv::run_key(q.http.method + " " + q.http.url, r.status, r.timing.total_ms);
+  }
+
+  // A kept response with what this view kept of its run.
+  std::pair<std::shared_ptr<const HttpResponse>, std::shared_ptr<const SentHttp>> with_extras(
+      const HttpResponse& kept, const std::shared_ptr<const SentHttp>& sent, const rv::RunExtras& x) {
+    std::shared_ptr<const HttpResponse> r = rv::restore_response(&kept, x);
+    extras_prompt_ms_ = x.prompt_ms <= kept.timing.queue_ms ? x.prompt_ms : 0;
+    extras_cut_size_ = x.head && kept.body.size() < x.body_size ? x.body_size : 0;
+    auto s = sent ? std::make_shared<SentHttp>(*sent) : std::make_shared<SentHttp>();
+    if (!sent) {
+      s->request.method = "GET";
+      s->request.url = kept.effective_url;
+    }
+    if (!s->pre_script) s->pre_script = x.pre;
+    if (!s->post_script) s->post_script = x.post;
+    s->scripts_skipped_untrusted = s->scripts_skipped_untrusted || x.scripts_skipped_untrusted;
+    return {std::move(r), std::move(s)};
+  }
+  std::pair<std::shared_ptr<const HttpResponse>, std::shared_ptr<const SentHttp>> with_extras_head(
+      const rv::RunExtras& x) {
+    std::shared_ptr<const HttpResponse> r = rv::restore_response(nullptr, x);
+    extras_prompt_ms_ = x.head && x.prompt_ms <= x.head->timing.queue_ms ? x.prompt_ms : 0;
+    auto s = std::make_shared<SentHttp>();
+    if (const RequestTab* t = tab()) s->request = t->request().http;
+    s->pre_script = x.pre;
+    s->post_script = x.post;
+    s->scripts_skipped_untrusted = x.scripts_skipped_untrusted;
+    return {std::move(r), std::move(s)};
+  }
+
+  // The newest history entry of the request has no response kept and nothing else of it is
+  // known (an older version kept none, or it was too large): its status and time, not a blank.
+  void show_not_kept(const HistoryEntry& e) {
+    ++view_seq_;
+    std::vector<StatusSeg> segs;
+    segs.push_back({"last run " + fmt::ms(e.total_ms) + " \xC2\xB7 body not kept",
+                    "The last run of this request, from the workspace history: its response was not kept (too "
+                    "large, or kept by an older version).\nThe time is as the history recorded it.\nCtrl+Enter "
+                    "sends the request again.",
+                    Tone::Plain, true});
+    segs.push_back(history_seg(e.when_iso));
+    if (e.status > 0)
+      status_->set(std::to_string(e.status), http_tone(e.status), std::move(segs));
+    else
+      status_->set("Failed", Tone::Err, std::move(segs));
+    wf_->clear(false);
+    body_->show_message("The last response of this request was not kept with the history (" + fmt::ms(e.total_ms) +
+                        ", status " + (e.status > 0 ? std::to_string(e.status) : std::string("none")) +
+                        ").\n\nCtrl+Enter sends the request again.");
+  }
+
   // ------------------------------------------------------------------ log
+
+  // The tab's last response from an earlier session: said so (it is not fresh, and it carries
+  // less than a live one: no TLS details, no certificate, no request as sent).
+  // The request's last response, read from the workspace history when the tab opened.
+  static StatusSeg history_seg(const std::string& when_iso) {
+    // Stored in UTC: shown in local time.
+    std::string when = when_iso;
+    wxDateTime dt;
+    if (when.size() >= 19 && dt.ParseISOCombined(wxString(when.substr(0, 19))))
+      when = dt.FromTimezone(wxDateTime::UTC).Format("%Y-%m-%d %H:%M").utf8_string();
+    return {"last run \xC2\xB7 " + when,
+            "The last response of this request, from the workspace history (" + when_iso +
+                "): it was not sent now.\nIts timing is as measured then (time in confirmation dialogs left out); "
+                "the connection details are those of that run.\nCtrl+Enter sends the request again.",
+            Tone::Warn, false, 1};
+  }
+
+  static StatusSeg restored_seg() {
+    return {"restored \xC2\xB7 earlier session",
+            "This response was received in an earlier session and restored with the tab: it is not fresh.\n"
+            "Its timing is as measured then (time in confirmation dialogs left out); the connection details are "
+            "those of that run.\nCtrl+Enter sends the request again.",
+            Tone::Warn, false, 1};
+  }
 
   struct Run;
   void set_log(const Run& run) {
-    const std::string text = http_transcript(*run.resp, run.sent.get(), request_->rows(),
-                                             run.at.Format("%Y-%m-%d %H:%M:%S").utf8_string());
-    fill_log(text);
+    std::string text = http_transcript(*run.resp, run.sent.get(), request_->rows(),
+                                       run.at.Format("%Y-%m-%d %H:%M:%S").utf8_string());
+    if (run.prompt_ms > 0)
+      text += "* " + fmt::ms(run.prompt_ms) + " in a confirmation dialog before the send: not counted in the timing\n";
+    if (const SentHttp* s = run.sent.get()) {
+      if (s->scripts_skipped_untrusted)
+        text += "! Scripts not run: this workspace's scripts are not trusted (you answered No). Send again to be asked "
+                "again.\n";
+      if (const SentHttp::TokenStep* tk = s->token.get()) {
+        text += "* OAuth 2.0 " + tk->grant + (tk->from.empty() ? std::string() : " (auth from " + tk->from + ")") + ": ";
+        if (tk->from_cache) text += "cached token used, no token request (" + fmt::ms(tk->ms) + ")\n";
+        else
+          text += std::string(tk->refreshed ? "token refreshed" : "token requested") + " from POST " + tk->token_url +
+                  " in " + fmt::ms(tk->ms) + (tk->ok ? std::string(", OK") : ": " + tk->error) +
+                  "; the access token was added to the request and is kept in memory only\n";
+      }
+      append_script_log(text, "pre-request", s->pre_script.get());
+      append_script_log(text, "post-response", s->post_script.get());
+    }
+    fill_log(std::move(text));
   }
 
-  // One colour per kind of line: "*" info dim, ">" sent in the accent colour, "<" received plain.
-  void fill_log(const std::string& text) {
-    const Theme& th = Theme::get();
-    log_->Freeze();
-    log_->Clear();
-    size_t at = 0;
-    while (at < text.size()) {
-      size_t e = text.find('\n', at);
-      if (e == std::string::npos) e = text.size() - 1;
-      const char p = text[at];
-      log_->SetDefaultStyle(wxTextAttr(p == '>' ? th.accent : p == '<' ? th.fg : th.dim, th.bg));
-      log_->AppendText(U(std::string_view(text).substr(at, e + 1 - at)));
-      at = e + 1;
+  // One script's console output, variable writes and error, for the Log ("|" console line, "!"
+  // warning / error, "*" info).
+  static void append_script_log(std::string& o, const char* phase, const ScriptRun* r) {
+    if (!r || !r->ran) return;
+    o += "*\n* " + std::string(phase) + " script \xC2\xB7 " + fmt::ms(r->elapsed_us / 1000.0);
+    if (r->setup_us > 0) o += " (sandbox setup " + fmt::ms(r->setup_us / 1000.0) + ")";
+    if (r->requests_sent > 0) o += " \xC2\xB7 " + std::to_string(r->requests_sent) + " sendRequest";
+    if (!r->tests.empty()) {
+      int pass = 0;
+      for (const ScriptTest& t : r->tests) pass += t.pass;
+      o += " \xC2\xB7 tests " + std::to_string(pass) + "/" + std::to_string(r->tests.size());
     }
-    log_->ShowPosition(0);
-    log_->Thaw();
+    o += '\n';
+    auto put = [&](char prefix, const std::string& label, const std::string& text) {
+      // One Log line per text line, each with the prefix (so the colours stay right).
+      size_t at = 0;
+      bool first = true;
+      do {
+        size_t e = text.find('\n', at);
+        if (e == std::string::npos) e = text.size();
+        o += prefix;
+        o += ' ';
+        o += first ? label : std::string(label.size(), ' ');
+        o.append(text, at, e - at);
+        o += '\n';
+        first = false;
+        at = e + 1;
+      } while (at < text.size());
+    };
+    static const char* kLevel[] = {"log   ", "info  ", "warn  ", "error "};
+    for (const ScriptLog& l : r->logs) {
+      const int lv = static_cast<int>(l.level);
+      put(lv >= 2 ? '!' : '|', kLevel[std::clamp(lv, 0, 3)], l.text.empty() ? std::string(" ") : l.text);
+    }
+    if (r->logs_truncated) o += "! (console output cut at the log limit)\n";
+    for (const ScriptTest& t : r->tests)
+      o += (t.pass ? "* test \xE2\x9C\x93 " : "! test \xE2\x9C\x97 ") + t.name +
+           (t.pass || t.message.empty() ? std::string() : ": " + t.message) + "\n";
+    static const char* kScope[] = {"runtime", "environment", "globals"};
+    for (const ScriptVar& v : r->vars_set) {
+      std::string val = v.removed ? std::string("(removed)") : v.value;
+      if (val.size() > 200) val = val.substr(0, 200) + "\xE2\x80\xA6";
+      for (char& c : val)
+        if (c == '\n' || c == '\r') c = ' ';
+      const std::string what = std::string(kScope[std::clamp(static_cast<int>(v.scope), 0, 2)]) + " " + v.name +
+                               (v.removed ? " removed" : " = " + val);
+      if (v.ok) o += "* set " + what + "\n";
+      else o += "! not set: " + what + (v.message.empty() ? std::string() : " (" + v.message + ")") + "\n";
+    }
+    if (!r->ok) o += "! error: " + script_error(*r) + "\n";
   }
+
+  // "line 3:14: ReferenceError: x is not defined" (the position first, when known).
+  static std::string script_error(const ScriptRun& r) {
+    std::string e = r.error.empty() ? std::string("script failed") : r.error;
+    if (r.line > 0) {
+      const std::string pos = std::to_string(r.line) + ":" + std::to_string(r.column);
+      if (e.rfind(pos, 0) == 0) e = "line " + e;
+      else e = "line " + pos + ": " + e;
+    }
+    return e;
+  }
+
+  // The Tests tab's Script group for the run on screen.
+  void set_script_results(const SentHttp* s) {
+    ScriptResults out;
+    if (s) {
+      out.skipped_untrusted = s->scripts_skipped_untrusted;
+      std::string note;
+      for (const auto& [phase, run] : {std::pair<const char*, const ScriptRun*>{"pre-request", s->pre_script.get()},
+                                       std::pair<const char*, const ScriptRun*>{"post-response", s->post_script.get()}}) {
+        if (!run || !run->ran) continue;
+        out.any_script = true;
+        for (const ScriptTest& t : run->tests)
+          out.rows.push_back({phase, t.name.empty() ? std::string("(unnamed test)") : t.name,
+                              t.pass ? ScriptTestRow::Pass : ScriptTestRow::Fail, t.message});
+        if (!run->ok) out.rows.push_back({phase, std::string(phase) + " script", ScriptTestRow::Error, script_error(*run)});
+        if (!note.empty()) note += ", ";
+        note += std::string(phase) + " " + fmt::ms(run->elapsed_us / 1000.0);
+      }
+      out.note = note;
+    }
+    tests_->set_script(std::move(out));
+    update_tests_label();
+  }
+
+  // Status strip: a dialog's time left out, scripts that did not run, script failures.
+  void add_script_segs(std::vector<StatusSeg>& segs, const Run& run) {
+    if (run.prompt_ms > 0) {
+      segs.push_back({fmt::ms(run.prompt_ms) + " in dialog, not counted",
+                      "A confirmation dialog (script trust, Windows sign-in or environment variables) was open for " +
+                          fmt::ms(run.prompt_ms) + " after the Send click. That time is left out of Queue and the "
+                          "total: it was you deciding, not the request.",
+                      Tone::Dim, false, 4});
+    }
+    const SentHttp* s = run.sent.get();
+    if (!s) return;
+    if (s->scripts_skipped_untrusted) {
+      StatusSeg seg{"scripts not run (workspace not trusted)",
+                    "The request has scripts, but you did not trust this workspace's scripts, so it was sent without "
+                    "them (no pre-request changes, no script tests). Send again to be asked again.",
+                    Tone::Warn, false, 2};
+      seg.click = kClickTests;
+      segs.push_back(std::move(seg));
+      return;
+    }
+    // Counted as the Tests tab counts them: every test() call, plus one failed row per script
+    // that threw (its error is a failure too, not just a note).
+    int pass = 0, fail = 0, errors = 0;
+    std::string err;
+    for (const ScriptRun* r : {s->pre_script.get(), s->post_script.get()}) {
+      if (!r || !r->ran) continue;
+      for (const ScriptTest& t : r->tests) (t.pass ? pass : fail)++;
+      if (!r->ok) {
+        ++fail;
+        ++errors;
+        if (err.empty()) err = (r == s->pre_script.get() ? "pre-request: " : "post-response: ") + script_error(*r);
+      }
+    }
+    if (!err.empty()) {
+      StatusSeg seg{"script error", err + "\nClick for the Log.", Tone::Err, false, 2};
+      seg.click = kClickLog;
+      segs.push_back(std::move(seg));
+    }
+    if (pass + fail > 0) {
+      StatusSeg seg{"script tests " + std::to_string(pass) + "/" + std::to_string(pass + fail),
+                    std::to_string(pass) + " of " + std::to_string(pass + fail) + " script checks passed" +
+                        (errors ? " (a script that threw counts as one failed check)." : ".") +
+                        "\nClick for the Tests tab.",
+                    fail ? Tone::Err : Tone::Ok, false, 2};
+      seg.click = kClickTests;
+      segs.push_back(std::move(seg));
+    }
+  }
+
+  // The Log page colours each line by its first character ("*" info, ">" sent, "<" received).
+  void fill_log(std::string text) { log_->set(std::move(text)); }
 
   void set_grpc_log(const GrpcResponse& r) {
     std::string o;
@@ -1377,6 +2757,21 @@ class ResponseView : public wxPanel, public ResponsePanel {
 
   void select_tab(int i) {
     tabs_->select(i);
+    show_page(i);
+  }
+
+  // Page i becomes visible: created now if it never was.
+  void show_page(int i) {
+    if (i < 0 || static_cast<size_t>(i) >= book_->GetPageCount()) return;
+    wxWindow* w = book_->GetPage(static_cast<size_t>(i));
+    if (auto* lp = dynamic_cast<LazyPage*>(w)) {
+      if (!lp->built()) {
+        wxWindowUpdateLocker lock(w);
+        lp->ensure();
+      }
+    } else if (i == kTests) {
+      tests_->ensure_built();
+    }
     book_->SetSelection(static_cast<size_t>(i));
     if (i == kTests) refresh_asserts(true);
   }
@@ -1386,7 +2781,8 @@ class ResponseView : public wxPanel, public ResponsePanel {
     const double total = cur.total;
     const double d = total - prev.total;
     // Run-to-run jitter (tens of microseconds locally, a few percent) is not a regression.
-    const bool noise = std::fabs(d) < std::max(0.1, 0.05 * std::max(total, prev.total));
+    // Under 1 ms or under 10% of the total is not coloured as a change.
+    const bool noise = fmt::delta_is_noise(d, std::max(total, prev.total));
     // One run on a fresh connection, the other on a reused one: the difference is mostly the
     // handshake, not the server. Said so, and not coloured as a regression / improvement.
     const bool conn_changed = cur.reused != prev.reused;
@@ -1421,17 +2817,136 @@ class ResponseView : public wxPanel, public ResponsePanel {
   }
 
   void update_history_chip() {
-    const bool any = runs_.size() > 1;
+    const bool none = shown_run_ >= runs_.size();  // e.g. cancelled: no kept run is on screen
+    const bool any = runs_.size() > 1 || (none && !runs_.empty());
     hist_->set_visible(1, any);
     if (!any) return hist_->Refresh();
+    if (none) {
+      hist_->set_label(1, "Earlier runs (" + std::to_string(runs_.size()) + ") \xE2\x96\xBE");
+      hist_->set_on(1, false);
+      return;
+    }
     const bool latest = shown_run_ + 1 == runs_.size();
     hist_->set_label(1, (latest ? std::string("Latest") : "Run " + std::to_string(shown_run_ + 1)) + " of " +
                             std::to_string(runs_.size()) + " \xE2\x96\xBE");
     hist_->set_on(1, !latest);
   }
 
+  // ------------------------------------------------------------------ examples
+
+  std::filesystem::path examples_folder() const {
+    RequestTab* t = tab();
+    const Workspace* ws = t ? t->workspace() : nullptr;
+    if (!ws || t->request().file.empty()) return {};
+    return examples_dir(ws->root(), t->request().id);
+  }
+
+  // Lists the request's examples on a worker (disk), then updates the chip.
+  void refresh_examples() {
+    const std::filesystem::path dir = examples_folder();
+    hist_->set_visible(2, !dir.empty());
+    hist_->Refresh();
+    examples_dir_ = dir;
+    if (dir.empty()) {
+      examples_.clear();
+      return;
+    }
+    const uint64_t seq = ++examples_seq_;
+    std::thread([dir, seq, alive = alive_, this] {
+      auto list = std::make_shared<std::vector<ExampleEntry>>(list_examples(dir));
+      if (!wxTheApp) return;
+      wxTheApp->CallAfter([alive, this, seq, list] {
+        if (!*alive || seq != examples_seq_) return;
+        examples_ = std::move(*list);
+        hist_->set_label(2, examples_.empty() ? std::string("Examples \xE2\x96\xBE")
+                                              : "Examples (" + std::to_string(examples_.size()) + ") \xE2\x96\xBE");
+        hist_->Refresh();
+      });
+    }).detach();
+  }
+
+  void examples_menu() {
+    wxMenu m;
+    const Run* run = !showing_grpc_ && shown_run_ < runs_.size() ? &runs_[shown_run_] : nullptr;
+    const bool can_save = run && run->resp->ok && run->example.empty() && !examples_dir_.empty();
+    m.Append(1, "Save this response as example\xE2\x80\xA6")->Enable(can_save);
+    if (!examples_.empty()) {
+      m.AppendSeparator();
+      for (size_t i = 0; i < examples_.size() && i < 40; ++i) {
+        const ExampleEntry& e = examples_[i];
+        m.Append(static_cast<int>(i) + 100,
+                 U(std::to_string(e.status) + "   " + elide_middle(e.name, 50) + "   \xC2\xB7   " + e.saved_at));
+      }
+    } else {
+      m.Append(2, showing_grpc_ ? "(examples are for HTTP responses)" : "(no examples saved yet)")->Enable(false);
+    }
+    const int id = GetPopupMenuSelectionFromUser(m, hist_->GetPosition() + wxPoint(0, hist_->GetSize().y));
+    if (id == 1 && can_save) return save_example_of(*run);
+    if (id >= 100 && static_cast<size_t>(id - 100) < examples_.size()) open_example(examples_[static_cast<size_t>(id - 100)]);
+  }
+
+  void save_example_of(const Run& run) {
+    const HttpResponse& r = *run.resp;
+    std::string def = std::to_string(r.status) + (r.status_text.empty() ? std::string() : " " + r.status_text);
+    wxTextEntryDialog dlg(this, "Name of the example (saved with this request, for you only):", "Save as example",
+                          U(def));
+    if (dlg.ShowModal() != wxID_OK) return;
+    const std::string name = dlg.GetValue().utf8_string();
+    const std::filesystem::path dir = examples_dir_;
+    auto resp = run.resp;
+    const std::string method = run.sent ? run.sent->request.method : std::string();
+    const std::string url = run.sent ? run.sent->request.url : r.effective_url;
+    status_note("saving the example\xE2\x80\xA6", Tone::Accent);
+    std::thread([dir, name, resp, method, url, alive = alive_, this] {
+      std::string err;
+      const bool ok = save_example(dir, name, *resp, method, url, &err);
+      if (!wxTheApp) return;
+      wxTheApp->CallAfter([alive, this, ok, err, name] {
+        if (!*alive) return;
+        status_note(ok ? "saved as example \"" + name + "\"" : "could not save the example: " + err,
+                    ok ? Tone::Ok : Tone::Err);
+        refresh_examples();
+      });
+    }).detach();
+  }
+
+  void open_example(const ExampleEntry& e) {
+    const std::filesystem::path file = e.file;
+    const std::string label = e.name + ", saved " + e.saved_at;
+    std::thread([file, label, alive = alive_, this] {
+      std::string method, url, err;
+      std::shared_ptr<HttpResponse> r = load_example(file, &method, &url, &err);
+      if (!wxTheApp) return;
+      wxTheApp->CallAfter([alive, this, r, method, url, err, label] {
+        if (!*alive) return;
+        if (!r) return status_note(err, Tone::Err);
+        show_example(r, method, url, label);
+      });
+    }).detach();
+  }
+
+  // An example joins the tab's runs (History) like a response, marked as an example: no captures
+  // are stored from it and it is never the base of a delta.
+  void show_example(std::shared_ptr<const HttpResponse> r, const std::string& method, const std::string& url,
+                    const std::string& label) {
+    auto sent = std::make_shared<SentHttp>();
+    sent->request.method = method.empty() ? std::string("GET") : method;
+    sent->request.url = url;
+    Run run{r, sent, http_model(*r, url.rfind("http:", 0) == 0), wxDateTime::Now()};
+    run.label = sent->request.method + " " + url;
+    run.example = label;
+    fresh_response_ = false;
+    runs_.push_back(std::move(run));
+    while (runs_.size() > kRuns) runs_.erase(runs_.begin());
+    show_run(runs_.size() - 1);
+    fresh_response_ = false;
+  }
+
+  // A short message in the status strip's place for notes (the body bar).
+  void status_note(const std::string& text, Tone tone) { body_->note(text, tone); }
+
   void history_menu() {
-    if (runs_.size() < 2) return;
+    if (runs_.empty() || (runs_.size() < 2 && shown_run_ < runs_.size())) return;
     wxMenu m;
     const wxDateTime now = wxDateTime::Now();
     for (size_t i = runs_.size(); i-- > 0;) {
@@ -1443,7 +2958,8 @@ class ResponseView : public wxPanel, public ResponsePanel {
       std::string label = "#" + std::to_string(i + 1) + "   " + when + "   ";
       label += x.resp->ok ? std::to_string(x.resp->status) : std::string("failed");
       label += "   " + fmt::ms(x.resp->timing.total_ms) + "   " + fmt::human_bytes(x.resp->body.size());
-      if (!x.label.empty()) label += "   \xC2\xB7   " + elide_middle(x.label, 80);
+      if (!x.example.empty()) label += "   \xC2\xB7   example " + elide_middle(x.example, 40);
+      else if (!x.label.empty()) label += "   \xC2\xB7   " + elide_middle(x.label, 80);
       m.AppendCheckItem(static_cast<int>(i) + 100, U(label))->Check(i == shown_run_);
     }
     const int id = GetPopupMenuSelectionFromUser(m, hist_->GetPosition() + wxPoint(0, hist_->GetSize().y));
@@ -1566,7 +3082,16 @@ class ResponseView : public wxPanel, public ResponsePanel {
     TimingModel base;   // previous run of the same request, when there was one
     wxDateTime base_at;
     bool has_base = false;
+    bool restored = false;  // the tab's last response from an earlier session (not sent now)
+    std::string from_history;  // restored from the workspace history: when it was received
+    std::string example;    // a saved example ("name, saved 2026-11-17 08:30"), not a live response
+    double prompt_ms = 0;   // a confirmation dialog's time, taken out of the timing
+    bool body_not_kept = false;  // restored without its body (too large to keep)
+    uint64_t cut_size = 0;       // restored with the start of its body only: the size received
+    uint64_t not_kept_size = 0;
   };
+  static constexpr double kPromptMinMs = 50;  // less is UI work, not a dialog someone answered
+  static constexpr int kClickTests = 3, kClickLog = 4;  // status strip segment ids (1 conn, 2 redirects)
   static constexpr size_t kRuns = 10;
   std::vector<Run> runs_;
   size_t shown_run_ = 0;
@@ -1576,32 +3101,75 @@ class ResponseView : public wxPanel, public ResponsePanel {
   TabStrip* tabs_;
   wxSimplebook* book_;
   BodyView* body_;
-  KvList* headers_;
-  KvList* cookies_;
-  KvList* trailers_;
-  MsgList* msgs_;
-  KvList* request_;
+  KvPage* headers_;
+  KvPage* cookies_;
+  KvPage* trailers_;
+  MsgPage* msgs_;
+  KvPage* request_;
   RequestKind kind_ = RequestKind::Http;
   bool live_ = false;
   std::map<std::string, Base> bases_;  // last good run per request key (HTTP and gRPC)
   std::string grpc_key_, grpc_label_;  // the gRPC call in flight
+  std::vector<ExampleEntry> examples_;  // the request's saved examples (newest first)
+  std::filesystem::path examples_dir_;
+  uint64_t examples_seq_ = 0;
   GrpcConnMeta grpc_meta_;             // ... and its target
   GrpcConnMeta grpc_shown_meta_;       // target of grpc_last_
   std::shared_ptr<const GrpcResponse> grpc_last_;
   bool showing_grpc_ = false;
   std::string shown_ident_;            // the request the waterfall's figures belong to
   TestsView* tests_ = nullptr;
-  wxTextCtrl* log_ = nullptr;
+  LogPage* log_ = nullptr;
+  bool fresh_response_ = false;  // the next run_tests() is for a response that just arrived
   uint64_t test_seq_ = 0;              // newest evaluation; older results are dropped
   bool asserts_owned_elsewhere_ = false;
+  Clock::time_point send_t0_{};
+  wxWindow* top_ = nullptr;  // frame whose key hook we added (Esc cancels)
+  double first_ms_ = -1;      // first byte / message of the request in flight (ms after the send)
+  bool sent_here_ = false;    // a request was sent from this view (else a result is a restored one)
+  bool awaiting_ = false;     // show_sending() was called and its result has not arrived yet
+  bool waiting_msg_ = false;  // the body shows "Waiting for the response" (no earlier response to fade)
+  Clock::time_point progress_shown_at_{};  // when show_progress() last rewrote that message
+  uint64_t view_seq_ = 0;
+  uint64_t help_seq_ = ~0ull;
+  wxTimer hist_timer_;  // retries the history lookup until the workspace is open
+  uint64_t hist_seq_ = 0;
+  int hist_tries_ = 0;  // == view_seq_ while the empty-state help is shown     // bumps on clear / send / result: a history lookup is dropped after it
+  std::string history_when_;  // show_* of a response read from history: when it was received
+  std::string grpc_history_when_;  // ... the gRPC response shown
+  bool extras_applied_ = false;    // show_http of a restored response already merged with its RunExtras
+  double extras_prompt_ms_ = 0;    // ... the dialog time with_extras() took out of it
+  uint64_t extras_cut_size_ = 0;   // ... its body as received, when only the start of it was kept
+  bool body_not_kept_ = false;     // ... rebuilt without its body (too large to keep)
+  uint64_t not_kept_size_ = 0;     // ... which was this large
+  std::map<std::string, std::string> filters_;  // JSONPath filter per request (by ident)
+
+  // The tab moved to another request (ident): the body filter of the old one is kept for it and
+  // the new one's (usually none) applied, so 03 Big's filter never hides 04 Redirect's body.
+  void switch_filter(const std::string& ident) {
+    if (ident == shown_ident_) return;
+    const std::string cur = body_->filter_text();
+    if (!shown_ident_.empty()) {
+      if (cur.empty()) filters_.erase(shown_ident_);
+      else if (filters_.size() < 512) filters_[shown_ident_] = cur;
+    }
+    const auto it = ident.empty() ? filters_.end() : filters_.find(ident);
+    body_->set_filter(it == filters_.end() ? std::string() : it->second);
+  }
   std::shared_ptr<bool> alive_ = std::make_shared<bool>(true);
 
  public:
-  ~ResponseView() override { *alive_ = false; }
+  ~ResponseView() override {
+    *alive_ = false;
+    if (top_) top_->Unbind(wxEVT_CHAR_HOOK, &ResponseView::on_top_key, this);
+  }
 };
 
 }  // namespace
 
-ResponsePanel* make_response_view(wxWindow* parent) { return new ResponseView(parent); }
+ResponsePanel* make_response_view(wxWindow* parent) {
+  TraceScope ts("build");
+  return new ResponseView(parent);
+}
 
 }  // namespace watt::app

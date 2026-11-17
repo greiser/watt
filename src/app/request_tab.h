@@ -31,6 +31,9 @@ struct LastResponse {
   std::shared_ptr<const HttpResponse> http;
   std::shared_ptr<const SentHttp> sent;
   std::shared_ptr<const GrpcResponse> grpc;
+  // Set when it comes from a history entry (UTC ISO time it was received): shown as "last run
+  // at ...", not as a tab restored from an earlier session. Not stored.
+  std::string when_iso;
   explicit operator bool() const { return http || grpc; }
 };
 // "" when r holds nothing or is too large to keep.
@@ -58,6 +61,8 @@ struct TabContext {
   // Keeps fn until the workspace has opened (then runs it) and returns true; false (fn dropped)
   // if the workspace is already open or failed to open. A send during start-up waits on it.
   std::function<bool(std::function<void()>)> when_workspace;
+  // The saved request a history snapshot came from (SidebarPanel::snapshot_origin); may be unset.
+  std::function<std::filesystem::path(const SavedRequest&)> snapshot_origin;
 };
 
 class RequestTab : public wxPanel, public EditorHost {
@@ -85,6 +90,9 @@ class RequestTab : public wxPanel, public EditorHost {
   // Ctrl+S: store + Workspace::save_request. False (with *err) on failure.
   bool save(Workspace& ws, std::string* err);
   void focus_url();
+  void vars_changed() {
+    if (RequestEditorPanel* ed = editor()) ed->vars_changed();
+  }
   // Builds the editor of a lazy tab (the frame calls it when the page is shown). Idempotent.
   void realize();
   // Builds the response view now instead of shortly after the tab is first shown (the start tab
@@ -119,6 +127,15 @@ class RequestTab : public wxPanel, public EditorHost {
   bool grpc_parked() const { return grpc_parked_; }
   // Where the first save of an unsaved request goes (empty: Workspace::save_request's default).
   void set_save_folder(const std::filesystem::path& folder) { save_folder_ = folder; }
+  const std::filesystem::path& save_folder() const { return save_folder_; }
+  // The name the Save dialog offers for an unsaved request: the URL's last path segment ("echo"
+  // for {{base}}/echo?x=1) or the gRPC method, never a {{variable}}.
+  std::string suggested_name() const;
+  // The Save dialog's choice: the next save() writes <folder>/<name>.req.json (a free name).
+  void set_save_target(const std::string& name, const std::filesystem::path& folder) {
+    save_name_ = name;
+    save_folder_ = folder;
+  }
 
   // EditorHost
   void send() override;
@@ -126,6 +143,9 @@ class RequestTab : public wxPanel, public EditorHost {
   void changed() override;
   void switch_kind(RequestKind kind) override;
   const Workspace* workspace() const override;
+  std::filesystem::path inherit_file() const override;
+  // req with file = inherit_file(): what the workspace's inheritance (folder.json) is computed on.
+  SavedRequest for_inheritance(const SavedRequest& req) const;
   void load_schema(const SavedRequest& r) override;
   void preconnect(const GrpcTarget& target) override;
   bool stream_send(const std::string& json, std::string* error) override;
@@ -138,6 +158,7 @@ class RequestTab : public wxPanel, public EditorHost {
   RequestEditorPanel* ensure_editor(RequestKind kind);
   void show_editor(RequestKind kind);
   void store() const;
+  void show_last();  // last_ into the response view (built)
   ResponsePanel* response();  // creates the response view on first use
   void on_idle(wxIdleEvent& e);
   void on_resp_timer();
@@ -165,7 +186,9 @@ class RequestTab : public wxPanel, public EditorHost {
   bool preview_ = false;
   bool loading_ = false;   // suppress changed() while load()ing an editor
   bool user_sash_ = false;  // the user dragged the sash: stop keeping it at 50%
+  bool layout_pending_ = false;  // resized while hidden: Layout() when shown again
   std::filesystem::path save_folder_;
+  std::string save_name_;
 
   wxSplitterWindow* split_ = nullptr;
   HttpEditorPanel* http_ = nullptr;

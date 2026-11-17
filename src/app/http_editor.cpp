@@ -1,13 +1,18 @@
 // REST request editor: method + URL bar (paste a curl command anywhere in it to import it), query
 // params synced both ways with the URL, headers with enable checkboxes and autocompletion, body
 // (none / JSON / text / form-urlencoded / multipart / binary file) in a wxStyledTextCtrl with the
-// JSON lexer and off-thread Beautify, auth (bearer / basic / API key), transport options,
+// JSON lexer and off-thread Beautify, auth (bearer / basic / API key / OAuth 2.0 with token status
+// and Get new token / Digest / NTLM / Negotiate / AWS SigV4), a Scripts page (pre-request
+// variables computed on a worker right before each send, see http_editor_pre.h; assertions,
+// captures; pre-request and post-response JavaScript saved as SavedRequest::pre_script /
+// post_script), transport options,
 // {{var}} highlighting with the resolved value on hover, Copy as curl, and an in-app prompt
 // before a request uploads a file from outside the workspace.
 //
 // Performance: nothing here scales with the body size per keystroke. The body lives only in the
 // Scintilla buffer (lexed lazily, only what is on screen); store_head() never touches it; {{var}}
 // highlighting looks at the visible part of the body only; Beautify runs on a worker thread.
+#include <wx/scrolwin.h>
 #include <wx/accel.h>
 #include <wx/eventfilter.h>
 #include <wx/toplevel.h>
@@ -18,8 +23,10 @@
 #include <wx/clipbrd.h>
 #include <wx/dcbuffer.h>
 #include <wx/filedlg.h>
+#include <wx/html/htmlwin.h>
 #include <wx/image.h>
 #include <wx/menu.h>
+#include <wx/msgdlg.h>
 #include <wx/panel.h>
 #include <wx/radiobut.h>
 #include <wx/simplebook.h>
@@ -30,11 +37,18 @@
 #include <wx/textctrl.h>
 #include <wx/textdlg.h>
 #include <wx/timer.h>
+#include <wx/weakref.h>
 #include <wx/wupdlock.h>
 #include <wx/msw/wrapwin.h>
 
 #include <algorithm>
+#include <array>
+#include <cctype>
+#include <chrono>
 #include <cmath>
+#include <cstring>
+#include <functional>
+#include <deque>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -43,10 +57,19 @@
 #include <thread>
 
 #include "app/http_editor_codegen.h"
+#include "app/http_editor_find.h"
+#include "app/http_editor_folder.h"
+#include "app/http_editor_inherit.h"
+#include "app/http_editor_network.h"
+#include "app/http_editor_jshelp.h"
 #include "app/http_editor_kv.h"
+#include "app/http_editor_pre.h"
 #include "app/http_editor_util.h"
 #include "app/http_editor_widgets.h"
+#include "app/main_frame.h"
 #include "app/panels.h"
+#include "core/http_client.h"
+#include "core/oauth2.h"
 
 namespace watt::app {
 namespace {
@@ -55,20 +78,64 @@ using namespace http_editor;
 
 const char* const kMethods[] = {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"};
 
-enum class BodyMode { None = 0, Json, Text, Xml, UrlEncoded, Multipart, Binary, CurlData };
-const char* const kBodyModeLabels[] = {"None", "JSON", "Text", "XML", "URL-encoded", "Multipart", "File"};
-constexpr int kBodyModeCount = 7;  // CurlData has no radio button (shown only for imported -d @file)
+// GraphQL: a JSON body {"query", "variables"} edited as two editors (http_editor_util.h).
+enum class BodyMode { None = 0, Json, Text, Xml, UrlEncoded, Multipart, Binary, GraphQL, CurlData };
+const char* const kBodyModeLabels[] = {"None", "JSON", "Text", "XML", "URL-encoded", "Multipart", "File", "GraphQL"};
+constexpr int kBodyModeCount = 8;  // CurlData has no radio button (shown only for imported -d @file)
 
 // Modes edited as text in the body editor.
 constexpr bool text_mode(BodyMode m) { return m == BodyMode::Json || m == BodyMode::Text || m == BodyMode::Xml; }
 
-enum class AuthMode { None = 0, Bearer, Basic, ApiKey };
-const char* const kAuthLabels[] = {"No auth", "Bearer token", "Basic auth", "API key"};
+// Bearer / API key are headers of the request, Basic is SavedRequest::basic_auth, the rest are
+// SavedRequest::auth (core: libcurl does Digest / NTLM / Negotiate / SigV4, oauth2.h the tokens).
+// Inherit: the folder's / collection's auth (HttpAuth::Type::Inherit, resolved by core when sent).
+enum class AuthMode { None = 0, Bearer, Basic, ApiKey, OAuth2, Digest, Ntlm, Negotiate, AwsSigV4, Inherit };
+const char* const kAuthLabels[] = {"No auth", "Bearer token", "Basic auth", "API key", "OAuth 2.0",
+                                   "Digest", "NTLM", "Negotiate (Kerberos)", "AWS Signature v4",
+                                   "Inherit from parent"};
+// The order the type list shows them in (Inherit first, as Postman / Insomnia / Bruno).
+constexpr AuthMode kAuthOrder[] = {AuthMode::Inherit, AuthMode::None, AuthMode::Bearer, AuthMode::Basic,
+                                   AuthMode::ApiKey, AuthMode::OAuth2, AuthMode::Digest, AuthMode::Ntlm,
+                                   AuthMode::Negotiate, AuthMode::AwsSigV4};
+constexpr bool scheme_mode(AuthMode m) { return m >= AuthMode::OAuth2 && m != AuthMode::Inherit; }
+HttpAuth::Type scheme_type(AuthMode m) {
+  switch (m) {
+    case AuthMode::OAuth2: return HttpAuth::Type::OAuth2;
+    case AuthMode::Digest: return HttpAuth::Type::Digest;
+    case AuthMode::Ntlm: return HttpAuth::Type::Ntlm;
+    case AuthMode::Negotiate: return HttpAuth::Type::Negotiate;
+    case AuthMode::AwsSigV4: return HttpAuth::Type::AwsSigV4;
+    default: return HttpAuth::Type::None;
+  }
+}
+AuthMode mode_of(HttpAuth::Type t) {
+  switch (t) {
+    case HttpAuth::Type::OAuth2: return AuthMode::OAuth2;
+    case HttpAuth::Type::Digest: return AuthMode::Digest;
+    case HttpAuth::Type::Ntlm: return AuthMode::Ntlm;
+    case HttpAuth::Type::Negotiate: return AuthMode::Negotiate;
+    case HttpAuth::Type::AwsSigV4: return AuthMode::AwsSigV4;
+    case HttpAuth::Type::Inherit: return AuthMode::Inherit;
+    default: return AuthMode::None;
+  }
+}
+// Page of the auth book per mode: Digest / NTLM / Negotiate share the user + password page.
+size_t auth_page(AuthMode m) {
+  switch (m) {
+    case AuthMode::Digest: case AuthMode::Ntlm: case AuthMode::Negotiate: return 5;
+    case AuthMode::AwsSigV4: return 6;
+    case AuthMode::Inherit: return 7;
+    default: return static_cast<size_t>(m);
+  }
+}
 
 // Indicators for {{var}} highlighting (Scintilla reserves 0-7 for lexers).
 constexpr int kIndOkBox = 8, kIndOkText = 9, kIndBadBox = 10, kIndBadText = 11;
 // Closers inserted by auto-close (hidden), and the JSON syntax error squiggle.
 constexpr int kIndAutoClose = 12, kIndJsonError = 13;
+// The script syntax problem (pre / post script editors) and its annotation under the line.
+constexpr int kIndJsLint = 14;
+constexpr int kStyleJsLint = 41;
 // Style for the URL placeholder (an end-of-line annotation on the empty line).
 constexpr int kStylePlaceholder = 40;
 
@@ -128,6 +195,44 @@ constexpr size_t kAsyncBody = 256 * 1024;
 // A body line at least this long is slow to edit (Scintilla lays out whole lines).
 constexpr size_t kLongLine = 64 * 1024;
 
+// Tabs of the editor, in order.
+enum : size_t { kTabParams, kTabBody, kTabHeaders, kTabAuth, kTabTests, kTabCookies, kTabOptions, kTabDocs, kTabCount };
+// The tab strip has one more tab than the book has pages: the Scripts page shows under two
+// tabs, "Scripts" (its pre-request side) and "Tests" (assertions, captures and the
+// post-response script), like Postman's Pre-request Script / Tests and Bruno's Script / Assert.
+constexpr size_t kStripScripts = kTabTests, kStripTests = kTabTests + 1;
+constexpr size_t strip_of(size_t page) { return page <= kTabTests ? page : page + 1; }
+constexpr size_t page_of(size_t strip) { return strip <= kTabTests ? strip : strip - 1; }
+
+// A 1px separator line: never a Tab stop (an empty wxPanel would take the focus).
+class Rule : public wxWindow {
+ public:
+  Rule(wxWindow* parent, wxSize size, wxColour c) : wxWindow(parent, wxID_ANY, wxDefaultPosition, size) {
+    SetBackgroundColour(c);
+  }
+  bool AcceptsFocus() const override { return false; }
+  bool AcceptsFocusFromKeyboard() const override { return false; }
+};
+
+// A page with only text on it: not a Tab stop either.
+class QuietPanel : public wxPanel {
+ public:
+  explicit QuietPanel(wxWindow* parent) : wxPanel(parent) {}
+  bool AcceptsFocus() const override { return false; }
+  bool AcceptsFocusFromKeyboard() const override { return false; }
+};
+
+// A {{var}} name as a capture writes it: no braces, blanks or control characters.
+std::string check_var_name(const std::string& v) {
+  if (v.empty()) return {};
+  if (v.size() > kMaxVarName) return "Variable name is too long";
+  if (v.find("{{") != std::string::npos || v.find("}}") != std::string::npos || v.front() == '{')
+    return "Type the variable name without braces: token, not {{token}}";
+  for (unsigned char c : v)
+    if (c <= 32 || c == 127) return "A variable name cannot hold blanks or control characters";
+  return {};
+}
+
 // Panel with a rounded 1px border, for the URL bar and the prompt banner.
 class FramePanel : public wxPanel {
  public:
@@ -181,6 +286,7 @@ class HttpEditor : public wxPanel, public HttpEditorPanel, public wxEventFilter 
   void store_head(SavedRequest& r) const override;
   void set_in_flight(bool in_flight) override;
   void focus_url() override;
+  void vars_changed() override { update_preview(); }
 
  private:
   // construction
@@ -225,8 +331,14 @@ class HttpEditor : public wxPanel, public HttpEditorPanel, public wxEventFilter 
   // {{var}} names offered by completion: active environment, globals, dynamic.
   std::vector<std::string> var_names() const;
   std::string sent_form(const std::string& body) const;
+  // One "{{name}}" span as sent: runtime vars, this request's folder / collection vars, then the
+  // environment and globals (Workspace::expand).
+  std::string expand_span(const Workspace& ws, const std::string& span) const;
   // {{names}} the request uses (URL, headers, auth, form fields) that resolve nowhere.
   std::vector<std::string> unresolved_vars(bool* in_url) const;
+  // Braces of a {{var}} typed wrong ("{{user", "Id}}") in the URL, a path variable, a header or a
+  // form field: "where" and what is wrong, first one first (brace_problem).
+  std::vector<std::pair<std::string, std::string>> brace_problems() const;
   void url_inserted(const wxString& text);
   void import_curl(const std::string& cmd, CmdBackslashes bs = CmdBackslashes::AsCurlExe);
   void set_body_mode(BodyMode m, bool user);
@@ -236,10 +348,15 @@ class HttpEditor : public wxPanel, public HttpEditorPanel, public wxEventFilter 
   void sync_api_key_query();
   void beautify();
   bool paste_long_json();
+  // Ctrl+C / Ctrl+Insert of a selection over 1 MB: the UTF-16 clipboard text is built on a worker
+  // (Scintilla's own copy converts 20 MB on the UI thread, ~300 ms), then handed to the
+  // clipboard in one call.
+  bool copy_big_selection();
   void auto_close(int ch);
   void lint();
   void show_lint(uint64_t gen, std::optional<JsonIssue> issue);
   void build_body_doc(std::shared_ptr<const std::string> text, bool reindent, uint64_t gen, uint64_t edits);
+  void fill_body_doc(std::shared_ptr<const std::string> src, bool reindent, uint64_t gen, uint64_t edits, double worker_ms);
   void swap_body_doc(void* doc, bool reindent, uint64_t gen, uint64_t edits, double worker_ms, size_t bytes);
   void copy_as_curl(CurlShell shell);
   void show_curl_menu();
@@ -252,6 +369,10 @@ class HttpEditor : public wxPanel, public HttpEditorPanel, public wxEventFilter 
   void var_tooltip(wxStyledTextCtrl* stc, int pos);
   // Typing "{{": closes it with "}}" and lists the variable names (environment, globals, dynamic).
   void var_completion(wxStyledTextCtrl* stc);
+  // A character typed after "{{" while the list is open (or with "{{ab" before the caret): the
+  // list narrows to the names that start with what was typed, and closes when none does.
+  void var_narrow(wxStyledTextCtrl* stc);
+  void show_var_list(wxStyledTextCtrl* stc, const std::string& typed);
   bool step_over_closer(wxStyledTextCtrl* s, int key);
   void step_past_var_closer(wxStyledTextCtrl* s);
 
@@ -270,6 +391,10 @@ class HttpEditor : public wxPanel, public HttpEditorPanel, public wxEventFilter 
   // url bar
   FlatButton* method_ = nullptr;
   std::string method_str_ = "GET";
+  PickPopup* method_pick_ = nullptr;  // the method list while open (keys come from url_ / method_)
+  bool method_pick_key(wxKeyEvent& e);
+  bool method_pick_char(wxKeyEvent& e);
+  void method_pick_focus_lost();
   FramePanel* url_box_ = nullptr;
   wxStyledTextCtrl* url_ = nullptr;
   FlatButton* send_ = nullptr;
@@ -294,6 +419,21 @@ class HttpEditor : public wxPanel, public HttpEditorPanel, public wxEventFilter 
   wxTimer lint_timer_;
   wxStaticText* lint_label_ = nullptr;
   uint64_t lint_gen_ = 0;
+  // Folding in a big body (http_editor.cpp, big_fold): Scintilla's own fold walks and styles
+  // every line of the block at once (250-370 ms for the root of a 1.4M-line body). Here the
+  // block end comes from a bracket scan and the lines are hidden / shown in slices, one per
+  // event-loop turn, in the order the clicks came.
+  struct FoldOp {
+    int from = 0, to = 0;  // lines, inclusive
+    bool show = false;
+  };
+  bool big_fold(int line);
+  int fold_block_end(int line);  // last line of the block opened on `line`; -1 when none
+  void run_fold_ops();
+  std::deque<FoldOp> fold_ops_;
+  uint64_t fold_edits_ = 0;  // body_edits_ the queued ops are for
+  void* fold_doc_ = nullptr;
+  wxTimer fold_timer_;
   std::optional<JsonIssue> lint_issue_;
   // params
   KvGrid* params_ = nullptr;
@@ -308,6 +448,14 @@ class HttpEditor : public wxPanel, public HttpEditorPanel, public wxEventFilter 
   wxStaticText* preview_ = nullptr;  // the URL as sent: {{vars}} expanded, encoded
   // body
   RadioStrip* body_modes_ = nullptr;
+  // Minified + Beautify: right of the mode radios, or on a row of their own under them when the
+  // editor is too narrow for both (never clipped).
+  wxBoxSizer* body_tools_ = nullptr;
+  wxBoxSizer* body_modes_row_ = nullptr;
+  wxBoxSizer* body_tools_row_ = nullptr;
+  wxPanel* body_page_panel_ = nullptr;
+  bool body_tools_wrapped_ = false;
+  void fit_body_tools();
   FlatButton* beautify_ = nullptr;
   wxSimplebook* body_book_ = nullptr;
   wxStyledTextCtrl* body_ = nullptr;
@@ -317,7 +465,13 @@ class HttpEditor : public wxPanel, public HttpEditorPanel, public wxEventFilter 
   KvGrid* multipart_ = nullptr;
   // Body pages other than the editor are created when their mode is first shown (page index in
   // body_book_ per kind: 0 none, 1 text, 2 urlencoded, 3 multipart, 4 file, 5 curl data).
-  int body_page_[6] = {-1, -1, -1, -1, -1, -1};
+  int body_page_[7] = {-1, -1, -1, -1, -1, -1, -1};
+  // GraphQL body: the two editors (built with their page) and their text until then.
+  wxStyledTextCtrl* gql_query_ = nullptr;
+  wxStyledTextCtrl* gql_vars_ = nullptr;
+  std::string gql_q_val_, gql_v_val_, gql_op_;
+  std::string gql_query_text() const;
+  std::string gql_vars_text() const;
   int ensure_body_page(int kind);
   void sync_body_book();
   std::string binary_val_;     // the File mode path (binary_path_ shows it once built)
@@ -366,17 +520,191 @@ class HttpEditor : public wxPanel, public HttpEditorPanel, public wxEventFilter 
   struct AuthVals {
     std::string bearer, user, pass, key_name, key_value;
     int key_where = 0;  // 0 header, 1 query
+    HttpAuth adv;       // OAuth 2.0 / Digest / NTLM / Negotiate / SigV4 settings (type set on store)
   } av_;
+  // OAuth 2.0 / Digest / NTLM / Negotiate / SigV4 widgets (built with the Auth page).
+  wxStyledTextCtrl *o_token_url_ = nullptr, *o_auth_url_ = nullptr, *o_client_id_ = nullptr, *o_scope_ = nullptr,
+                   *o_audience_ = nullptr, *o_user_ = nullptr, *o_prefix_ = nullptr, *o_param_ = nullptr;
+  wxTextCtrl *o_secret_ = nullptr, *o_pass_ = nullptr;
+  ChoiceButton *o_grant_ = nullptr, *o_client_auth_ = nullptr, *o_add_to_ = nullptr;
+  CheckButton* o_refresh_ = nullptr;
+  wxStaticText* o_status_ = nullptr;
+  FlatButton* o_get_ = nullptr;
+  FlatButton* o_clear_ = nullptr;
+  wxTimer o_timer_;
+  bool o_busy_ = false;
+  std::string o_last_error_;
+  void update_oauth_status();
+  void get_oauth_token();
+  wxStyledTextCtrl *s_user_ = nullptr, *s_aws_key_ = nullptr, *s_aws_region_ = nullptr, *s_aws_service_ = nullptr,
+                   *s_aws_token_ = nullptr;
+  wxTextCtrl *s_pass_ = nullptr, *s_aws_secret_ = nullptr;
+  wxStaticText* s_hint_ = nullptr;
+  void set_scheme_hint();
+  std::vector<wxStaticText*> auth_hints_;
+  int auth_wrap_ = -1;
+  // Each auth type's page is built the first time it is shown (the OAuth 2.0 page alone has 13
+  // fields): opening the Auth tab builds only the selected one.
+  void build_auth_subpage(size_t index);
+  std::array<bool, 8> auth_built_{};
+  // Inherit from parent: what the folders / collection give (Workspace::effective_settings, read
+  // on a worker after each load and folder save), shown on the Auth tab and under Auto headers.
+  InheritView inh_;
+  uint64_t inh_gen_ = 0;
+  wxStaticText* inh_title_ = nullptr;
+  wxStaticText* inh_detail_ = nullptr;
+  wxStaticText* inh_errors_ = nullptr;
+  FlatButton* inh_edit_ = nullptr;
+  FlatButton* inh_own_ = nullptr;
+  FlatButton* inh_coll_ = nullptr;
+  void refresh_inherited();
+  void show_inherited();
+  void edit_folder(const std::filesystem::path& folder);
+  // The folder of this request (the root for an unsaved one).
+  std::filesystem::path own_folder() const;
+  // The file whose folders this request inherits from (a history copy: the request it came from).
+  std::filesystem::path inherit_from() const {
+    std::filesystem::path f = host_->inherit_file();
+    return f.empty() ? base_.file : f;
+  }
+  PickPopup* auth_pick_ = nullptr;
+  void show_auth_menu();
+  // A masked one-line box themed like the {{var}} fields (a native edit with no border inside a
+  // FramePanel).
+  wxTextCtrl* make_secret_box(wxWindow* parent, const char* hint, wxWindow** frame, long style = wxTE_PASSWORD);
+  // OAuth 2.0 rows shown only for some grants / token placements: {label, field}.
+  std::vector<wxWindow*> o_code_rows_, o_password_rows_, o_header_rows_, o_query_rows_;
+  wxPanel* o_page_ = nullptr;
+  void update_oauth_fields();
+  // Widget creation split into short steps (the OAuth 2.0 page), run a few per UI turn.
+  std::vector<std::function<void()>> auth_steps_;
+  bool o_ready_ = false;  // every OAuth 2.0 widget exists
+  void run_auth_steps();
   struct OptVals {
     long timeout_ms = 30000;
     bool redirects = true, verify_tls = true, fresh = false;
     int version = 0;
+    NetworkSettings net;  // the request's own CA / client certificate / proxy
+    std::string pass;     // its passphrase (read on a worker after load)
   } ov_;
+  NetworkPanel* net_panel_ = nullptr;
+  uint64_t pass_gen_ = 0;  // passphrase reads / writes: only the latest one counts
+  void load_passphrase();
+  void save_passphrase(const std::string& pass);
   wxPanel* auth_holder_ = nullptr;
   wxPanel* opts_holder_ = nullptr;
+  // Tests: Assert and Capture tables (core/asserts.h), built on first show; until then the rows
+  // live in assert_vals_ / capture_vals_.
+  wxPanel* tests_holder_ = nullptr;
+  KvGrid* asserts_ = nullptr;
+  KvGrid* captures_ = nullptr;
+  wxStaticText* tests_hint_ = nullptr;
+  wxPanel* tests_page_ = nullptr;
+  KvPanel* assert_panel_ = nullptr;
+  KvPanel* capture_panel_ = nullptr;
+  void layout_tests_page();
+  std::vector<Assertion> assert_vals_;
+  std::vector<Capture> capture_vals_;
+  // The checks as last loaded / stored, and into which request: the response view's Tests tab
+  // edits the tab's request directly, and store() into that same request then keeps (and shows)
+  // those edits instead of writing the table's older rows over them.
+  mutable std::vector<Assertion> asserts_stored_;
+  mutable const SavedRequest* asserts_target_ = nullptr;
+  void set_assert_rows(const std::vector<Assertion>& a);
+  wxWindow* build_tests_page();
+  std::vector<Assertion> asserts_now() const;
+  std::vector<Capture> captures_now() const;
+  void update_tests_hint();
+  // Notes on the Scripts page that wrap to its width (never cut with "..."): text as written.
+  std::vector<std::pair<wxStaticText*, wxString>> tests_notes_;
+  // Script trust (Workspace::scripts_trusted, a file outside the workspace): read on a worker,
+  // shown under both script editors with a Trust / Stop trusting button. -1: not known yet.
+  int trust_state_ = -1;
+  uint64_t trust_gen_ = 0;
+  wxStaticText* trust_text_[2] = {nullptr, nullptr};
+  FlatButton* trust_btn_[2] = {nullptr, nullptr};
+  void refresh_trust(bool after_send = false);
+  // The Scripts tab's two sides, each built when first shown (or a UI turn after the other).
+  wxPanel* pre_pg_ = nullptr;
+  wxPanel* post_pg_ = nullptr;
+  void build_pre_side();
+  void build_post_side();
+  void add_tests_note(wxWindow* parent, wxSizer* s, const wxString& text, int top);
+  void add_trust_row(wxWindow* parent, wxSizer* s, int side);
+  void setup_tests_grid(KvGrid* g);
+  void show_trust();
+  void set_trust(bool trusted);
+  bool has_scripts() const;
+  int tests_wrap_ = -1;
+  // Pre-request | Post-response sides of the Scripts page, and their JavaScript editors
+  // (SavedRequest::pre_script / post_script, run by the core sandbox, see core/script.h).
+  TabStrip* script_tabs_ = nullptr;
+  wxSimplebook* script_book_ = nullptr;
+  wxStyledTextCtrl* pre_js_ = nullptr;
+  wxStyledTextCtrl* post_js_ = nullptr;
+  wxStyledTextCtrl* make_script_editor(wxWindow* parent, const char* placeholder);
+  // pm. / bru. / req. / res. completion, Ctrl+Space, the lint squiggle; and the Snippets button.
+  void setup_script_help(wxStyledTextCtrl* s, bool post);
+  wxWindow* make_script_label(wxWindow* parent, wxStyledTextCtrl** editor, bool post);
+  void lint_script(wxStyledTextCtrl* s);
+  void script_completion(wxStyledTextCtrl* s, bool post, bool explicit_request);
+  // The first syntax problem of either script, as "Pre-request script, line 3: ..." (empty: none).
+  wxString script_lint_summary() const;
+  void update_script_badges();
+  // The Scripts page on one side (0 pre-request, 1 post-response: the Tests tab).
+  void show_script_side(size_t side);
+  size_t want_side_ = 2;  // the side the Scripts page opens on when it is built (2: by content)
+  // Pre-request variables (http_editor_pre.h): the first table of the Scripts page, saved in the
+  // docs block (RowDocs::pre) while the model has no field for them. Evaluated on a worker right
+  // before a send (do_send), and for the "Value now" column a moment after an edit.
+  KvGrid* pre_ = nullptr;
+  KvPanel* pre_panel_ = nullptr;
+  std::vector<PreRow> pre_vals_;  // the rows until the page is built
+  std::vector<PreRow> pre_now() const;
+  static std::vector<PreVar> to_pre_vars(const std::vector<PreRow>& rows);
+  std::set<std::string> pre_names_;  // enabled rows' names: they count as defined {{vars}}
+  void update_pre_names();
+  std::map<std::string, KvGrid::Preview> pre_preview_;
+  wxTimer pre_timer_;
+  uint64_t pre_gen_ = 0, pre_send_gen_ = 0;
+  void preview_pre();
+  bool pre_busy_ = false;   // a send waits for its pre-request variables
+  bool pre_ready_ = false;  // do_send(): they were just computed and stored
+  void run_pre_then_send(std::vector<PreVar> rows);
+  void pre_done(uint64_t gen, const std::vector<PreVar>& rows, const std::vector<PreVarResult>& res, double ms);
+  // The request as it would be sent, for evaluation (pre-request values, Copy as): store() into a
+  // copy of base_ that leaves the assert bookkeeping alone; the body only when asked for.
+  SavedRequest eval_request(bool with_body, bool sending) const;
+  mutable bool store_no_body_ = false;
+  // Copy as: the request with {{vars}} (and the previewed pre-request values) resolved when that
+  // is on, and what the copy cannot do as sent ("" when nothing).
+  SavedRequest export_request(std::string* warning) const;
+  // The minified JSON body (Minified on, an edited big body), built on a worker after each edit
+  // burst so a send never minifies 10 MB on the UI thread.
+  std::shared_ptr<const std::string> minified_;
+  uint64_t minified_edits_ = ~uint64_t{0};
+  bool minify_busy_ = false;
+  bool minified_current() const { return minified_ && minified_edits_ == body_edits_; }
+  void minify_then_send();
+  // Cookies: what the Cookie header(s) and curl -b jars will send (read-only list).
+  wxPanel* cookies_holder_ = nullptr;
+  wxPanel* cookie_list_ = nullptr;
+  wxFlexGridSizer* cookie_grid_ = nullptr;
+  wxStaticText* cookie_head_ = nullptr;
+  std::vector<std::string> cookie_sig_;
+  wxWindow* build_cookies_page();
+  void update_cookies();
+  // Descriptions of params (by key) and path variables (by name), kept when a row goes away and
+  // comes back (retyping the URL).
+  std::map<std::string, std::string> param_descs_, path_descs_;
+  // Bytes of the body as sent ({{vars}} expanded, minified), or nullopt when that is not known
+  // before sending (files, multipart, or too big to compute here).
+  std::optional<size_t> sent_body_size() const;
   // Docs: notes about the request (Markdown), in docs_text_ until the page is first shown.
   wxPanel* docs_holder_ = nullptr;
   wxStyledTextCtrl* docs_ = nullptr;
+  wxHtmlWindow* docs_html_ = nullptr;  // the Preview (built on first use)
+  std::function<void(bool, bool)> docs_preview_;  // true: show the rendered notes
   std::string docs_text_;
   wxWindow* build_docs_page();
   void ensure_page(size_t i);
@@ -414,8 +742,19 @@ class HttpEditor : public wxPanel, public HttpEditorPanel, public wxEventFilter 
   // back to it in O(1) instead of Scintilla undoing a 25 MB insert.
   void* prev_doc_ = nullptr;
   bool prev_minify_ = false;
+  // The document Ctrl+Z swapped out (with its own undo history): Ctrl+Y swaps it back. Dropped
+  // on the next edit of the restored document.
+  void* redo_doc_ = nullptr;
+  bool redo_minify_ = false;
+  std::shared_ptr<const std::string> redo_raw_;
+  void drop_redo_doc();
+  // Ctrl+Z / Ctrl+Y past the start / end of the document's own history.
+  bool undo_swap();
+  bool redo_swap();
   void release_doc_async(void* doc);
-  void install_doc(void* doc);
+  // fresh: a document built by a loader (Scintilla leaves its undo collection off), whose
+  // history starts empty here; else a document that keeps the history it had.
+  void install_doc(void* doc, bool fresh);
   void paste_arrived(uint64_t gen, uint64_t edits, int start, int end, bool whole,
                      std::shared_ptr<const std::string> text, bool long_json);
   uint64_t body_edits_ = 0;
@@ -440,55 +779,79 @@ HttpEditor::HttpEditor(wxWindow* parent, EditorHost* host) : wxPanel(parent, wxI
   // Tab strip + Copy as curl on the right.
   auto* tabrow = new wxBoxSizer(wxHORIZONTAL);
   tabs_ = new TabStrip(this);
-  tabs_->set_tabs({"Params", "Body", "Headers", "Auth", "Options", "Docs"});
+  tabs_->set_tabs({"Params", "Body", "Headers", "Auth", "Scripts", "Tests", "Cookies", "Options", "Docs"});
   tabrow->Add(tabs_, 1, wxEXPAND);
   curl_btn_ = new FlatButton(this, "Copy as", FlatButton::Style::Subtle, true);
   curl_btn_->SetToolTip("Copy this request as a curl command (bash, cmd, PowerShell) or as code (Python, "
                         "JavaScript, Node.js, Go, Java, C#, PowerShell, HTTPie), with {{variables}} resolved or kept");
   tabrow->Add(curl_btn_, 0, wxALIGN_CENTER_VERTICAL);
   sz->Add(tabrow, 0, wxEXPAND | wxLEFT | wxRIGHT, FromDIP(12));
-  auto* line = new wxPanel(this, wxID_ANY, wxDefaultPosition, wxSize(-1, 1));
-  line->SetBackgroundColour(t.border);
+  auto* line = new Rule(this, wxSize(-1, 1), t.border);
   sz->Add(line, 0, wxEXPAND | wxLEFT | wxRIGHT, FromDIP(12));
 
   book_ = new wxSimplebook(this);
   book_->SetBackgroundColour(t.bg);
   book_->AddPage(build_params_page(), "Params");
   book_->AddPage(build_body_page(), "Body");
-  for (wxPanel** h : {&headers_holder_, &auth_holder_, &opts_holder_, &docs_holder_}) {
+  for (wxPanel** h : {&headers_holder_, &auth_holder_, &tests_holder_, &cookies_holder_, &opts_holder_, &docs_holder_}) {
     *h = new wxPanel(book_);
     (*h)->SetBackgroundColour(t.bg);
     (*h)->SetSizer(new wxBoxSizer(wxVERTICAL));
   }
   book_->AddPage(headers_holder_, "Headers");
   book_->AddPage(auth_holder_, "Auth");
+  book_->AddPage(tests_holder_, "Tests");
+  book_->AddPage(cookies_holder_, "Cookies");
   book_->AddPage(opts_holder_, "Options");
   book_->AddPage(docs_holder_, "Docs");
   sz->Add(book_, 1, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, FromDIP(12));
   // Status line under the pages (paste / copy / format notes): never squeezes the tab strip.
-  note_ = new wxStaticText(this, wxID_ANY, "", wxDefaultPosition, wxDefaultSize, wxST_ELLIPSIZE_END | wxST_NO_AUTORESIZE);
+  // Wrapped to the editor's width (at most a few lines), never cut.
+  note_ = new wxStaticText(this, wxID_ANY, "");
   note_->SetForegroundColour(t.dim);
-  note_->SetMinSize(wxSize(-1, GetCharHeight()));
   note_->Hide();
   sz->Add(note_, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, FromDIP(12));
   SetSizer(sz);
 
-  tabs_->on_select = [this](size_t i) {
+  tabs_->on_select = [this](size_t strip) {
+    if (strip == kStripScripts || strip == kStripTests) {
+      show_script_side(strip == kStripTests ? 1 : 0);
+      return;
+    }
+    const size_t i = page_of(strip);
     ensure_page(i);
     book_->ChangeSelection(i);
-    if (i == 1) sync_body_book();
-    if (i == 2) update_auto_headers();
+    if (i == kTabBody) sync_body_book();
+    if (i == kTabHeaders) update_auto_headers();
+    // The folders' settings may have changed on disk (another tab, git pull): read them again.
+    if (i == kTabAuth || i == kTabHeaders) refresh_inherited();
+    if (i == kTabCookies) update_cookies();
+    if (i == kTabTests) preview_pre();
   };
   curl_btn_->on_click = [this] { show_curl_menu(); };
+  pre_timer_.Bind(wxEVT_TIMER, [this](wxTimerEvent&) { preview_pre(); });
   note_timer_.Bind(wxEVT_TIMER, [this](wxTimerEvent&) { note(""); });
   lint_timer_.Bind(wxEVT_TIMER, [this](wxTimerEvent&) { lint(); });
+  fold_timer_.Bind(wxEVT_TIMER, [this](wxTimerEvent&) { run_fold_ops(); });
 
   // Ctrl+Enter sends from anywhere in the editor (ahead of the frame's own accelerator, so the
   // upload check below runs first).
   const int id_send = wxWindow::NewControlId();
   wxAcceleratorEntry acc[] = {{wxACCEL_CTRL, WXK_RETURN, id_send}, {wxACCEL_CTRL, WXK_NUMPAD_ENTER, id_send}};
   SetAcceleratorTable(wxAcceleratorTable(2, acc));
-  Bind(wxEVT_MENU, [this](wxCommandEvent&) { do_send(); }, id_send);
+  Bind(wxEVT_MENU, [this](wxCommandEvent&) {
+    // The focus can stay in a control of a tab that is no longer shown (a preview tab replaced by
+    // quick-open): Ctrl+Enter always sends the active tab, never this hidden one.
+    if (!IsShownOnScreen()) {
+      if (wxWindow* top = wxGetTopLevelParent(this)) {
+        wxCommandEvent ev(wxEVT_MENU, MainFrame::kSendCommand);
+        ev.SetEventObject(top);
+        wxPostEvent(top, ev);
+      }
+      return;
+    }
+    do_send();
+  }, id_send);
   wxEvtHandler::AddFilter(this);
 }
 
@@ -509,6 +872,8 @@ HttpEditor::~HttpEditor() {
   alive_->docs.clear();
   if (prev_doc_) body_->ReleaseDocument(prev_doc_);
   prev_doc_ = nullptr;
+  if (redo_doc_) body_->ReleaseDocument(redo_doc_);
+  redo_doc_ = nullptr;
 }
 
 void HttpEditor::build_url_bar(wxSizer* sz) {
@@ -520,7 +885,7 @@ void HttpEditor::build_url_bar(wxSizer* sz) {
   method_->set_text_colour(method_colour("GET"));
   method_->SetToolTip("HTTP method (Alt+Down in the URL opens this list, Ctrl+Up / Ctrl+Down cycles)");
   inner->Add(method_, 0, wxEXPAND | wxALL, FromDIP(3));
-  auto* sep = new wxPanel(url_box_, wxID_ANY, wxDefaultPosition, wxSize(1, -1));
+  auto* sep = new Rule(url_box_, wxSize(1, -1), t.border);
   sep->SetBackgroundColour(t.border);
   sep->Disable();  // never a Tab stop: Shift+Tab from the URL lands on the method button
   inner->Add(sep, 0, wxEXPAND | wxTOP | wxBOTTOM, FromDIP(7));
@@ -536,6 +901,32 @@ void HttpEditor::build_url_bar(wxSizer* sz) {
   sz->AddSpacer(FromDIP(8));
 
   method_->on_click = [this] { show_method_menu(); };
+  // The method button with the focus: Down / Alt+Down open the list, typing a letter opens it
+  // filtered (as in Postman, where the method box takes typed text). Bound after FlatButton's own
+  // handlers, so these run first.
+  method_->Bind(wxEVT_KEY_DOWN, [this](wxKeyEvent& e) {
+    if (method_pick_ && method_pick_key(e)) return;
+    const int k = e.GetKeyCode();
+    if (!method_pick_ && (k == WXK_DOWN || k == WXK_NUMPAD_DOWN) && (!e.HasAnyModifiers() || e.GetModifiers() == wxMOD_ALT)) {
+      show_method_menu();
+      return;
+    }
+    e.Skip();
+  });
+  method_->Bind(wxEVT_CHAR, [this](wxKeyEvent& e) {
+    if (method_pick_ && method_pick_char(e)) return;
+    const wxChar c = e.GetUnicodeKey();
+    if (!method_pick_ && !e.ControlDown() && !e.AltDown() && c > 32 && c < 127 && c != ' ') {
+      show_method_menu();
+      if (method_pick_) method_pick_->chr(static_cast<wxChar>(wxToupper(c)));
+      return;
+    }
+    e.Skip();
+  });
+  method_->Bind(wxEVT_KILL_FOCUS, [this](wxFocusEvent& e) {
+    e.Skip();
+    method_pick_focus_lost();
+  });
   send_->on_click = [this] { in_flight_ ? host_->cancel() : do_send(); };
 }
 
@@ -579,6 +970,7 @@ void HttpEditor::setup_url_stc() {
 
   s->Bind(wxEVT_KEY_DOWN, [this](wxKeyEvent& e) {
     const int k = e.GetKeyCode();
+    if (method_pick_ && method_pick_key(e)) return;
     if (url_->AutoCompActive() && !e.HasAnyModifiers()) {
       // The {{variable}} list is open: its keys pick / move / close it (Scintilla handles them).
       switch (k) {
@@ -615,12 +1007,14 @@ void HttpEditor::setup_url_stc() {
   // hand does not end up as {{var}}}}.
   s->IndicatorSetStyle(kIndAutoClose, wxSTC_INDIC_HIDDEN);
   s->Bind(wxEVT_CHAR, [this](wxKeyEvent& e) {
+    if (method_pick_ && method_pick_char(e)) return;
     if (step_over_closer(url_, e.GetUnicodeKey())) return;
     e.Skip();
   });
   s->Bind(wxEVT_STC_CHARADDED, [this](wxStyledTextEvent& e) {
     e.Skip();
     if (e.GetKey() == '{') var_completion(url_);
+    else var_narrow(url_);
   });
   s->Bind(wxEVT_STC_AUTOCOMP_COMPLETED, [this](wxStyledTextEvent& e) {
     e.Skip();
@@ -634,6 +1028,7 @@ void HttpEditor::setup_url_stc() {
     e.Skip();
     url_box_->set_focus(false);
     url_->CallTipCancel();
+    method_pick_focus_lost();
   });
   s->Bind(wxEVT_STC_MODIFIED, [this](wxStyledTextEvent& e) {
     e.Skip();
@@ -750,17 +1145,31 @@ wxWindow* HttpEditor::build_body_page() {
   beautify_ = new FlatButton(p, "Beautify", FlatButton::Style::Subtle);
   beautify_->SetToolTip("Re-indent the JSON body (keeps values and {{variables}} as written)  Ctrl+B");
   beautify_->on_click = [this] { beautify(); };
-  minify_ = new CheckButton(p, "Minified");
-  minify_->SetToolTip("Edit the JSON formatted, send it without the whitespace between tokens (an unedited "
-                      "paste is sent byte for byte as pasted)");
+  minify_ = new CheckButton(p, "Send minified");
+  minify_->SetToolTip("The body is shown and edited formatted; on: it is sent without the whitespace between "
+                      "tokens (an unedited paste byte for byte as pasted), off: sent as shown");
   minify_->on_change = [this] {
     if (!loading_) touched();
+    // Only what is sent changes: the view stays, repainted whole (no stale line paint over a
+    // big document).
+    if (body_) body_->Refresh(false);
   };
-  modes->Add(minify_, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, FromDIP(10));
-  modes->Add(beautify_, 0, wxALIGN_CENTER_VERTICAL);
+  body_tools_ = new wxBoxSizer(wxHORIZONTAL);
+  body_tools_->Add(minify_, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, FromDIP(10));
+  body_tools_->Add(beautify_, 0, wxALIGN_CENTER_VERTICAL);
   // As tall as the Beautify button in every mode, so the radio row never moves.
-  modes->Add(0, beautify_->GetBestSize().y);
+  body_tools_->Add(0, beautify_->GetBestSize().y);
+  modes->Add(body_tools_, 0, wxALIGN_CENTER_VERTICAL);
+  body_modes_row_ = modes;
   s->Add(modes, 0, wxEXPAND | wxTOP | wxBOTTOM, FromDIP(8));
+  body_tools_row_ = new wxBoxSizer(wxHORIZONTAL);
+  body_tools_row_->AddStretchSpacer();
+  s->Add(body_tools_row_, 0, wxEXPAND);
+  body_page_panel_ = p;
+  p->Bind(wxEVT_SIZE, [this](wxSizeEvent& e) {
+    e.Skip();
+    fit_body_tools();
+  });
 
   body_book_ = new wxSimplebook(p);
   body_book_->SetBackgroundColour(t.bg);
@@ -770,6 +1179,7 @@ wxWindow* HttpEditor::build_body_page() {
     auto* fs = new wxBoxSizer(wxVERTICAL);
     body_ = new wxStyledTextCtrl(frame, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxBORDER_NONE);
     setup_body_stc();
+    attach_find(body_);
     fs->Add(body_, 1, wxEXPAND | wxALL, FromDIP(1));
     frame->SetSizer(fs);
     body_book_->AddPage(frame, "text");
@@ -793,6 +1203,21 @@ wxWindow* HttpEditor::build_body_page() {
   return p;
 }
 
+void HttpEditor::fit_body_tools() {
+  if (!body_tools_ || !body_page_panel_) return;
+  const int avail = body_page_panel_->GetClientSize().x;
+  int tools = 0;
+  if (minify_->IsShown()) tools += minify_->GetBestSize().x + FromDIP(10);
+  if (beautify_->IsShown()) tools += beautify_->GetBestSize().x;
+  const bool wrap = avail > 0 && tools > 0 && body_modes_->GetBestSize().x + FromDIP(16) + tools > avail;
+  if (wrap != body_tools_wrapped_) {
+    body_tools_wrapped_ = wrap;
+    (wrap ? body_modes_row_ : body_tools_row_)->Detach(body_tools_);
+    (wrap ? body_tools_row_ : body_modes_row_)->Add(body_tools_, 0, wxALIGN_CENTER_VERTICAL | wxBOTTOM, wrap ? FromDIP(6) : 0);
+  }
+  body_page_panel_->Layout();
+}
+
 KvGrid* HttpEditor::form_grid(int which) {
   ensure_body_page(which == 0 ? 2 : 3);
   return which == 0 ? urlenc_ : multipart_;
@@ -801,7 +1226,7 @@ KvGrid* HttpEditor::form_grid(int which) {
 // Shows the page of the current body mode, creating it on first use; only while the Body tab is
 // shown (a new GET tab never builds the "no body" page or a form table it does not show).
 void HttpEditor::sync_body_book() {
-  if (book_->GetSelection() != 1) return;
+  if (book_->GetSelection() != kTabBody) return;
   int kind = 0;
   switch (body_mode_) {
     case BodyMode::None: kind = 0; break;
@@ -812,6 +1237,7 @@ void HttpEditor::sync_body_book() {
     case BodyMode::Multipart: kind = 3; break;
     case BodyMode::Binary: kind = 4; break;
     case BodyMode::CurlData: kind = 5; break;
+    case BodyMode::GraphQL: kind = 6; break;
   }
   const int page = ensure_body_page(kind);
   if (body_book_->GetSelection() != page) body_book_->ChangeSelection(static_cast<size_t>(page));
@@ -823,7 +1249,7 @@ int HttpEditor::ensure_body_page(int kind) {
   wxWindowUpdateLocker lock(body_book_);
   wxWindow* page = nullptr;
   if (kind == 0) {
-    auto* np = new wxPanel(body_book_);
+    auto* np = new QuietPanel(body_book_);
     np->SetBackgroundColour(t.bg);
     auto* ns = new wxBoxSizer(wxVERTICAL);
     auto* l = new wxStaticText(np, wxID_ANY, "This request does not have a body");
@@ -838,6 +1264,7 @@ int HttpEditor::ensure_body_page(int kind) {
     KvGrid*& g = which == 0 ? urlenc_ : multipart_;
     g = new KvGrid(body_book_, which == 0 ? KvGrid::Kind::UrlEncoded : KvGrid::Kind::Multipart);
     g->lookup = [this](const std::string& n) { return resolve(n); };
+    g->var_names = [this] { return var_names(); };
     g->on_change = [this] {
       if (!loading_) touched();
     };
@@ -868,8 +1295,38 @@ int HttpEditor::ensure_body_page(int kind) {
       if (dlg.ShowModal() == wxID_OK) binary_path_->SetValue(dlg.GetPath());
     });
     page = bp;
+  } else if (kind == 6) {
+    auto* gp = new wxPanel(body_book_);
+    gp->SetBackgroundColour(t.bg);
+    auto* gs = new wxBoxSizer(wxVERTICAL);
+    auto label = [&](const char* text) {
+      auto* l = new wxStaticText(gp, wxID_ANY, text);
+      l->SetForegroundColour(t.dim);
+      gs->Add(l, 0, wxTOP | wxBOTTOM, FromDIP(4));
+    };
+    label("Query");
+    gql_query_ = make_script_editor(gp, "query { user(id: $id) { id name } }");
+    gql_query_->SetKeyWords(0, "query mutation subscription fragment on true false null");
+    gql_query_->SetKeyWords(1, "");
+    gs->Add(gql_query_, 3, wxEXPAND);
+    label("Variables (JSON, {{variables}} allowed)");
+    gql_vars_ = make_script_editor(gp, "{ \"id\": \"{{userId}}\" }");
+    gs->Add(gql_vars_, 2, wxEXPAND);
+    auto* note = new wxStaticText(gp, wxID_ANY, "Sent as a JSON POST body {\"query\": ..., \"variables\": ...} "
+                                                "(Content-Type: application/json).");
+    note->SetForegroundColour(t.dim);
+    gs->Add(note, 0, wxTOP, FromDIP(4));
+    gp->SetSizer(gs);
+    const bool was = loading_;
+    loading_ = true;
+    gql_query_->SetText(wxString::FromUTF8(gql_q_val_));
+    gql_vars_->SetText(wxString::FromUTF8(gql_v_val_));
+    gql_query_->EmptyUndoBuffer();
+    gql_vars_->EmptyUndoBuffer();
+    loading_ = was;
+    page = gp;
   } else if (kind == 5) {
-    auto* cp = new wxPanel(body_book_);
+    auto* cp = new QuietPanel(body_book_);
     cp->SetBackgroundColour(t.bg);
     auto* cs = new wxBoxSizer(wxVERTICAL);
     curl_data_text_ = new wxStaticText(cp, wxID_ANY, curl_data_label_);
@@ -1008,8 +1465,9 @@ void HttpEditor::setup_body_stc() {
     ++body_edits_;
     update_line_margin();
     if (loading_) return;
+    drop_redo_doc();  // an edit after Ctrl+Z: the swapped-out document is no longer a redo
     body_hl_first_ = -1;
-    if (body_mode_ == BodyMode::Json) lint_timer_.StartOnce(body_->GetLength() < 256 * 1024 ? 250 : 600);
+    if (body_mode_ == BodyMode::Json) lint_timer_.StartOnce(body_->GetLength() < 256 * 1024 ? 250 : 300);
     touched();
   });
   s->Bind(wxEVT_STC_UPDATEUI, [this](wxStyledTextEvent& e) {
@@ -1021,22 +1479,14 @@ void HttpEditor::setup_body_stc() {
     const bool paste = (e.GetModifiers() == wxMOD_CONTROL && k == 'V') ||
                        (e.GetModifiers() == wxMOD_SHIFT && (k == WXK_INSERT || k == WXK_NUMPAD_INSERT));
     if (paste && paste_long_json()) return;
-    // Undo past a swapped-in paste / format: the previous document comes back in O(1).
-    if (e.GetModifiers() == wxMOD_CONTROL && k == 'Z' && prev_doc_ && !body_->CanUndo() && !pending_body_) {
-      void* cur = body_->GetDocPointer();
-      body_->AddRefDocument(cur);
-      void* back = prev_doc_;
-      prev_doc_ = nullptr;
-      install_doc(back);
-      body_->ReleaseDocument(back);  // the control holds it now
-      release_doc_async(cur);
-      minify_->set_value(prev_minify_);
-      raw_body_.reset();
-      ++body_edits_;
-      note("Undid the paste");
-      touched();
+    const bool copy = (e.GetModifiers() == wxMOD_CONTROL && (k == 'C' || k == WXK_INSERT || k == WXK_NUMPAD_INSERT));
+    if (copy && copy_big_selection()) return;
+    // Undo past a swapped-in paste / format: the previous document comes back in O(1) (the edits
+    // made after the paste are undone one by one first, by Scintilla). Redo swaps forward again.
+    const int mods = e.GetModifiers();
+    if (mods == wxMOD_CONTROL && k == 'Z' && undo_swap()) return;
+    if (((mods == wxMOD_CONTROL && k == 'Y') || (mods == (wxMOD_CONTROL | wxMOD_SHIFT) && k == 'Z')) && redo_swap())
       return;
-    }
     e.Skip();
   });
   // Ctrl+B (Postman) / Ctrl+Shift+F (Insomnia) beautify the JSON body. A char hook, so it runs
@@ -1052,7 +1502,9 @@ void HttpEditor::setup_body_stc() {
     e.Skip();
   });
   s->Bind(wxEVT_STC_MARGINCLICK, [this](wxStyledTextEvent& e) {
-    if (e.GetMargin() == 1) body_->ToggleFold(body_->LineFromPosition(e.GetPosition()));
+    if (e.GetMargin() != 1) return;
+    const int line = body_->LineFromPosition(e.GetPosition());
+    if (!big_fold(line)) body_->ToggleFold(line);
   });
   // Auto-indent: a new line keeps the previous line's indent, one level more after { or [.
   // Typing over a closer this editor inserted itself steps over it (like Postman / VS Code).
@@ -1075,6 +1527,7 @@ void HttpEditor::setup_body_stc() {
       if (key == '{') var_completion(body_);
       return;
     }
+    if (body_->AutoCompActive()) var_narrow(body_);
     if (key != '\n') return;
     const int line = body_->GetCurrentLine();
     if (line <= 0) return;
@@ -1111,6 +1564,7 @@ wxWindow* HttpEditor::build_headers_page() {
   auto* kp = new KvPanel(p, KvGrid::Kind::Headers, "Headers");
   headers_ = kp->grid();
   headers_->lookup = [this](const std::string& n) { return resolve(n); };
+  headers_->var_names = [this] { return var_names(); };
   headers_->on_change = [this] {
     if (!loading_) touched();
   };
@@ -1168,7 +1622,7 @@ void HttpEditor::set_header_rows(const std::vector<KvRow>& rows) {
 }
 
 void HttpEditor::ensure_page(size_t i) {
-  if (i == 2 && !headers_) {
+  if (i == kTabHeaders && !headers_) {
     wxWindowUpdateLocker lock(headers_holder_);
     headers_holder_->GetSizer()->Add(build_headers_page(), 1, wxEXPAND);
     const bool was = loading_;
@@ -1178,17 +1632,25 @@ void HttpEditor::ensure_page(size_t i) {
     loading_ = was;
     update_files_row();
     headers_holder_->Layout();
-  } else if (i == 3 && !auth_book_) {
+  } else if (i == kTabAuth && !auth_book_) {
     wxWindowUpdateLocker lock(auth_holder_);
     auth_holder_->GetSizer()->Add(build_auth_page(), 1, wxEXPAND);
     push_auth();
     auth_holder_->Layout();
-  } else if (i == 4 && !timeout_) {
+  } else if (i == kTabTests && !tests_page_) {
+    wxWindowUpdateLocker lock(tests_holder_);
+    tests_holder_->GetSizer()->Add(build_tests_page(), 1, wxEXPAND);
+    tests_holder_->Layout();
+  } else if (i == kTabCookies && !cookie_list_) {
+    wxWindowUpdateLocker lock(cookies_holder_);
+    cookies_holder_->GetSizer()->Add(build_cookies_page(), 1, wxEXPAND);
+    cookies_holder_->Layout();
+  } else if (i == kTabOptions && !timeout_) {
     wxWindowUpdateLocker lock(opts_holder_);
     opts_holder_->GetSizer()->Add(build_options_page(), 1, wxEXPAND);
     push_opts();
     opts_holder_->Layout();
-  } else if (i == 5 && !docs_) {
+  } else if (i == kTabDocs && !docs_) {
     wxWindowUpdateLocker lock(docs_holder_);
     docs_holder_->GetSizer()->Add(build_docs_page(), 1, wxEXPAND);
     docs_holder_->Layout();
@@ -1199,16 +1661,151 @@ void HttpEditor::push_auth() {
   if (!auth_book_) return;
   const bool was = loading_;
   loading_ = true;
-  bearer_->ChangeValue(wxString::FromUTF8(av_.bearer));
-  basic_user_->ChangeValue(wxString::FromUTF8(av_.user));
-  basic_pass_->ChangeValue(wxString::FromUTF8(av_.pass));
-  basic_pass_alt_->ChangeValue(wxString::FromUTF8(av_.pass));
-  key_name_->ChangeValue(wxString::FromUTF8(av_.key_name));
-  key_value_->ChangeValue(wxString::FromUTF8(av_.key_value));
-  key_where_->set_selection(av_.key_where);
+  build_auth_subpage(auth_page(auth_mode_));
+  if (bearer_) bearer_->ChangeValue(wxString::FromUTF8(av_.bearer));
+  if (basic_user_) {
+    basic_user_->ChangeValue(wxString::FromUTF8(av_.user));
+    basic_pass_->ChangeValue(wxString::FromUTF8(av_.pass));
+    basic_pass_alt_->ChangeValue(wxString::FromUTF8(av_.pass));
+  }
+  if (key_name_) {
+    key_name_->ChangeValue(wxString::FromUTF8(av_.key_name));
+    key_value_->ChangeValue(wxString::FromUTF8(av_.key_value));
+    key_where_->set_selection(av_.key_where);
+  }
+  const HttpAuth& a = av_.adv;
+  const OAuth2Config& o = a.oauth2;
+  if (o_ready_) {
+  o_token_url_->ChangeValue(wxString::FromUTF8(o.token_url));
+  o_auth_url_->ChangeValue(wxString::FromUTF8(o.auth_url));
+  o_client_id_->ChangeValue(wxString::FromUTF8(o.client_id));
+  o_secret_->ChangeValue(wxString::FromUTF8(o.client_secret));
+  o_scope_->ChangeValue(wxString::FromUTF8(o.scope));
+  o_audience_->ChangeValue(wxString::FromUTF8(o.audience));
+  o_user_->ChangeValue(wxString::FromUTF8(o.username));
+  o_pass_->ChangeValue(wxString::FromUTF8(o.password));
+  o_prefix_->ChangeValue(wxString::FromUTF8(o.header_prefix));
+  o_param_->ChangeValue(wxString::FromUTF8(o.query_param));
+  o_grant_->set_selection(static_cast<int>(o.grant));
+  o_client_auth_->set_selection(static_cast<int>(o.client_auth));
+  o_add_to_->set_selection(static_cast<int>(o.add_to));
+  o_refresh_->set_value(o.auto_refresh);
+  update_oauth_fields();
+  }
+  if (s_user_) {
+    s_user_->ChangeValue(wxString::FromUTF8(a.user));
+    s_pass_->ChangeValue(wxString::FromUTF8(a.password));
+  }
+  if (s_aws_key_) {
+  s_aws_key_->ChangeValue(wxString::FromUTF8(a.aws_access_key));
+  s_aws_secret_->ChangeValue(wxString::FromUTF8(a.aws_secret_key));
+  s_aws_token_->ChangeValue(wxString::FromUTF8(a.aws_session_token));
+  s_aws_region_->ChangeValue(wxString::FromUTF8(a.aws_region));
+  s_aws_service_->ChangeValue(wxString::FromUTF8(a.aws_service));
+  }
   auth_btn_->SetLabel(kAuthLabels[static_cast<int>(auth_mode_)]);
-  auth_book_->ChangeSelection(static_cast<size_t>(auth_mode_));
+  auth_book_->ChangeSelection(auth_page(auth_mode_));
+  set_scheme_hint();
+  update_oauth_status();
   loading_ = was;
+}
+
+void HttpEditor::set_scheme_hint() {
+  if (!s_hint_) return;
+  const char* h = auth_mode_ == AuthMode::Ntlm
+                      ? "NTLM (Windows SSPI): libcurl answers the server's 401 challenge. Leave both empty to sign in as "
+                        "the current Windows user."
+                  : auth_mode_ == AuthMode::Negotiate
+                      ? "Negotiate / Kerberos (SPNEGO, Windows SSPI). Leave both empty to use the current Windows logon."
+                      : "Digest: libcurl answers the server's 401 challenge (one extra round trip per connection). "
+                        "{{variables}} are allowed.";
+  if (s_hint_->GetLabel() != h) {
+    s_hint_->SetLabel(h);
+    s_hint_->Wrap(auth_wrap_ > 0 ? auth_wrap_ : FromDIP(560));
+    s_hint_->GetParent()->Layout();
+  }
+}
+
+// "Token valid for 54 min" from the core cache (expanding a few settings: cheap).
+void HttpEditor::update_oauth_status() {
+  if (!o_status_) return;
+  const Workspace* ws = host_->workspace();
+  wxString st;
+  bool warn = false;
+  if (o_busy_) {
+    st = wxString::FromUTF8("Getting a token\xE2\x80\xA6");
+  } else if (!ws) {
+    st = "The workspace is still opening.";
+  } else {
+    SavedRequest r = base_;
+    r.auth = av_.adv;
+    r.auth.type = HttpAuth::Type::OAuth2;
+    const auto tok = oauth2_cached_token(*ws, r);
+    const long long now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+    const bool code = av_.adv.oauth2.grant == OAuth2Config::Grant::AuthorizationCode;
+    if (tok && tok->valid(now, 0)) {
+      if (tok->expires_at == 0) {
+        st = "Token cached (no expiry given by the server).";
+      } else {
+        const long long left = tok->expires_at - now;
+        st = left >= 120 ? wxString::Format("Token valid for %lld min", left / 60) : wxString::Format("Token valid for %lld s", left);
+      }
+      st += wxString::FromUTF8(" \xC2\xB7 " + (tok->token_type.empty() ? std::string("Bearer") : tok->token_type));
+      if (!tok->scope.empty()) st += wxString::FromUTF8(" \xC2\xB7 scope " + tok->scope);
+      if (!tok->refresh_token.empty()) st += wxString::FromUTF8(" \xC2\xB7 refresh token");
+    } else if (tok) {
+      st = !tok->refresh_token.empty() && av_.adv.oauth2.auto_refresh
+               ? "Token expired: the next send refreshes it first (off the UI thread)."
+           : code ? "Token expired: Get new token to sign in again."
+                  : "Token expired: the next send gets a new one first (off the UI thread).";
+      warn = code && tok->refresh_token.empty();
+    } else {
+      st = code ? "No token: Get new token opens the sign-in page in your browser."
+                : "No token yet: the next send gets one first (off the UI thread), or Get new token now.";
+      warn = code;
+    }
+    if (!o_last_error_.empty()) {
+      st = wxString::FromUTF8("\xE2\x9A\xA0 " + o_last_error_);
+      warn = true;
+    }
+  }
+  const Theme& t = Theme::get();
+  o_status_->SetForegroundColour(warn ? t.var_bad : t.dim);
+  if (o_status_->GetLabel() != st) {
+    o_status_->SetLabel(st);
+    o_status_->Wrap(auth_wrap_ > 0 ? auth_wrap_ : FromDIP(560));
+    o_status_->GetParent()->Layout();
+  }
+  if (o_get_) o_get_->Enable(!o_busy_);
+}
+
+void HttpEditor::get_oauth_token() {
+  const Workspace* ws = host_->workspace();
+  if (!ws || o_busy_) return;
+  auto req = std::make_shared<SavedRequest>(base_);
+  store(*req);
+  req->auth = av_.adv;
+  req->auth.type = HttpAuth::Type::OAuth2;
+  auto wsc = std::make_shared<Workspace>(*ws);
+  o_busy_ = true;
+  o_last_error_.clear();
+  update_oauth_status();
+  const bool verify = ov_.verify_tls;
+  std::thread([alive = alive_, req, wsc, verify] {
+    OAuth2Hooks hooks;
+    hooks.interactive = true;  // the authorization code grant opens the system browser
+    hooks.verify_tls = verify;
+    const OAuth2Result res = oauth2_get_token(*wsc, *req, hooks, true);
+    std::lock_guard lk(alive->m);
+    if (!alive->target) return;
+    auto* ed = static_cast<HttpEditor*>(alive->target);
+    ed->CallAfter([ed, ok = res.ok, err = res.error, ms = res.elapsed_ms] {
+      ed->o_busy_ = false;
+      ed->o_last_error_ = ok ? std::string() : (err.empty() ? std::string("no token") : err);
+      ed->update_oauth_status();
+      if (ok) ed->note(wxString::Format("Got a new OAuth 2.0 token in %.1f ms (off the UI thread)", ms));
+    });
+  }).detach();
 }
 
 void HttpEditor::push_opts() {
@@ -1220,7 +1817,52 @@ void HttpEditor::push_opts() {
   verify_tls_->set_value(ov_.verify_tls);
   fresh_->set_value(ov_.fresh);
   version_->set_selection(ov_.version);
+  if (net_panel_) {
+    net_panel_->set(ov_.net, ov_.pass);
+    net_panel_->set_inherited(wxString::FromUTF8(inh_.network));
+  }
   loading_ = was;
+}
+
+// The request's own client certificate passphrase lives in .watt/secrets.json (DPAPI): read
+// and written on a worker, keyed by the request id.
+void HttpEditor::load_passphrase() {
+  const Workspace* ws = host_->workspace();
+  const uint64_t gen = ++pass_gen_;
+  if (!ws || ov_.net.cert_file.empty()) {
+    ov_.pass.clear();
+    return;
+  }
+  auto wsc = std::make_shared<Workspace>(*ws);
+  const std::string key = Workspace::passphrase_key(SettingsOrigin{}, base_.id);
+  std::thread([alive = alive_, wsc, key, gen] {
+    std::string pass = wsc->cert_passphrase(key);
+    std::lock_guard lk(alive->m);
+    auto* ed = static_cast<HttpEditor*>(alive->target);
+    if (!ed) return;
+    ed->CallAfter([ed, pass = std::move(pass), gen]() mutable {
+      if (gen != ed->pass_gen_) return;
+      ed->ov_.pass = std::move(pass);
+      ed->push_opts();
+    });
+  }).detach();
+}
+
+void HttpEditor::save_passphrase(const std::string& pass) {
+  const Workspace* ws = host_->workspace();
+  if (!ws || base_.id.empty()) return;
+  const uint64_t gen = ++pass_gen_;
+  ov_.pass = pass;
+  auto wsc = std::make_shared<Workspace>(*ws);
+  const std::string key = Workspace::passphrase_key(SettingsOrigin{}, base_.id);
+  static std::mutex mu;  // one writer at a time; a newer value is never overwritten by an older one
+  static uint64_t written = 0;
+  std::thread([wsc, key, pass, gen] {
+    std::lock_guard lk(mu);
+    if (gen < written) return;
+    written = gen;
+    wsc->set_cert_passphrase(key, pass);
+  }).detach();
 }
 
 wxWindow* HttpEditor::build_auth_page() {
@@ -1232,7 +1874,7 @@ wxWindow* HttpEditor::build_auth_page() {
   auto* l = new wxStaticText(p, wxID_ANY, "Type");
   l->SetForegroundColour(t.dim);
   top->Add(l, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, FromDIP(10));
-  auth_btn_ = new FlatButton(p, kAuthLabels[0], FlatButton::Style::Subtle, true);
+  auth_btn_ = new FlatButton(p, kAuthLabels[0], FlatButton::Style::Outline, true);
   {
     // as wide as the widest type, so the button does not jump when the type changes
     int w = 0;
@@ -1243,44 +1885,113 @@ wxWindow* HttpEditor::build_auth_page() {
     auth_btn_->SetLabel(kAuthLabels[0]);
     auth_btn_->SetMinSize(wxSize(w, -1));
   }
-  auth_btn_->SetToolTip("Authorization type (Up / Down change it)");
-  auth_btn_->on_click = [this] {
-    wxMenu menu;
-    for (int i = 0; i < static_cast<int>(std::size(kAuthLabels)); ++i)
-      menu.AppendRadioItem(i + 1, kAuthLabels[i])->Check(i == static_cast<int>(auth_mode_));
-    const int sel = auth_btn_->GetPopupMenuSelectionFromUser(menu, wxPoint(0, auth_btn_->GetSize().y));
-    if (sel >= 1 && sel <= static_cast<int>(std::size(kAuthLabels)) && sel - 1 != static_cast<int>(auth_mode_))
-      set_auth_mode(static_cast<AuthMode>(sel - 1), true);
-  };
+  auth_btn_->SetToolTip("Authorization type: click or type to pick (\"bear\" Enter: Bearer token); Up / Down change it");
+  auth_btn_->on_click = [this] { show_auth_menu(); };
   auth_btn_->Bind(wxEVT_KEY_DOWN, [this](wxKeyEvent& e) {
     const int k = e.GetKeyCode();
-    const int n = static_cast<int>(std::size(kAuthLabels));
+    if (auth_pick_) {
+      if (e.ControlDown() || e.AltDown()) {
+        auth_pick_->close();
+        e.Skip();
+        return;
+      }
+      if (!auth_pick_->key(k)) e.Skip();  // characters arrive as wxEVT_CHAR
+      return;
+    }
+    const int n = static_cast<int>(std::size(kAuthOrder));
     const bool up = k == WXK_UP || k == WXK_NUMPAD_UP, down = k == WXK_DOWN || k == WXK_NUMPAD_DOWN;
     if ((up || down) && !e.HasAnyModifiers()) {
-      const int i = (static_cast<int>(auth_mode_) + (down ? 1 : n - 1)) % n;
-      set_auth_mode(static_cast<AuthMode>(i), true);
+      int at = 0;
+      for (int i = 0; i < n; ++i)
+        if (kAuthOrder[i] == auth_mode_) at = i;
+      set_auth_mode(kAuthOrder[(at + (down ? 1 : n - 1)) % n], true);
+      return;
+    }
+    if ((k == WXK_RETURN || k == WXK_NUMPAD_ENTER || k == WXK_SPACE) && !e.HasAnyModifiers()) {
+      show_auth_menu();
       return;
     }
     e.Skip();
+  });
+  auth_btn_->Bind(wxEVT_CHAR, [this](wxKeyEvent& e) {
+    const wxChar c = e.GetUnicodeKey();
+    if (e.ControlDown() || e.AltDown() || c == WXK_NONE || c < 32) {
+      e.Skip();
+      return;
+    }
+    if (!auth_pick_) show_auth_menu();  // typing on the closed button opens the list filtered
+    if (auth_pick_) auth_pick_->chr(c);
+  });
+  auth_btn_->Bind(wxEVT_KILL_FOCUS, [this](wxFocusEvent& e) {
+    e.Skip();
+    CallAfter([this] {
+      if (!auth_pick_) return;
+      if (auth_pick_->GetScreenRect().Contains(wxGetMousePosition()) && wxGetMouseState().LeftIsDown()) return;
+      if (wxWindow::FindFocus() != auth_btn_) auth_pick_->close();
+    });
   });
   top->Add(auth_btn_, 0, wxALIGN_CENTER_VERTICAL);
   s->Add(top, 0, wxTOP | wxBOTTOM, FromDIP(10));
 
   auth_book_ = new wxSimplebook(p);
   auth_book_->SetBackgroundColour(t.bg);
-  auto page = [&](const char* hint) {
+  // Empty pages: build_auth_subpage() fills the one shown.
+  for (const char* n : {"none", "bearer", "basic", "apikey", "oauth2", "challenge", "awsv4", "inherit"}) {
     auto* pg = new wxPanel(auth_book_);
     pg->SetBackgroundColour(t.bg);
+    pg->SetSizer(new wxBoxSizer(wxVERTICAL));
+    auth_book_->AddPage(pg, n);
+  }
+  s->Add(auth_book_, 1, wxEXPAND);
+  p->SetSizer(s);
+  // The hints wrap to the page width (never cut).
+  p->Bind(wxEVT_SIZE, [this, p](wxSizeEvent& e) {
+    e.Skip();
+    const int w = p->GetClientSize().x - FromDIP(8);
+    if (w < FromDIP(200) || w == auth_wrap_) return;
+    auth_wrap_ = w;
+    CallAfter([this, w] {
+      for (wxStaticText* h : auth_hints_) {
+        if (h == s_hint_) continue;  // set_scheme_hint() wraps its own text
+        wxString raw = h->GetLabel();
+        raw.Replace("\n", " ");
+        h->SetLabel(raw);
+        h->Wrap(w);
+      }
+      if (s_hint_) {
+        s_hint_->SetLabel("");
+        set_scheme_hint();
+      }
+      if (o_status_) {
+        o_status_->SetLabel("");
+        update_oauth_status();
+      }
+      for (size_t i = 0; i < auth_book_->GetPageCount(); ++i) auth_book_->GetPage(i)->Layout();
+    });
+  });
+  return p;
+}
+
+void HttpEditor::build_auth_subpage(size_t index) {
+  if (!auth_book_ || index >= auth_built_.size() || auth_built_[index]) return;
+  auth_built_[index] = true;
+  const Theme& t = Theme::get();
+  auto* holder = static_cast<wxPanel*>(auth_book_->GetPage(index));
+  wxWindowUpdateLocker lock(holder);
+  const size_t hints_before = auth_hints_.size();
+  auto page = [&](const char* hint) {
+    wxPanel* pg = holder;
     auto* grid = new wxFlexGridSizer(2, FromDIP(8), FromDIP(10));
     grid->AddGrowableCol(1, 1);
-    pg->SetSizer(new wxBoxSizer(wxVERTICAL));
     auto* h = new wxStaticText(pg, wxID_ANY, hint);
     h->SetForegroundColour(t.dim);
+    auth_hints_.push_back(h);
     pg->GetSizer()->Add(h, 0, wxBOTTOM, FromDIP(10));
     pg->GetSizer()->Add(grid, 0, wxEXPAND);
     return std::make_pair(pg, grid);
   };
-  auto var_field = [&](wxPanel* pg, wxFlexGridSizer* grid, const char* label, const char* hint, std::string* val) {
+  auto var_field = [this](wxPanel* pg, wxFlexGridSizer* grid, const char* label, const char* hint, std::string* val) {
+    const Theme& t = Theme::get();
     auto* lb = new wxStaticText(pg, wxID_ANY, label);
     lb->SetForegroundColour(t.fg);
     wxWindow* frame = nullptr;
@@ -1289,99 +2000,334 @@ wxWindow* HttpEditor::build_auth_page() {
     grid->Add(frame, 1, wxEXPAND);
     return f;
   };
-  auto field = [&](wxPanel* pg, wxFlexGridSizer* grid, const char* label, const char* hint, std::string* val,
-                   long style = 0) {
+  auto secret_field = [this](wxPanel* pg, wxFlexGridSizer* grid, const char* label, const char* hint, std::string* val) {
+    const Theme& t = Theme::get();
     auto* lb = new wxStaticText(pg, wxID_ANY, label);
     lb->SetForegroundColour(t.fg);
-    auto* tc = new wxTextCtrl(pg, wxID_ANY, "", wxDefaultPosition, wxSize(FromDIP(380), -1), style);
-    tc->SetHint(hint);
+    wxWindow* frame = nullptr;
+    wxTextCtrl* tc = make_secret_box(pg, hint, &frame);
     grid->Add(lb, 0, wxALIGN_CENTER_VERTICAL);
-    grid->Add(tc, 1, wxEXPAND);
+    grid->Add(frame, 1, wxEXPAND);
     tc->Bind(wxEVT_TEXT, [this, tc, val](wxCommandEvent&) {
       if (loading_) return;
       *val = tc->GetValue().utf8_string();
-      if (auth_mode_ == AuthMode::ApiKey) sync_api_key_query();
+      o_last_error_.clear();
       touched();
     });
     return tc;
   };
-  {
-    auto [pg, grid] = page("This request sends no authorization.");
-    (void)grid;
-    auth_book_->AddPage(pg, "none");
-  }
-  {
-    auto [pg, grid] = page("Sent as the header  Authorization: Bearer <token>.  {{variables}} are allowed.");
-    bearer_ = var_field(pg, grid, "Token", "{{token}}", &av_.bearer);
-    auth_book_->AddPage(pg, "bearer");
-  }
-  {
-    auto [pg, grid] = page("Sent as  Authorization: Basic base64(user:password)  unless the request sets its own Authorization header.");
-    basic_user_ = var_field(pg, grid, "Username", "user", &av_.user);
-    basic_pass_ = field(pg, grid, "Password", "password or {{secret}}", &av_.pass, wxTE_PASSWORD);
-    // Show / Hide: wxTE_PASSWORD cannot change on a live control, so a plain twin takes its place.
-    {
-      grid->Detach(basic_pass_);  // the last item: the row below takes its place
-      auto* row = new wxBoxSizer(wxHORIZONTAL);
-      basic_pass_alt_ = new wxTextCtrl(pg, wxID_ANY, "", wxDefaultPosition, basic_pass_->GetSize());
-      basic_pass_alt_->SetHint("password or {{secret}}");
-      basic_pass_alt_->Hide();
-      basic_pass_alt_->Bind(wxEVT_TEXT, [this](wxCommandEvent&) {
-        if (loading_) return;
-        av_.pass = basic_pass_alt_->GetValue().utf8_string();
-        touched();
-      });
-      auto* eye = new FlatButton(pg, "Hide", FlatButton::Style::Subtle);
-      eye->SetMinSize(eye->GetBestSize());
-      eye->SetLabel("Show");
-      eye->SetToolTip("Show / hide the password");
-      row->Add(basic_pass_, 1, wxALIGN_CENTER_VERTICAL);
-      row->Add(basic_pass_alt_, 1, wxALIGN_CENTER_VERTICAL);
-      row->Add(eye, 0, wxALIGN_CENTER_VERTICAL | wxLEFT, FromDIP(6));
-      grid->Add(row, 1, wxEXPAND);
-      eye->on_click = [this, eye, pg] {
-        const bool was = loading_;
-        loading_ = true;
-        basic_pass_alt_->ChangeValue(basic_pass_->GetValue());
-        loading_ = was;
-        const bool focus = wxWindow::FindFocus() == basic_pass_;
-        basic_pass_->Hide();
-        basic_pass_alt_->Show();
-        std::swap(basic_pass_, basic_pass_alt_);
-        eye->SetLabel(basic_pass_->HasFlag(wxTE_PASSWORD) ? "Show" : "Hide");
-        pg->Layout();
-        if (focus) basic_pass_->SetFocus();
-      };
-    }
-    auth_book_->AddPage(pg, "basic");
-  }
-  {
-    auto [pg, grid] = page("An API key sent as a header or as a query parameter.");
-    key_name_ = var_field(pg, grid, "Key", "X-API-Key", &av_.key_name);
-    key_value_ = var_field(pg, grid, "Value", "{{api_key}}", &av_.key_value);
-    auto* lb = new wxStaticText(pg, wxID_ANY, "Add to");
+  auto choice = [this](wxPanel* pg, wxFlexGridSizer* grid, const char* label, std::vector<wxString> items) {
+    const Theme& t = Theme::get();
+    auto* lb = new wxStaticText(pg, wxID_ANY, label);
     lb->SetForegroundColour(t.fg);
-    key_where_ = new ChoiceButton(pg, {"Header", "Query params"});
+    auto* c = new ChoiceButton(pg, std::move(items));
     grid->Add(lb, 0, wxALIGN_CENTER_VERTICAL);
-    grid->Add(key_where_, 0);
-    key_where_->on_select = [this](int sel) {
-      av_.key_where = std::max(sel, 0);
-      if (av_.key_where == 0 && !api_key_param_.empty()) {
-        // moved from the query to a header: take it out of the URL
-        auto rows = params_->rows();
-        rows.erase(std::remove_if(rows.begin(), rows.end(), [&](const KvRow& r) { return r.key == api_key_param_; }), rows.end());
-        api_key_param_.clear();
-        params_->set_rows(rows);
-        params_changed();
+    grid->Add(c, 0);
+    return c;
+  };
+  switch (index) {
+    case 0: {
+      auto [pg, grid] = page("This request sends no authorization (not even a folder's or the collection's).");
+      (void)grid;
+      break;
+    }
+    case 7: {
+      auto [pg, grid] = page("Uses the auth of the nearest folder above this request that sets one, else the "
+                             "collection's. Pick another type to override it here.");
+      (void)grid;
+      inh_title_ = new wxStaticText(pg, wxID_ANY, "");
+      inh_title_->SetForegroundColour(t.fg);
+      inh_title_->SetFont(inh_title_->GetFont().Bold());
+      pg->GetSizer()->Add(inh_title_, 0, wxBOTTOM, FromDIP(4));
+      inh_detail_ = new wxStaticText(pg, wxID_ANY, "");
+      inh_detail_->SetForegroundColour(t.dim);
+      inh_detail_->SetFont(mono_font(9));
+      pg->GetSizer()->Add(inh_detail_, 0, wxBOTTOM, FromDIP(10));
+      auto* links = new wxBoxSizer(wxHORIZONTAL);
+      inh_edit_ = new FlatButton(pg, "Edit on folder", FlatButton::Style::Outline);
+      inh_edit_->on_click = [this] {
+        edit_folder(!inh_.source_folder.empty() ? inh_.source_folder : own_folder());
+      };
+      links->Add(inh_edit_, 0, wxRIGHT, FromDIP(8));
+      inh_own_ = new FlatButton(pg, "This folder's settings", FlatButton::Style::Outline);
+      inh_own_->SetToolTip("Auth, headers, variables and scripts of the folder this request is in");
+      inh_own_->on_click = [this] { edit_folder(own_folder()); };
+      links->Add(inh_own_, 0, wxRIGHT, FromDIP(8));
+      inh_coll_ = new FlatButton(pg, "Collection settings", FlatButton::Style::Outline);
+      inh_coll_->SetToolTip("Auth, headers, variables and scripts of the whole workspace (folder.json at its root)");
+      inh_coll_->on_click = [this] {
+        if (const Workspace* ws = host_->workspace()) edit_folder(ws->root());
+      };
+      links->Add(inh_coll_, 0);
+      pg->GetSizer()->Add(links, 0, wxBOTTOM, FromDIP(8));
+      inh_errors_ = new wxStaticText(pg, wxID_ANY, "");
+      inh_errors_->SetForegroundColour(t.js_error);
+      inh_errors_->Hide();
+      pg->GetSizer()->Add(inh_errors_, 0, wxBOTTOM, FromDIP(8));
+      show_inherited();
+      break;
+    }
+    case 1: {
+      auto [pg, grid] = page("Sent as the header  Authorization: Bearer <token>.  {{variables}} are allowed.");
+      bearer_ = var_field(pg, grid, "Token", "{{token}}", &av_.bearer);
+      break;
+    }
+    case 2: {
+      auto [pg, grid] = page("Sent as  Authorization: Basic base64(user:password)  unless the request sets its own Authorization header.");
+      basic_user_ = var_field(pg, grid, "Username", "user", &av_.user);
+      {
+        auto* lb = new wxStaticText(pg, wxID_ANY, "Password");
+        lb->SetForegroundColour(t.fg);
+        grid->Add(lb, 0, wxALIGN_CENTER_VERTICAL);
+        // Show / Hide: wxTE_PASSWORD cannot change on a live control, so a plain twin takes its
+        // place in the same frame.
+        wxWindow* frame = nullptr;
+        basic_pass_ = make_secret_box(pg, "password or {{secret}}", &frame);
+        basic_pass_alt_ = new wxTextCtrl(frame, wxID_ANY, "", wxDefaultPosition, wxDefaultSize, wxBORDER_NONE);
+        basic_pass_alt_->SetBackgroundColour(t.field);
+        basic_pass_alt_->SetForegroundColour(t.fg);
+        basic_pass_alt_->SetHint("password or {{secret}}");
+        basic_pass_alt_->Hide();
+        frame->GetSizer()->Add(basic_pass_alt_, 1, wxALIGN_CENTER_VERTICAL | wxALL, FromDIP(5));
+        for (wxTextCtrl* tc : {basic_pass_, basic_pass_alt_}) {
+          tc->Bind(wxEVT_TEXT, [this, tc](wxCommandEvent&) {
+            if (loading_ || tc != basic_pass_) return;
+            av_.pass = tc->GetValue().utf8_string();
+            touched();
+          });
+        }
+        auto* row = new wxBoxSizer(wxHORIZONTAL);
+        auto* eye = new FlatButton(pg, "Hide", FlatButton::Style::Subtle);
+        eye->SetMinSize(eye->GetBestSize());
+        eye->SetLabel("Show");
+        eye->SetToolTip("Show / hide the password");
+        row->Add(frame, 1, wxALIGN_CENTER_VERTICAL);
+        row->Add(eye, 0, wxALIGN_CENTER_VERTICAL | wxLEFT, FromDIP(6));
+        grid->Add(row, 1, wxEXPAND);
+        eye->on_click = [this, eye, frame] {
+          const bool was = loading_;
+          loading_ = true;
+          basic_pass_alt_->ChangeValue(basic_pass_->GetValue());
+          loading_ = was;
+          const bool focus = wxWindow::FindFocus() == basic_pass_;
+          basic_pass_->Hide();
+          basic_pass_alt_->Show();
+          std::swap(basic_pass_, basic_pass_alt_);
+          eye->SetLabel(basic_pass_->HasFlag(wxTE_PASSWORD) ? "Show" : "Hide");
+          frame->Layout();
+          if (focus) basic_pass_->SetFocus();
+        };
       }
-      sync_api_key_query();
-      touched();
-    };
-    auth_book_->AddPage(pg, "apikey");
+      break;
+    }
+    case 3: {
+      auto [pg, grid] = page("An API key sent as a header or as a query parameter.");
+      key_name_ = var_field(pg, grid, "Key", "X-API-Key", &av_.key_name);
+      key_value_ = var_field(pg, grid, "Value", "{{api_key}}", &av_.key_value);
+      auto* lb = new wxStaticText(pg, wxID_ANY, "Add to");
+      lb->SetForegroundColour(t.fg);
+      key_where_ = new ChoiceButton(pg, {"Header", "Query params"});
+      grid->Add(lb, 0, wxALIGN_CENTER_VERTICAL);
+      grid->Add(key_where_, 0);
+      key_where_->on_select = [this](int sel) {
+        av_.key_where = std::max(sel, 0);
+        if (av_.key_where == 0 && !api_key_param_.empty()) {
+          // moved from the query to a header: take it out of the URL
+          auto rows = params_->rows();
+          rows.erase(std::remove_if(rows.begin(), rows.end(), [&](const KvRow& r) { return r.key == api_key_param_; }), rows.end());
+          api_key_param_.clear();
+          params_->set_rows(rows);
+          params_changed();
+        }
+        sync_api_key_query();
+        touched();
+      };
+      break;
+    }
+    case 4: {
+      // 13 fields cost ~60 ms to create: built in steps of at most ~20 ms (run_auth_steps), the
+      // page frozen until the last one, so no UI-thread turn is long.
+      OAuth2Config* o = &av_.adv.oauth2;
+      auto [pg0, grid0] = page("OAuth 2.0: the access token is fetched off the UI thread, cached in memory per workspace "
+                               "and environment (never written to disk), refreshed when it expires, and sent as "
+                               "Authorization: Bearer <token>. Put secrets in {{secret}} environment variables.");
+      wxPanel* pg = pg0;
+      wxFlexGridSizer* grid = grid0;
+      holder->Freeze();  // thawed by the last step
+      // the label and the field just added (rows shown only for some grants / placements)
+      auto last_row = [grid](std::vector<wxWindow*>& v) {
+        const size_t n = grid->GetItemCount();
+        v.push_back(grid->GetItem(n - 2)->GetWindow());
+        v.push_back(grid->GetItem(n - 1)->GetWindow());
+      };
+      auto& st = auth_steps_;
+      st.push_back([=, this] { o_grant_ = choice(pg, grid, "Grant", {"Client credentials", "Password", "Authorization code (browser, PKCE)"}); });
+      st.push_back([=, this] { o_token_url_ = var_field(pg, grid, "Token URL", "https://auth.example.com/oauth/token", &o->token_url); });
+      st.push_back([=, this] {
+        o_auth_url_ = var_field(pg, grid, "Auth URL", "https://auth.example.com/authorize", &o->auth_url);
+        last_row(o_code_rows_);
+      });
+      st.push_back([=, this] { o_client_id_ = var_field(pg, grid, "Client ID", "{{client_id}}", &o->client_id); });
+      st.push_back([=, this] { o_secret_ = secret_field(pg, grid, "Client secret", "{{client_secret}}", &o->client_secret); });
+      st.push_back([=, this] {
+        o_user_ = var_field(pg, grid, "Username", "{{username}}", &o->username);
+        last_row(o_password_rows_);
+      });
+      st.push_back([=, this] {
+        o_pass_ = secret_field(pg, grid, "Password", "{{password}}", &o->password);
+        last_row(o_password_rows_);
+      });
+      st.push_back([=, this] { o_scope_ = var_field(pg, grid, "Scope", "read write (optional)", &o->scope); });
+      st.push_back([=, this] { o_audience_ = var_field(pg, grid, "Audience", "optional (Auth0 and others)", &o->audience); });
+      st.push_back([=, this] {
+        o_client_auth_ = choice(pg, grid, "Client auth", {"Basic auth header", "In the request body"});
+        o_add_to_ = choice(pg, grid, "Add token to", {"Header", "Query param"});
+      });
+      st.push_back([=, this] {
+        o_prefix_ = var_field(pg, grid, "Header prefix", "Bearer", &o->header_prefix);
+        last_row(o_header_rows_);
+      });
+      st.push_back([=, this] {
+        o_param_ = var_field(pg, grid, "Query param", "access_token", &o->query_param);
+        last_row(o_query_rows_);
+      });
+      st.push_back([=, this] {
+        const Theme& th = Theme::get();
+        grid->Add(new wxPanel(pg), 0);
+        o_refresh_ = new CheckButton(pg, "Refresh with the refresh token when the access token expired");
+        grid->Add(o_refresh_, 0);
+        o_grant_->on_select = [this](int i) {
+          av_.adv.oauth2.grant = static_cast<OAuth2Config::Grant>(std::clamp(i, 0, 2));
+          o_last_error_.clear();
+          update_oauth_fields();
+          update_oauth_status();
+          touched();
+        };
+        o_client_auth_->on_select = [this](int i) {
+          av_.adv.oauth2.client_auth = i == 1 ? OAuth2Config::ClientAuth::Body : OAuth2Config::ClientAuth::BasicHeader;
+          touched();
+        };
+        o_add_to_->on_select = [this](int i) {
+          av_.adv.oauth2.add_to = i == 1 ? OAuth2Config::AddTo::Query : OAuth2Config::AddTo::Header;
+          update_oauth_fields();
+          touched();
+        };
+        o_refresh_->on_change = [this] {
+          av_.adv.oauth2.auto_refresh = o_refresh_->value();
+          touched();
+        };
+        auto* row = new wxBoxSizer(wxHORIZONTAL);
+        o_get_ = new FlatButton(pg, "Get new token", FlatButton::Style::Primary);
+        o_get_->SetToolTip("Fetch a new access token now (a worker thread; the authorization code grant opens your browser)");
+        o_get_->on_click = [this] { get_oauth_token(); };
+        o_clear_ = new FlatButton(pg, "Clear token", FlatButton::Style::Subtle);
+        o_clear_->SetToolTip("Forget the cached token of this request");
+        o_clear_->on_click = [this] {
+          if (const Workspace* ws = host_->workspace()) {
+            SavedRequest r = base_;
+            r.auth = av_.adv;
+            r.auth.type = HttpAuth::Type::OAuth2;
+            oauth2_forget(*ws, r);
+          }
+          o_last_error_.clear();
+          update_oauth_status();
+        };
+        row->Add(o_get_, 0, wxALIGN_CENTER_VERTICAL);
+        row->Add(o_clear_, 0, wxALIGN_CENTER_VERTICAL | wxLEFT, FromDIP(8));
+        o_status_ = new wxStaticText(pg, wxID_ANY, "");
+        o_status_->SetForegroundColour(th.dim);
+        pg->GetSizer()->Add(row, 0, wxTOP, FromDIP(12));
+        pg->GetSizer()->Add(o_status_, 0, wxEXPAND | wxTOP, FromDIP(6));
+        o_timer_.Bind(wxEVT_TIMER, [this](wxTimerEvent&) {
+          if (auth_mode_ == AuthMode::OAuth2 && book_->GetSelection() == kTabAuth && IsShownOnScreen()) update_oauth_status();
+        });
+        o_timer_.Start(15000);
+        o_page_ = pg;
+        o_ready_ = true;
+        push_auth();  // the values, the grant's rows and the token status
+        pg->Layout();
+        if (pg->IsFrozen()) pg->Thaw();
+      });
+      run_auth_steps();
+      break;
+    }
+    case 5: {
+      auto [pg, grid] = page("Digest");
+      s_hint_ = static_cast<wxStaticText*>(pg->GetSizer()->GetItem(size_t{0})->GetWindow());
+      s_user_ = var_field(pg, grid, "Username", "user or DOMAIN\\user", &av_.adv.user);
+      s_pass_ = secret_field(pg, grid, "Password", "password or {{secret}}", &av_.adv.password);
+      break;
+    }
+    case 6: {
+      auto [pg, grid] = page("AWS Signature Version 4: libcurl signs each request (curl --aws-sigv4). A session token is "
+                             "sent (and signed) as X-Amz-Security-Token.");
+      s_aws_key_ = var_field(pg, grid, "Access key ID", "{{aws_access_key_id}}", &av_.adv.aws_access_key);
+      s_aws_secret_ = secret_field(pg, grid, "Secret key", "{{aws_secret_access_key}}", &av_.adv.aws_secret_key);
+      s_aws_token_ = var_field(pg, grid, "Session token", "optional: {{aws_session_token}}", &av_.adv.aws_session_token);
+      s_aws_region_ = var_field(pg, grid, "Region", "eu-west-1", &av_.adv.aws_region);
+      s_aws_service_ = var_field(pg, grid, "Service", "execute-api", &av_.adv.aws_service);
+      break;
+    }
+    default: break;
   }
-  s->Add(auth_book_, 1, wxEXPAND);
-  p->SetSizer(s);
-  return p;
+  if (auth_wrap_ > 0)
+    for (size_t i = hints_before; i < auth_hints_.size(); ++i)
+      if (auth_hints_[i] != s_hint_) auth_hints_[i]->Wrap(auth_wrap_);
+  holder->Layout();
+}
+
+void HttpEditor::run_auth_steps() {
+  const auto t0 = Clock::now();
+  size_t i = 0;
+  while (i < auth_steps_.size() && (i == 0 || ms_between(t0, Clock::now()) < 18.0)) {
+    auto step = std::move(auth_steps_[i]);
+    step();
+    ++i;
+  }
+  auth_steps_.erase(auth_steps_.begin(), auth_steps_.begin() + static_cast<std::ptrdiff_t>(i));
+  if (!auth_steps_.empty()) CallAfter([this] { run_auth_steps(); });
+}
+
+// Only the fields the chosen grant uses (Postman / Insomnia): the client credentials grant has
+// no auth URL, user or password; the token goes either in a header (prefix) or in a query param.
+void HttpEditor::update_oauth_fields() {
+  if (!o_page_) return;
+  const OAuth2Config& o = av_.adv.oauth2;
+  bool changed = false;
+  auto show = [&](const std::vector<wxWindow*>& rows, bool on) {
+    for (wxWindow* w : rows)
+      if (w && w->IsShown() != on) {
+        w->Show(on);
+        changed = true;
+      }
+  };
+  show(o_code_rows_, o.grant == OAuth2Config::Grant::AuthorizationCode);
+  show(o_password_rows_, o.grant == OAuth2Config::Grant::Password);
+  show(o_header_rows_, o.add_to != OAuth2Config::AddTo::Query);
+  show(o_query_rows_, o.add_to == OAuth2Config::AddTo::Query);
+  if (changed) o_page_->Layout();
+}
+
+wxTextCtrl* HttpEditor::make_secret_box(wxWindow* parent, const char* hint, wxWindow** frame_out, long style) {
+  const Theme& t = Theme::get();
+  auto* frame = new FramePanel(parent, t.field, t.border);
+  auto* fs = new wxBoxSizer(wxHORIZONTAL);
+  auto* tc = new wxTextCtrl(frame, wxID_ANY, "", wxDefaultPosition, wxSize(FromDIP(380), -1), style | wxBORDER_NONE);
+  tc->SetBackgroundColour(t.field);
+  tc->SetForegroundColour(t.fg);
+  tc->SetHint(hint);
+  fs->Add(tc, 1, wxALIGN_CENTER_VERTICAL | wxALL, FromDIP(5));
+  frame->SetSizer(fs);
+  tc->Bind(wxEVT_SET_FOCUS, [frame](wxFocusEvent& e) {
+    e.Skip();
+    frame->set_focus(true);
+  });
+  tc->Bind(wxEVT_KILL_FOCUS, [frame](wxFocusEvent& e) {
+    e.Skip();
+    frame->set_focus(false);
+  });
+  *frame_out = frame;
+  return tc;
 }
 
 wxStyledTextCtrl* HttpEditor::make_var_field(wxWindow* parent, const char* hint, std::string* val, wxWindow** frame_out) {
@@ -1447,6 +2393,7 @@ wxStyledTextCtrl* HttpEditor::make_var_field(wxWindow* parent, const char* hint,
   s->Bind(wxEVT_STC_CHARADDED, [this, s](wxStyledTextEvent& e) {
     e.Skip();
     if (e.GetKey() == '{') var_completion(s);
+    else var_narrow(s);
   });
   s->Bind(wxEVT_STC_AUTOCOMP_COMPLETED, [this, s](wxStyledTextEvent& e) {
     e.Skip();
@@ -1494,7 +2441,9 @@ wxStyledTextCtrl* HttpEditor::make_var_field(wxWindow* parent, const char* hint,
 
 wxWindow* HttpEditor::build_options_page() {
   const Theme& t = Theme::get();
-  auto* p = new wxPanel(opts_holder_);
+  // Scrolls: with Certificates & proxy the page is taller than a small request pane.
+  auto* p = new wxScrolled<wxPanel>(opts_holder_);
+  p->SetScrollRate(0, FromDIP(12));
   p->SetBackgroundColour(t.bg);
   auto* s = new wxBoxSizer(wxVERTICAL);
   auto* grid = new wxFlexGridSizer(2, FromDIP(10), FromDIP(14));
@@ -1538,6 +2487,19 @@ wxWindow* HttpEditor::build_options_page() {
       ov_.redirects = redirects_->value();
       ov_.verify_tls = verify_tls_->value();
       ov_.fresh = fresh_->value();
+      touched();
+    };
+  }
+  {
+    // CA / client certificate / proxy of this request, over its folders' (Certificates & proxy).
+    const Workspace* ws = host_->workspace();
+    net_panel_ = new NetworkPanel(p, ws ? ws->root() : std::filesystem::path(), false);
+    s->Add(net_panel_, 0, wxEXPAND | wxTOP | wxBOTTOM | wxRIGHT, FromDIP(6));
+    net_panel_->on_change = [this] {
+      if (loading_) return;
+      ov_.net = net_panel_->get();
+      const std::string pass = ov_.net.cert_file.empty() ? std::string() : net_panel_->passphrase();
+      if (pass != ov_.pass) save_passphrase(pass);
       touched();
     };
   }
@@ -1591,9 +2553,14 @@ wxWindow* HttpEditor::build_docs_page() {
   auto* p = new wxPanel(docs_holder_);
   p->SetBackgroundColour(t.bg);
   auto* s = new wxBoxSizer(wxVERTICAL);
+  auto* head = new wxBoxSizer(wxHORIZONTAL);
   auto* hint = new wxStaticText(p, wxID_ANY, "Notes about this request (Markdown), saved with it");
   hint->SetForegroundColour(t.dim);
-  s->Add(hint, 0, wxTOP | wxBOTTOM, FromDIP(8));
+  head->Add(hint, 1, wxALIGN_CENTER_VERTICAL);
+  auto* mode = new RadioStrip(p, {"Edit", "Preview"});
+  mode->SetToolTip("Edit the Markdown or preview it rendered (Ctrl+Shift+V)");
+  head->Add(mode, 0, wxALIGN_CENTER_VERTICAL);
+  s->Add(head, 0, wxEXPAND | wxTOP | wxBOTTOM, FromDIP(8));
   auto* frame = new FramePanel(p, t.field, t.border);
   auto* fs = new wxBoxSizer(wxVERTICAL);
   docs_ = new wxStyledTextCtrl(frame, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxBORDER_NONE);
@@ -1643,10 +2610,49 @@ wxWindow* HttpEditor::build_docs_page() {
     e.Skip();
     frame->set_focus(false);
   });
+  attach_find(d);
   fs->Add(d, 1, wxEXPAND | wxALL, FromDIP(6));
   frame->SetSizer(fs);
   s->Add(frame, 1, wxEXPAND | wxBOTTOM, FromDIP(4));
   p->SetSizer(s);
+  // Preview: a wxHtmlWindow (no script engine; raw HTML in the docs is escaped, only http(s)
+  // links open, in the system browser), built on first use.
+  auto show_preview = [this, p, s, frame, mode](bool on, bool user) {
+    const Theme& th = Theme::get();
+    mode->select(on ? 1 : 0);
+    if (on && !docs_html_) {
+      docs_html_ = new wxHtmlWindow(p, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxHW_SCROLLBAR_AUTO | wxBORDER_NONE);
+      docs_html_->SetBackgroundColour(th.field);
+      docs_html_->Bind(wxEVT_HTML_LINK_CLICKED, [](wxHtmlLinkEvent& e) {
+        const wxString href = e.GetLinkInfo().GetHref();
+        if (href.Lower().StartsWith("https://") || href.Lower().StartsWith("http://")) wxLaunchDefaultBrowser(href);
+      });
+      s->Insert(2, docs_html_, 1, wxEXPAND | wxBOTTOM, FromDIP(4));
+    }
+    if (on) {
+      auto hex = [](const wxColour& c) { return c.GetAsString(wxC2S_HTML_SYNTAX).utf8_string(); };
+      std::string body = markdown_to_html(docs_text_);
+      if (trim(docs_text_).empty()) body = "<p><font color=\"" + hex(th.dim) + "\">Nothing written yet.</font></p>";
+      const std::string page = "<html><body bgcolor=\"" + hex(th.field) + "\" text=\"" + hex(th.fg) + "\" link=\"" +
+                               hex(th.accent) + "\">" + body + "</body></html>";
+      docs_html_->SetPage(wxString::FromUTF8(page));
+    }
+    frame->Show(!on);
+    if (docs_html_) docs_html_->Show(on);
+    p->Layout();
+    if (!on && user) docs_->SetFocus();
+  };
+  docs_preview_ = show_preview;
+  mode->on_select = [show_preview](int i) { show_preview(i == 1, true); };
+  p->Bind(wxEVT_CHAR_HOOK, [mode, show_preview](wxKeyEvent& e) {
+    if (e.GetModifiers() == (wxMOD_CONTROL | wxMOD_SHIFT) && (e.GetKeyCode() == 'V' || e.GetKeyCode() == 'v')) {
+      show_preview(mode->selection() != 1, true);
+      return;
+    }
+    e.Skip();
+  });
+  // A request whose notes are written opens on the rendered view, like Bruno's Docs tab.
+  if (!trim(docs_text_).empty()) show_preview(true, false);
   return p;
 }
 
@@ -1659,10 +2665,28 @@ void HttpEditor::load(const SavedRequest& r) {
   base_.http.body.clear();
   base_.http.body.shrink_to_fit();
 
+  // Row descriptions travel at the end of the docs (see split_row_docs).
+  RowDocs row_docs;
+  docs_text_ = split_row_docs(r.docs, row_docs);
+  pre_vals_ = row_docs.pre;
+  pre_preview_.clear();
+  param_descs_.clear();
+  path_descs_.clear();
+  for (const auto& [k, d] : row_docs.params) {
+    if (!k.empty() && k[0] == ':') path_descs_.emplace(k.substr(1), d);
+    else param_descs_.emplace(k, d);
+  }
+  auto header_desc = [&](const std::string& name) {
+    for (const auto& [k, d] : row_docs.headers)
+      if (iequals(k, name)) return d;
+    return std::string();
+  };
+
   set_method(r.http.method.empty() ? "GET" : r.http.method);
   set_url_text(r.http.url);
   path_values_.clear();
   for (const auto& [k, v] : r.path_params) path_values_[k] = v;
+  path_names_.clear();  // rebuilt with the descriptions just read
   sync_path_rows();
   update_preview();
   url_->GotoPos(0);
@@ -1670,6 +2694,8 @@ void HttpEditor::load(const SavedRequest& r) {
   std::vector<KvRow> prow;
   for (const auto& q : parse_query_decoded(split_url(r.http.url).query)) prow.push_back({q.key, q.value, true, false, q.bare});
   for (const auto& [k, v] : r.disabled_params) prow.push_back({k, v, false, false, false});
+  for (auto& row : prow)
+    if (const auto it = param_descs_.find(row.key); it != param_descs_.end()) row.desc = it->second;
   params_->set_rows(prow);
   if (path_panel_ && path_panel_->IsShown()) layout_params_page();
 
@@ -1678,10 +2704,12 @@ void HttpEditor::load(const SavedRequest& r) {
   auth_header_index_ = SIZE_MAX;
   AuthMode am = AuthMode::None;
   std::string bearer, key_name, key_value;
+  // An inheriting request's own Authorization / API key header stays a plain header row.
+  const bool inherits = r.auth.type == HttpAuth::Type::Inherit;
   for (size_t i = 0; i < r.http.headers.size(); ++i) {
     const auto& [k, v] = r.http.headers[i];
     const bool enabled = !r.disabled_headers.count(i);
-    if (am == AuthMode::None && !r.basic_auth.enabled && enabled) {
+    if (!inherits && am == AuthMode::None && !r.basic_auth.enabled && enabled) {
       if (iequals(k, "Authorization") && istarts_with(v, "Bearer ")) {
         am = AuthMode::Bearer;
         bearer = v.substr(7);
@@ -1696,10 +2724,18 @@ void HttpEditor::load(const SavedRequest& r) {
         continue;
       }
     }
-    hrows.push_back({k, v, enabled, false, false});
+    hrows.push_back({k, v, enabled, false, false, header_desc(k)});
   }
   set_header_rows(hrows);
   if (r.basic_auth.enabled) am = AuthMode::Basic;
+  av_.adv = r.auth;
+  if (r.auth.type != HttpAuth::Type::None) am = mode_of(r.auth.type);  // replaces basic_auth
+  // A new request (nothing in it yet) starts on Inherit from parent, as in Postman / Insomnia /
+  // Bruno: one folder or collection auth covers it.
+  if (r.kind == RequestKind::Http && r.file.empty() && r.id.empty() && r.http.url.empty() && r.http.headers.empty() &&
+      r.http.body.empty() && !r.basic_auth.enabled && r.auth.type == HttpAuth::Type::None && r.form.empty())
+    am = AuthMode::Inherit;
+  if (am == AuthMode::Inherit) av_.adv.type = HttpAuth::Type::None;  // the scheme pages start empty
   av_.bearer = bearer;
   av_.user = r.basic_auth.user;
   av_.pass = r.basic_auth.password;
@@ -1710,6 +2746,7 @@ void HttpEditor::load(const SavedRequest& r) {
   auth_mode_ = am;
   push_auth();
   set_auth_mode(am, false);
+  refresh_inherited();
 
   update_files_row();
 
@@ -1721,11 +2758,33 @@ void HttpEditor::load(const SavedRequest& r) {
   if (!r.form.empty()) bm = BodyMode::Multipart;
   else if (!r.body_file.empty()) bm = BodyMode::Binary;
   else if (!r.body_data.empty()) bm = BodyMode::CurlData;
-  else if (ct.find("x-www-form-urlencoded") != std::string::npos) bm = BodyMode::UrlEncoded;
+  // A form Content-Type over a JSON / XML body (curl -d '{"k":1}' without -H sends exactly that)
+  // is shown as the raw body it is, with the header kept so the bytes sent stay curl's, as
+  // Postman and Insomnia import it, not as one form row named {"k":1}.
+  else if (ct.find("x-www-form-urlencoded") != std::string::npos && !looks_like_json(r.http.body) &&
+           !looks_like_xml(r.http.body))
+    bm = BodyMode::UrlEncoded;
   else if (r.http.body.empty()) bm = BodyMode::None;
   else if (ct.find("json") != std::string::npos || looks_like_json(r.http.body)) bm = BodyMode::Json;
   else if (ct.find("xml") != std::string::npos || looks_like_xml(r.http.body)) bm = BodyMode::Xml;
   else bm = BodyMode::Text;
+
+  // {"query": "...", "variables": {...}}: the GraphQL editors (a body over 1 MB stays JSON).
+  gql_q_val_.clear();
+  gql_v_val_.clear();
+  gql_op_.clear();
+  if (bm == BodyMode::Json && r.http.body.size() < 1024 * 1024 &&
+      split_graphql_body(r.http.body, gql_q_val_, gql_v_val_, &gql_op_))
+    bm = BodyMode::GraphQL;
+  if (gql_query_) {
+    const bool was = loading_;
+    loading_ = true;
+    gql_query_->SetText(wxString::FromUTF8(gql_q_val_));
+    gql_vars_->SetText(wxString::FromUTF8(gql_v_val_));
+    gql_query_->EmptyUndoBuffer();
+    gql_vars_->EmptyUndoBuffer();
+    loading_ = was;
+  }
 
   std::vector<KvRow> mrows;
   for (const auto& part : r.form) mrows.push_back({part.name, part.value, part.enabled, part.kind != FormPart::Kind::Text, false});
@@ -1757,8 +2816,10 @@ void HttpEditor::load(const SavedRequest& r) {
     release_doc_async(prev_doc_);
     prev_doc_ = nullptr;
   }
+  drop_redo_doc();
   body_->SetReadOnly(false);
   body_->ClearAll();
+  body_->SetScrollWidth(1);  // tracking only grows it: a wide body before must not leave a scroll bar
   if (text_mode(bm) && !r.http.body.empty()) {
     if (r.http.body.size() < kAsyncBody) {
       body_->AddTextRaw(r.http.body.data(), static_cast<int>(r.http.body.size()));
@@ -1786,11 +2847,39 @@ void HttpEditor::load(const SavedRequest& r) {
                 });
   }
 
-  // Docs.
-  docs_text_ = r.docs;
+  // Tests.
+  assert_vals_ = r.asserts;
+  capture_vals_ = r.captures;
+  asserts_stored_ = r.asserts;
+  asserts_target_ = nullptr;
+  if (asserts_) {
+    std::vector<KvRow> cr;
+    for (const auto& c : r.captures) cr.push_back({c.var, c.target, c.enabled, false, false, {}, capture_scope_name(c.scope)});
+    set_assert_rows(r.asserts);
+    captures_->set_rows(cr);
+    post_js_->SetText(wxString::FromUTF8(r.post_script));
+    post_js_->EmptyUndoBuffer();
+  }
+  if (pre_) {
+    std::vector<KvRow> pr;
+    for (const auto& x : pre_vals_) pr.push_back({x.var, x.expr, x.enabled, false, false, {}, x.scope.empty() ? "runtime" : x.scope});
+    pre_->set_rows(pr);
+    pre_js_->SetText(wxString::FromUTF8(r.pre_script));
+    pre_js_->EmptyUndoBuffer();
+  }
+  if (tests_page_) {
+    update_tests_hint();
+    layout_tests_page();
+  }
+  update_pre_names();
+  if (book_->GetSelection() == kTabTests) pre_timer_.StartOnce(150);
+  cookie_sig_.clear();
+
+  // Docs (docs_text_ was set above, without the row descriptions).
   if (docs_) {
     docs_->SetText(wxString::FromUTF8(docs_text_));
     docs_->EmptyUndoBuffer();
+    if (docs_preview_) docs_preview_(!trim(docs_text_).empty(), false);
   }
 
   // Options.
@@ -1799,17 +2888,22 @@ void HttpEditor::load(const SavedRequest& r) {
   ov_.verify_tls = r.http.verify_tls;
   ov_.fresh = r.http.fresh_connection;
   ov_.version = static_cast<int>(r.http.version);
+  ov_.net = r.network;
+  ov_.pass.clear();
+  load_passphrase();
   push_opts();
 
   // Show the body of a request that has one (unless the user is on another tab than Params).
-  if (first_load_ || tabs_->selection() == 0 || tabs_->selection() == 1) {
+  if (first_load_ || tabs_->selection() == kTabParams || tabs_->selection() == kTabBody) {
     first_load_ = false;
-    const size_t tab = (bm != BodyMode::None && prow.empty()) ? 1 : (tabs_->selection() == 1 && bm != BodyMode::None ? 1 : 0);
-    tabs_->select(tab);
+    const size_t tab = (bm != BodyMode::None && prow.empty()) ? kTabBody
+                       : (tabs_->selection() == kTabBody && bm != BodyMode::None ? kTabBody : kTabParams);
+    tabs_->select(strip_of(tab));
     book_->ChangeSelection(tab);
     sync_body_book();
   }
   update_badges();
+  if (book_->GetSelection() == kTabCookies) update_cookies();
   loading_ = false;
 }
 
@@ -1836,7 +2930,35 @@ void HttpEditor::store_head(SavedRequest& r) const {
 
 void HttpEditor::store(SavedRequest& r) const {
   store_head(r);
-  r.docs = docs_text_;
+  {
+    RowDocs d;
+    for (const auto& row : params_->rows())
+      if (!row.desc.empty() && !trim(row.key).empty()) d.params.emplace_back(row.key, row.desc);
+    for (const auto& n : path_names_)
+      if (const auto it = path_descs_.find(n); it != path_descs_.end() && !it->second.empty())
+        d.params.emplace_back(":" + n, it->second);
+    for (const auto& row : header_rows())
+      if (!row.desc.empty() && !clean_header_name(row.key).empty()) d.headers.emplace_back(clean_header_name(row.key), row.desc);
+    d.pre = pre_now();
+    r.docs = join_row_docs(docs_text_, d);
+  }
+  {
+    std::vector<Assertion> now = asserts_now();
+    if (&r == asserts_target_ && r.asserts != asserts_stored_ && now == asserts_stored_) {
+      // Edited elsewhere (the response's Tests tab) since the last store, not here: adopt it.
+      auto* self = const_cast<HttpEditor*>(this);
+      self->assert_vals_ = r.asserts;
+      self->set_assert_rows(r.asserts);
+      self->update_badges();
+    } else {
+      r.asserts = std::move(now);
+    }
+    asserts_stored_ = r.asserts;
+    asserts_target_ = &r;
+  }
+  r.captures = captures_now();
+  if (pre_js_) r.pre_script.assign(pre_js_->GetCharacterPointer(), static_cast<size_t>(pre_js_->GetLength()));
+  if (post_js_) r.post_script.assign(post_js_->GetCharacterPointer(), static_cast<size_t>(post_js_->GetLength()));
   r.path_params.clear();
   for (const auto& n : path_names_) {
     const auto it = path_values_.find(n);
@@ -1885,6 +3007,13 @@ void HttpEditor::store(SavedRequest& r) const {
     r.basic_auth.user = av_.user;
     r.basic_auth.password = av_.pass;
   }
+  r.auth = {};
+  if (scheme_mode(auth_mode_)) {
+    r.auth = av_.adv;
+    r.auth.type = scheme_type(auth_mode_);
+  } else if (auth_mode_ == AuthMode::Inherit) {
+    r.auth.type = HttpAuth::Type::Inherit;
+  }
 
   r.form.clear();
   r.body_file.clear();
@@ -1896,16 +3025,18 @@ void HttpEditor::store(SavedRequest& r) const {
     case BodyMode::Json:
     case BodyMode::Text:
     case BodyMode::Xml: {
+      if (store_no_body_) break;
       if (pending_body_) {
         r.http.body = *pending_body_;
         break;
       }
-      const std::string_view shown(body_->GetCharacterPointer(), static_cast<size_t>(body_->GetLength()));
       if (body_mode_ == BodyMode::Json && minify_->value()) {
         if (raw_body_ && raw_edits_ == body_edits_) r.http.body = *raw_body_;  // as pasted
-        else r.http.body = minify_json(shown);
+        else if (minified_current()) r.http.body = *minified_;               // built on a worker
+        else r.http.body = minify_json(std::string_view(body_->GetCharacterPointer(), static_cast<size_t>(body_->GetLength())));
         break;
       }
+      const std::string_view shown(body_->GetCharacterPointer(), static_cast<size_t>(body_->GetLength()));
       // One copy straight out of Scintilla's buffer (GetTextRaw would copy twice).
       r.http.body.assign(shown);
       break;
@@ -1953,6 +3084,9 @@ void HttpEditor::store(SavedRequest& r) const {
     case BodyMode::CurlData:
       r.body_data = base_.body_data;
       break;
+    case BodyMode::GraphQL:
+      r.http.body = graphql_body(gql_query_text(), gql_vars_text(), gql_op_);
+      break;
   }
   r.header_files = base_.header_files;
   r.cookie_files = base_.cookie_files;
@@ -1962,10 +3096,12 @@ void HttpEditor::store(SavedRequest& r) const {
   r.http.verify_tls = ov_.verify_tls;
   r.http.fresh_connection = ov_.fresh;
   r.http.version = static_cast<HttpVersion>(ov_.version);
+  r.network = ov_.net;
 }
 
 void HttpEditor::set_in_flight(bool f) {
   in_flight_ = f;
+  if (!f && auth_mode_ == AuthMode::OAuth2) update_oauth_status();
   send_->SetLabel(f ? "Cancel" : "Send");
   send_->SetToolTip(f ? "Cancel the request in flight" : "Send (Ctrl+Enter)");
 }
@@ -1981,6 +3117,7 @@ void HttpEditor::touched() {
   if (!banner_missing_.empty() && banner_ && banner_->IsShown()) {
     auto now = unresolved_vars(nullptr);
     for (const auto& n : empty_path_vars()) now.push_back(":" + n);
+    for (const auto& b : brace_problems()) now.push_back("{}" + b.first);
     if (std::none_of(banner_missing_.begin(), banner_missing_.end(),
                      [&](const std::string& v) { return std::find(now.begin(), now.end(), v) != now.end(); }))
       hide_banner();
@@ -1993,8 +3130,8 @@ void HttpEditor::update_badges() {
   // Rows with a value but no key are not counted (they are not sent): the badge turns to the
   // warning colour instead.
   const size_t np = params_->enabled_count(), po = params_->orphan_count();
-  tabs_->set_badge(0, np || po ? wxString::Format("%zu", np) : wxString(), po > 0);
-  tabs_->set_badge(1, body_mode_ == BodyMode::None ? wxString() : wxString::FromUTF8("\xE2\x97\x8F"));
+  tabs_->set_badge(strip_of(kTabParams), np || po ? wxString::Format("%zu", np) : wxString(), po > 0);
+  tabs_->set_badge(strip_of(kTabBody), body_mode_ == BodyMode::None ? wxString() : wxString::FromUTF8("\xE2\x97\x8F"));
   size_t nh = 0, ho = 0;
   if (headers_) {
     nh = headers_->enabled_count();
@@ -2005,19 +3142,47 @@ void HttpEditor::update_badges() {
       else if (r.enabled) ++nh;
     }
   }
-  if ((auth_mode_ == AuthMode::Bearer || (auth_mode_ == AuthMode::ApiKey && av_.key_where == 0)))
-    ++nh;
-  tabs_->set_badge(2, nh || ho ? wxString::Format("%zu", nh) : wxString(), ho > 0);
-  tabs_->set_badge(3, auth_mode_ == AuthMode::None ? wxString() : wxString::FromUTF8("\xE2\x97\x8F"));
-  const bool opts = ov_.timeout_ms != 30000 || !ov_.redirects || !ov_.verify_tls || ov_.fresh || ov_.version != 0;
-  tabs_->set_badge(4, opts ? wxString::FromUTF8("\xE2\x97\x8F") : wxString());
-  tabs_->set_badge(5, docs_text_.empty() ? wxString() : wxString::FromUTF8("\xE2\x97\x8F"));
+  // The rows of the table only: the Auth tab's header is listed under Auto headers.
+  tabs_->set_badge(strip_of(kTabHeaders), nh || ho ? wxString::Format("%zu", nh) : wxString(), ho > 0);
+  tabs_->set_badge(strip_of(kTabAuth), auth_mode_ == AuthMode::None || (auth_mode_ == AuthMode::Inherit && (!inh_.known || inh_.type == "No auth"))
+                                 ? wxString()
+                                 : wxString::FromUTF8("\xE2\x97\x8F"));
+  {
+    size_t npre = 0, npost = 0;
+    if (asserts_) {
+      npost = asserts_->enabled_count() + captures_->enabled_count();
+    } else {
+      for (const auto& a : assert_vals_) npost += a.enabled && !a.target.empty();
+      for (const auto& c : capture_vals_) npost += c.enabled && !c.var.empty();
+    }
+    if (pre_) {
+      npre = pre_->enabled_count();
+    } else {
+      for (const auto& x : pre_vals_) npre += x.enabled && !x.var.empty();
+    }
+    const bool bad = tests_hint_ && tests_hint_->IsShown();
+    npre += pre_js_ ? pre_js_->GetLength() > 0 : !base_.pre_script.empty();
+    npost += post_js_ ? post_js_->GetLength() > 0 : !base_.post_script.empty();
+    tabs_->set_badge(kStripScripts, npre ? wxString::Format("%zu", npre) : wxString());
+    tabs_->set_badge(kStripTests, npost || bad ? wxString::Format("%zu", npost) : wxString(), bad);
+  }
+  {
+    size_t nc = base_.cookie_files.size();
+    for (const auto& r : header_rows())
+      if (r.enabled && iequals(trim(r.key), "Cookie")) nc += parse_cookie_header(r.value).size();
+    tabs_->set_badge(strip_of(kTabCookies), nc ? wxString::Format("%zu", nc) : wxString());
+  }
+  const bool opts = ov_.timeout_ms != 30000 || !ov_.redirects || !ov_.verify_tls || ov_.fresh || ov_.version != 0 ||
+                    !ov_.net.empty();
+  tabs_->set_badge(strip_of(kTabOptions), opts ? wxString::FromUTF8("\xE2\x97\x8F") : wxString());
+  tabs_->set_badge(strip_of(kTabDocs), docs_text_.empty() ? wxString() : wxString::FromUTF8("\xE2\x97\x8F"));
+  if (book_->GetSelection() == kTabCookies) update_cookies();
   update_auto_headers();
 }
 
 // What HttpClient / libcurl add on their own (see src/core/http_client.cpp).
 void HttpEditor::update_auto_headers(bool force) {
-  if (!auto_btn_ || (!force && book_->GetSelection() != 2)) return;  // only while the Headers tab is shown
+  if (!auto_btn_ || (!force && book_->GetSelection() != kTabHeaders)) return;  // only while the Headers tab is shown
   std::vector<std::pair<std::string, std::string>> rows;
   std::string url = url_text();
   if (const Workspace* ws = host_->workspace(); ws && url.find("{{") != std::string::npos) url = ws->expand(url);
@@ -2031,22 +3196,53 @@ void HttpEditor::update_auto_headers(bool force) {
   rows.emplace_back("User-Agent", "watt/0.1");
   rows.emplace_back("Accept", "*/*");
   rows.emplace_back("Accept-Encoding", "deflate, gzip");
-  if (auth_mode_ == AuthMode::Basic) rows.emplace_back("Authorization", "Basic <user:password from the Auth tab>");
+  // The Auth tab's header (as written there; {{vars}} are expanded when sent).
+  const char* kFromAuth = "   (Auth tab)";
+  if (auth_mode_ == AuthMode::Basic) {
+    rows.emplace_back("Authorization", std::string("Basic <user:password>") + kFromAuth);
+  } else if (auth_mode_ == AuthMode::Bearer && !av_.bearer.empty()) {
+    std::string tok = av_.bearer;
+    // a literal token is shown cut: the list is on screen, the token is a secret
+    if (tok.find("{{") == std::string::npos && tok.size() > 12) tok = tok.substr(0, 6) + "\xE2\x80\xA6" + tok.substr(tok.size() - 4);
+    rows.emplace_back("Authorization", "Bearer " + tok + kFromAuth);
+  } else if (auth_mode_ == AuthMode::ApiKey && av_.key_where == 0 && !av_.key_name.empty()) {
+    rows.emplace_back(av_.key_name, av_.key_value + kFromAuth);
+  } else if (auth_mode_ == AuthMode::OAuth2 && av_.adv.oauth2.add_to == OAuth2Config::AddTo::Header) {
+    const std::string pre = av_.adv.oauth2.header_prefix.empty() ? std::string("Bearer") : av_.adv.oauth2.header_prefix;
+    rows.emplace_back("Authorization", pre + " <OAuth 2.0 access token>" + kFromAuth);
+  } else if (auth_mode_ == AuthMode::AwsSigV4) {
+    rows.emplace_back("Authorization", std::string("AWS4-HMAC-SHA256 <signed by libcurl>") + kFromAuth);
+    rows.emplace_back("X-Amz-Date", std::string("<when sent>") + kFromAuth);
+  } else if (scheme_mode(auth_mode_)) {
+    rows.emplace_back("Authorization", std::string(kAuthLabels[static_cast<int>(auth_mode_)]) +
+                                           " <answers the 401 challenge>" + kFromAuth);
+  } else if (auth_mode_ == AuthMode::Inherit && inh_.known && !inh_.source.empty()) {
+    // The inherited auth's header (a Bearer / API key one is listed with the folder headers).
+    const std::string from = "   (from " + inh_.source + ")";
+    if (inh_.type == "Basic auth") rows.emplace_back("Authorization", "Basic <user:password>" + from);
+    else if (inh_.type == "OAuth 2.0") rows.emplace_back("Authorization", "<OAuth 2.0 access token>" + from);
+    else if (inh_.type == "AWS Signature v4") rows.emplace_back("Authorization", "AWS4-HMAC-SHA256 <signed by libcurl>" + from);
+    else if (inh_.type != "No auth" && inh_.type != "Bearer token" && inh_.type != "API key")
+      rows.emplace_back("Authorization", inh_.type + " <answers the 401 challenge>" + from);
+  }
+  // Folder / collection headers, with the folder they come from (a request header of the same
+  // name replaces one). A folder's Bearer / API key header is its auth: shown masked.
+  for (const auto& h : inh_.headers) {
+    std::string v = !h.auth ? h.value
+                    : iequals(h.name, "Authorization") ? "Bearer " + mask_secret(std::string_view(h.value).substr(7))
+                                                       : mask_secret(h.value);
+    rows.emplace_back(h.name, v + "   (from " + h.from + ")");
+  }
   switch (body_mode_) {
     case BodyMode::None:
-      break;
-    case BodyMode::Json:
-    case BodyMode::Text:
-    case BodyMode::Xml:
-      rows.emplace_back("Content-Length",
-                        pending_body_ ? std::to_string(pending_body_->size()) : std::to_string(body_->GetLength()));
       break;
     case BodyMode::Multipart:
       rows.emplace_back("Content-Type", "multipart/form-data; boundary=<generated>");
       rows.emplace_back("Content-Length", "<computed when sent>");
       break;
     default:
-      rows.emplace_back("Content-Length", "<computed when sent>");
+      if (const auto n = sent_body_size()) rows.emplace_back("Content-Length", std::to_string(*n));
+      else rows.emplace_back("Content-Length", "<computed when sent>");
       break;
   }
   if (const wxString label = wxString::Format("Auto headers (%zu)", rows.size()); label != auto_btn_->GetLabel()) {
@@ -2058,7 +3254,6 @@ void HttpEditor::update_auto_headers(bool force) {
   std::set<std::string> overridden;
   for (const auto& r : header_rows())
     if (r.enabled) overridden.insert(canonical_header_name(r.key));
-  if (auth_mode_ == AuthMode::Bearer) overridden.insert("Authorization");
   auto sig = rows;
   for (auto& [k, v] : sig)
     if (overridden.count(canonical_header_name(k))) v += '\x01';
@@ -2077,6 +3272,28 @@ void HttpEditor::update_auto_headers(bool force) {
       wxFont f = kl->GetFont();
       f.SetStrikethrough(true);
       kl->SetFont(f);
+    } else if (v.size() >= strlen(kFromAuth) && v.compare(v.size() - strlen(kFromAuth), std::string::npos, kFromAuth) == 0) {
+      kl->SetToolTip("Set on the Auth tab");
+      vl->SetToolTip("Set on the Auth tab");
+    } else if (const size_t at = v.rfind("   (from "); at != std::string::npos && v.back() == ')') {
+      // Inherited: the folder's settings open on a click.
+      const std::string from = v.substr(at + 9, v.size() - at - 10);
+      const wxString tip = "Inherited from " + wxString::FromUTF8(from) +
+                           ". A header of the same name in the table replaces it for this request. Click to edit the "
+                           "folder's settings.";
+      kl->SetToolTip(tip);
+      vl->SetToolTip(tip);
+      vl->SetForegroundColour(t.var_ok);
+      kl->SetCursor(wxCursor(wxCURSOR_HAND));
+      vl->SetCursor(wxCursor(wxCURSOR_HAND));
+      auto open = [this, from](wxMouseEvent&) {
+        const Workspace* ws = host_->workspace();
+        if (!ws) return;
+        const std::u8string u8(reinterpret_cast<const char8_t*>(from.data()), from.size());
+        edit_folder(from == "Collection" ? ws->root() : ws->root() / std::filesystem::path(u8));
+      };
+      kl->Bind(wxEVT_LEFT_UP, open);
+      vl->Bind(wxEVT_LEFT_UP, open);
     } else {
       const bool computed = v.front() == '<' || v.front() == '(';
       kl->SetCursor(wxCursor(wxCURSOR_HAND));
@@ -2108,45 +3325,77 @@ void HttpEditor::set_method(const std::string& m) {
 }
 
 void HttpEditor::show_method_menu() {
-  wxMenu menu;
-  int id = 1;
-  for (const char* m : kMethods) {
-    auto* it = new wxMenuItem(&menu, id++, m);
-    // A dot in the method's colour (the button's text colour): the native dark menu ignores
-    // per-item text colours.
-    const int px = FromDIP(16);
-    wxImage img(px, px);
-    img.InitAlpha();
-    const wxColour c = method_colour(m);
-    const double r = px * 0.28, cx = (px - 1) / 2.0, cy = (px - 1) / 2.0;
-    for (int y = 0; y < px; ++y)
-      for (int x = 0; x < px; ++x) {
-        const double d = std::hypot(x - cx, y - cy);
-        const double a = std::clamp(r + 0.5 - d, 0.0, 1.0);  // anti-aliased edge
-        img.SetRGB(x, y, c.Red(), c.Green(), c.Blue());
-        img.SetAlpha(x, y, static_cast<unsigned char>(a * 255));
-      }
-    it->SetBitmap(wxBitmap(img));
-    menu.Append(it);
-  }
-  menu.AppendSeparator();
-  menu.Append(100, wxString::FromUTF8("Custom\xE2\x80\xA6"));
-  const int sel = GetPopupMenuSelectionFromUser(menu, method_->GetPosition() + url_box_->GetPosition() +
-                                                          wxPoint(0, method_->GetSize().y + FromDIP(4)));
-  std::string m;
-  if (sel >= 1 && sel <= static_cast<int>(std::size(kMethods))) {
-    m = kMethods[sel - 1];
-  } else if (sel == 100) {
-    wxTextEntryDialog dlg(this, "Method (e.g. PROPFIND, PURGE):", "Custom method", wxString::FromUTF8(method_str_));
-    if (dlg.ShowModal() != wxID_OK) return;
-    m = std::string(trim(dlg.GetValue().Upper().utf8_string()));
-    if (m.empty() || m.find_first_of(" \t\r\n") != std::string::npos) return;
-  } else {
+  if (method_pick_) {  // a second click / Alt+Down closes it, like a combo box
+    method_pick_->close();
     return;
   }
-  if (m == method_str_) return;
-  set_method(m);
-  touched();
+  // A themed, keyboard-first list (not the native menu, where Down+Enter picked the first item):
+  // the current method is selected, Up / Down move, Enter picks, typing filters, and a typed
+  // method that is not in the list (PROPFIND, PURGE) is used as typed.
+  static const char* const desc[] = {"read",          "create / submit", "replace", "modify part",
+                                     "remove",        "headers only",    "allowed methods / CORS"};
+  std::vector<PickItem> items;
+  for (size_t i = 0; i < std::size(kMethods); ++i) items.push_back({kMethods[i], desc[i], ""});
+  const wxString cur = wxString::FromUTF8(method_str_);
+  if (std::none_of(std::begin(kMethods), std::end(kMethods), [&](const char* m) { return method_str_ == m; }))
+    items.push_back({cur, "custom", ""});
+  wxWindow* f = wxWindow::FindFocus();
+  if (f != url_ && f != method_) method_->SetFocus();  // the window that forwards the keys
+  auto* p = new PickPopup(this, std::move(items), cur);
+  p->free_hint = "Enter: custom method";
+  method_pick_ = p;
+  p->on_close = [this, p] {
+    if (method_pick_ == p) method_pick_ = nullptr;
+  };
+  p->on_pick = [this](const wxString& v) {
+    std::string m(trim(v.Upper().utf8_string()));
+    if (m.empty() || !watt::is_http_token(m)) {
+      wxBell();  // not an RFC 9110 token: the method stays
+      return;
+    }
+    if (m == method_str_) return;
+    set_method(m);
+    touched();
+  };
+  const wxRect r = method_->GetScreenRect();
+  p->show_below(wxRect(r.x, r.y, r.width, r.height + FromDIP(4)));
+}
+
+bool HttpEditor::method_pick_key(wxKeyEvent& e) {
+  const int k = e.GetKeyCode();
+  if (k == WXK_ALT || k == WXK_CONTROL || k == WXK_SHIFT || k == WXK_WINDOWS_LEFT || k == WXK_WINDOWS_RIGHT) return false;
+  if ((k == WXK_DOWN || k == WXK_NUMPAD_DOWN || k == WXK_UP || k == WXK_NUMPAD_UP) && e.GetModifiers() == wxMOD_ALT) {
+    method_pick_->close();  // Alt+Down / Alt+Up toggles
+    return true;
+  }
+  if (e.ControlDown() || e.AltDown() || k == WXK_LEFT || k == WXK_RIGHT) {
+    method_pick_->close();  // and the key does what it does
+    return false;
+  }
+  if (k == WXK_SPACE && method_pick_->filter().empty()) {
+    method_pick_->pick_selected();
+    return true;
+  }
+  return method_pick_->key(k);  // a character: filtered on wxEVT_CHAR
+}
+
+bool HttpEditor::method_pick_char(wxKeyEvent& e) {
+  if (e.ControlDown() || e.AltDown()) return false;
+  const wxChar c = e.GetUnicodeKey();
+  if (c == WXK_NONE || c < 32) return c != WXK_NONE;  // Enter / Tab / Esc were handled on key down
+  return method_pick_->chr(static_cast<wxChar>(wxToupper(c)));
+}
+
+void HttpEditor::method_pick_focus_lost() {
+  if (!method_pick_) return;
+  CallAfter([this] {
+    if (!method_pick_) return;
+    // A press on the list picks there (on the press); keep it open for that.
+    if (method_pick_->GetScreenRect().Contains(wxGetMousePosition()) && wxGetMouseState().LeftIsDown()) return;
+    wxWindow* f = wxWindow::FindFocus();
+    if (f == url_ || f == method_) return;
+    method_pick_->close();
+  });
 }
 
 std::string HttpEditor::url_text() const {
@@ -2185,7 +3434,10 @@ void HttpEditor::url_changed() {
   // Params follow the URL; disabled params and rows without a key (not in the URL) are kept at
   // the end.
   std::vector<KvRow> rows;
-  for (const auto& q : parse_query_decoded(split_url(u).query)) rows.push_back({q.key, q.value, true, false, q.bare});
+  for (const auto& q : parse_query_decoded(split_url(u).query)) {
+    rows.push_back({q.key, q.value, true, false, q.bare});
+    if (const auto it = param_descs_.find(q.key); it != param_descs_.end()) rows.back().desc = it->second;
+  }
   const size_t from_url = rows.size();
   for (auto& old : params_->rows()) {
     if (old.enabled && !trim(old.key).empty()) continue;
@@ -2229,8 +3481,17 @@ void HttpEditor::sync_path_rows() {
   std::vector<std::string> names = path_var_names(url_text());
   if (names == path_names_ && (path_panel_ || names.empty())) return;
   path_names_ = std::move(names);
+  if (!path_panel_ && path_names_.empty()) return;
+  // Building or showing the Path table happens while the user types in the URL; on Windows the
+  // new grid (or the page around it) takes the keyboard focus, and every later keystroke landed
+  // in a panel that ignores it. Keep the focus where it was, now and after queued focus events.
+  wxWindow* focus = wxWindow::FindFocus();
+  const auto keep_focus = [this, focus] {
+    wxWindow* now = wxWindow::FindFocus();
+    if (focus && now != focus && (!now || now == params_page_ || params_page_->IsDescendant(now)))
+      focus->SetFocus();
+  };
   if (!path_panel_) {
-    if (path_names_.empty()) return;
     wxWindowUpdateLocker lock(params_page_);
     path_panel_ = new KvPanel(params_page_, KvGrid::Kind::Path, "Path variables");
     path_panel_->SetToolTip("Each /:name segment of the URL is replaced by its value, URL-encoded");
@@ -2239,7 +3500,10 @@ void HttpEditor::sync_path_rows() {
     path_->var_names = [this] { return var_names(); };
     path_->on_change = [this] {
       if (loading_) return;
-      for (const auto& row : path_->rows()) path_values_[row.key] = row.value;
+      for (const auto& row : path_->rows()) {
+        path_values_[row.key] = row.value;
+        path_descs_[row.key] = row.desc;
+      }
       update_preview();
       touched();
     };
@@ -2248,7 +3512,9 @@ void HttpEditor::sync_path_rows() {
   std::vector<KvRow> rows;
   for (const auto& n : path_names_) {
     const auto it = path_values_.find(n);
-    rows.push_back({n, it == path_values_.end() ? std::string() : it->second, true, false, false});
+    const auto d = path_descs_.find(n);
+    rows.push_back({n, it == path_values_.end() ? std::string() : it->second, true, false, false,
+                    d == path_descs_.end() ? std::string() : d->second});
   }
   const bool was = loading_;
   loading_ = true;
@@ -2256,6 +3522,13 @@ void HttpEditor::sync_path_rows() {
   loading_ = was;
   path_panel_->Show(!path_names_.empty());
   layout_params_page();
+  if (focus && !params_page_->IsDescendant(focus)) {
+    keep_focus();
+    wxWeakRef<wxWindow> weak(focus);
+    CallAfter([this, weak, keep_focus] {
+      if (weak) keep_focus();
+    });
+  }
 }
 
 void HttpEditor::layout_params_page() {
@@ -2279,24 +3552,40 @@ std::vector<std::string> HttpEditor::var_names() const {
     if (env.name == ws->active_env)
       for (const auto& [k, v] : env.vars) names.insert(k);
   for (const auto& [k, v] : ws->globals) names.insert(k);
+  for (const auto& [k, v] : inh_.vars) names.insert(k);  // folder / collection variables
+  for (const auto& [k, v] : ws->runtime_vars) names.insert(k);  // captured / set by scripts
   for (const auto& n : names)
     if (!n.empty() && std::none_of(n.begin(), n.end(), [](char c) { return static_cast<unsigned char>(c) <= 32; }))
       out.push_back(n);
   for (const char* d : {"$guid", "$timestamp", "$isoTimestamp", "$randomInt"}) out.emplace_back(d);
+  for (const auto& n : pre_names_)
+    if (!names.count(n)) out.push_back(n);
   return out;
+}
+
+std::string HttpEditor::expand_span(const Workspace& ws, const std::string& span) const {
+  // A folder / collection variable (inh_.vars, nearest folder first) comes after the runtime
+  // variables and before the environment, as core expands it when the request is sent.
+  if (!inh_.vars.empty() && span.size() > 4 && span.compare(0, 2, "{{") == 0) {
+    const std::string name(trim(std::string_view(span).substr(2, span.size() - 4)));
+    if (!ws.runtime_vars.count(name))
+      for (const auto& [k, v] : inh_.vars)
+        if (k == name) return v.find("{{") == std::string::npos ? v : ws.expand(v);
+  }
+  return ws.expand(span);
 }
 
 std::string HttpEditor::sent_url() const {
   const std::string t = normalize_url(with_path(url_text()));
   const Workspace* ws = host_->workspace();
   if (!ws || t.find("{{") == std::string::npos) return t;
-  return expand_url(t, [ws](const std::string& span) { return ws->expand(span); });
+  return expand_url(t, [this, ws](const std::string& span) { return expand_span(*ws, span); });
 }
 
 std::string HttpEditor::sent_form(const std::string& body) const {
   const Workspace* ws = host_->workspace();
   if (!ws) return body;
-  return expand_form(body, [ws](const std::string& span) { return ws->expand(span); });
+  return expand_form(body, [this, ws](const std::string& span) { return expand_span(*ws, span); });
 }
 
 std::vector<std::string> HttpEditor::unresolved_vars(bool* in_url) const {
@@ -2323,6 +3612,20 @@ std::vector<std::string> HttpEditor::unresolved_vars(bool* in_url) const {
     case AuthMode::Bearer: scan(av_.bearer); break;
     case AuthMode::Basic: scan(av_.user + "\n" + av_.pass); break;
     case AuthMode::ApiKey: scan(av_.key_name + "\n" + av_.key_value); break;
+    case AuthMode::OAuth2: {
+      const OAuth2Config& o = av_.adv.oauth2;
+      scan(o.token_url + "\n" + o.client_id + "\n" + o.client_secret + "\n" + o.scope + "\n" + o.audience);
+      if (o.grant == OAuth2Config::Grant::Password) scan(o.username + "\n" + o.password);
+      if (o.grant == OAuth2Config::Grant::AuthorizationCode) scan(o.auth_url);
+      break;
+    }
+    case AuthMode::Digest: case AuthMode::Ntlm: case AuthMode::Negotiate:
+      scan(av_.adv.user + "\n" + av_.adv.password);
+      break;
+    case AuthMode::AwsSigV4:
+      scan(av_.adv.aws_access_key + "\n" + av_.adv.aws_secret_key + "\n" + av_.adv.aws_session_token + "\n" +
+           av_.adv.aws_region + "\n" + av_.adv.aws_service);
+      break;
     default: break;
   }
   if (body_mode_ == BodyMode::UrlEncoded)
@@ -2334,12 +3637,44 @@ std::vector<std::string> HttpEditor::unresolved_vars(bool* in_url) const {
   return out;
 }
 
+std::vector<std::pair<std::string, std::string>> HttpEditor::brace_problems() const {
+  std::vector<std::pair<std::string, std::string>> out;
+  auto scan = [&](const std::string& where, const std::string& text) {
+    if (std::string p = brace_problem(text); !p.empty()) out.emplace_back(where, std::move(p));
+  };
+  scan("the URL", url_text());
+  for (const auto& n : path_names_)
+    if (const auto it = path_values_.find(n); it != path_values_.end()) scan("path variable :" + n, it->second);
+  for (const auto& row : header_rows())
+    if (row.enabled) {
+      scan("header name " + row.key, row.key);
+      scan("header " + row.key, row.value);
+    }
+  if (body_mode_ == BodyMode::UrlEncoded || body_mode_ == BodyMode::Multipart)
+    for (const auto& row : form_rows(body_mode_ == BodyMode::UrlEncoded ? 0 : 1))
+      if (row.enabled) {
+        scan("form field name " + row.key, row.key);
+        if (!row.file) scan("form field " + row.key, row.value);
+      }
+  return out;
+}
+
 void HttpEditor::update_preview() {
   const std::string u = sent_url();
-  const wxString w = u.empty() ? wxString() : wxString::FromUTF8("Sent as  " + u);
+  // "{{base}}" that already holds a scheme behind a typed / imported "http://": the request
+  // would go to the host "http" (curl -> http://http://127.0.0.1/...). Said first, so the middle
+  // ellipsis never hides it.
+  const bool doubled = doubled_scheme(u);
+  const wxString w = u.empty() ? wxString()
+                     : doubled ? wxString::FromUTF8("\xE2\x9A\xA0 Doubled scheme  " + u)
+                               : wxString::FromUTF8("Sent as  " + u);
+  preview_->SetForegroundColour(doubled ? Theme::get().var_bad : Theme::get().dim);
   if (w == preview_->GetLabelText()) return;
   preview_->SetLabelText(w);  // no '&' mnemonics
-  preview_->SetToolTip(wxString::FromUTF8(u));
+  preview_->SetToolTip(doubled ? wxString::FromUTF8("Sent as " + u +
+                                                    "\nA {{variable}} in the URL already holds a scheme: remove the "
+                                                    "http:// typed in front of it.")
+                               : wxString::FromUTF8(u));
   if (preview_->IsShown() != !w.empty()) {  // no blank reserved line under the title
     preview_->Show(!w.empty());
     preview_->GetParent()->Layout();
@@ -2354,8 +3689,10 @@ void HttpEditor::params_changed() {
   std::vector<KvItem> items;
   // A row with a value but no key stays out of the URL (it is flagged on the row): "&=f" would
   // be sent otherwise.
-  for (const auto& r : params_->rows())
+  for (const auto& r : params_->rows()) {
     items.push_back({r.key, r.value, r.enabled && !trim(r.key).empty(), r.value.empty()});
+    if (!r.key.empty()) param_descs_[r.key] = r.desc;
+  }
   const std::string nu = with_decoded_query(u, items);
   if (nu != u) {
     set_url_text(nu);
@@ -2389,6 +3726,9 @@ void HttpEditor::url_inserted(const wxString& ins) {
 void HttpEditor::import_curl(const std::string& cmd, CmdBackslashes bs) {
   std::string err;
   auto imp = parse_curl(cmd, &err, bs);
+  // curl's default "http://" goes in front of a URL without a scheme, but not in front of a
+  // {{variable}} (Postman's {{baseUrl}}/path): that variable holds the scheme.
+  if (imp) imp->http.url = strip_curl_default_scheme(imp->http.url, cmd);
   if (!imp) {
     // Not importable: keep the text as a one-line URL and say why.
     std::string u = url_text();
@@ -2424,6 +3764,20 @@ void HttpEditor::import_curl(const std::string& cmd, CmdBackslashes bs) {
 }
 
 void HttpEditor::set_body_mode(BodyMode m, bool user) {
+  // JSON -> GraphQL by hand: a body that already is {"query": ...} fills the two editors.
+  if (user && m == BodyMode::GraphQL && body_mode_ == BodyMode::Json && gql_query_text().empty() && !pending_body_ &&
+      body_->GetLength() < 1024 * 1024) {
+    std::string q, v, op;
+    if (split_graphql_body(std::string_view(body_->GetCharacterPointer(), static_cast<size_t>(body_->GetLength())), q, v, &op)) {
+      gql_q_val_ = q;
+      gql_v_val_ = v;
+      gql_op_ = op;
+      if (gql_query_) {
+        gql_query_->SetText(wxString::FromUTF8(q));
+        gql_vars_->SetText(wxString::FromUTF8(v));
+      }
+    }
+  }
   body_mode_ = m;
   body_modes_->select(static_cast<int>(m) < kBodyModeCount ? static_cast<int>(m) : -1);
   sync_body_book();
@@ -2437,7 +3791,7 @@ void HttpEditor::set_body_mode(BodyMode m, bool user) {
   // Only once a one-line body is shown formatted (or the request was saved that way).
   minify_->Show(m == BodyMode::Json && (minify_->value() || raw_body_));
   lint_timer_.StartOnce(50);
-  beautify_->GetParent()->Layout();
+  fit_body_tools();
   if (!user) return;
   switch (m) {
     case BodyMode::None: set_content_type(nullptr); break;
@@ -2447,9 +3801,11 @@ void HttpEditor::set_body_mode(BodyMode m, bool user) {
     case BodyMode::UrlEncoded: set_content_type("application/x-www-form-urlencoded"); break;
     case BodyMode::Multipart: set_content_type(nullptr); break;  // built with its boundary at send time
     case BodyMode::Binary: set_content_type("application/octet-stream"); break;
+    case BodyMode::GraphQL: set_content_type("application/json"); break;
     case BodyMode::CurlData: break;
   }
   if (text_mode(m)) body_->SetFocus();
+  if (m == BodyMode::GraphQL && gql_query_) gql_query_->SetFocus();
   touched();
 }
 
@@ -2479,8 +3835,16 @@ void HttpEditor::set_auth_mode(AuthMode m, bool user) {
   auth_mode_ = m;
   if (auth_book_) {
     auth_btn_->SetLabel(kAuthLabels[static_cast<int>(m)]);
-    auth_book_->ChangeSelection(static_cast<size_t>(m));
+    if (!auth_built_[auth_page(m)]) {
+      build_auth_subpage(auth_page(m));
+      push_auth();  // the new page's fields
+    }
+    auth_book_->ChangeSelection(auth_page(m));
+    set_scheme_hint();
+    update_oauth_status();
+    if (m == AuthMode::Inherit) show_inherited();
   }
+  if (m != old) update_auto_headers();
   if (!user) return;
   if (old == AuthMode::ApiKey && m != AuthMode::ApiKey && !api_key_param_.empty()) {
     auto rows = params_->rows();
@@ -2494,9 +3858,131 @@ void HttpEditor::set_auth_mode(AuthMode m, bool user) {
     push_auth();
   }
   if (m == AuthMode::ApiKey) sync_api_key_query();
-  wxWindow* focus = m == AuthMode::Bearer ? bearer_ : m == AuthMode::Basic ? basic_user_ : m == AuthMode::ApiKey ? key_value_ : nullptr;
+  wxWindow* focus = m == AuthMode::Bearer   ? static_cast<wxWindow*>(bearer_)
+                    : m == AuthMode::Basic  ? basic_user_
+                    : m == AuthMode::ApiKey ? key_value_
+                    : m == AuthMode::OAuth2 ? o_token_url_
+                    : m == AuthMode::AwsSigV4 ? s_aws_key_
+                    : scheme_mode(m)        ? s_user_
+                                            : nullptr;
   if (focus) CallAfter([focus] { focus->SetFocus(); });  // after the dropdown has closed
   touched();
+}
+
+// The auth type list: a themed popup that filters on typed text like the method list ("bear"
+// Enter picks Bearer token), Inherit from parent first.
+void HttpEditor::show_auth_menu() {
+  if (auth_pick_) {
+    auth_pick_->close();
+    return;
+  }
+  static const char* const desc[] = {"no Authorization header",   "Authorization: Bearer <token>",
+                                     "user + password",           "a header or query parameter",
+                                     "token from a token URL",    "challenge / response",
+                                     "Windows challenge / response", "Kerberos / SPNEGO",
+                                     "signed request",            "the folder's / collection's auth"};
+  std::vector<PickItem> items;
+  for (AuthMode m : kAuthOrder) items.push_back({kAuthLabels[static_cast<int>(m)], desc[static_cast<int>(m)], ""});
+  if (wxWindow::FindFocus() != auth_btn_) auth_btn_->SetFocus();  // the window that forwards the keys
+  auto* p = new PickPopup(this, std::move(items), kAuthLabels[static_cast<int>(auth_mode_)]);
+  auth_pick_ = p;
+  p->on_close = [this, p] {
+    if (auth_pick_ == p) auth_pick_ = nullptr;
+  };
+  p->on_pick = [this](const wxString& v) {
+    for (AuthMode m : kAuthOrder)
+      if (v == kAuthLabels[static_cast<int>(m)]) {
+        if (m != auth_mode_) set_auth_mode(m, true);
+        return;
+      }
+  };
+  const wxRect r = auth_btn_->GetScreenRect();
+  p->show_below(wxRect(r.x, r.y, r.width, r.height + FromDIP(4)));
+}
+
+std::filesystem::path HttpEditor::own_folder() const {
+  const Workspace* ws = host_->workspace();
+  if (!ws) return {};
+  const std::filesystem::path f = inherit_from();
+  if (f.empty()) return ws->root();
+  const std::filesystem::path dir = f.parent_path().lexically_normal();
+  const std::filesystem::path rel = dir.lexically_relative(ws->root().lexically_normal());
+  if (rel.empty() || *rel.begin() == "..") return ws->root();
+  return dir;
+}
+
+// What the folders and the collection give this request, read on a worker (folder.json files
+// are on disk; the UI thread never waits on them).
+void HttpEditor::refresh_inherited() {
+  const Workspace* ws = host_->workspace();
+  const uint64_t gen = ++inh_gen_;
+  if (!ws) return;  // opened before the workspace (start-up): read when the Auth / Headers tab shows
+  SavedRequest probe;  // only what decides the inheritance: the file (its folders), an inheriting auth
+  probe.kind = RequestKind::Http;
+  probe.file = inherit_from();
+  probe.auth.type = HttpAuth::Type::Inherit;
+  auto wsc = std::make_shared<Workspace>(*ws);
+  std::thread([alive = alive_, wsc, probe, gen] {
+    InheritView v = make_inherit_view(wsc->effective_settings(probe));
+    std::lock_guard lk(alive->m);
+    auto* ed = static_cast<HttpEditor*>(alive->target);
+    if (!ed) return;
+    ed->CallAfter([ed, v = std::move(v), gen]() mutable {
+      if (gen != ed->inh_gen_) return;
+      ed->inh_ = std::move(v);
+      ed->show_inherited();
+      if (ed->net_panel_) ed->net_panel_->set_inherited(wxString::FromUTF8(ed->inh_.network));
+      ed->update_badges();
+      ed->update_auto_headers();
+    });
+  }).detach();
+}
+
+void HttpEditor::show_inherited() {
+  if (!inh_title_) return;
+  const Theme& t = Theme::get();
+  wxString title, detail;
+  if (!inh_.known) {
+    title = wxString::FromUTF8("Reading the folder settings\xE2\x80\xA6");
+  } else if (inh_.source.empty() || (inh_.type == "No auth" && inh_.source == "Collection")) {
+    title = "Inherit: no auth set above this request";
+    detail = "No folder above it and not the collection sets auth, so it is sent with none. Set it once on a folder or "
+             "the collection and every request below that inherits uses it.";
+  } else {
+    title = wxString::FromUTF8("Inherit from " + inh_.source + ": " + inh_.type);
+    detail = wxString::FromUTF8(inh_.detail);
+  }
+  inh_title_->SetLabel(title);
+  inh_detail_->SetLabel(detail);
+  inh_detail_->Wrap(auth_wrap_ > 0 ? auth_wrap_ : FromDIP(560));
+  inh_edit_->SetLabel(inh_.source.empty() ? wxString("Edit on folder")
+                                          : wxString::FromUTF8("Edit on " + inh_.source));
+  inh_edit_->SetToolTip(inh_.source.empty() ? wxString("Open the settings of this request's folder")
+                                            : wxString::FromUTF8("Open the settings of " + inh_.source +
+                                                                 ", where this auth is set"));
+  inh_edit_->InvalidateBestSize();
+  inh_own_->Show(!inh_.source.empty() && own_folder() != inh_.source_folder);
+  if (!inh_.errors.empty()) {
+    wxString e = "Not used (the request is not sent while it is broken):";
+    for (const auto& x : inh_.errors) e += "\n" + wxString::FromUTF8(x);
+    inh_errors_->SetLabel(e);
+    inh_errors_->SetForegroundColour(t.js_error);
+    inh_errors_->Show();
+  } else {
+    inh_errors_->Hide();
+  }
+  if (auto* pg = inh_title_->GetParent()) pg->Layout();
+}
+
+void HttpEditor::edit_folder(const std::filesystem::path& folder) {
+  const Workspace* ws = host_->workspace();
+  if (!ws || folder.empty()) return;
+  wxWeakRef<HttpEditor> self(this);
+  edit_folder_settings(this, *ws, folder, [self] {
+    if (!self) return;
+    self->refresh_inherited();
+    self->note("Folder settings saved");
+  });
 }
 
 // API key "in query": the key is a real query param (visible in the URL and the Params tab).
@@ -2547,6 +4033,113 @@ void HttpEditor::beautify() {
   note("Formatted");
 }
 
+bool HttpEditor::big_fold(int line) {
+  if (body_->GetLineCount() < 100000 || line < 0) return false;
+  if (!(body_->GetFoldLevel(line) & wxSTC_FOLDLEVELHEADERFLAG)) return false;
+  const int last = fold_block_end(line);
+  if (last <= line) return false;
+  if (fold_edits_ != body_edits_ || fold_doc_ != body_->GetDocPointer()) {
+    fold_ops_.clear();  // queued for another text
+    fold_edits_ = body_edits_;
+    fold_doc_ = body_->GetDocPointer();
+  }
+  const bool contract = body_->GetFoldExpanded(line);
+  body_->SetFoldExpanded(line, !contract);
+  if (contract) {
+    // The caret inside the block would be hidden: put it on the header (as Scintilla does).
+    const int cur = body_->LineFromPosition(body_->GetCurrentPos());
+    if (cur > line && cur <= last) body_->GotoPos(body_->GetLineEndPosition(line));
+  }
+  fold_ops_.push_back({line + 1, last, !contract});
+  // The slices run from a timer: a message, so input and paints get in between them (CallAfter
+  // events would all run in one go).
+  if (!fold_timer_.IsRunning()) fold_timer_.StartOnce(1);
+  return true;
+}
+
+int HttpEditor::fold_block_end(int line) {
+  const int len = body_->GetLength();
+  const char* p = body_->GetCharacterPointer();
+  const int ls = body_->PositionFromLine(line), le = body_->GetLineEndPosition(line);
+  // The outermost opener on the line that the line itself does not close.
+  int opener = -1, depth = 0;
+  bool str = false;
+  for (int i = ls; i < le; ++i) {
+    const char c = p[i];
+    if (str) {
+      if (c == '\\') ++i;
+      else if (c == '"') str = false;
+      continue;
+    }
+    if (c == '"') str = true;
+    else if (c == '/' && i + 1 < le && p[i + 1] == '/') break;
+    else if (c == '{' || c == '[') {
+      if (depth++ == 0) opener = i;
+    } else if ((c == '}' || c == ']') && depth > 0) {
+      if (--depth == 0) opener = -1;
+    }
+  }
+  if (opener < 0 || depth == 0) return -1;
+  depth = 0;
+  str = false;
+  for (int i = opener; i < len; ++i) {
+    const char c = p[i];
+    if (str) {
+      if (c == '\\') ++i;
+      else if (c == '"') str = false;
+      continue;
+    }
+    switch (c) {
+      case '"': str = true; break;
+      case '/':
+        if (i + 1 < len && p[i + 1] == '/') {
+          while (i < len && p[i] != '\n') ++i;
+        } else if (i + 1 < len && p[i + 1] == '*') {
+          i += 2;
+          while (i + 1 < len && !(p[i] == '*' && p[i + 1] == '/')) ++i;
+          ++i;
+        }
+        break;
+      case '{': case '[': ++depth; break;
+      case '}': case ']':
+        if (--depth == 0) return body_->LineFromPosition(i);
+        break;
+      default: break;
+    }
+  }
+  return body_->GetLineCount() - 1;  // not closed: to the end, as the lexer folds it
+}
+
+void HttpEditor::run_fold_ops() {
+  if (fold_edits_ != body_edits_ || fold_doc_ != body_->GetDocPointer()) fold_ops_.clear();
+  // ~100k lines per turn (~12 ms): a 1.4M-line root folds over a few frames, no long stall.
+  int budget = 100000;
+  while (!fold_ops_.empty() && budget > 0) {
+    FoldOp& op = fold_ops_.front();
+    const int e = std::min(op.to, op.from + budget - 1);
+    if (op.show) body_->ShowLines(op.from, e);
+    else body_->HideLines(op.from, e);
+    budget -= e - op.from + 1;
+    if (e < op.to) {
+      op.from = e + 1;
+      break;
+    }
+    const FoldOp done = op;
+    fold_ops_.pop_front();
+    if (done.show) {
+      // A block folded inside the one just shown stays folded.
+      std::vector<FoldOp> again;
+      for (int h = body_->ContractedFoldNext(done.from); h >= 0 && h <= done.to;) {
+        const int last = fold_block_end(h);
+        if (last > h) again.push_back({h + 1, std::min(last, done.to), false});
+        h = body_->ContractedFoldNext(std::max(last, h) + 1);
+      }
+      fold_ops_.insert(fold_ops_.begin(), again.begin(), again.end());
+    }
+  }
+  if (!fold_ops_.empty()) fold_timer_.StartOnce(1);
+}
+
 // Debounced JSON syntax check: small bodies here (~10 ms per MB), big ones on a worker.
 void HttpEditor::lint() {
   const uint64_t gen = ++lint_gen_;
@@ -2560,12 +4153,23 @@ void HttpEditor::lint() {
     return;
   }
   auto text = std::make_shared<const std::string>(body_->GetCharacterPointer(), len);
-  std::thread([alive = alive_, text, gen] {
+  // Sent minified: build that copy here too, so the next send does not minify on the UI thread.
+  const bool minify = minify_ && minify_->value() && !(raw_body_ && raw_edits_ == body_edits_) && !minified_current();
+  const uint64_t edits = body_edits_;
+  std::thread([alive = alive_, text, gen, minify, edits] {
     auto issue = check_json(*text);
+    std::shared_ptr<const std::string> mini;
+    if (minify) mini = std::make_shared<const std::string>(minify_json(*text));
     std::lock_guard lk(alive->m);
     if (!alive->target) return;
     auto* ed = static_cast<HttpEditor*>(alive->target);
-    ed->CallAfter([ed, gen, issue = std::move(issue)] { ed->show_lint(gen, issue); });
+    ed->CallAfter([ed, gen, issue = std::move(issue), mini, edits] {
+      if (mini && edits == ed->body_edits_) {
+        ed->minified_ = mini;
+        ed->minified_edits_ = edits;
+      }
+      ed->show_lint(gen, issue);
+    });
   }).detach();
 }
 
@@ -2677,6 +4281,51 @@ bool HttpEditor::paste_long_json() {
   return true;
 }
 
+bool HttpEditor::copy_big_selection() {
+  const int s = body_->GetSelectionStart(), e = body_->GetSelectionEnd();
+  if (e - s < (1 << 20) || body_->GetSelections() != 1 || body_->SelectionIsRectangle()) return false;
+  const auto t0 = Clock::now();
+  // One contiguous copy (a memcpy, a few ms for 20 MB); the worker converts it.
+  auto text = std::make_shared<const std::string>(body_->GetCharacterPointer() + s, static_cast<size_t>(e - s));
+  const double ui_ms = ms_between(t0, Clock::now());
+  note(wxString::FromUTF8("Copying " + std::string(human_size(text->size()).utf8_string()) + "\xE2\x80\xA6"));
+  std::thread([alive = alive_, text, ui_ms] {
+    const auto w0 = Clock::now();
+    const int n = MultiByteToWideChar(CP_UTF8, 0, text->data(), static_cast<int>(text->size()), nullptr, 0);
+    HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE, (static_cast<size_t>(n) + 1) * sizeof(wchar_t));
+    if (h) {
+      auto* p = static_cast<wchar_t*>(GlobalLock(h));
+      MultiByteToWideChar(CP_UTF8, 0, text->data(), static_cast<int>(text->size()), p, n);
+      p[n] = 0;
+      GlobalUnlock(h);
+    }
+    const double worker_ms = ms_between(w0, Clock::now());
+    const size_t bytes = text->size();
+    std::lock_guard lk(alive->m);
+    auto* ed = static_cast<HttpEditor*>(alive->target);
+    if (!ed || !h) {
+      if (h) GlobalFree(h);
+      return;
+    }
+    ed->CallAfter([ed, h, bytes, worker_ms, ui_ms] {
+      const auto t1 = Clock::now();
+      bool ok = false;
+      if (OpenClipboard(static_cast<HWND>(ed->GetHWND()))) {
+        EmptyClipboard();
+        ok = SetClipboardData(CF_UNICODETEXT, h) != nullptr;
+        CloseClipboard();
+      }
+      if (!ok) GlobalFree(h);  // the clipboard owns it only once set
+      if (ok)
+        ed->note(wxString::Format("Copied %s (%.0f ms on a worker, UI %.1f ms)", human_size(bytes), worker_ms,
+                                  ui_ms + ms_between(t1, Clock::now())));
+      else
+        ed->note("Copy failed: the clipboard is in use by another program", true);
+    });
+  }).detach();
+  return true;
+}
+
 void HttpEditor::paste_arrived(uint64_t gen, uint64_t edits, int start, int end, bool whole,
                                std::shared_ptr<const std::string> text, bool long_json) {
   if (gen != beautify_gen_ || edits != body_edits_ || pending_body_ || body_->GetReadOnly()) {
@@ -2707,43 +4356,62 @@ void HttpEditor::paste_arrived(uint64_t gen, uint64_t edits, int start, int end,
 // Builds a Scintilla document from `text` (re-indented first when `reindent`) on a worker thread
 // and swaps it in when done, if nothing changed meanwhile (see swap_body_doc).
 void HttpEditor::build_body_doc(std::shared_ptr<const std::string> text, bool reindent, uint64_t gen, uint64_t edits) {
-  const size_t hint = std::min<size_t>(text->size() + (reindent ? text->size() : 0), 0x7FFFFFF0);
+  if (reindent) {
+    // Re-indent first, then make the loader: an already formatted body then never creates (and
+    // releases) a Scintilla document at all, and the view is left exactly as it is.
+    std::thread([alive = alive_, text, gen, edits] {
+      const auto t0 = Clock::now();
+      auto out = std::make_shared<const std::string>(reindent_json(*text));
+      const bool same = *out == *text;
+      const double ms = ms_between(t0, Clock::now());
+      std::lock_guard lk(alive->m);
+      auto* ed = static_cast<HttpEditor*>(alive->target);
+      if (!ed) return;
+      ed->CallAfter([ed, out, same, gen, edits, ms] {
+        if (gen != ed->beautify_gen_ || edits != ed->body_edits_ || ed->pending_body_) return;  // edited meanwhile
+        // A paste (raw_pending_) is still inserted when it needed no formatting.
+        if (same && !ed->raw_pending_) {
+          ed->note("Already formatted");
+          ed->body_->Refresh(false);
+          return;
+        }
+        ed->fill_body_doc(out, true, gen, edits, ms);
+      });
+    }).detach();
+    return;
+  }
+  fill_body_doc(std::move(text), false, gen, edits, 0);
+}
+
+// A Scintilla document filled with `src` on a worker (the loader is made here, on the UI thread),
+// then swapped in by swap_body_doc().
+void HttpEditor::fill_body_doc(std::shared_ptr<const std::string> src, bool reindent, uint64_t gen, uint64_t edits,
+                               double worker_ms) {
+  const size_t hint = std::min<size_t>(src->size(), 0x7FFFFFF0);
   auto* loader = static_cast<SciLoader*>(body_->CreateLoader(static_cast<int>(hint)));
   if (!loader) {  // cannot happen with Scintilla 5; keep the body usable anyway
     if (!reindent) {
       pending_body_.reset();
       body_->SetReadOnly(false);
-      body_->AddTextRaw(text->data(), static_cast<int>(text->size()));
+      body_->AddTextRaw(src->data(), static_cast<int>(src->size()));
     }
     return;
   }
-  std::thread([alive = alive_, text, reindent, gen, edits, loader] {
+  std::thread([alive = alive_, src, reindent, gen, edits, loader, worker_ms] {
     const auto t0 = Clock::now();
-    std::string out;
-    if (reindent) out = reindent_json(*text);
-    const std::string& src = reindent ? out : *text;
-    const bool same = reindent && out == *text;
-    if (!same) {
-      for (size_t off = 0; off < src.size(); off += size_t{1} << 20)
-        loader->AddData(src.data() + off, static_cast<ptrdiff_t>(std::min(src.size() - off, size_t{1} << 20)));
-    }
-    const double worker_ms = ms_between(t0, Clock::now());
-    const size_t bytes = src.size();
+    for (size_t off = 0; off < src->size(); off += size_t{1} << 20)
+      loader->AddData(src->data() + off, static_cast<ptrdiff_t>(std::min(src->size() - off, size_t{1} << 20)));
+    const double ms = worker_ms + ms_between(t0, Clock::now());
+    const size_t bytes = src->size();
     std::lock_guard lk(alive->m);
-    if (!alive->target || same) {
+    if (!alive->target) {
       loader->Release();
-      if (same && alive->target) {
-        auto* ed = static_cast<HttpEditor*>(alive->target);
-        ed->CallAfter([ed] { ed->note("Already formatted"); });
-      }
       return;
     }
     void* doc = loader->ConvertToDocument();
     alive->docs.push_back(doc);
     auto* ed = static_cast<HttpEditor*>(alive->target);
-    ed->CallAfter([ed, doc, reindent, gen, edits, worker_ms, bytes] {
-      ed->swap_body_doc(doc, reindent, gen, edits, worker_ms, bytes);
-    });
+    ed->CallAfter([ed, doc, reindent, gen, edits, ms, bytes] { ed->swap_body_doc(doc, reindent, gen, edits, ms, bytes); });
   }).detach();
 }
 
@@ -2772,7 +4440,8 @@ void HttpEditor::swap_body_doc(void* doc, bool reindent, uint64_t gen, uint64_t 
   } else {
     release_doc_async(old);
   }
-  install_doc(doc);
+  drop_redo_doc();
+  install_doc(doc, true);
   body_->ReleaseDocument(doc);  // the control holds its own reference now
   pending_body_.reset();
   if (reindent) {
@@ -2783,9 +4452,9 @@ void HttpEditor::swap_body_doc(void* doc, bool reindent, uint64_t gen, uint64_t 
       minify_->set_value(true);
       if (!minify_->IsShown()) {
         minify_->Show();
-        minify_->GetParent()->Layout();
+        fit_body_tools();
       }
-      note(wxString::Format("Pasted %s of one-line JSON: shown formatted (%s, %.0f ms on a worker, UI %.1f ms), "
+      note(wxString::Format("Pasted %s of one-line JSON: shown formatted (%s, %.0f ms on a worker, UI %.1f ms); "
                             "sent as pasted. Ctrl+Z undoes.",
                             human_size(raw_body_->size()), human_size(bytes), worker_ms, ms_between(t0, Clock::now())));
     } else {
@@ -2796,11 +4465,66 @@ void HttpEditor::swap_body_doc(void* doc, bool reindent, uint64_t gen, uint64_t 
   }
 }
 
-void HttpEditor::install_doc(void* doc) {
+bool HttpEditor::undo_swap() {
+  if (!prev_doc_ || body_->CanUndo() || pending_body_) return false;
+  void* cur = body_->GetDocPointer();
+  body_->AddRefDocument(cur);
+  void* back = prev_doc_;
+  prev_doc_ = nullptr;
+  drop_redo_doc();
+  redo_doc_ = cur;  // kept with its undo / redo history for Ctrl+Y
+  redo_minify_ = minify_->value();
+  redo_raw_ = raw_body_ && raw_edits_ == body_edits_ ? raw_body_ : nullptr;
+  install_doc(back, false);
+  body_->ReleaseDocument(back);  // the control holds it now
+  minify_->set_value(prev_minify_);
+  raw_body_.reset();
+  ++body_edits_;
+  note("Undid the paste / format (Ctrl+Y redoes it)");
+  touched();
+  return true;
+}
+
+bool HttpEditor::redo_swap() {
+  if (!redo_doc_ || body_->CanRedo() || pending_body_) return false;
+  void* cur = body_->GetDocPointer();
+  body_->AddRefDocument(cur);
+  if (prev_doc_) release_doc_async(prev_doc_);
+  prev_doc_ = cur;
+  prev_minify_ = minify_->value();
+  void* fwd = redo_doc_;
+  redo_doc_ = nullptr;
+  install_doc(fwd, false);
+  body_->ReleaseDocument(fwd);
+  minify_->set_value(redo_minify_);
+  ++body_edits_;
+  raw_body_ = std::move(redo_raw_);
+  raw_edits_ = body_edits_;
+  note("Redid the paste / format");
+  touched();
+  return true;
+}
+
+void HttpEditor::drop_redo_doc() {
+  if (!redo_doc_) return;
+  release_doc_async(redo_doc_);
+  redo_doc_ = nullptr;
+  redo_raw_.reset();
+}
+
+void HttpEditor::install_doc(void* doc, bool fresh) {
   const bool was = loading_;
   loading_ = true;
   body_->SetReadOnly(false);
   body_->SetDocPointer(doc);
+  body_->SetScrollWidth(1);
+  if (fresh) {
+    // A loader-built document has undo collection off: typing into it would leave nothing to
+    // undo, and Ctrl+Z would throw the edits away with the paste.
+    body_->SetUndoCollection(true);
+    body_->EmptyUndoBuffer();
+    body_->SetSavePoint();
+  }
   // Document-level settings travel with the document: set them on the new one.
   body_->SetCodePage(wxSTC_CP_UTF8);
   body_->SetEOLMode(wxSTC_EOL_LF);
@@ -2845,16 +4569,14 @@ void HttpEditor::show_curl_menu() {
     copy_as_curl(sel == 1 ? CurlShell::Bash : sel == 2 ? CurlShell::Cmd : CurlShell::PowerShell);
   } else if (sel >= 21 && sel < 21 + kCodeLangCount) {
     const auto lang = static_cast<CodeLang>(sel - 21);
-    SavedRequest r = base_;
-    store(r);
-    r.http.url = with_path(r.http.url);
-    const Workspace* ws = host_->workspace();
-    if (resolve_vars_in_curl_ && ws) r = ws->expanded(r);
+    std::string warning;
+    const SavedRequest r = export_request(&warning);
     const std::string code = to_code(r, lang);
     if (wxTheClipboard->Open()) {
       wxTheClipboard->SetData(new wxTextDataObject(wxString::FromUTF8(code)));
       wxTheClipboard->Close();
-      note(wxString::Format("Copied %s, %zu chars", code_lang_name(lang), code.size()));
+      if (!warning.empty()) note(wxString::FromUTF8(std::string("Copied ") + code_lang_name(lang) + ", but: " + warning), true);
+      else note(wxString::Format("Copied %s, %zu chars", code_lang_name(lang), code.size()));
     } else {
       note("Could not open the clipboard", true);
     }
@@ -2862,13 +4584,11 @@ void HttpEditor::show_curl_menu() {
 }
 
 void HttpEditor::copy_as_curl(CurlShell shell) {
-  SavedRequest r = base_;
-  store(r);
-  r.http.url = with_path(r.http.url);
-  const Workspace* ws = host_->workspace();
-  if (resolve_vars_in_curl_ && ws) r = ws->expanded(r);
+  std::string warning;
+  const SavedRequest r = export_request(&warning);
   const std::string cmd = to_curl_command(r, shell);
-  const std::string problem = curl_export_problem(r.http, r.form, shell);
+  std::string problem = curl_export_problem(r.http, r.form, shell);
+  if (problem.empty()) problem = warning;
   if (wxTheClipboard->Open()) {
     wxTheClipboard->SetData(new wxTextDataObject(wxString::FromUTF8(cmd)));
     wxTheClipboard->Close();
@@ -2885,12 +4605,13 @@ void HttpEditor::note(const wxString& text, bool warn) {
   note_->SetForegroundColour(warn ? t.var_bad : t.dim);
   wxString shown = text;
   if (shown.length() > 400) shown = shown.Left(397) + "...";
+  const bool was_shown = note_->IsShown();
+  const int old_h = note_->GetSize().y;
   note_->SetLabel(shown);
+  if (!shown.empty()) note_->Wrap(std::max(FromDIP(200), GetClientSize().x - FromDIP(24)));
   note_->SetToolTip(text);
-  if (note_->IsShown() != !text.empty()) {
-    note_->Show(!text.empty());
-    Layout();
-  }
+  if (was_shown != !text.empty()) note_->Show(!text.empty());
+  if (was_shown != !text.empty() || (!text.empty() && note_->GetBestSize().y != old_h)) Layout();
   note_timer_.Stop();
   if (!text.empty()) note_timer_.StartOnce(warn ? 12000 : 3500);
 }
@@ -2898,10 +4619,15 @@ void HttpEditor::note(const wxString& text, bool warn) {
 // ------------------------------------------------------------------ {{vars}}
 
 std::optional<std::string> HttpEditor::resolve(const std::string& name) const {
+  if (pre_names_.count(name)) {  // set by a pre-request row right before the send
+    const auto it = pre_preview_.find(name);
+    if (it != pre_preview_.end() && it->second.ok) return it->second.text;
+    return std::string("(computed before each send)");
+  }
   const Workspace* ws = host_->workspace();
   if (!ws) return std::nullopt;
   const std::string ph = "{{" + name + "}}";
-  std::string v = ws->expand(ph);
+  std::string v = expand_span(*ws, ph);
   if (v == ph) return std::nullopt;
   return v;
 }
@@ -2944,8 +4670,37 @@ void HttpEditor::var_completion(wxStyledTextCtrl* s) {
     }
   }
   if (!host_->workspace()) return;
+  show_var_list(s, {});
+}
+
+void HttpEditor::var_narrow(wxStyledTextCtrl* s) {
+  const int pos = s->GetCurrentPos();
+  auto var_char = [](int c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+                                     c == '_' || c == '$' || c == '.' || c == '-'; };
+  int a = pos;
+  while (a > 0 && pos - a < 64 && var_char(s->GetCharAt(a - 1))) --a;
+  if (a < 2 || a == pos || s->GetCharAt(a - 1) != '{' || s->GetCharAt(a - 2) != '{' ||
+      (a >= 3 && s->GetCharAt(a - 3) == '{')) {
+    if (s->AutoCompActive()) s->AutoCompCancel();
+    return;
+  }
+  if (!host_->workspace()) return;
+  show_var_list(s, s->GetTextRange(a, pos).utf8_string());
+}
+
+void HttpEditor::show_var_list(wxStyledTextCtrl* s, const std::string& typed) {
+  auto lower = [](std::string v) {
+    for (char& c : v) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return v;
+  };
+  const std::string want = lower(typed);
   std::string list;
-  for (const auto& n : var_names()) list += (list.empty() ? "" : " ") + n;
+  for (const auto& n : var_names())
+    if (want.empty() || lower(n).compare(0, want.size(), want) == 0) list += (list.empty() ? "" : " ") + n;
+  if (list.empty()) {
+    if (s->AutoCompActive()) s->AutoCompCancel();
+    return;
+  }
   s->AutoCompSetIgnoreCase(true);
   // Scintilla finds the typed prefix by binary search: the "$..." entries come after the names,
   // so the list is unsorted and without this {{ba matched nothing and the list closed.
@@ -2954,7 +4709,7 @@ void HttpEditor::var_completion(wxStyledTextCtrl* s) {
   s->AutoCompSetDropRestOfWord(false);
   s->AutoCompSetMaxHeight(10);
   s->AutoCompSetSeparator(' ');
-  s->AutoCompShow(0, wxString::FromUTF8(list));
+  s->AutoCompShow(static_cast<int>(typed.size()), wxString::FromUTF8(list));
 }
 
 void HttpEditor::highlight_vars(wxStyledTextCtrl* s, int start, int end) {
@@ -3037,8 +4792,25 @@ void HttpEditor::do_send() {
     host_->cancel();
     return;
   }
+  if (pre_busy_ || minify_busy_) return;  // the send is on its way
+  // A curl command typed (not pasted) into the URL bar: import it first, then send what it
+  // describes (a paste imports at once, see url_inserted).
+  if (const std::string typed = url_text(); looks_like_curl(typed)) {
+    import_curl(std::string(trim(typed)));
+    if (looks_like_curl(url_text())) return;  // not imported: the banner says why, nothing sent
+  }
+  // A script that cannot parse fails in the sandbox anyway: say where now (the send goes on, and
+  // its Log tab has the engine's own message).
+  if (const wxString lint = script_lint_summary(); !lint.empty()) note(lint, true);
   url_->CallTipCancel();
   body_->CallTipCancel();
+  // An edited big JSON body shown formatted is sent minified: minify it on a worker first (the
+  // send follows when it is done), never 10 MB here.
+  if (body_mode_ == BodyMode::Json && minify_ && minify_->value() && !pending_body_ &&
+      body_->GetLength() >= 512 * 1024 && !(raw_body_ && raw_edits_ == body_edits_) && !minified_current()) {
+    minify_then_send();
+    return;
+  }
   // The URL bar keeps what the user typed: store() and the "Sent as" line encode it.
   const Workspace* ws = host_->workspace();
   if (ws) {
@@ -3050,6 +4822,14 @@ void HttpEditor::do_send() {
     std::string head = url_text();
     for (const auto& row : header_rows()) head += row.key + row.value;
     head += av_.bearer + av_.user + av_.pass + av_.key_value;
+    if (scheme_mode(auth_mode_)) {
+      const HttpAuth& a = av_.adv;
+      const OAuth2Config& o = a.oauth2;
+      head += a.user + a.password + a.aws_access_key + a.aws_secret_key + a.aws_session_token + o.token_url +
+              o.auth_url + o.client_id + o.client_secret + o.scope + o.audience + o.username + o.password;
+    }
+    const std::vector<PreVar> pre_rows = to_pre_vars(pre_now());
+    for (const auto& pv : pre_rows) head += pv.expr;
     bool env = head.find("env.") != std::string::npos;
     // A body over 4 MB is not scanned here (it would cost milliseconds per send): if it reads an
     // environment variable that is not allowed, http_to_send() refuses it and names the variable.
@@ -3064,6 +4844,10 @@ void HttpEditor::do_send() {
       std::vector<std::string> blocked_env;
       if (files) blocked = ws->blocked_files(r);
       if (env) blocked_env = ws->blocked_env_vars(r);
+      // A pre-request expression reading an OS environment variable: the same consent.
+      if (env)
+        for (auto& v : pre_env_refs(pre_rows, *ws))
+          if (std::find(blocked_env.begin(), blocked_env.end(), v) == blocked_env.end()) blocked_env.push_back(std::move(v));
       if (!blocked.empty() || !blocked_env.empty()) {
         show_upload_prompt(blocked, blocked_env);
         return;
@@ -3116,6 +4900,9 @@ void HttpEditor::do_send() {
       }
       text += in_url ? "Define it in the environment, or remove it from the URL."
                      : "Define it in the environment, or send it as written.";
+      // The usual case after a restart: a token a login request captured into a runtime variable.
+      text += " Runtime variables (captures, scripts) last until watt closes: send the request that sets it "
+              "first.";
       const Theme& t = Theme::get();
       show_info(wxString::FromUTF8(title), wxString::FromUTF8(text), in_url ? wxString() : wxString("Send as written"),
                 [this] {
@@ -3129,12 +4916,43 @@ void HttpEditor::do_send() {
       return;
     }
   }
+  // A {{var}} with a brace missing goes out literally: say where, before anything is sent.
+  if (!force_send_) {
+    if (const auto bad = brace_problems(); !bad.empty()) {
+      std::string title = "Not sent: " + bad.front().first + " has a broken {{variable}}";
+      std::string text = bad.front().second;
+      if (bad.size() > 1) text += " (and " + std::to_string(bad.size() - 1) + " more)";
+      text += ". Fix the braces, or send it as written.";
+      const Theme& t = Theme::get();
+      show_info(wxString::FromUTF8(title), wxString::FromUTF8(text), "Send as written", [this] {
+        force_send_ = true;
+        do_send();
+        force_send_ = false;
+      });
+      banner_->set_colours(t.warn_bg, t.warn_border);
+      banner_->Refresh();
+      banner_missing_.clear();
+      for (const auto& b : bad) banner_missing_.push_back("{}" + b.first);
+      return;
+    }
+  }
+  // Pre-request variables: computed on a worker, stored, then this runs again to send.
+  if (!pre_ready_ && ws) {
+    auto rows = to_pre_vars(pre_now());
+    if (std::any_of(rows.begin(), rows.end(), [](const PreVar& v) { return v.enabled && !trim(v.var).empty(); })) {
+      run_pre_then_send(std::move(rows));
+      return;
+    }
+  }
   hide_banner();
   if (body_mode_ == BodyMode::Json && lint_issue_)
     note(wxString::FromUTF8("Sent, but the JSON body is invalid: " + lint_issue_->message), true);
   sending_ = true;
   host_->send();
   sending_ = false;
+  // The shell asked to trust the scripts (if it had to) inside send(): read back the answer
+  // off the UI thread, and say so here when they were not run.
+  if (has_scripts()) refresh_trust(true);
 }
 
 void HttpEditor::show_upload_prompt(const std::vector<std::filesystem::path>& files,
@@ -3241,6 +5059,1074 @@ void HttpEditor::hide_banner() {
 }
 
 }  // namespace
+
+// ------------------------------------------------------------------ tests (assert / capture)
+
+wxWindow* HttpEditor::build_tests_page() {
+  const Theme& t = Theme::get();
+  auto* p = new wxPanel(tests_holder_);
+  p->SetBackgroundColour(t.bg);
+  auto* outer = new wxBoxSizer(wxVERTICAL);
+  tests_notes_.clear();
+  tests_wrap_ = -1;
+  tests_page_ = p;
+  // Pre-request | Post-response (Postman's Scripts tab, Bruno's Vars / Script / Assert).
+  script_tabs_ = new TabStrip(p);
+  script_tabs_->set_tabs({"Pre-request", "Post-response"});
+  script_tabs_->Hide();  // the editor's Scripts / Tests tabs pick the side
+  outer->Add(script_tabs_, 0, wxEXPAND | wxTOP, FromDIP(2));
+  script_book_ = new wxSimplebook(p);
+  script_book_->SetBackgroundColour(t.bg);
+  outer->Add(script_book_, 1, wxEXPAND | wxTOP, FromDIP(6));
+  // Each side is built when first shown, the other one a UI turn later: three tables and two
+  // script editors at once cost ~50 ms.
+  for (wxPanel** pg : {&pre_pg_, &post_pg_}) {
+    *pg = new wxPanel(script_book_);
+    (*pg)->SetBackgroundColour(t.bg);
+  }
+  script_book_->AddPage(pre_pg_, "pre");
+  script_book_->AddPage(post_pg_, "post");
+  p->SetSizer(outer);
+  script_tabs_->on_select = [this](size_t i) {
+    if (i == 0) build_pre_side();
+    else build_post_side();
+    script_book_->ChangeSelection(i);
+    if (i == 0) preview_pre();
+    layout_tests_page();
+  };
+  p->Bind(wxEVT_SIZE, [this](wxSizeEvent& e) {
+    e.Skip();
+    CallAfter([this] { layout_tests_page(); });
+  });
+  // Open on the side that has something (pre-request when both or neither).
+  const bool has_pre = !pre_vals_.empty() || !base_.pre_script.empty();
+  const bool has_post = !assert_vals_.empty() || !capture_vals_.empty() || !base_.post_script.empty();
+  // The side its tab asked for (Scripts / Tests), else the one with something in it; the other
+  // side is built a UI turn later.
+  const size_t side = want_side_ <= 1 ? want_side_ : has_post && !has_pre ? 1 : 0;
+  want_side_ = 2;
+  if (side == 0) build_pre_side();
+  else build_post_side();
+  script_tabs_->select(side);
+  script_book_->ChangeSelection(side);
+  CallAfter([this] {
+    build_pre_side();
+    build_post_side();
+  });
+  update_script_badges();
+  update_pre_names();
+  update_tests_hint();
+  layout_tests_page();
+  refresh_trust();
+  return p;
+}
+
+void HttpEditor::show_script_side(size_t side) {
+  want_side_ = side;
+  ensure_page(kTabTests);
+  want_side_ = 2;
+  book_->ChangeSelection(kTabTests);
+  tabs_->select(side == 1 ? kStripTests : kStripScripts);
+  if (script_tabs_ && script_tabs_->selection() != side) {
+    if (side == 0) build_pre_side();
+    else build_post_side();
+    script_tabs_->select(side);
+    script_book_->ChangeSelection(side);
+    layout_tests_page();
+  }
+  if (side == 0) preview_pre();
+}
+
+void HttpEditor::add_tests_note(wxWindow* parent, wxSizer* s, const wxString& text, int top) {
+  auto* n = new wxStaticText(parent, wxID_ANY, text);
+  n->SetForegroundColour(Theme::get().dim);
+  tests_notes_.emplace_back(n, text);
+  if (tests_wrap_ > 0) n->Wrap(tests_wrap_ - FromDIP(4));
+  s->Add(n, 0, wxEXPAND | wxTOP, FromDIP(top));
+}
+
+// Under each script: what it can do, when it runs, where its output shows, and the trust state.
+void HttpEditor::add_trust_row(wxWindow* parent, wxSizer* s, int side) {
+  const Theme& t = Theme::get();
+  auto* row = new wxBoxSizer(wxHORIZONTAL);
+  trust_text_[side] = new wxStaticText(parent, wxID_ANY, wxString::FromUTF8("Checking whether this workspace's scripts are trusted\xE2\x80\xA6"));
+  trust_text_[side]->SetForegroundColour(t.dim);
+  trust_btn_[side] = new FlatButton(parent, "Stop trusting", FlatButton::Style::Subtle);
+  trust_btn_[side]->SetMinSize(trust_btn_[side]->GetBestSize());
+  trust_btn_[side]->Hide();
+  trust_btn_[side]->on_click = [this] { set_trust(trust_state_ != 1); };
+  row->Add(trust_text_[side], 1, wxALIGN_CENTER_VERTICAL);
+  row->Add(trust_btn_[side], 0, wxALIGN_CENTER_VERTICAL | wxLEFT, FromDIP(8));
+  s->Add(row, 0, wxEXPAND | wxTOP, FromDIP(4));
+  if (trust_state_ >= 0) show_trust();
+}
+
+void HttpEditor::setup_tests_grid(KvGrid* g) {
+  g->lookup = [this](const std::string& n) { return resolve(n); };
+  g->var_names = [this] { return var_names(); };
+  g->on_change = [this, g] {
+    if (g == pre_) {
+      update_pre_names();
+      pre_timer_.StartOnce(250);
+    }
+    update_tests_hint();
+    layout_tests_page();
+    if (!loading_) touched();
+  };
+}
+
+void HttpEditor::build_pre_side() {
+  if (pre_ || !pre_pg_) return;
+  wxWindowUpdateLocker lock(pre_pg_);
+  auto* ps = new wxBoxSizer(wxVERTICAL);
+  // Pre-request: variables computed before the request is built, then the script.
+  auto* pp = new KvPanel(pre_pg_, KvGrid::Kind::PreVar, "Variables, computed before each send: use them as {{name}}");
+  pre_ = pp->grid();
+  pre_panel_ = pp;
+  ps->Add(pp, 0, wxEXPAND);
+  add_tests_note(pre_pg_, ps,
+                 wxString::FromUTF8(
+                     "Functions: hmacSha256(key, text[, \"base64\"]) hmacSha1 hmacSha512 sha256 sha1 sha512 md5 "
+                     "base64 base64url base64Decode hex urlencode urldecode lower upper trim replace substr length "
+                     "now() unix([+s]) iso([+s]) uuid() randomInt(lo, hi) randomHex(n) jsonPath({{json}}, \"$.a.b\").  "
+                     "Inputs: 'text', {{var}}, req.method req.url req.body req.headers.<name>, joined with +.  "
+                     "Example: hmacSha256({{secret}}, req.method + req.url + {{ts}})"),
+                 4);
+  ps->Add(make_script_label(pre_pg_, &pre_js_, false), 0, wxEXPAND | wxTOP | wxBOTTOM, FromDIP(4));
+  pre_js_ = make_script_editor(pre_pg_, "// pm. bru. req. complete as you type (Ctrl+Space); Snippets has examples");
+  setup_script_help(pre_js_, false);
+  attach_find(pre_js_);
+  ps->Add(pre_js_, 1, wxEXPAND);
+  add_tests_note(pre_pg_, ps,
+                 "Runs on Send, on a worker thread, after the variables above and before the request is built: "
+                 "pm.request / req can change the method, URL, headers and body. QuickJS sandbox (pm.* and bru.* APIs, "
+                 "crypto, CryptoJS, sendRequest): 1 s CPU, no files, no OS access. console output and errors go to the "
+                 "response's Log tab.",
+                 4);
+  add_trust_row(pre_pg_, ps, 0);
+  pre_pg_->SetSizer(ps);
+  setup_tests_grid(pre_);
+  pre_->check = [g = pre_](int col, const std::string& text) -> std::string {
+    if (trim(text).empty()) return {};
+    if (col == g->col_key()) return check_var_name(text);
+    if (col == g->col_value()) return check_pre_expr(text);
+    return {};
+  };
+  pre_->preview = [this](const std::string& var) -> std::optional<KvGrid::Preview> {
+    const auto it = pre_preview_.find(var);
+    if (it == pre_preview_.end()) return std::nullopt;
+    return it->second;
+  };
+  const bool was = loading_;
+  loading_ = true;
+  std::vector<KvRow> pr;
+  for (const auto& x : pre_vals_) pr.push_back({x.var, x.expr, x.enabled, false, false, {}, x.scope.empty() ? "runtime" : x.scope});
+  pre_->set_rows(pr);
+  pre_js_->SetText(wxString::FromUTF8(base_.pre_script));
+  pre_js_->EmptyUndoBuffer();
+  loading_ = was;
+  update_script_badges();
+  update_pre_names();
+  update_tests_hint();
+  pre_pg_->Layout();
+  layout_tests_page();
+}
+
+void HttpEditor::build_post_side() {
+  if (asserts_ || !post_pg_) return;
+  const Theme& t = Theme::get();
+  wxWindowUpdateLocker lock(post_pg_);
+  auto* qs = new wxBoxSizer(wxVERTICAL);
+  // Post-response: assertions, captures, then the script.
+  add_tests_note(post_pg_, qs,
+                 "Assertions are checked on every response (results in the response's Tests tab). Targets: res.status, "
+                 "res.body.items[0].id, res.headers.content-type, res.responseTime, res.timing.ttfb, res.size",
+                 0);
+  auto* ap = new KvPanel(post_pg_, KvGrid::Kind::Assert, "Assertions");
+  asserts_ = ap->grid();
+  assert_panel_ = ap;
+  auto* cp = new KvPanel(post_pg_, KvGrid::Kind::Capture, "Captures: copy a response value into a {{variable}} for later requests");
+  captures_ = cp->grid();
+  capture_panel_ = cp;
+  setup_tests_grid(asserts_);
+  setup_tests_grid(captures_);
+  asserts_->check = [g = asserts_](int col, const std::string& text) -> std::string {
+    if (col != g->col_key() || trim(text).empty()) return {};
+    return check_target(std::string(trim(text)));
+  };
+  captures_->check = [g = captures_](int col, const std::string& text) -> std::string {
+    if (trim(text).empty()) return {};
+    if (col == g->col_key()) return check_var_name(text);
+    if (col == g->col_value()) return check_target(std::string(trim(text)));
+    return {};
+  };
+  qs->Add(ap, 0, wxEXPAND | wxTOP, FromDIP(4));
+  tests_hint_ = new wxStaticText(post_pg_, wxID_ANY, "");
+  tests_hint_->SetForegroundColour(t.var_bad);
+  tests_hint_->Hide();
+  qs->Add(tests_hint_, 0, wxEXPAND | wxTOP, FromDIP(4));
+  qs->Add(cp, 0, wxEXPAND | wxTOP, FromDIP(10));
+  add_tests_note(post_pg_, qs,
+                 "Scope: runtime = this session only; environment / globals = saved there (a secret variable is never "
+                 "overwritten). Use the value as {{name}}.",
+                 4);
+  qs->Add(make_script_label(post_pg_, &post_js_, true), 0, wxEXPAND | wxTOP | wxBOTTOM, FromDIP(4));
+  post_js_ = make_script_editor(post_pg_, "// pm.test('ok', () => pm.response.to.have.status(200)); Snippets has more");
+  setup_script_help(post_js_, true);
+  attach_find(post_js_);
+  qs->Add(post_js_, 1, wxEXPAND);
+  add_tests_note(post_pg_, qs,
+                 "Runs on a worker thread once the response arrived: pm.test / test() results appear next to the "
+                 "assertions in the response's Tests tab, console output and errors in its Log tab, "
+                 "pm.environment.set / bru.setVar values are kept like captures. Same sandbox as the pre-request script.",
+                 4);
+  add_trust_row(post_pg_, qs, 1);
+  post_pg_->SetSizer(qs);
+  const bool was = loading_;
+  loading_ = true;
+  std::vector<KvRow> ar, cr;
+  for (const auto& a : assert_vals_) ar.push_back({a.target, a.value, a.enabled, false, false, {}, a.op.empty() ? "eq" : a.op});
+  for (const auto& c : capture_vals_) cr.push_back({c.var, c.target, c.enabled, false, false, {}, capture_scope_name(c.scope)});
+  asserts_->set_rows(ar);
+  captures_->set_rows(cr);
+  post_js_->SetText(wxString::FromUTF8(base_.post_script));
+  post_js_->EmptyUndoBuffer();
+  loading_ = was;
+  update_script_badges();
+  update_tests_hint();
+  post_pg_->Layout();
+  layout_tests_page();
+}
+
+bool HttpEditor::has_scripts() const {
+  const bool pre = pre_js_ ? pre_js_->GetLength() > 0 : !base_.pre_script.empty();
+  const bool post = post_js_ ? post_js_->GetLength() > 0 : !base_.post_script.empty();
+  return pre || post;
+}
+
+void HttpEditor::refresh_trust(bool after_send) {
+  const Workspace* ws = host_->workspace();
+  if (!ws) return;
+  auto wsc = std::make_shared<Workspace>(*ws);
+  const uint64_t gen = ++trust_gen_;
+  std::thread([alive = alive_, wsc, gen, after_send] {
+    const bool trusted = wsc->scripts_trusted();  // a small file read: never on the UI thread
+    std::lock_guard lk(alive->m);
+    if (!alive->target) return;
+    auto* ed = static_cast<HttpEditor*>(alive->target);
+    ed->CallAfter([ed, gen, trusted, after_send] {
+      if (gen != ed->trust_gen_) return;
+      ed->trust_state_ = trusted ? 1 : 0;
+      ed->show_trust();
+      if (after_send && !trusted && ed->has_scripts())
+        ed->note("Scripts not run: this workspace's scripts are not trusted (Scripts tab: Trust scripts)", true);
+    });
+  }).detach();
+}
+
+void HttpEditor::show_trust() {
+  const Theme& t = Theme::get();
+  for (int i = 0; i < 2; ++i) {
+    if (!trust_text_[i]) continue;
+    wxString txt;
+    if (trust_state_ == 1) {
+      txt = "This workspace's scripts are trusted: they run on every send.";
+    } else if (trust_state_ == 0) {
+      txt = wxString::FromUTF8("Not run yet: this workspace's scripts are not trusted. The first send of a request with a "
+                               "script asks; a request sent without trust says \xE2\x80\x9Cscript not run\xE2\x80\x9D.");
+    } else {
+      continue;
+    }
+    trust_text_[i]->SetForegroundColour(trust_state_ == 1 ? t.dim : t.var_bad);
+    if (trust_text_[i]->GetLabel() != txt) trust_text_[i]->SetLabel(txt);
+    const int w = tests_wrap_ > 0 ? tests_wrap_ - trust_btn_[i]->GetBestSize().x - FromDIP(16) : FromDIP(600);
+    trust_text_[i]->Wrap(std::max(w, FromDIP(200)));
+    trust_btn_[i]->SetLabel(trust_state_ == 1 ? "Stop trusting" : "Trust scripts");
+    trust_btn_[i]->SetToolTip(trust_state_ == 1 ? "Stop running this workspace's scripts (kept in your user settings, outside the workspace)"
+                                                : "Run this workspace's request scripts from now on (asks first)");
+    trust_btn_[i]->Show();
+    trust_text_[i]->GetParent()->Layout();
+  }
+}
+
+void HttpEditor::set_trust(bool trusted) {
+  const Workspace* ws = host_->workspace();
+  if (!ws) return;
+  if (trusted) {
+    // The same question the first send asks (request_tab.cpp): scripts are code from whoever
+    // wrote the workspace.
+    const auto ans = wxMessageBox(
+        wxString::Format("Run the request scripts of this workspace?\n\n%s\n\nScripts run in a sandbox (no file or "
+                         "process access; network only through watt's own checks), but they can read and change "
+                         "your requests and variables.",
+                         ws->root().wstring()),
+        "watt", wxYES_NO | wxNO_DEFAULT | wxICON_QUESTION, this);
+    if (ans != wxYES) return;
+  }
+  auto wsc = std::make_shared<Workspace>(*ws);
+  std::thread([alive = alive_, wsc, trusted] {
+    std::string err;
+    const bool ok = wsc->trust_scripts(trusted, &err);
+    std::lock_guard lk(alive->m);
+    if (!alive->target) return;
+    auto* ed = static_cast<HttpEditor*>(alive->target);
+    ed->CallAfter([ed, ok, err] {
+      if (!ok) ed->note(wxString::FromUTF8("Could not save the script trust decision: " + err), true);
+      ed->refresh_trust();
+    });
+  }).detach();
+}
+
+// A JavaScript editor (pre-request / post-response script): Scintilla's C++ lexer with JS
+// keywords, themed like the body; edits mark the tab dirty.
+wxStyledTextCtrl* HttpEditor::make_script_editor(wxWindow* parent, const char* placeholder) {
+  const Theme& t = Theme::get();
+  auto* s = new wxStyledTextCtrl(parent, wxID_ANY, wxDefaultPosition, wxSize(-1, FromDIP(120)), wxBORDER_NONE);
+  s->SetLexer(wxSTC_LEX_CPP);
+  s->SetKeyWords(0, "async await break case catch class const continue default delete do else export extends "
+                    "finally for function if in instanceof let new of return switch this throw try typeof var void "
+                    "while yield true false null undefined");
+  s->SetKeyWords(1, "pm bru req res console crypto CryptoJS expect test require JSON Math Date Object Array String "
+                    "Number Boolean Promise setTimeout atob btoa");
+  const wxFont f = mono_font(10);
+  s->StyleSetFont(wxSTC_STYLE_DEFAULT, f);
+  s->StyleSetBackground(wxSTC_STYLE_DEFAULT, t.field);
+  s->StyleSetForeground(wxSTC_STYLE_DEFAULT, t.fg);
+  s->StyleClearAll();
+  s->StyleSetForeground(wxSTC_C_COMMENT, t.dim);
+  s->StyleSetForeground(wxSTC_C_COMMENTLINE, t.dim);
+  s->StyleSetForeground(wxSTC_C_COMMENTDOC, t.dim);
+  s->StyleSetForeground(wxSTC_C_NUMBER, t.js_number);
+  s->StyleSetForeground(wxSTC_C_STRING, t.js_string);
+  s->StyleSetForeground(wxSTC_C_CHARACTER, t.js_string);
+  s->StyleSetForeground(wxSTC_C_STRINGEOL, t.js_error);
+  s->StyleSetForeground(wxSTC_C_WORD, t.js_keyword);
+  s->StyleSetForeground(wxSTC_C_WORD2, t.js_key);
+  s->StyleSetForeground(wxSTC_C_OPERATOR, t.js_punct);
+  s->StyleSetForeground(wxSTC_C_REGEX, t.js_string);
+  s->StyleSetForeground(wxSTC_STYLE_LINENUMBER, t.dim);
+  s->StyleSetBackground(wxSTC_STYLE_LINENUMBER, t.field);
+  s->SetMarginType(0, wxSTC_MARGIN_NUMBER);
+  s->SetMarginWidth(0, s->TextWidth(wxSTC_STYLE_LINENUMBER, "_999"));
+  for (int m = 1; m < 5; ++m) s->SetMarginWidth(m, 0);
+  s->SetMarginLeft(FromDIP(4));
+  s->SetCaretForeground(t.fg);
+  s->SetSelBackground(true, t.dark ? wxColour(0x26, 0x4F, 0x78) : wxColour(0xAD, 0xD6, 0xFF));
+  s->SetTabWidth(2);
+  s->SetUseTabs(false);
+  s->SetIndent(2);
+  s->SetTabIndents(true);
+  s->SetBackSpaceUnIndents(true);
+  s->SetWrapMode(wxSTC_WRAP_WORD);  // no horizontal scroll bar on a short script editor
+  s->SetUseHorizontalScrollBar(false);
+  s->SetModEventMask(wxSTC_MOD_INSERTTEXT | wxSTC_MOD_DELETETEXT);
+  const wxString ph = wxString::FromUTF8(placeholder);
+  auto show_placeholder = [s, ph] {
+    s->EOLAnnotationClearAll();
+    if (s->GetLength() == 0) {
+      s->EOLAnnotationSetText(0, ph);
+      s->EOLAnnotationSetStyle(0, kStylePlaceholder);
+    }
+  };
+  s->StyleSetForeground(kStylePlaceholder, t.dim);
+  s->StyleSetBackground(kStylePlaceholder, t.field);
+  s->StyleSetItalic(kStylePlaceholder, true);
+  s->EOLAnnotationSetVisible(wxSTC_EOLANNOTATION_STANDARD);
+  show_placeholder();
+  s->Bind(wxEVT_STC_CHANGE, [this, show_placeholder](wxStyledTextEvent& e) {
+    e.Skip();
+    show_placeholder();
+    if (loading_) return;
+    update_script_badges();
+    touched();
+  });
+  // Enter keeps the indentation of the line (Ctrl+Enter still sends).
+  s->Bind(wxEVT_STC_CHARADDED, [s](wxStyledTextEvent& e) {
+    e.Skip();
+    if (e.GetKey() != '\n') return;
+    const int line = s->GetCurrentLine();
+    if (line <= 0) return;
+    const int ind = s->GetLineIndentation(line - 1);
+    if (ind <= 0) return;
+    s->SetLineIndentation(line, ind);
+    s->GotoPos(s->GetLineIndentPosition(line));
+  });
+  return s;
+}
+
+// "Script" with a Snippets button on the right (Postman's snippet list). `editor` is read when
+// the button is used (the editor is created after this row).
+wxWindow* HttpEditor::make_script_label(wxWindow* parent, wxStyledTextCtrl** editor, bool post) {
+  const Theme& t = Theme::get();
+  auto* row = new wxPanel(parent);
+  auto* h = new wxBoxSizer(wxHORIZONTAL);
+  auto* l = new wxStaticText(row, wxID_ANY, "Script");
+  l->SetForegroundColour(t.dim);
+  h->Add(l, 0, wxALIGN_CENTER_VERTICAL);
+  h->AddStretchSpacer();
+  auto* b = new FlatButton(row, "Snippets", FlatButton::Style::Subtle, true);
+  b->SetToolTip(post ? "Insert a ready-made test or capture below the cursor's line"
+                     : "Insert a ready-made pre-request step below the cursor's line");
+  h->Add(b, 0, wxALIGN_CENTER_VERTICAL);
+  row->SetSizer(h);
+  b->on_click = [b, editor, post] {
+    wxStyledTextCtrl* s = *editor;
+    if (!s) return;
+    const auto& list = js_snippets(post);
+    wxMenu menu;
+    for (size_t i = 0; i < list.size(); ++i) menu.Append(static_cast<int>(i) + 1, wxString::FromUTF8(list[i].title));
+    const int sel = b->GetPopupMenuSelectionFromUser(menu, wxPoint(0, b->GetSize().y));
+    if (sel < 1 || sel > static_cast<int>(list.size())) return;
+    // After the caret's line when it has text, so a snippet never splits a statement.
+    int pos = s->GetCurrentPos();
+    const int line = s->LineFromPosition(pos);
+    std::string code = list[static_cast<size_t>(sel - 1)].code;
+    if (s->GetLineEndPosition(line) > s->PositionFromLine(line)) {
+      pos = s->GetLineEndPosition(line);
+      code = "\n" + code;
+      code.pop_back();  // the line's own newline follows
+    }
+    s->InsertText(pos, wxString::FromUTF8(code));
+    s->GotoPos(pos + static_cast<int>(code.size()));
+    s->SetFocus();
+  };
+  return row;
+}
+
+void HttpEditor::setup_script_help(wxStyledTextCtrl* s, bool post) {
+  const Theme& t = Theme::get();
+  s->IndicatorSetStyle(kIndJsLint, wxSTC_INDIC_SQUIGGLE);
+  s->IndicatorSetForeground(kIndJsLint, t.js_error);
+  s->StyleSetForeground(kStyleJsLint, t.js_error);
+  s->StyleSetBackground(kStyleJsLint, t.field);
+  s->StyleSetFont(kStyleJsLint, GetFont());
+  s->AnnotationSetVisible(wxSTC_ANNOTATION_STANDARD);
+  s->AutoCompSetIgnoreCase(false);
+  s->AutoCompSetAutoHide(true);
+  s->AutoCompSetDropRestOfWord(false);
+  s->AutoCompSetMaxHeight(10);
+  s->AutoCompSetSeparator(' ');
+  s->AutoCompSetOrder(wxSTC_ORDER_PERFORMSORT);
+  s->Bind(wxEVT_STC_CHARADDED, [this, s, post](wxStyledTextEvent& e) {
+    e.Skip();
+    const int k = e.GetKey();
+    if (k == '.') {
+      script_completion(s, post, false);
+    } else if (!s->AutoCompActive() && ((k >= 'a' && k <= 'z') || (k >= 'A' && k <= 'Z'))) {
+      // A top-level name after two letters typed (pm, bru, req, res, console, ...).
+      const int pos = s->GetCurrentPos();
+      const int start = s->WordStartPosition(pos, true);
+      if (pos - start == 2 && (start == 0 || s->GetCharAt(start - 1) != '.')) script_completion(s, post, false);
+    }
+  });
+  s->Bind(wxEVT_KEY_DOWN, [this, s, post](wxKeyEvent& e) {
+    if (e.GetKeyCode() == WXK_SPACE && e.GetModifiers() == wxMOD_CONTROL) {
+      script_completion(s, post, true);
+      return;
+    }
+    e.Skip();
+  });
+  // The lint runs 400 ms after the last edit (a script is small: microseconds).
+  auto* timer = new wxTimer();
+  timer->Bind(wxEVT_TIMER, [this, s](wxTimerEvent&) { lint_script(s); });
+  s->Bind(wxEVT_DESTROY, [timer, s](wxWindowDestroyEvent& e) {
+    e.Skip();
+    if (e.GetEventObject() == s) {
+      timer->Stop();
+      delete timer;
+    }
+  });
+  s->Bind(wxEVT_STC_CHANGE, [timer](wxStyledTextEvent& e) {
+    e.Skip();
+    timer->StartOnce(400);
+  });
+}
+
+void HttpEditor::script_completion(wxStyledTextCtrl* s, bool post, bool explicit_request) {
+  const int pos = s->GetCurrentPos();
+  // Not inside a string or a comment.
+  const int style = pos > 0 ? s->GetStyleAt(pos - 1) : 0;
+  if (style == wxSTC_C_STRING || style == wxSTC_C_CHARACTER || style == wxSTC_C_COMMENT ||
+      style == wxSTC_C_COMMENTLINE || style == wxSTC_C_COMMENTDOC || style == wxSTC_C_STRINGEOL)
+    return;
+  const int line_start = s->PositionFromLine(s->LineFromPosition(pos));
+  const wxCharBuffer buf = s->GetTextRangeRaw(line_start, pos);
+  const std::string_view text(buf.data(), buf.length());
+  // "pm.res|": the word being typed, and the chain before its dot.
+  size_t w = text.size();
+  while (w > 0 && (std::isalnum(static_cast<unsigned char>(text[w - 1])) || text[w - 1] == '_' || text[w - 1] == '$')) --w;
+  const size_t typed = text.size() - w;
+  std::string chain;
+  if (w > 0 && text[w - 1] == '.') {
+    chain = js_chain_before(text, w - 1);
+    if (chain.empty()) return;
+  } else if (!explicit_request && typed < 2) {
+    return;
+  }
+  const auto members = js_members(chain, post);
+  if (members.empty()) return;
+  const std::string_view word = text.substr(w);
+  std::string list;
+  bool any = false;
+  for (const auto& m : members) {
+    list += (list.empty() ? "" : " ") + m;
+    any = any || m.compare(0, word.size(), word) == 0;
+  }
+  if (!any) return;
+  s->AutoCompShow(static_cast<int>(typed), wxString::FromUTF8(list));
+}
+
+void HttpEditor::lint_script(wxStyledTextCtrl* s) {
+  s->SetIndicatorCurrent(kIndJsLint);
+  s->IndicatorClearRange(0, s->GetLength());
+  s->AnnotationClearAll();
+  if (s->GetLength() == 0 || s->GetLength() > 512 * 1024) return;
+  const auto issue = js_lint(std::string_view(s->GetCharacterPointer(), static_cast<size_t>(s->GetLength())));
+  if (!issue) return;
+  const int pos = static_cast<int>(issue->pos);
+  s->IndicatorFillRange(pos, 1);
+  const int line = s->LineFromPosition(pos);
+  s->AnnotationSetText(line, wxString::FromUTF8("\xE2\x9A\xA0 " + issue->message));
+  s->AnnotationSetStyle(line, kStyleJsLint);
+}
+
+wxString HttpEditor::script_lint_summary() const {
+  const auto check = [](const char* name, wxStyledTextCtrl* ed, const std::string& saved) -> wxString {
+    const std::string_view src = ed ? std::string_view(ed->GetCharacterPointer(), static_cast<size_t>(ed->GetLength()))
+                                    : std::string_view(saved);
+    if (src.empty() || src.size() > 512 * 1024) return {};
+    const auto issue = js_lint(src);
+    if (!issue) return {};
+    const auto line = 1 + std::count(src.begin(), src.begin() + static_cast<std::ptrdiff_t>(issue->pos), '\n');
+    return wxString::Format("%s script, line %d: %s", name, static_cast<int>(line), wxString::FromUTF8(issue->message));
+  };
+  wxString w = check("Pre-request", pre_js_, base_.pre_script);
+  if (w.empty()) w = check("Post-response", post_js_, base_.post_script);
+  return w;
+}
+
+std::string HttpEditor::gql_query_text() const {
+  if (!gql_query_) return gql_q_val_;
+  return std::string(gql_query_->GetCharacterPointer(), static_cast<size_t>(gql_query_->GetLength()));
+}
+
+std::string HttpEditor::gql_vars_text() const {
+  if (!gql_vars_) return gql_v_val_;
+  return std::string(gql_vars_->GetCharacterPointer(), static_cast<size_t>(gql_vars_->GetLength()));
+}
+
+void HttpEditor::update_script_badges() {
+  if (!script_tabs_) return;
+  size_t npre = 0, npost = 0;
+  if (pre_) {
+    npre = pre_->enabled_count();
+  } else {
+    for (const auto& x : pre_vals_) npre += x.enabled && !x.var.empty();
+  }
+  npre += pre_js_ ? pre_js_->GetLength() > 0 : !base_.pre_script.empty();
+  if (asserts_) {
+    npost = asserts_->enabled_count() + captures_->enabled_count();
+  } else {
+    for (const auto& a : assert_vals_) npost += a.enabled && !a.target.empty();
+    for (const auto& c : capture_vals_) npost += c.enabled && !c.var.empty();
+  }
+  npost += post_js_ ? post_js_->GetLength() > 0 : !base_.post_script.empty();
+  script_tabs_->set_badge(0, npre ? wxString::Format("%zu", npre) : wxString());
+  script_tabs_->set_badge(1, npost ? wxString::Format("%zu", npost) : wxString(), tests_hint_ && tests_hint_->IsShown());
+}
+
+// The tables as tall as their rows (capped), the problem line right under the assertions, the
+// script editor taking what is left.
+void HttpEditor::layout_tests_page() {
+  if (!tests_page_) return;
+  const wxSize cs = script_book_->GetClientSize();
+  const int h = cs.y;
+  if (h <= 0) return;
+  if (cs.x > FromDIP(40) && cs.x != tests_wrap_) {
+    tests_wrap_ = cs.x;
+    for (auto& [n, text] : tests_notes_) {
+      n->SetLabel(text);
+      n->Wrap(cs.x - FromDIP(4));
+    }
+    if (tests_hint_ && tests_hint_->IsShown()) {
+      const wxString m = tests_hint_->GetToolTipText();
+      tests_hint_->SetLabel(m);
+      tests_hint_->Wrap(cs.x - FromDIP(4));
+    }
+  }
+  if (pre_panel_) pre_panel_->fit_rows(std::max(FromDIP(90), h * 2 / 5));
+  if (assert_panel_) assert_panel_->fit_rows(std::max(FromDIP(110), h / 3));
+  if (capture_panel_) capture_panel_->fit_rows(std::max(FromDIP(80), h / 6));
+  update_script_badges();
+  for (size_t i = 0; i < script_book_->GetPageCount(); ++i) script_book_->GetPage(i)->Layout();
+  tests_page_->Layout();
+}
+
+void HttpEditor::set_assert_rows(const std::vector<Assertion>& a) {
+  if (!asserts_) return;
+  std::vector<KvRow> rows;
+  for (const auto& x : a) rows.push_back({x.target, x.value, x.enabled, false, false, {}, x.op.empty() ? "eq" : x.op});
+  const bool was = loading_;
+  loading_ = true;
+  asserts_->set_rows(rows);
+  loading_ = was;
+  update_tests_hint();
+  layout_tests_page();
+}
+
+std::vector<Assertion> HttpEditor::asserts_now() const {
+  if (!asserts_) return assert_vals_;
+  std::vector<Assertion> out;
+  for (const auto& row : asserts_->rows()) {
+    Assertion a;
+    a.enabled = row.enabled;
+    a.target = std::string(trim(row.key));
+    a.op = row.type.empty() ? "eq" : row.type;
+    a.value = assert_op_unary(a.op) ? std::string() : row.value;
+    out.push_back(std::move(a));
+  }
+  return out;
+}
+
+std::vector<Capture> HttpEditor::captures_now() const {
+  if (!captures_) return capture_vals_;
+  std::vector<Capture> out;
+  for (const auto& row : captures_->rows()) {
+    Capture c;
+    c.enabled = row.enabled;
+    c.var = std::string(trim(row.key));
+    c.target = std::string(trim(row.value));
+    c.scope = capture_scope_from(row.type);
+    out.push_back(std::move(c));
+  }
+  return out;
+}
+
+// The first problem of the tables, under the assertions (each bad cell is also drawn in the
+// warning colour, with the message as its tooltip).
+void HttpEditor::update_tests_hint() {
+  if (!tests_hint_) return;
+  wxString msg;
+  int n = 0;
+  auto scan = [&](KvGrid* g, const char* what) {
+    if (!g) return;  // that side of the page is not built yet
+    const auto rows = g->rows();
+    for (size_t i = 0; i < rows.size(); ++i) {
+      std::string m;
+      if (trim(rows[i].key).empty()) m = std::string(g == asserts_ ? "no target" : "no variable name") + ", not run";
+      if (m.empty()) m = g->check(g->col_key(), rows[i].key);
+      if (m.empty()) m = g->check(g->col_value(), rows[i].value);
+      if (g == captures_ && m.empty() && trim(rows[i].value).empty()) m = "no response target to copy from";
+      if (g == pre_ && m.empty() && trim(rows[i].value).empty()) m = "no expression, not set";
+      if (m.empty()) continue;
+      if (++n == 1) msg = wxString::FromUTF8(std::string("\xE2\x9A\xA0 ") + what + " " + std::to_string(i + 1) + ": " + m);
+    }
+  };
+  scan(pre_, "Pre-request");
+  scan(asserts_, "Assertion");
+  scan(captures_, "Capture");
+  if (n > 1) msg += wxString::Format("  (+%d more)", n - 1);
+  tests_hint_->SetToolTip(msg);
+  tests_hint_->SetLabel(msg);
+  if (tests_page_ && tests_page_->GetClientSize().x > FromDIP(40)) tests_hint_->Wrap(tests_page_->GetClientSize().x - FromDIP(4));
+  if (tests_hint_->IsShown() != (n > 0)) {
+    tests_hint_->Show(n > 0);
+    tests_hint_->GetParent()->Layout();
+  }
+}
+
+// ------------------------------------------------------------------ cookies
+
+wxWindow* HttpEditor::build_cookies_page() {
+  const Theme& t = Theme::get();
+  auto* p = new wxPanel(cookies_holder_);
+  p->SetBackgroundColour(t.bg);
+  auto* s = new wxBoxSizer(wxVERTICAL);
+  auto* row = new wxBoxSizer(wxHORIZONTAL);
+  cookie_head_ = new wxStaticText(p, wxID_ANY, "");
+  cookie_head_->SetForegroundColour(t.dim);
+  row->Add(cookie_head_, 1, wxALIGN_CENTER_VERTICAL);
+  auto* add = new FlatButton(p, "Add cookie", FlatButton::Style::Subtle);
+  add->SetToolTip("Add a cookie to the Cookie header (Headers tab)");
+  row->Add(add, 0, wxALIGN_CENTER_VERTICAL);
+  s->Add(row, 0, wxEXPAND | wxTOP | wxBOTTOM, FromDIP(6));
+  auto* frame = new FramePanel(p, t.field, t.border);
+  auto* fs = new wxBoxSizer(wxVERTICAL);
+  cookie_list_ = new wxPanel(frame);
+  cookie_list_->SetBackgroundColour(t.field);
+  cookie_grid_ = new wxFlexGridSizer(3, FromDIP(6), FromDIP(20));
+  cookie_grid_->AddGrowableCol(1, 1);
+  cookie_list_->SetSizer(cookie_grid_);
+  fs->Add(cookie_list_, 1, wxEXPAND | wxALL, FromDIP(10));
+  frame->SetSizer(fs);
+  s->Add(frame, 0, wxEXPAND);
+  auto* foot = new wxStaticText(p, wxID_ANY,
+                                "No cookie jar: a response's Set-Cookie (its Cookies tab) is not sent back on its own.",
+                                wxDefaultPosition, wxDefaultSize, wxST_ELLIPSIZE_END | wxST_NO_AUTORESIZE);
+  foot->SetForegroundColour(t.dim);
+  foot->SetMinSize(wxSize(-1, GetCharHeight()));
+  foot->SetToolTip(foot->GetLabel());
+  s->Add(foot, 0, wxEXPAND | wxTOP, FromDIP(8));
+  p->SetSizer(s);
+  add->on_click = [this] {
+    ensure_page(kTabHeaders);
+    auto hrows = headers_->rows();
+    int at = -1;
+    for (size_t i = 0; i < hrows.size(); ++i)
+      if (hrows[i].enabled && iequals(trim(hrows[i].key), "Cookie")) at = static_cast<int>(i);
+    if (at < 0) {
+      hrows.push_back({"Cookie", "", true, false, false});
+      at = static_cast<int>(hrows.size()) - 1;
+    } else if (!trim(hrows[static_cast<size_t>(at)].value).empty()) {
+      hrows[static_cast<size_t>(at)].value = std::string(trim(hrows[static_cast<size_t>(at)].value)) + "; ";
+    }
+    headers_->set_rows(hrows);
+    tabs_->select(strip_of(kTabHeaders));
+    book_->ChangeSelection(kTabHeaders);
+    update_auto_headers();
+    touched();
+    headers_->SetFocus();
+    headers_->SetGridCursor(at, headers_->col_value());
+    headers_->MakeCellVisible(at, headers_->col_value());
+    headers_->CallAfter([g = headers_] {
+      if (!g->IsCellEditControlEnabled() && g->CanEnableCellControl()) g->EnableCellEditControl();
+    });
+  };
+  cookie_sig_.clear();
+  return p;
+}
+
+// The cookies the request sends: each enabled Cookie header row split into its cookies
+// ({{vars}} shown resolved), then the curl -b jars (read when sent, not here).
+void HttpEditor::update_cookies() {
+  if (!cookie_list_) return;
+  const Workspace* ws = host_->workspace();
+  std::vector<std::string> sig;
+  struct Row {
+    std::string name, value, source;
+  };
+  std::vector<Row> rows;
+  for (const auto& r : header_rows()) {
+    if (!r.enabled || !iequals(trim(r.key), "Cookie")) continue;
+    for (auto& [n, v] : parse_cookie_header(r.value)) {
+      std::string shown = v;
+      if (ws && shown.find("{{") != std::string::npos) {
+        const std::string x = ws->expand(shown);
+        if (x != shown) shown += "  =  " + (x.size() > 120 ? x.substr(0, 120) + "\xE2\x80\xA6" : x);
+      }
+      rows.push_back({n, shown, "Cookie header"});
+    }
+  }
+  for (const auto& f : base_.cookie_files) rows.push_back({"(cookie jar)", f, "curl -b file, read when sent"});
+  for (const auto& r : rows) sig.push_back(r.name + '\x01' + r.value + '\x01' + r.source);
+  if (sig == cookie_sig_ && cookie_grid_->GetItemCount() > 0) return;
+  cookie_sig_ = sig;
+  const Theme& t = Theme::get();
+  wxWindowUpdateLocker lock(cookie_list_);
+  cookie_grid_->Clear(true);
+  auto head = [&](const char* text) {
+    auto* l = new wxStaticText(cookie_list_, wxID_ANY, text);
+    l->SetForegroundColour(t.dim);
+    l->SetFont(l->GetFont().Bold());
+    cookie_grid_->Add(l, 0);
+  };
+  if (rows.empty()) {
+    auto* l = new wxStaticText(cookie_list_, wxID_ANY,
+                               "No cookies are sent. Add a Cookie header (\"Cookie: session=abc; theme=dark\") or click "
+                               "Add cookie.");
+    l->SetForegroundColour(t.dim);
+    cookie_grid_->Add(l, 0);
+    cookie_grid_->AddSpacer(0);
+    cookie_grid_->AddSpacer(0);
+  } else {
+    head("Name");
+    head("Value");
+    head("From");
+    const wxFont mono = mono_font(GetFont().GetPointSize());
+    for (const auto& r : rows) {
+      auto* n = new wxStaticText(cookie_list_, wxID_ANY, wxString::FromUTF8(r.name));
+      n->SetForegroundColour(t.fg);
+      n->SetFont(mono);
+      auto* v = new wxStaticText(cookie_list_, wxID_ANY, wxString::FromUTF8(r.value), wxDefaultPosition, wxDefaultSize,
+                                 wxST_ELLIPSIZE_END);
+      v->SetForegroundColour(t.fg);
+      v->SetFont(mono);
+      v->SetToolTip(wxString::FromUTF8(r.value));
+      auto* src = new wxStaticText(cookie_list_, wxID_ANY, wxString::FromUTF8(r.source));
+      src->SetForegroundColour(t.dim);
+      cookie_grid_->Add(n, 0, wxALIGN_CENTER_VERTICAL);
+      cookie_grid_->Add(v, 1, wxEXPAND | wxALIGN_CENTER_VERTICAL);
+      cookie_grid_->Add(src, 0, wxALIGN_CENTER_VERTICAL);
+    }
+  }
+  size_t nc = 0;
+  for (const auto& r : rows) nc += r.source == "Cookie header";
+  cookie_head_->SetLabel(rows.empty() ? wxString("Cookies sent with this request")
+                                      : wxString::Format("%zu cookie%s sent with this request%s", nc, nc == 1 ? "" : "s",
+                                                         base_.cookie_files.empty() ? "" : ", plus the jar files below"));
+  cookie_list_->GetParent()->GetParent()->Layout();
+}
+
+std::optional<size_t> HttpEditor::sent_body_size() const {
+  const Workspace* ws = host_->workspace();
+  constexpr size_t kMax = 1 << 20;  // above this the size is the template's (no expansion here)
+  auto expanded = [&](std::string_view b) -> size_t {
+    if (!ws || b.size() > kMax || b.find("{{") == std::string_view::npos) return b.size();
+    return ws->expand(std::string(b)).size();
+  };
+  switch (body_mode_) {
+    case BodyMode::None:
+      return 0;
+    case BodyMode::Json:
+    case BodyMode::Text:
+    case BodyMode::Xml: {
+      if (pending_body_) return pending_body_->size();
+      const std::string_view shown(body_->GetCharacterPointer(), static_cast<size_t>(body_->GetLength()));
+      if (body_mode_ == BodyMode::Json && minify_->value()) {
+        if (raw_body_ && raw_edits_ == body_edits_) return expanded(*raw_body_);
+        if (minified_current()) return expanded(*minified_);
+        if (shown.size() > kMax) return std::nullopt;
+        return expanded(minify_json(shown));
+      }
+      return expanded(shown);
+    }
+    case BodyMode::UrlEncoded: {
+      std::vector<KvItem> items;
+      for (const auto& row : form_rows(0)) items.push_back({row.key, row.value, row.enabled, false});
+      const std::string b = build_urlencoded(items);
+      return b.find("{{") == std::string::npos ? b.size() : sent_form(b).size();
+    }
+    default:
+      return std::nullopt;
+  }
+}
+
+// ------------------------------------------------------------------ pre-request variables
+
+std::vector<PreRow> HttpEditor::pre_now() const {
+  if (!pre_) return pre_vals_;
+  std::vector<PreRow> out;
+  for (const auto& row : pre_->rows()) {
+    PreRow x;
+    x.var = std::string(trim(row.key));
+    x.expr = row.value;
+    x.scope = row.type.empty() ? "runtime" : row.type;
+    x.enabled = row.enabled;
+    out.push_back(std::move(x));
+  }
+  return out;
+}
+
+std::vector<PreVar> HttpEditor::to_pre_vars(const std::vector<PreRow>& rows) {
+  std::vector<PreVar> out;
+  for (const auto& x : rows) {
+    PreVar v;
+    v.enabled = x.enabled;
+    v.var = x.var;
+    v.expr = x.expr;
+    v.scope = capture_scope_from(x.scope);
+    out.push_back(std::move(v));
+  }
+  return out;
+}
+
+void HttpEditor::update_pre_names() {
+  pre_names_.clear();
+  for (const auto& x : pre_now())
+    if (x.enabled && !x.var.empty() && !trim(x.expr).empty()) pre_names_.insert(x.var);
+}
+
+SavedRequest HttpEditor::eval_request(bool with_body, bool sending) const {
+  SavedRequest r = base_;
+  const auto stored = asserts_stored_;
+  const SavedRequest* target = asserts_target_;
+  auto* self = const_cast<HttpEditor*>(this);
+  const bool was = sending_;
+  self->sending_ = sending;
+  store_no_body_ = !with_body;
+  store(r);
+  store_no_body_ = false;
+  self->sending_ = was;
+  asserts_stored_ = stored;
+  asserts_target_ = target;
+  if (!sending) r.http.url = with_path(r.http.url);
+  return r;
+}
+
+SavedRequest HttpEditor::export_request(std::string* warning) const {
+  SavedRequest r = eval_request(true, false);
+  const Workspace* ws = host_->workspace();
+  const std::filesystem::path own_file = r.file;
+  if (std::filesystem::path f = inherit_from(); !f.empty()) r.file = f;  // its folders' headers / auth
+  std::string warn;
+  if (const auto empty = empty_path_vars(); !empty.empty())
+    warn = "path variable :" + empty.front() + " has no value (Send refuses this request)";
+  if (!resolve_vars_in_curl_ && ws) {
+    r = ws->resolved(r);  // the folders' / collection's headers and auth, {{vars}} kept
+  } else if (resolve_vars_in_curl_ && ws) {
+    if (pre_names_.empty()) {
+      r = ws->expanded(r);
+    } else {
+      // The pre-request values as last computed for the Value column (a timestamp or a nonce is
+      // computed again by each send).
+      Workspace w = *ws;
+      size_t missing = 0;
+      for (const auto& n : pre_names_) {
+        const auto it = pre_preview_.find(n);
+        if (it != pre_preview_.end() && it->second.ok) w.runtime_vars[n] = it->second.text;
+        else ++missing;
+      }
+      r = w.expanded(r);
+      if (warn.empty())
+        warn = missing ? "pre-request variables not computed yet stay as {{name}}"
+                       : "pre-request values are the ones shown on the Scripts tab (each send computes them again)";
+    }
+  }
+  if (warning) *warning = std::move(warn);
+  r.file = own_file;
+  return r;
+}
+
+// The "Value now" column: the rows evaluated on a worker against a copy of the workspace.
+void HttpEditor::preview_pre() {
+  if (!pre_ || book_->GetSelection() != kTabTests) return;
+  const Workspace* ws = host_->workspace();
+  auto rows = to_pre_vars(pre_now());
+  const uint64_t gen = ++pre_gen_;
+  if (!ws || rows.empty()) {
+    pre_preview_.clear();
+    pre_->ForceRefresh();
+    return;
+  }
+  // The body only when an expression reads it and it is small (a big one is read at send time).
+  const bool wants_body = std::any_of(rows.begin(), rows.end(), [](const PreVar& v) { return v.expr.find("req.body") != std::string::npos; });
+  const bool body = wants_body && (!text_mode(body_mode_) || body_->GetLength() < 1024 * 1024);
+  auto req = std::make_shared<SavedRequest>(eval_request(body, false));
+  auto wsc = std::make_shared<Workspace>(*ws);
+  std::thread([alive = alive_, rows = std::move(rows), req, wsc, gen, wants_body, body] {
+    auto res = evaluate_pre_vars(rows, *req, *wsc);
+    std::map<std::string, KvGrid::Preview> out;
+    for (const auto& x : res) {
+      KvGrid::Preview pv{x.ok, x.ok ? x.value : x.message};
+      if (x.ok && wants_body && !body && rows[x.index].expr.find("req.body") != std::string::npos)
+        pv = {false, "the body is over 1 MB: computed when sent"};
+      out[std::string(trim(rows[x.index].var))] = std::move(pv);
+    }
+    std::lock_guard lk(alive->m);
+    if (!alive->target) return;
+    auto* ed = static_cast<HttpEditor*>(alive->target);
+    ed->CallAfter([ed, gen, out = std::move(out)] {
+      if (gen != ed->pre_gen_ || !ed->pre_) return;
+      ed->pre_preview_ = out;
+      ed->pre_->ForceRefresh();
+    });
+  }).detach();
+}
+
+void HttpEditor::run_pre_then_send(std::vector<PreVar> rows) {
+  const Workspace* ws = host_->workspace();
+  if (!ws) return;
+  const bool body = std::any_of(rows.begin(), rows.end(), [](const PreVar& v) { return v.expr.find("req.body") != std::string::npos; });
+  auto req = std::make_shared<SavedRequest>(eval_request(body, true));  // as sent: path values, minified body
+  auto wsc = std::make_shared<Workspace>(*ws);
+  const uint64_t gen = ++pre_send_gen_;
+  pre_busy_ = true;
+  const auto t0 = Clock::now();
+  std::thread([alive = alive_, rows = std::move(rows), req, wsc, gen, t0] {
+    auto res = evaluate_pre_vars(rows, *req, *wsc);
+    const double ms = ms_between(t0, Clock::now());
+    std::lock_guard lk(alive->m);
+    if (!alive->target) return;
+    auto* ed = static_cast<HttpEditor*>(alive->target);
+    ed->CallAfter([ed, gen, rows, res = std::move(res), ms] { ed->pre_done(gen, rows, res, ms); });
+  }).detach();
+}
+
+void HttpEditor::pre_done(uint64_t gen, const std::vector<PreVar>& rows, const std::vector<PreVarResult>& res, double ms) {
+  pre_busy_ = false;
+  if (gen != pre_send_gen_) return;
+  // The shell's workspace (as the response view's captures write to it): the values are runtime
+  // variables of this session, and saved into the environment / globals when the row says so.
+  auto* ws = const_cast<Workspace*>(host_->workspace());
+  if (!ws) return;
+  for (const auto& x : res) {
+    const PreVar& pv = rows[x.index];
+    const std::string name(trim(pv.var));
+    pre_preview_[name] = {x.ok, x.ok ? x.value : x.message};
+    if (x.ok) continue;
+    const Theme& t = Theme::get();
+    show_info(wxString::FromUTF8("Not sent: pre-request variable '" + name + "': " + x.message),
+              "Fix the row on the Scripts tab (its Value column shows the problem).", "Show", [this] {
+                hide_banner();
+                show_script_side(0);  // the Pre-request side, where the row is
+              });
+    banner_->set_colours(t.warn_bg, t.warn_border);
+    banner_->Refresh();
+    banner_missing_.clear();
+    if (pre_) pre_->ForceRefresh();
+    return;
+  }
+  Environment* env = nullptr;
+  for (auto& e : ws->environments())
+    if (e.name == ws->active_env) env = &e;
+  bool persist = false;
+  std::string skipped;
+  for (const auto& x : res) {
+    const PreVar& pv = rows[x.index];
+    const std::string name(trim(pv.var));
+    ws->runtime_vars[name] = x.value;  // what this send expands (runtime vars come first)
+    if (pv.scope == Capture::Environment) {
+      if (!env) {
+        skipped = name;
+      } else if (env->vars[name] != x.value) {
+        env->vars[name] = x.value;
+        persist = true;
+      }
+    } else if (pv.scope == Capture::Globals && ws->globals[name] != x.value) {
+      ws->globals[name] = x.value;
+      persist = true;
+    }
+  }
+  if (persist) {
+    // Saved off the UI thread from a snapshot (the UI keeps changing the live workspace).
+    auto snap = std::make_shared<Workspace>(*ws);
+    std::thread([snap] { snap->save_settings(); }).detach();
+  }
+  if (pre_) pre_->ForceRefresh();
+  pre_ready_ = true;
+  do_send();
+  pre_ready_ = false;
+  if (!in_flight_) return;  // stopped by a later check (its banner says why)
+  note(wxString::Format("Pre-request: %zu variable%s in %.2f ms, off the UI thread%s", res.size(), res.size() == 1 ? "" : "s", ms,
+                        skipped.empty() ? wxString() : wxString::FromUTF8(" (no active environment for " + skipped + ": runtime only)")));
+}
+
+// ------------------------------------------------------------------ minified send of a big edited body
+
+void HttpEditor::minify_then_send() {
+  auto text = std::make_shared<const std::string>(body_->GetCharacterPointer(), static_cast<size_t>(body_->GetLength()));
+  const uint64_t edits = body_edits_;
+  minify_busy_ = true;
+  const auto t0 = Clock::now();
+  std::thread([alive = alive_, text, edits, t0] {
+    auto mini = std::make_shared<const std::string>(minify_json(*text));
+    const double ms = ms_between(t0, Clock::now());
+    std::lock_guard lk(alive->m);
+    if (!alive->target) return;
+    auto* ed = static_cast<HttpEditor*>(alive->target);
+    ed->CallAfter([ed, mini, edits, ms] {
+      ed->minify_busy_ = false;
+      if (edits != ed->body_edits_) {  // edited meanwhile: minify the new text
+        ed->do_send();
+        return;
+      }
+      ed->minified_ = mini;
+      ed->minified_edits_ = edits;
+      ed->do_send();
+      (void)ms;
+    });
+  }).detach();
+}
 
 HttpEditorPanel* make_http_editor(wxWindow* parent, EditorHost* host) { return new HttpEditor(parent, host); }
 

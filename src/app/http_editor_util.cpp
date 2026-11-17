@@ -1,7 +1,12 @@
 #include "app/http_editor_util.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cstring>
+
+#include <rapidjson/document.h>
+#include <rapidjson/prettywriter.h>
+#include <rapidjson/stringbuffer.h>
 
 namespace watt::app::http_editor {
 
@@ -246,6 +251,40 @@ std::vector<VarSpan> find_vars(std::string_view s) {
     i = close + 2;
   }
   return out;
+}
+
+std::string brace_problem(std::string_view s) {
+  if (s.find("{{") == std::string_view::npos && s.find("}}") == std::string_view::npos) return {};
+  std::string m(s);
+  for (const auto& v : find_vars(s))
+    for (size_t i = v.begin; i < v.end; ++i) m[i] = ' ';
+  auto word = [](char c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '$' ||
+           c == '.' || c == '-';
+  };
+  for (size_t at = m.find("{{"); at != std::string::npos; at = m.find("{{", at + 2)) {
+    size_t j = at + 2;
+    while (j < m.size() && m[j] == '{') ++j;  // "{{{" is a literal brace
+    if (j > at + 2) {
+      at = j - 2;
+      continue;
+    }
+    while (j < m.size() && m[j] == ' ') ++j;
+    if (j < m.size() && word(m[j])) {
+      size_t e = j;
+      while (e < m.size() && word(m[e])) ++e;
+      return "\"{{" + m.substr(j, e - j) + "\" is not closed with }}";
+    }
+  }
+  for (size_t at = m.find("}}"); at != std::string::npos; at = m.find("}}", at + 2)) {
+    size_t b = at;
+    while (b > 0 && word(m[b - 1])) --b;
+    if (b == at) continue;
+    if (b == 0 || m[b - 1] == '{' || m[b - 1] == ' ' || m[b - 1] == '/' || m[b - 1] == '=' || m[b - 1] == '&')
+      return "\"" + m.substr(b - (b > 0 && m[b - 1] == '{' ? 1 : 0), at + 2 - b + (b > 0 && m[b - 1] == '{' ? 1 : 0)) +
+             "\" has no opening {{";
+  }
+  return {};
 }
 
 std::optional<JsonIssue> check_json(std::string_view s) {
@@ -973,6 +1012,520 @@ void TypingModel::type(char c) {
   const std::string close = var_closer(std::string_view(text).substr(0, caret), std::string_view(text).substr(caret));
   text.insert(caret, close);
   auto_closed.insert(auto_closed.begin() + static_cast<std::ptrdiff_t>(caret), close.size(), true);
+}
+
+namespace {
+
+constexpr std::string_view kRowDocsOpen = "<!-- watt:descriptions";
+
+std::string escape_doc_field(std::string_view s) {
+  std::string o;
+  o.reserve(s.size());
+  for (char c : s) {
+    switch (c) {
+      case '\\': o += "\\\\"; break;
+      case '\t': o += "\\t"; break;
+      case '\r': o += "\\r"; break;
+      case '\n': o += "\\n"; break;
+      case '>': o += "\\g"; break;
+      default: o += c; break;
+    }
+  }
+  return o;
+}
+
+std::string unescape_doc_field(std::string_view s) {
+  std::string o;
+  o.reserve(s.size());
+  for (size_t i = 0; i < s.size(); ++i) {
+    if (s[i] != '\\' || i + 1 == s.size()) {
+      o += s[i];
+      continue;
+    }
+    switch (s[++i]) {
+      case 't': o += '\t'; break;
+      case 'r': o += '\r'; break;
+      case 'n': o += '\n'; break;
+      case 'g': o += '>'; break;
+      default: o += s[i]; break;
+    }
+  }
+  return o;
+}
+
+}  // namespace
+
+std::string split_row_docs(std::string_view docs, RowDocs& out) {
+  out = {};
+  std::string_view body = docs;
+  while (!body.empty() && (body.back() == '\n' || body.back() == '\r' || body.back() == ' ')) body.remove_suffix(1);
+  if (body.size() < 3 || body.substr(body.size() - 3) != "-->") return std::string(docs);
+  const size_t open = body.rfind(kRowDocsOpen);
+  if (open == std::string_view::npos || (open > 0 && body[open - 1] != '\n')) return std::string(docs);
+  std::string_view block = body.substr(open + kRowDocsOpen.size(), body.size() - 3 - open - kRowDocsOpen.size());
+  if (block.find("-->") != std::string_view::npos) return std::string(docs);
+  // first line is the title (rest of the opening line)
+  size_t nl = block.find('\n');
+  block = nl == std::string_view::npos ? std::string_view() : block.substr(nl + 1);
+  while (!block.empty()) {
+    nl = block.find('\n');
+    std::string_view line = block.substr(0, nl);
+    block = nl == std::string_view::npos ? std::string_view() : block.substr(nl + 1);
+    if (!line.empty() && line.back() == '\r') line.remove_suffix(1);
+    const size_t t1 = line.find('\t');
+    if (t1 == std::string_view::npos) continue;
+    const size_t t2 = line.find('\t', t1 + 1);
+    if (t2 == std::string_view::npos) continue;
+    const std::string_view kind = line.substr(0, t1);
+    std::string key = unescape_doc_field(line.substr(t1 + 1, t2 - t1 - 1));
+    if (kind == "pre") {
+      // var, expression, scope, on|off
+      std::string_view rest = line.substr(t2 + 1);
+      const size_t t3 = rest.find('\t');
+      const std::string_view expr = rest.substr(0, t3);
+      rest = t3 == std::string_view::npos ? std::string_view() : rest.substr(t3 + 1);
+      const size_t t4 = rest.find('\t');
+      PreRow pr;
+      pr.var = std::move(key);
+      pr.expr = unescape_doc_field(expr);
+      pr.scope = unescape_doc_field(rest.substr(0, t4));
+      pr.enabled = t4 == std::string_view::npos || rest.substr(t4 + 1) != "off";
+      if (!pr.var.empty()) out.pre.push_back(std::move(pr));
+      continue;
+    }
+    std::string text = unescape_doc_field(line.substr(t2 + 1));
+    if (kind == "auth") {
+      if (!key.empty()) out.auth.emplace_back(std::move(key), std::move(text));
+      continue;
+    }
+    if (key.empty() || text.empty()) continue;
+    if (kind == "param") out.params.emplace_back(std::move(key), std::move(text));
+    else if (kind == "header") out.headers.emplace_back(std::move(key), std::move(text));
+  }
+  std::string_view rest = docs.substr(0, open);
+  while (!rest.empty() && (rest.back() == '\n' || rest.back() == '\r')) rest.remove_suffix(1);
+  return std::string(rest);
+}
+
+std::string join_row_docs(std::string_view docs, const RowDocs& d) {
+  if (d.empty()) return std::string(docs);
+  std::string o(docs);
+  while (!o.empty() && (o.back() == '\n' || o.back() == '\r')) o.pop_back();
+  if (!o.empty()) o += "\n\n";
+  o += kRowDocsOpen;
+  o += " (watt editor data: row notes, pre-request variables, auth settings)\n";
+  auto add = [&](const char* kind, const std::vector<std::pair<std::string, std::string>>& rows) {
+    for (const auto& [k, t] : rows) {
+      if (k.empty() || t.empty()) continue;
+      o += kind;
+      o += '\t';
+      o += escape_doc_field(k);
+      o += '\t';
+      o += escape_doc_field(t);
+      o += '\n';
+    }
+  };
+  add("param", d.params);
+  add("header", d.headers);
+  for (const auto& p : d.pre) {
+    if (p.var.empty()) continue;
+    o += "pre\t" + escape_doc_field(p.var) + '\t' + escape_doc_field(p.expr) + '\t' + escape_doc_field(p.scope) +
+         (p.enabled ? "\ton\n" : "\toff\n");
+  }
+  for (const auto& [k, v] : d.auth) {
+    if (k.empty()) continue;
+    o += "auth\t" + escape_doc_field(k) + '\t' + escape_doc_field(v) + '\n';
+  }
+  o += "-->\n";
+  return o;
+}
+
+std::vector<std::pair<std::string, std::string>> parse_cookie_header(std::string_view v) {
+  std::vector<std::pair<std::string, std::string>> out;
+  while (!v.empty()) {
+    const size_t semi = v.find(';');
+    std::string_view part = trim(v.substr(0, semi));
+    v = semi == std::string_view::npos ? std::string_view() : v.substr(semi + 1);
+    if (part.empty()) continue;
+    const size_t eq = part.find('=');
+    if (eq == std::string_view::npos) out.emplace_back(std::string(part), std::string());
+    else out.emplace_back(std::string(trim(part.substr(0, eq))), std::string(trim(part.substr(eq + 1))));
+  }
+  return out;
+}
+
+std::string strip_curl_default_scheme(std::string_view url, std::string_view cmd) {
+  constexpr std::string_view kAdded = "http://{{";
+  if (url.size() < kAdded.size() || !istarts_with(url, kAdded)) return std::string(url);
+  // written in the command (any case): kept
+  for (size_t at = 0; (at = cmd.find("://{{", at)) != std::string_view::npos; ++at)
+    if (at >= 4 && istarts_with(cmd.substr(at - 4), "http")) return std::string(url);
+  return std::string(url.substr(7));
+}
+
+bool doubled_scheme(std::string_view url) {
+  const size_t a = url.find("://");
+  if (a == std::string_view::npos || a == 0 || a > 5) return false;
+  const std::string_view rest = url.substr(a + 3);
+  return istarts_with(rest, "http://") || istarts_with(rest, "https://");
+}
+
+namespace {
+
+void append_json_string(std::string& out, std::string_view v) {
+  out += '"';
+  for (const char ch : v) {
+    const auto c = static_cast<unsigned char>(ch);
+    switch (c) {
+      case '"': out += "\\\""; break;
+      case '\\': out += "\\\\"; break;
+      case '\n': out += "\\n"; break;
+      case '\r': out += "\\r"; break;
+      case '\t': out += "\\t"; break;
+      case '\b': out += "\\b"; break;
+      case '\f': out += "\\f"; break;
+      default:
+        if (c < 0x20) {
+          static const char* const hex = "0123456789abcdef";
+          out += "\\u00";
+          out += hex[c >> 4];
+          out += hex[c & 15];
+        } else {
+          out += ch;
+        }
+    }
+  }
+  out += '"';
+}
+
+}  // namespace
+
+std::string graphql_body(std::string_view query, std::string_view variables, std::string_view operation_name) {
+  std::string out = "{\"query\":";
+  append_json_string(out, query);
+  const std::string_view vars = trim(variables);
+  if (!vars.empty()) {
+    out += ",\"variables\":";
+    out += vars;
+  }
+  if (!trim(operation_name).empty()) {
+    out += ",\"operationName\":";
+    append_json_string(out, trim(operation_name));
+  }
+  out += '}';
+  return out;
+}
+
+bool split_graphql_body(std::string_view body, std::string& query, std::string& variables, std::string* operation_name) {
+  const std::string_view b = trim(body);
+  if (b.size() < 10 || b.front() != '{' || b.find("\"query\"") == std::string_view::npos) return false;
+  rapidjson::Document d;
+  d.Parse(b.data(), b.size());
+  if (d.HasParseError() || !d.IsObject()) return false;
+  const auto q = d.FindMember("query");
+  if (q == d.MemberEnd() || !q->value.IsString()) return false;
+  std::string vars, op;
+  for (auto it = d.MemberBegin(); it != d.MemberEnd(); ++it) {
+    const std::string_view k(it->name.GetString(), it->name.GetStringLength());
+    if (k == "query") continue;
+    if (k == "variables") {
+      if (it->value.IsNull()) continue;
+      if (!it->value.IsObject()) return false;
+      rapidjson::StringBuffer sb;
+      rapidjson::PrettyWriter<rapidjson::StringBuffer> w(sb);
+      w.SetIndent(' ', 2);
+      it->value.Accept(w);
+      vars.assign(sb.GetString(), sb.GetSize());
+    } else if (k == "operationName") {
+      if (it->value.IsNull()) continue;
+      if (!it->value.IsString()) return false;
+      op.assign(it->value.GetString(), it->value.GetStringLength());
+    } else {
+      return false;  // something else rides along: not a plain GraphQL body
+    }
+  }
+  query.assign(q->value.GetString(), q->value.GetStringLength());
+  variables = std::move(vars);
+  if (operation_name) *operation_name = std::move(op);
+  else if (!op.empty()) return false;  // the caller could not keep it
+  return true;
+}
+
+namespace {
+// Next occurrence of needle at or after from (npos when none).
+size_t find_from(std::string_view hay, std::string_view needle, bool match_case, size_t from) {
+  if (needle.empty() || from > hay.size()) return std::string_view::npos;
+  if (match_case) return hay.find(needle, from);
+  auto low = [](unsigned char c) { return static_cast<unsigned char>(c >= 'A' && c <= 'Z' ? c + 32 : c); };
+  const unsigned char f0 = low(static_cast<unsigned char>(needle[0]));
+  const unsigned char f1 = f0 >= 'a' && f0 <= 'z' ? static_cast<unsigned char>(f0 - 32) : f0;
+  const size_t last = hay.size() - std::min(hay.size(), needle.size() - 1);
+  // memchr for either case of the first byte, then compare the rest. The next hit of each case
+  // is kept until passed: searching again from every candidate for a case that occurs late (or
+  // never: "item" in a body without a capital I) rescanned the rest of a 10 MB text each time.
+  const char* const base = hay.data();
+  const char* const end = base + last;
+  auto next = [&](unsigned char c, size_t at) -> const char* {
+    const void* q = at < last ? std::memchr(base + at, c, last - at) : nullptr;
+    return q ? static_cast<const char*>(q) : end;
+  };
+  size_t i = from;
+  if (i >= last) return std::string_view::npos;
+  const char* na = next(f0, i);
+  const char* nb = f1 != f0 ? next(f1, i) : end;
+  while (i < last) {
+    if (na < base + i) na = next(f0, i);
+    if (nb < base + i && f1 != f0) nb = next(f1, i);
+    const char* p = na < nb ? na : nb;
+    if (p >= end) return std::string_view::npos;
+    i = static_cast<size_t>(p - base);
+    size_t k = 1;
+    while (k < needle.size() && low(static_cast<unsigned char>(hay[i + k])) == low(static_cast<unsigned char>(needle[k]))) ++k;
+    if (k == needle.size()) return i;
+    ++i;
+  }
+  return std::string_view::npos;
+}
+}  // namespace
+
+MatchCount count_matches(std::string_view hay, std::string_view needle, bool match_case, size_t before, size_t limit) {
+  MatchCount m;
+  if (needle.empty()) return m;
+  for (size_t at = find_from(hay, needle, match_case, 0); at != std::string_view::npos;
+       at = find_from(hay, needle, match_case, at + needle.size())) {
+    if (m.total >= limit) {
+      m.capped = true;
+      break;
+    }
+    ++m.total;
+    if (at < before) ++m.before;
+  }
+  return m;
+}
+
+size_t find_match(std::string_view hay, std::string_view needle, bool match_case, size_t from, bool forward) {
+  if (needle.empty() || needle.size() > hay.size()) return std::string_view::npos;
+  from = std::min(from, hay.size());
+  if (forward) {
+    const size_t at = find_from(hay, needle, match_case, from);
+    return at != std::string_view::npos ? at : find_from(hay, needle, match_case, 0);
+  }
+  size_t last_before = std::string_view::npos, last = std::string_view::npos;
+  for (size_t at = find_from(hay, needle, match_case, 0); at != std::string_view::npos;
+       at = find_from(hay, needle, match_case, at + 1)) {
+    if (at >= from && last_before != std::string_view::npos) break;
+    if (at < from) last_before = at;
+    last = at;
+  }
+  return last_before != std::string_view::npos ? last_before : last;
+}
+
+std::string replace_all(std::string_view hay, std::string_view needle, std::string_view with, bool match_case, size_t* n) {
+  std::string out;
+  size_t count = 0;
+  if (needle.empty()) {
+    if (n) *n = 0;
+    return std::string(hay);
+  }
+  out.reserve(hay.size());
+  size_t from = 0;
+  for (size_t at = find_from(hay, needle, match_case, 0); at != std::string_view::npos;
+       at = find_from(hay, needle, match_case, from)) {
+    out.append(hay.substr(from, at - from));
+    out.append(with);
+    from = at + needle.size();
+    ++count;
+  }
+  out.append(hay.substr(from));
+  if (n) *n = count;
+  return out;
+}
+
+namespace {
+void html_escape_to(std::string& out, std::string_view s) {
+  for (const char c : s) {
+    switch (c) {
+      case '&': out += "&amp;"; break;
+      case '<': out += "&lt;"; break;
+      case '>': out += "&gt;"; break;
+      case '"': out += "&quot;"; break;
+      default: out += c;
+    }
+  }
+}
+
+// `code`, **bold**, *italic* / _italic_, [text](http(s)://url); everything escaped.
+std::string md_inline(std::string_view s) {
+  std::string out;
+  size_t i = 0;
+  bool bold = false, em = false;
+  while (i < s.size()) {
+    const char c = s[i];
+    if (c == '`') {
+      const size_t e = s.find('`', i + 1);
+      if (e != std::string_view::npos) {
+        out += "<code>";
+        html_escape_to(out, s.substr(i + 1, e - i - 1));
+        out += "</code>";
+        i = e + 1;
+        continue;
+      }
+    }
+    if (c == '*' && i + 1 < s.size() && s[i + 1] == '*') {
+      out += bold ? "</b>" : "<b>";
+      bold = !bold;
+      i += 2;
+      continue;
+    }
+    if ((c == '*' || c == '_') && (em || (i + 1 < s.size() && s[i + 1] != ' '))) {
+      // '_' inside a word (snake_case) stays a character
+      if (c == '_' && !em && i > 0 && std::isalnum(static_cast<unsigned char>(s[i - 1]))) {
+        out += c;
+        ++i;
+        continue;
+      }
+      out += em ? "</i>" : "<i>";
+      em = !em;
+      ++i;
+      continue;
+    }
+    if (c == '[') {
+      const size_t close = s.find(']', i + 1);
+      if (close != std::string_view::npos && close + 1 < s.size() && s[close + 1] == '(') {
+        const size_t pe = s.find(')', close + 2);
+        if (pe != std::string_view::npos) {
+          const std::string_view text = s.substr(i + 1, close - i - 1);
+          const std::string_view url = trim(s.substr(close + 2, pe - close - 2));
+          if (istarts_with(url, "https://") || istarts_with(url, "http://")) {
+            out += "<a href=\"";
+            html_escape_to(out, url);
+            out += "\">";
+            html_escape_to(out, text);
+            out += "</a>";
+          } else {
+            html_escape_to(out, text);
+          }
+          i = pe + 1;
+          continue;
+        }
+      }
+    }
+    html_escape_to(out, std::string_view(&c, 1));
+    ++i;
+  }
+  if (em) out += "</i>";
+  if (bold) out += "</b>";
+  return out;
+}
+}  // namespace
+
+std::string markdown_to_html(std::string_view md_in) {
+  // CRLF and a lone CR (old Mac files) end a line like LF.
+  std::string norm;
+  norm.reserve(md_in.size());
+  for (size_t i = 0; i < md_in.size(); ++i) {
+    if (md_in[i] == '\r') {
+      norm += '\n';
+      if (i + 1 < md_in.size() && md_in[i + 1] == '\n') ++i;
+    } else {
+      norm += md_in[i];
+    }
+  }
+  const std::string_view md = norm;
+  std::string out;
+  std::string para;
+  enum class List { None, Ul, Ol } list = List::None;
+  bool fence = false;
+  std::string code;
+  auto flush_para = [&] {
+    if (!para.empty()) {
+      out += "<p>" + md_inline(para) + "</p>\n";
+      para.clear();
+    }
+  };
+  auto close_list = [&] {
+    if (list == List::Ul) out += "</ul>\n";
+    if (list == List::Ol) out += "</ol>\n";
+    list = List::None;
+  };
+  size_t pos = 0;
+  while (pos <= md.size()) {
+    size_t nl = md.find('\n', pos);
+    if (nl == std::string_view::npos) nl = md.size();
+    std::string_view line = md.substr(pos, nl - pos);
+    if (!line.empty() && line.back() == '\r') line.remove_suffix(1);
+    pos = nl + 1;
+    const std::string_view t = trim(line);
+    if (t.substr(0, 3) == "```") {
+      if (fence) {
+        out += "<pre><code>";
+        html_escape_to(out, code);
+        out += "</code></pre>\n";
+        code.clear();
+      } else {
+        flush_para();
+        close_list();
+      }
+      fence = !fence;
+      continue;
+    }
+    if (fence) {
+      code.append(line);
+      code += '\n';
+      continue;
+    }
+    if (t.empty()) {
+      flush_para();
+      close_list();
+      continue;
+    }
+    size_t h = 0;
+    while (h < t.size() && h < 6 && t[h] == '#') ++h;
+    if (h > 0 && h < t.size() && t[h] == ' ') {
+      flush_para();
+      close_list();
+      out += "<h" + std::to_string(h) + ">" + md_inline(trim(t.substr(h + 1))) + "</h" + std::to_string(h) + ">\n";
+      continue;
+    }
+    if (t == "---" || t == "***" || t == "___") {
+      flush_para();
+      close_list();
+      out += "<hr>\n";
+      continue;
+    }
+    if (t[0] == '>') {
+      flush_para();
+      close_list();
+      out += "<blockquote>" + md_inline(trim(t.substr(1))) + "</blockquote>\n";
+      continue;
+    }
+    const bool ul = t.size() > 2 && (t[0] == '-' || t[0] == '*' || t[0] == '+') && t[1] == ' ';
+    size_t d = 0;
+    while (d < t.size() && std::isdigit(static_cast<unsigned char>(t[d]))) ++d;
+    const bool ol = d > 0 && d + 1 < t.size() && (t[d] == '.' || t[d] == ')') && t[d + 1] == ' ';
+    if (ul || ol) {
+      flush_para();
+      const List want = ul ? List::Ul : List::Ol;
+      if (list != want) {
+        close_list();
+        out += ul ? "<ul>\n" : "<ol>\n";
+        list = want;
+      }
+      out += "<li>" + md_inline(trim(t.substr(ul ? 2 : d + 2))) + "</li>\n";
+      continue;
+    }
+    close_list();
+    if (!para.empty()) para += ' ';
+    para.append(t);
+  }
+  if (fence) {
+    out += "<pre><code>";
+    html_escape_to(out, code);
+    out += "</code></pre>\n";
+  }
+  flush_para();
+  close_list();
+  return out;
 }
 
 }  // namespace watt::app::http_editor

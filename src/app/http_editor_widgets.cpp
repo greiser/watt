@@ -1,6 +1,11 @@
 #include "app/http_editor_widgets.h"
 
+#include <wx/app.h>
+#ifdef __WXMSW__
+#include <wx/msw/wrapwin.h>
+#endif
 #include <wx/dcbuffer.h>
+#include <wx/display.h>
 #include <wx/menu.h>
 #include <wx/settings.h>
 
@@ -156,12 +161,15 @@ void FlatButton::paint() {
       break;
     case Style::Subtle:
     case Style::Method:
+    case Style::Outline:
       fill = hover_ ? t.hover : parent_bg;
       fg = text_.IsOk() ? text_ : t.fg;
       break;
   }
   if (!IsEnabled()) fg = t.dim;
-  dc.SetPen(HasFocus() && style_ != Style::Primary ? wxPen(t.accent, FromDIP(1)) : *wxTRANSPARENT_PEN);
+  dc.SetPen(HasFocus() && style_ != Style::Primary ? wxPen(t.accent, FromDIP(1))
+            : style_ == Style::Outline           ? wxPen(hover_ ? t.dim : t.border, FromDIP(1))
+                                                 : *wxTRANSPARENT_PEN);
   if (HasFocus() && style_ == Style::Primary) dc.SetPen(wxPen(t.accent_fg, FromDIP(1), wxPENSTYLE_DOT));
   dc.SetBrush(wxBrush(fill));
   dc.DrawRoundedRectangle(0, 0, sz.x, sz.y, FromDIP(4));
@@ -193,14 +201,60 @@ ChoiceButton::ChoiceButton(wxWindow* parent, std::vector<wxString> items)
   if (!items_.empty()) SetLabel(items_[0]);
   SetMinSize(wxSize(w, -1));
   on_click = [this] {
-    wxMenu menu;
-    for (int i = 0; i < static_cast<int>(items_.size()); ++i)
-      menu.AppendRadioItem(i + 1, items_[static_cast<size_t>(i)])->Check(i == sel_);
-    const int s = GetPopupMenuSelectionFromUser(menu, wxPoint(0, GetSize().y));
-    if (s >= 1 && s <= static_cast<int>(items_.size())) pick(s - 1);
+    if (list_) {
+      close_list();  // a second click closes it, like a combo box
+      return;
+    }
+    std::vector<PickItem> items;
+    for (const auto& it : items_) items.push_back({it, "", ""});
+    auto* p = new PickPopup(this, std::move(items), sel_ >= 0 && sel_ < static_cast<int>(items_.size())
+                                                        ? items_[static_cast<size_t>(sel_)]
+                                                        : wxString());
+    list_ = p;
+    p->on_close = [this, p] {
+      if (list_ == p) list_ = nullptr;
+    };
+    p->on_pick = [this](const wxString& v) {
+      for (size_t i = 0; i < items_.size(); ++i)
+        if (items_[i] == v) {
+          pick(static_cast<int>(i));
+          break;
+        }
+    };
+    SetFocus();
+    p->show_below(GetScreenRect());
   };
+  // The open list takes the keys (the button keeps the focus): ahead of the dialog's Esc.
+  Bind(wxEVT_CHAR_HOOK, [this](wxKeyEvent& e) {
+    if (list_ && e.GetKeyCode() == WXK_ESCAPE) {
+      close_list();
+      return;
+    }
+    e.Skip();
+  });
+  Bind(wxEVT_CHAR, [this](wxKeyEvent& e) {
+    const wxChar c = e.GetUnicodeKey();
+    if (list_ && c != WXK_NONE && !e.ControlDown() && !e.AltDown() && list_->chr(c)) return;
+    e.Skip();
+  });
+  Bind(wxEVT_KILL_FOCUS, [this](wxFocusEvent& e) {
+    e.Skip();
+    if (list_)
+      CallAfter([this] {
+        if (!list_) return;
+        // A press on the list itself picks there.
+        if (list_->GetScreenRect().Contains(wxGetMousePosition()) && wxGetMouseState().LeftIsDown()) return;
+        close_list();
+      });
+  });
   Bind(wxEVT_KEY_DOWN, [this](wxKeyEvent& e) {
     const int k = e.GetKeyCode();
+    if (list_ && !e.ControlDown() && !e.AltDown()) {
+      if (k == WXK_SHIFT) return;
+      if (list_->key(k)) return;  // Up / Down / Enter / Tab / Esc / Backspace
+      e.Skip();                   // a character: filtered on wxEVT_CHAR
+      return;
+    }
     const int n = static_cast<int>(items_.size());
     const bool up = k == WXK_UP || k == WXK_NUMPAD_UP, down = k == WXK_DOWN || k == WXK_NUMPAD_DOWN;
     if ((up || down) && !e.HasAnyModifiers() && n > 0) {
@@ -209,6 +263,10 @@ ChoiceButton::ChoiceButton(wxWindow* parent, std::vector<wxString> items)
     }
     e.Skip();  // FlatButton's own handler: Space / Enter open the list, Tab moves on
   });
+}
+
+void ChoiceButton::close_list() {
+  if (list_) list_->close();  // its on_close clears list_
 }
 
 void ChoiceButton::set_selection(int index) {
@@ -351,8 +409,10 @@ wxSize TabStrip::DoGetBestClientSize() const {
 
 void TabStrip::layout_tabs(wxDC& dc) {
   int x = 0;
-  const int h = GetClientSize().y;
+  const wxSize cs = GetClientSize();
   const wxFont bold = GetFont().Bold();
+  std::vector<int> widths;
+  int sum = 0;
   for (auto& t : tabs_) {
     dc.SetFont(bold);  // width of the bold label, so selecting a tab does not shift the others
     int w = dc.GetTextExtent(t.label).x;
@@ -360,8 +420,16 @@ void TabStrip::layout_tabs(wxDC& dc) {
       dc.SetFont(GetFont().Smaller());
       w += FromDIP(5) + dc.GetTextExtent(t.badge).x;
     }
-    t.rect = wxRect(x, 0, w + FromDIP(20), h);
-    x += t.rect.width;
+    widths.push_back(w);
+    sum += w;
+  }
+  // Narrow (badges shown, a narrow window): less space between the tabs before any label is cut.
+  pad_ = FromDIP(20);
+  if (!tabs_.empty() && sum + pad_ * static_cast<int>(tabs_.size()) > cs.x)
+    pad_ = std::max(FromDIP(8), (cs.x - sum) / static_cast<int>(tabs_.size()));
+  for (size_t i = 0; i < tabs_.size(); ++i) {
+    tabs_[i].rect = wxRect(x, 0, widths[i] + pad_, cs.y);
+    x += tabs_[i].rect.width;
   }
 }
 
@@ -378,7 +446,7 @@ void TabStrip::paint() {
     dc.SetFont(sel ? GetFont().Bold() : GetFont());
     dc.SetTextForeground(sel || static_cast<int>(i) == hover_ ? th.fg : th.dim);
     const int ty = (sz.y - dc.GetCharHeight()) / 2;
-    int x = t.rect.x + FromDIP(10);
+    int x = t.rect.x + pad_ / 2;
     dc.DrawText(t.label, x, ty);
     x += dc.GetTextExtent(t.label).x + FromDIP(5);
     if (!t.badge.empty()) {
@@ -389,7 +457,8 @@ void TabStrip::paint() {
     if (sel) {
       dc.SetPen(*wxTRANSPARENT_PEN);
       dc.SetBrush(wxBrush(th.accent));
-      dc.DrawRectangle(t.rect.x + FromDIP(8), sz.y - FromDIP(2), t.rect.width - FromDIP(16), FromDIP(2));
+      const int inset = std::min(FromDIP(8), pad_ / 2);
+      dc.DrawRectangle(t.rect.x + inset, sz.y - FromDIP(2), t.rect.width - 2 * inset, FromDIP(2));
     }
   }
 }
@@ -507,6 +576,314 @@ void RadioStrip::paint() {
       dc.DrawRoundedRectangle(r.x - FromDIP(2), FromDIP(1), r.width + FromDIP(2), h - FromDIP(2), FromDIP(3));
     }
   }
+}
+
+
+// ------------------------------------------------------------------ PickPopup
+
+PickPopup::PickPopup(wxWindow* owner, std::vector<PickItem> items, const wxString& current)
+    : wxPopupWindow(owner, wxBORDER_NONE), items_(std::move(items)), current_(current) {
+  SetBackgroundStyle(wxBG_STYLE_PAINT);
+  SetFont(owner->GetFont());
+  Bind(wxEVT_PAINT, [this](wxPaintEvent&) { paint(); });
+  Bind(wxEVT_MOTION, [this](wxMouseEvent& e) {
+    const int r = row_at(e.GetPosition().y);
+    if (r >= 0 && rows_[static_cast<size_t>(r)].item >= 0 && r != sel_) {
+      sel_ = r;
+      Refresh();
+    }
+  });
+  // Picked on the press: the release may land after the popup is gone (and a press that moves
+  // the focus would otherwise close it first).
+  Bind(wxEVT_LEFT_DOWN, [this](wxMouseEvent& e) {
+    const int r = row_at(e.GetPosition().y);
+    if (r >= 0 && rows_[static_cast<size_t>(r)].item >= 0) {
+      sel_ = r;
+      pick_selected();
+    }
+  });
+  Bind(wxEVT_MOUSEWHEEL, [this](wxMouseEvent& e) {
+    const int n = static_cast<int>(rows_.size()), vis = visible_rows();
+    top_ = std::clamp(top_ - (e.GetWheelRotation() > 0 ? 3 : -3), 0, std::max(0, n - vis));
+    Refresh();
+  });
+  rebuild();
+}
+
+int PickPopup::row_h() const { return GetCharHeight() + FromDIP(9); }
+int PickPopup::header_h() const { return compact ? FromDIP(3) : GetCharHeight() + FromDIP(12); }  // the filter line
+int PickPopup::visible_rows() const { return std::max(1, (GetClientSize().y - header_h() - FromDIP(4)) / row_h()); }
+
+int PickPopup::row_at(int y) const {
+  y -= header_h();
+  if (y < 0) return -1;
+  const int r = top_ + y / row_h();
+  return r < static_cast<int>(rows_.size()) ? r : -1;
+}
+
+void PickPopup::rebuild() {
+  rows_.clear();
+  const wxString f = filter_.Lower();
+  if (f.empty()) {
+    wxString group;
+    bool first = true;
+    for (size_t i = 0; i < items_.size(); ++i) {
+      if (first || items_[i].group != group) {
+        group = items_[i].group;
+        if (!group.empty()) rows_.push_back({-1, group});
+        first = false;
+      }
+      rows_.push_back({static_cast<int>(i), items_[i].group});
+    }
+  } else {
+    // a prefix of the value first, then inside the value, then in the description
+    for (int pass = 0; pass < 3; ++pass)
+      for (size_t i = 0; i < items_.size(); ++i) {
+        const wxString v = items_[i].value.Lower();
+        const bool pre = v.StartsWith(f), in = v.Find(f) != wxNOT_FOUND;
+        const bool desc = items_[i].desc.Lower().Find(f) != wxNOT_FOUND;
+        if ((pass == 0 && pre) || (pass == 1 && !pre && in) || (pass == 2 && !in && desc))
+          rows_.push_back({static_cast<int>(i), items_[i].group});
+      }
+  }
+  sel_ = -1;
+  for (size_t r = 0; r < rows_.size(); ++r) {
+    if (rows_[r].item < 0) continue;
+    if (sel_ < 0) sel_ = static_cast<int>(r);  // the best match
+    if (f.empty() && items_[static_cast<size_t>(rows_[r].item)].value == current_) {
+      sel_ = static_cast<int>(r);
+      break;
+    }
+  }
+  top_ = 0;
+  ensure_visible();
+  // Shown: as tall as what the filter left (a list of 10 cut to 1 by typing shrinks).
+  if (IsShown() && !anchor_.IsEmpty()) show_below(anchor_);
+  Refresh();
+}
+
+void PickPopup::ensure_visible() {
+  if (sel_ < 0) return;
+  const int vis = visible_rows();
+  int want = sel_;
+  if (want > 0 && rows_[static_cast<size_t>(want - 1)].item < 0) --want;  // keep its header in view
+  if (want < top_) top_ = want;
+  if (sel_ >= top_ + vis) top_ = sel_ - vis + 1;
+  top_ = std::clamp(top_, 0, std::max(0, static_cast<int>(rows_.size()) - vis));
+}
+
+void PickPopup::show_below(const wxRect& cell) {
+  if (closed_) return;  // closed (destroyed at the next idle time): never shown again
+  anchor_ = cell;
+  wxClientDC dc(this);
+  dc.SetFont(GetFont());
+  int w = cell.width;
+  // room for "value  description · group" (the group is added while filtering)
+  for (const auto& it : items_)
+    w = std::max(w, dc.GetTextExtent(it.value).x + dc.GetTextExtent(it.desc).x +
+                        (it.group.empty() ? 0 : dc.GetTextExtent(it.group).x + FromDIP(14)) + FromDIP(52));
+  w = std::max(w, FromDIP(220));
+  const int rows = std::max(1, std::min<int>(static_cast<int>(rows_.size()), compact ? 10 : 16));
+  const int h = header_h() + rows * row_h() + FromDIP(4);
+  const int di = wxDisplay::GetFromPoint(cell.GetBottomLeft());
+  const wxRect scr = wxDisplay(di == wxNOT_FOUND ? 0u : static_cast<unsigned>(di)).GetClientArea();
+  const int x = std::max(scr.x, std::min(cell.x, scr.GetRight() - w));
+  int y = cell.GetBottom() + 1;
+  if (y + h > scr.GetBottom() && cell.y - h >= scr.y) y = cell.y - h;
+  SetSize(x, y, w, h);
+  ensure_visible();
+  Show();
+}
+
+bool PickPopup::Show(bool show) {
+#ifdef __WXMSW__
+  if (show) {
+    if (!wxWindowBase::Show(true)) return false;  // the shown flag; the window below
+    ::SetWindowPos(static_cast<HWND>(GetHWND()), HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    return true;
+  }
+#endif
+  return wxPopupWindow::Show(show);
+}
+
+#ifdef __WXMSW__
+WXLRESULT PickPopup::MSWWindowProc(WXUINT msg, WXWPARAM wp, WXLPARAM lp) {
+  if (msg == WM_MOUSEACTIVATE) return MA_NOACTIVATE;
+  return wxPopupWindow::MSWWindowProc(msg, wp, lp);
+}
+#endif
+
+void PickPopup::set_items(std::vector<PickItem> items, const wxString& current) {
+  items_ = std::move(items);
+  current_ = current;
+  rebuild();
+}
+
+wxString PickPopup::selected_value() const {
+  if (sel_ < 0 || sel_ >= static_cast<int>(rows_.size()) || rows_[static_cast<size_t>(sel_)].item < 0) return {};
+  return items_[static_cast<size_t>(rows_[static_cast<size_t>(sel_)].item)].value;
+}
+
+void PickPopup::set_filter(const wxString& f) {
+  if (f == filter_) return;
+  filter_ = f;
+  rebuild();
+}
+
+void PickPopup::move(int delta) {
+  if (rows_.empty()) return;
+  const int n = static_cast<int>(rows_.size());
+  int r = sel_ < 0 ? (delta > 0 ? -1 : n) : sel_;
+  const int step = delta > 0 ? 1 : -1;
+  for (int left = std::abs(delta); left > 0;) {
+    int nr = r + step;
+    while (nr >= 0 && nr < n && rows_[static_cast<size_t>(nr)].item < 0) nr += step;
+    if (nr < 0 || nr >= n) break;
+    r = nr;
+    --left;
+  }
+  if (r >= 0 && r < n && rows_[static_cast<size_t>(r)].item >= 0) sel_ = r;
+  ensure_visible();
+  Refresh();
+}
+
+bool PickPopup::key(int code) {
+  if (closed_) return false;
+  switch (code) {
+    case WXK_UP: case WXK_NUMPAD_UP: move(-1); return true;
+    case WXK_DOWN: case WXK_NUMPAD_DOWN: move(1); return true;
+    case WXK_PAGEUP: case WXK_NUMPAD_PAGEUP: move(-visible_rows()); return true;
+    case WXK_PAGEDOWN: case WXK_NUMPAD_PAGEDOWN: move(visible_rows()); return true;
+    case WXK_HOME: case WXK_NUMPAD_HOME: move(-1000); return true;
+    case WXK_END: case WXK_NUMPAD_END: move(1000); return true;
+    case WXK_RETURN: case WXK_NUMPAD_ENTER: case WXK_TAB: pick_selected(); return true;
+    case WXK_ESCAPE: close(); return true;
+    case WXK_BACK:
+      if (!filter_.empty()) set_filter(filter_.Left(filter_.length() - 1));
+      return true;
+    default: return false;
+  }
+}
+
+bool PickPopup::chr(wxChar c) {
+  if (closed_) return false;
+  if (c < 32 || c == 127) return false;
+  set_filter(filter_ + c);
+  return true;
+}
+
+void PickPopup::pick_selected() {
+  if (closed_) return;
+  wxString v;
+  if (sel_ < 0 || sel_ >= static_cast<int>(rows_.size()) || rows_[static_cast<size_t>(sel_)].item < 0) {
+    if (free_hint.empty() || filter_.empty()) {
+      close();  // nothing matches: the old value stays
+      return;
+    }
+    v = filter_;  // free text: the typed value itself
+  } else {
+    v = items_[static_cast<size_t>(rows_[static_cast<size_t>(sel_)].item)].value;
+  }
+  auto cb = on_pick;
+  close();
+  if (cb) cb(v);
+}
+
+void PickPopup::close() {
+  if (closed_) return;
+  closed_ = true;
+  Hide();
+  auto cb = std::move(on_close);
+  on_close = nullptr;
+  on_pick = nullptr;
+  if (cb) cb();
+  // Deleted at the next idle time, not here: a popup is not a wxTopLevelWindow, so Destroy()
+  // would delete it at once, and close() can run inside one of its own calls (a pick, a resize
+  // that moved the focus) whose caller still uses it.
+  if (wxTheApp) wxTheApp->ScheduleForDestruction(this);
+  else Destroy();
+}
+
+void PickPopup::paint() {
+  wxAutoBufferedPaintDC dc(this);
+  const Theme& t = Theme::get();
+  const wxSize sz = GetClientSize();
+  const wxColour bg = t.dark ? wxColour(0x25, 0x25, 0x26) : t.field;
+  dc.SetBackground(wxBrush(bg));
+  dc.Clear();
+  dc.SetFont(GetFont());
+  const int pad = FromDIP(10), rh = row_h(), hh = header_h();
+  if (!compact) {  // the filter line
+    const int ty = (hh - dc.GetCharHeight()) / 2;
+    if (filter_.empty()) {
+      dc.SetTextForeground(t.dim);
+      dc.DrawText("Type to filter", pad, ty);
+    } else {
+      dc.SetTextForeground(t.fg);
+      dc.DrawText(filter_, pad, ty);
+      const int cx = pad + dc.GetTextExtent(filter_).x + FromDIP(1);
+      dc.SetPen(wxPen(t.accent, FromDIP(1)));
+      dc.DrawLine(cx, ty, cx, ty + dc.GetCharHeight());
+      if (rows_.empty()) {
+        const wxString note = free_hint.empty() ? wxString("no match") : free_hint;
+        dc.SetTextForeground(free_hint.empty() ? t.var_bad : t.dim);
+        dc.DrawText(note, sz.x - pad - dc.GetTextExtent(note).x, ty);
+      }
+    }
+    dc.SetPen(wxPen(t.border));
+    dc.DrawLine(0, hh - 1, sz.x, hh - 1);
+  }
+  const int vis = visible_rows();
+  wxFont small = GetFont();
+  small.SetPointSize(std::max(7, small.GetPointSize() - 1));
+  small.MakeBold();
+  for (int i = 0; i < vis && top_ + i < static_cast<int>(rows_.size()); ++i) {
+    const int r = top_ + i;
+    const Row& row = rows_[static_cast<size_t>(r)];
+    const int y = hh + i * rh;
+    const int ty = y + (rh - dc.GetCharHeight()) / 2;
+    if (row.item < 0) {
+      dc.SetFont(small);
+      dc.SetTextForeground(t.dim);
+      dc.DrawText(row.group.Upper(), pad, y + (rh - dc.GetCharHeight()) / 2 + FromDIP(1));
+      dc.SetFont(GetFont());
+      continue;
+    }
+    const PickItem& it = items_[static_cast<size_t>(row.item)];
+    const bool sel = r == sel_;
+    if (sel) {
+      dc.SetPen(*wxTRANSPARENT_PEN);
+      dc.SetBrush(wxBrush(t.accent));
+      dc.DrawRoundedRectangle(FromDIP(4), y + FromDIP(1), sz.x - FromDIP(8), rh - FromDIP(2), FromDIP(3));
+    }
+    const int ind = filter_.empty() && !row.group.empty() ? FromDIP(8) : 0;
+    dc.SetTextForeground(sel ? t.accent_fg : t.fg);
+    dc.DrawText(it.value, pad + ind, ty);
+    const int x = pad + ind + dc.GetTextExtent(it.value).x + FromDIP(12);
+    wxString d = it.desc;
+    if (!filter_.empty() && !it.group.empty()) d = d.empty() ? it.group : d + wxString::FromUTF8(" \xC2\xB7 ") + it.group;
+    if (!d.empty()) {
+      dc.SetTextForeground(sel ? wxColour(0xDD, 0xE8, 0xFA) : t.dim);
+      dc.DrawText(d, x, ty);
+    }
+    if (it.value == current_) {
+      dc.SetTextForeground(sel ? t.accent_fg : t.accent);
+      const wxString tick = wxString::FromUTF8("\xE2\x9C\x93");
+      dc.DrawText(tick, sz.x - pad - dc.GetTextExtent(tick).x, ty);
+    }
+  }
+  const int n = static_cast<int>(rows_.size());
+  if (n > vis) {  // where the visible rows are in the list
+    const int track = sz.y - hh - FromDIP(4);
+    const int th = std::max(FromDIP(16), track * vis / n);
+    const int y0 = hh + (track - th) * top_ / std::max(1, n - vis);
+    dc.SetPen(*wxTRANSPARENT_PEN);
+    dc.SetBrush(wxBrush(t.border));
+    dc.DrawRoundedRectangle(sz.x - FromDIP(5), y0 + FromDIP(2), FromDIP(3), th, FromDIP(1));
+  }
+  dc.SetPen(wxPen(t.dark ? wxColour(0x55, 0x55, 0x55) : t.border));
+  dc.SetBrush(*wxTRANSPARENT_BRUSH);
+  dc.DrawRectangle(0, 0, sz.x, sz.y);
 }
 
 }  // namespace watt::app::http_editor

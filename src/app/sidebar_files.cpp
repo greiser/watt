@@ -5,6 +5,10 @@
 #include <system_error>
 #include <vector>
 
+#include <rapidjson/document.h>
+
+#include "core/model_json.h"
+
 namespace watt::app::sidebar {
 
 namespace fs = std::filesystem;
@@ -27,17 +31,6 @@ bool is_request_file(const fs::path& p) {
 std::string lower(std::string_view s) {
   std::string out(s);
   for (char& c : out) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-  return out;
-}
-
-std::vector<std::string> words_of(std::string_view q) {
-  std::vector<std::string> out;
-  for (size_t p = 0; p < q.size();) {
-    size_t e = q.find(' ', p);
-    if (e == std::string_view::npos) e = q.size();
-    if (e > p) out.emplace_back(q.substr(p, e - p));
-    p = e + 1;
-  }
   return out;
 }
 
@@ -158,31 +151,72 @@ std::optional<SavedRequest> create_request(Workspace& ws, const fs::path& folder
 }
 
 int filter_rank(std::string_view q, std::string_view name, std::string_view folder_path, std::string_view rest) {
-  const auto words = words_of(q);
-  if (words.empty()) return -1;
-  const std::string n = lower(name), f = lower(folder_path), o = lower(rest);
-  int in_name = 0, prefix = 0, score = 0;
-  for (const auto& w : words) {
+  return filter_rank_lower(lower(std::string(q)), lower(name), lower(folder_path), lower(rest));
+}
+
+int filter_rank_lower(std::string_view whole, std::string_view n, std::string_view f, std::string_view o) {
+  int in_name = 0, prefix = 0, score = 0, words = 0;
+  for (size_t p = 0; p < whole.size();) {
+    size_t e = whole.find(' ', p);
+    if (e == std::string_view::npos) e = whole.size();
+    const std::string_view w = whole.substr(p, e - p);
+    p = e + 1;
+    if (w.empty()) continue;
+    ++words;
     const size_t at = n.find(w);
-    if (at != std::string::npos) {
+    if (at != std::string_view::npos) {
       ++in_name;
       // At a word start ("order" in "Create order", not in "Reorder").
       if (at == 0 || !std::isalnum(static_cast<unsigned char>(n[at - 1]))) ++prefix;
       continue;
     }
-    if (f.find(w) != std::string::npos) score += 30;
-    else if (o.find(w) != std::string::npos) score += 20;
+    if (f.find(w) != std::string_view::npos) score += 30;
+    else if (o.find(w) != std::string_view::npos) score += 20;
     else return -1;
   }
-  const std::string whole = lower(std::string(q));
+  if (words == 0) return -1;
   if (n == whole) score += 10000;
   else if (n.rfind(whole, 0) == 0) score += 5000;
-  else if (n.find(whole) != std::string::npos) score += 3000;
-  if (in_name == static_cast<int>(words.size())) score += 1000;
+  else if (n.find(whole) != std::string_view::npos) score += 3000;
+  if (in_name == words) score += 1000;
   score += in_name * 100 + prefix * 40;
   // Shorter names are the tighter match.
   score -= static_cast<int>(std::min<size_t>(n.size(), 80));
   return std::max(score, 0);
+}
+
+std::vector<UnreadableEnv> unreadable_env_files(const fs::path& root) {
+  std::vector<UnreadableEnv> out;
+  std::error_code ec;
+  const fs::path dir = root / "environments";
+  if (!fs::is_directory(dir, ec)) return out;
+  for (fs::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
+    if (!it->is_regular_file(ec) || it->path().extension() != ".json") continue;
+    std::string text;
+    if (!detail::read_file(it->path(), text)) continue;
+    rapidjson::Document d;
+    d.Parse(text.data(), text.size());
+    if (!d.HasParseError() && d.IsObject()) continue;
+    UnreadableEnv u{it->path(), false};
+    if (text.size() >= 3 && text.compare(0, 3, "\xEF\xBB\xBF") == 0) {
+      rapidjson::Document d2;
+      d2.Parse(text.data() + 3, text.size() - 3);
+      u.bom = !d2.HasParseError() && d2.IsObject();
+    }
+    out.push_back(std::move(u));
+  }
+  std::sort(out.begin(), out.end(), [](const UnreadableEnv& a, const UnreadableEnv& b) { return a.file < b.file; });
+  return out;
+}
+
+bool remove_utf8_bom(const fs::path& file, std::string* err) {
+  std::string text;
+  if (!detail::read_file(file, text)) {
+    if (err) *err = "cannot read " + u8(file.filename());
+    return false;
+  }
+  if (text.size() < 3 || text.compare(0, 3, "\xEF\xBB\xBF") != 0) return true;
+  return detail::write_file_atomic(file, text.substr(3), err);
 }
 
 }  // namespace watt::app::sidebar

@@ -22,6 +22,7 @@
 #include <rapidjson/memorystream.h>
 #include <rapidjson/reader.h>
 
+#include "core/crypto.h"
 #include "core/model_history_file.h"
 #include "core/model_json.h"
 #include "core/model_prescan.h"
@@ -645,6 +646,52 @@ std::vector<SettingsRow> rows_from(const Value& o, const char* key) {
 //     "asserts": [as in a request],
 //     "pre_script": ..., "post_script": ... (as in a request) }
 // Every key but "version" only when set.
+// "network": { ca_file?, ca_off?, cert_file?, key_file?, cert_off?, proxy?, proxy_url?, no_proxy? }
+// (NetworkSettings; proxy is "env" | "system" | "none" | "url", absent = inherit). Only what is set.
+const char* proxy_mode_name(NetworkSettings::Proxy p) {
+  switch (p) {
+    case NetworkSettings::Proxy::Env: return "env";
+    case NetworkSettings::Proxy::System: return "system";
+    case NetworkSettings::Proxy::Off: return "none";
+    case NetworkSettings::Proxy::Url: return "url";
+    default: return "inherit";
+  }
+}
+
+Value network_value(const NetworkSettings& n, Alloc& a) {
+  Value o(rapidjson::kObjectType);
+  if (!n.ca_file.empty()) o.AddMember("ca_file", jstr(n.ca_file, a), a);
+  if (n.ca_off) o.AddMember("ca_off", true, a);
+  if (!n.cert_file.empty()) o.AddMember("cert_file", jstr(n.cert_file, a), a);
+  if (!n.key_file.empty()) o.AddMember("key_file", jstr(n.key_file, a), a);
+  if (n.cert_off) o.AddMember("cert_off", true, a);
+  if (n.proxy != NetworkSettings::Proxy::Inherit)
+    o.AddMember("proxy", Value(rapidjson::StringRef(proxy_mode_name(n.proxy))), a);
+  if (!n.proxy_url.empty()) o.AddMember("proxy_url", jstr(n.proxy_url, a), a);
+  if (!n.no_proxy.empty()) o.AddMember("no_proxy", jstr(n.no_proxy, a), a);
+  return o;
+}
+
+NetworkSettings network_from(const Value& parent) {
+  NetworkSettings n;
+  const Value* o = get_obj(parent, "network");
+  if (!o) return n;
+  n.ca_file = get_str(*o, "ca_file");
+  n.ca_off = get_bool(*o, "ca_off", false);
+  n.cert_file = get_str(*o, "cert_file");
+  n.key_file = get_str(*o, "key_file");
+  n.cert_off = get_bool(*o, "cert_off", false);
+  const std::string p = lower_ascii(get_str(*o, "proxy", "inherit"));
+  n.proxy = p == "env"                                   ? NetworkSettings::Proxy::Env
+            : p == "system"                              ? NetworkSettings::Proxy::System
+            : p == "none" || p == "off" || p == "direct" ? NetworkSettings::Proxy::Off
+            : p == "url"                                 ? NetworkSettings::Proxy::Url
+                                                         : NetworkSettings::Proxy::Inherit;
+  n.proxy_url = get_str(*o, "proxy_url");
+  n.no_proxy = get_str(*o, "no_proxy");
+  return n;
+}
+
 Value folder_value(const FolderSettings& s, Alloc& a) {
   Value o(rapidjson::kObjectType);
   o.AddMember("version", 1, a);
@@ -668,6 +715,7 @@ Value folder_value(const FolderSettings& s, Alloc& a) {
   if (!s.asserts.empty()) o.AddMember("asserts", asserts_value(s.asserts, a), a);
   if (!s.pre_script.empty()) o.AddMember("pre_script", body_value(s.pre_script, a, true), a);
   if (!s.post_script.empty()) o.AddMember("post_script", body_value(s.post_script, a, true), a);
+  if (!s.network.empty()) o.AddMember("network", network_value(s.network, a), a);
   return o;
 }
 
@@ -692,6 +740,7 @@ void folder_from_value(const Value& o, FolderSettings& s) {
   s.asserts = asserts_from(o);
   s.pre_script = body_from(o, "pre_script");
   s.post_script = body_from(o, "post_script");
+  s.network = network_from(o);
 }
 
 Value request_value(const SavedRequest& r, Alloc& a, bool lines, size_t body_cap) {
@@ -729,6 +778,7 @@ Value request_value(const SavedRequest& r, Alloc& a, bool lines, size_t body_cap
     http.AddMember("auth", auth, a);
   }
   if (r.auth.type != HttpAuth::Type::None) http.AddMember("auth_scheme", auth_scheme_value(r.auth, a), a);
+  if (!r.network.empty()) http.AddMember("network", network_value(r.network, a), a);
   if (r.kind == RequestKind::Http || detail::json_compact(http) != default_http_json())
     o.AddMember("http", http, a);
   Value grpc = grpc_section(r, a, lines, body_cap);
@@ -795,6 +845,7 @@ void request_from_value(const Value& o, SavedRequest& r) {
       r.basic_auth.password = get_str(*auth, "password");
     }
     if (const Value* sch = get_obj(*h, "auth_scheme")) auth_scheme_from(*sch, r.auth);
+    r.network = network_from(*h);
   }
   if (const Value* g = get_obj(o, "grpc")) {
     r.grpc_target.address = get_str(*g, "address");
@@ -914,6 +965,8 @@ namespace {
 
 constexpr const char* kStateFile = "state.json";      // in .watt/
 constexpr const char* kSecretsFile = "secrets.json";  // in .watt/
+// In secrets.json: { level key: sealed passphrase } (Workspace::set_cert_passphrase).
+constexpr const char* kCertPassKey = "watt:cert_passphrases";
 
 std::string sealed_key(const std::string& env, const std::string& var) { return env + '\0' + var; }
 
@@ -1771,10 +1824,71 @@ Workspace::FolderChain Workspace::folder_chain(const SavedRequest& r) const {
   return c;
 }
 
+namespace {
+
+// CA, client certificate and proxy as they apply: the request first, then its folders nearest
+// first, then the collection; each part from the first level that sets it.
+struct NetworkResolved {
+  NetworkSettings n;
+  SettingsOrigin ca_from, cert_from, proxy_from;
+};
+
+NetworkResolved resolve_network(const NetworkSettings& own,
+                                const std::vector<std::pair<const NetworkSettings*, SettingsOrigin>>& outer,
+                                const fs::path& root) {
+  NetworkResolved out;
+  const SettingsOrigin def{SettingsOrigin::Level::Collection, root, ""};
+  out.ca_from = out.cert_from = out.proxy_from = def;
+  out.n.proxy = NetworkSettings::Proxy::Env;
+  bool ca = false, cert = false, proxy = false;
+  auto take = [&](const NetworkSettings& s, const SettingsOrigin& o) {
+    if (!ca && (s.ca_off || !s.ca_file.empty())) {
+      ca = true;
+      out.n.ca_off = s.ca_off;
+      out.n.ca_file = s.ca_off ? std::string() : s.ca_file;
+      out.ca_from = o;
+    }
+    if (!cert && (s.cert_off || !s.cert_file.empty())) {
+      cert = true;
+      out.n.cert_off = s.cert_off;
+      out.n.cert_file = s.cert_off ? std::string() : s.cert_file;
+      out.n.key_file = s.cert_off ? std::string() : s.key_file;
+      out.cert_from = o;
+    }
+    if (!proxy && s.proxy != NetworkSettings::Proxy::Inherit) {
+      proxy = true;
+      out.n.proxy = s.proxy;
+      out.n.proxy_url = s.proxy == NetworkSettings::Proxy::Url ? s.proxy_url : std::string();
+      out.n.no_proxy = s.no_proxy;
+      out.proxy_from = o;
+    }
+  };
+  take(own, SettingsOrigin{SettingsOrigin::Level::Request, {}, "Request"});
+  for (const auto& [s, o] : outer) take(*s, o);
+  return out;
+}
+
+}  // namespace
+
+std::string Workspace::passphrase_key(const SettingsOrigin& level, const std::string& request_id) {
+  switch (level.level) {
+    case SettingsOrigin::Level::Request: return "request:" + request_id;
+    case SettingsOrigin::Level::Collection: return "";
+    default: return level.label;
+  }
+}
+
 SavedRequest Workspace::resolve_with(const SavedRequest& r, const FolderChain& c) const {
   if (r.settings_merged) return r;
   SavedRequest x = r;
   x.settings_merged = true;
+  if (r.kind == RequestKind::Http) {
+    std::vector<std::pair<const NetworkSettings*, SettingsOrigin>> outer;
+    for (size_t i = c.levels.size(); i-- > 0;) outer.emplace_back(&c.levels[i].data->s.network, c.levels[i].origin);
+    NetworkResolved nr = resolve_network(r.network, outer, root_);
+    x.network = std::move(nr.n);
+    x.cert_from_key = passphrase_key(nr.cert_from, r.id);
+  }
   // Auth: Inherit walks up to the nearest level that decides (anything but Inherit).
   if (x.auth.type == HttpAuth::Type::Inherit) {
     x.auth = HttpAuth{};
@@ -1981,6 +2095,16 @@ EffectiveSettings Workspace::effective_settings(const SavedRequest& r) const {
   if (!r.post_script.empty()) e.post_scripts.push_back({r.post_script, req});
   for (size_t i = c.levels.size(); i-- > 0;)
     if (!c.levels[i].data->s.post_script.empty()) e.post_scripts.push_back({c.levels[i].data->s.post_script, c.levels[i].origin});
+  // CA / client certificate / proxy.
+  if (!grpc) {
+    std::vector<std::pair<const NetworkSettings*, SettingsOrigin>> outer;
+    for (size_t i = c.levels.size(); i-- > 0;) outer.emplace_back(&c.levels[i].data->s.network, c.levels[i].origin);
+    NetworkResolved nr = resolve_network(r.settings_merged ? NetworkSettings{} : r.network, outer, root_);
+    e.network = std::move(nr.n);
+    e.ca_from = nr.ca_from;
+    e.cert_from = nr.cert_from;
+    e.proxy_from = nr.proxy_from;
+  }
   // Asserts: the request's own, then the inherited ones (as resolved()).
   for (const auto& a : r.asserts) e.asserts.push_back({a, req});
   for (const auto& l : c.levels)
@@ -2108,9 +2232,51 @@ bool Workspace::save_settings(std::string* err) const {
   st.AddMember("active_env", jstr(active_env, st.GetAllocator()), st.GetAllocator());
   if (!active_env.empty() || fs::exists(priv / kStateFile, ec))
     if (!write_if_changed(priv / kStateFile, detail::json_pretty(st), err)) return false;
+  // Client certificate passphrases (set_cert_passphrase) are kept as they are in the file.
+  if (rapidjson::Document old; parse_json_file(priv / kSecretsFile, old))
+    if (const Value* cp = get_obj(old, kCertPassKey); cp && !sec.HasMember(kCertPassKey))
+      sec.AddMember(Value(kCertPassKey, sa), Value(*cp, sa), sa);
   if (sec.MemberCount() > 0 || fs::exists(priv / kSecretsFile, ec))
     if (!write_if_changed(priv / kSecretsFile, detail::json_pretty(sec), err)) return false;
   return true;
+}
+
+std::string Workspace::cert_passphrase(const std::string& key) const {
+  rapidjson::Document d;
+  if (!parse_json_file(root_ / ".watt" / kSecretsFile, d)) return {};
+  const Value* cp = get_obj(d, kCertPassKey);
+  if (!cp) return {};
+  const auto it = cp->FindMember(Value(key.c_str(), static_cast<SizeType>(key.size())));
+  if (it == cp->MemberEnd() || !it->value.IsString()) return {};
+  std::string plain;
+  const std::string stored(it->value.GetString(), it->value.GetStringLength());
+  return detail::unseal_secret(stored, plain) == detail::Unseal::Failed ? std::string() : plain;
+}
+
+bool Workspace::set_cert_passphrase(const std::string& key, const std::string& passphrase, std::string* err) const {
+  const fs::path priv = root_ / ".watt";
+  rapidjson::Document d;
+  if (!parse_json_file(priv / kSecretsFile, d)) d.SetObject();
+  auto& a = d.GetAllocator();
+  if (!d.HasMember(kCertPassKey)) {
+    if (passphrase.empty()) return true;
+    d.AddMember(Value(kCertPassKey, a), Value(rapidjson::kObjectType), a);
+  }
+  Value& cp = d[kCertPassKey];
+  if (!cp.IsObject()) cp.SetObject();
+  cp.RemoveMember(Value(key.c_str(), static_cast<SizeType>(key.size())));
+  if (!passphrase.empty()) {
+    std::string stored;
+    if (!detail::seal_secret(passphrase, stored)) {
+      if (err) *err = "cannot encrypt the certificate passphrase";
+      return false;
+    }
+    cp.AddMember(jstr(key, a), jstr(stored, a), a);
+  }
+  if (cp.MemberCount() == 0) d.RemoveMember(kCertPassKey);
+  std::error_code ec;
+  if (!fs::is_directory(priv, ec)) detail::create_private_dir(priv);
+  return write_if_changed(priv / kSecretsFile, detail::json_pretty(d), err);
 }
 
 // ------------------------------------------------------------------ history
@@ -2796,6 +2962,9 @@ SavedRequest Workspace::expanded_with(const SavedRequest& r, const FolderChain& 
     v = expand(v);
   }
   x.http.body = expand(x.http.body);
+  for (std::string* f : {&x.network.ca_file, &x.network.cert_file, &x.network.key_file, &x.network.proxy_url,
+                         &x.network.no_proxy})
+    *f = expand(*f);
   x.grpc_target.address = expand(x.grpc_target.address);
   x.grpc_target.authority = expand(x.grpc_target.authority);
   x.grpc_method = expand(x.grpc_method);
@@ -3121,6 +3290,11 @@ std::vector<fs::path> Workspace::blocked_files(const SavedRequest& r) const {
   }
   for (const auto& f : x.header_files) check(policy.resolve(expand(f)));
   for (const auto& f : x.cookie_files) check(policy.resolve(expand(f)));
+  // CA bundle and client certificate / key (already expanded): a cloned workspace must not make
+  // Send present the user's client certificate from outside it without asking.
+  if (r.kind == RequestKind::Http)
+    for (const std::string* f : {&x.network.ca_file, &x.network.cert_file, &x.network.key_file})
+      if (!f->empty()) check(policy.resolve(*f));
   return out;
 }
 
@@ -3236,6 +3410,9 @@ std::vector<std::string> Workspace::env_refs_left(const SavedRequest& x, const F
   for (const auto& d : x.body_data) scan(expand(d.value));
   for (const auto& f : x.header_files) scan(expand(f));
   for (const auto& f : x.cookie_files) scan(expand(f));
+  for (const std::string* f : {&x.network.ca_file, &x.network.cert_file, &x.network.key_file, &x.network.proxy_url,
+                               &x.network.no_proxy})
+    scan(*f);
   scan(x.grpc_target.address);
   scan(x.grpc_target.authority);
   scan(x.grpc_method);
@@ -3294,6 +3471,215 @@ bool Workspace::disallow_file(const fs::path& file, std::string* err) const {
   if (end == list.end()) return true;
   list.erase(end, list.end());
   return write_allowlist(list, err);
+}
+
+// ------------------------------------------------------------------ network trust (proxy / CA / client cert)
+
+namespace {
+
+// <user_config_dir()>/allowed_network.json: {"version": 1, "workspaces": {"<resolved root>": [keys]}}.
+constexpr const char* kAllowedNetworkFile = "allowed_network.json";
+
+std::string level_name(const SettingsOrigin& o) {
+  switch (o.level) {
+    case SettingsOrigin::Level::Request: return "request";
+    case SettingsOrigin::Level::Collection: return "collection";
+    default: return "folder " + o.label;
+  }
+}
+
+std::string colon_hex(const std::string& raw) {
+  static const char* d = "0123456789ABCDEF";
+  std::string out;
+  for (const unsigned char c : raw) {
+    if (!out.empty()) out += ':';
+    out += d[c >> 4];
+    out += d[c & 15];
+  }
+  return out;
+}
+
+std::string ca_key(const std::string& pem, const fs::path& file) {
+  return "ca sha256:" + crypto::hex(crypto::digest(crypto::Hash::Sha256, pem)) + " " + generic_utf8(file);
+}
+
+std::string cert_key(const fs::path& cert, const fs::path& key) {
+  std::string k = "cert " + generic_utf8(cert);
+  if (!key.empty()) k += " key " + generic_utf8(key);
+  return k;
+}
+
+// The password of a proxy URL's user info as written (before {{var}} expansion), "" if none.
+std::string literal_proxy_password(const std::string& url) {
+  const size_t s = url.find("://");
+  const size_t a0 = s == std::string::npos ? 0 : s + 3;
+  const size_t a1 = url.find_first_of("/?#", a0);
+  const std::string auth = url.substr(a0, a1 == std::string::npos ? std::string::npos : a1 - a0);
+  const size_t at = auth.rfind('@');
+  if (at == std::string::npos) return {};
+  const std::string ui = auth.substr(0, at);
+  const size_t colon = ui.find(':');
+  return colon == std::string::npos ? std::string() : ui.substr(colon + 1);
+}
+
+}  // namespace
+
+std::string Workspace::proxy_origin(const std::string& proxy_url, bool* has_credentials, std::string* normalized) {
+  if (has_credentials) *has_credentials = false;
+  if (normalized) normalized->clear();
+  if (proxy_url.empty() || proxy_url.find('\\') != std::string::npos) return {};
+  for (const char c : proxy_url)
+    if (static_cast<unsigned char>(c) <= 0x20 || c == 0x7F) return {};
+  std::string url = proxy_url;
+  if (url.find("://") == std::string::npos) url = "http://" + url;  // libcurl's default proxy scheme
+  const std::string scheme = lower_ascii(url.substr(0, url.find("://")));
+  if (scheme != "http" && scheme != "https" && scheme != "socks5" && scheme != "socks5h") return {};
+  CURLU* u = curl_url();
+  if (!u) return {};
+  std::string out;
+  if (curl_url_set(u, CURLUPART_URL, url.c_str(), CURLU_NON_SUPPORT_SCHEME) == CURLUE_OK) {
+    char *host = nullptr, *port = nullptr, *user = nullptr, *pass = nullptr, *query = nullptr, *frag = nullptr,
+         *path = nullptr;
+    const bool got = curl_url_get(u, CURLUPART_HOST, &host, 0) == CURLUE_OK && host && *host;
+    if (curl_url_get(u, CURLUPART_PORT, &port, 0) != CURLUE_OK) port = nullptr;
+    const bool has_user = curl_url_get(u, CURLUPART_USER, &user, 0) == CURLUE_OK && user && *user;
+    const bool has_pass = curl_url_get(u, CURLUPART_PASSWORD, &pass, 0) == CURLUE_OK && pass && *pass;
+    const bool has_query = curl_url_get(u, CURLUPART_QUERY, &query, 0) == CURLUE_OK && query;
+    const bool has_frag = curl_url_get(u, CURLUPART_FRAGMENT, &frag, 0) == CURLUE_OK && frag;
+    const bool has_path = curl_url_get(u, CURLUPART_PATH, &path, 0) == CURLUE_OK && path && std::string(path) != "/";
+    if (got && !has_query && !has_frag && !has_path) {
+      std::string h = lower_ascii(host);
+      while (!h.empty() && h.back() == '.') h.pop_back();
+      const std::string p = port ? std::string(port)
+                            : scheme == "https" ? std::string("443")
+                            : scheme == "http"  ? std::string("80")
+                                                : std::string("1080");
+      if (!h.empty()) {
+        out = scheme + "://" + h + ":" + p;
+        if (has_credentials) *has_credentials = has_user || has_pass;
+        if (normalized) {
+          std::string ui;
+          if (has_user || has_pass) ui = std::string(user ? user : "") + (has_pass ? ":" + std::string(pass) : "") + "@";
+          *normalized = scheme + "://" + ui + h + ":" + p;
+        }
+      }
+    }
+    curl_free(host);
+    curl_free(port);
+    curl_free(user);
+    curl_free(pass);
+    curl_free(query);
+    curl_free(frag);
+    curl_free(path);
+  }
+  curl_url_cleanup(u);
+  return out;
+}
+
+std::vector<Workspace::NetworkItem> Workspace::blocked_network_settings(const SavedRequest& r) const {
+  std::vector<NetworkItem> out;
+  if (r.kind != RequestKind::Http) return out;
+  const FolderChain c = folder_chain(r);
+  const SavedRequest x = expanded_with(r, c);
+  const NetworkSettings& n = x.network;
+  if (n.ca_file.empty() && n.cert_file.empty() && n.proxy != NetworkSettings::Proxy::Url) return out;
+  const EffectiveSettings e = effective_settings(r);
+  const auto allowed = read_root_list(kAllowedNetworkFile, root_);
+  auto listed = [&](const std::string& k) { return std::find(allowed.begin(), allowed.end(), k) != allowed.end(); };
+  const UploadPolicy policy(root_);
+
+  if (n.proxy == NetworkSettings::Proxy::Url && !n.proxy_url.empty()) {
+    bool creds = false;
+    const std::string origin = proxy_origin(n.proxy_url, &creds);
+    // Not a valid proxy URL: nothing to approve, http_to_send() refuses it.
+    if (!origin.empty() && !listed("proxy " + origin)) {
+      NetworkItem it;
+      it.kind = NetworkItem::Kind::Proxy;
+      it.key = "proxy " + origin;
+      it.level = level_name(e.proxy_from);
+      it.proxy_origin = origin;
+      it.proxy_credentials = creds;
+      it.text = "the proxy " + origin + (creds ? " (the URL carries proxy credentials)" : "");
+      out.push_back(std::move(it));
+    }
+  }
+  if (!n.ca_file.empty()) {
+    NetworkItem it;
+    it.kind = NetworkItem::Kind::Ca;
+    it.level = level_name(e.ca_from);
+    it.file = policy.resolve(n.ca_file);
+    if (!policy.allowed(it.file)) {  // judged from the text: never touched before approval
+      it.file_blocked.push_back(it.file);
+      it.key = "file " + generic_utf8(it.file);
+      it.text = "the CA certificate file " + to_utf8(it.file) + " (outside the workspace)";
+      out.push_back(std::move(it));
+    } else {
+      std::string pem;
+      if (detail::read_file(it.file, pem)) {  // unreadable: http_to_send() fails naming it
+        it.key = ca_key(pem, it.file);
+        if (!listed(it.key)) {
+          it.fingerprint = colon_hex(crypto::digest(crypto::Hash::Sha256, pem));
+          it.subjects = pem_certificate_subjects(pem);
+          std::string who;
+          for (size_t k = 0; k < it.subjects.size() && k < 3; ++k) who += (k ? ", " : "") + it.subjects[k];
+          if (it.subjects.size() > 3) who += ", ...";
+          it.text = "the CA certificate file " + to_utf8(it.file) + (who.empty() ? "" : " (" + who + ")") +
+                    ", SHA-256 " + it.fingerprint;
+          out.push_back(std::move(it));
+        }
+      }
+    }
+  }
+  if (!n.cert_file.empty()) {
+    NetworkItem it;
+    it.kind = NetworkItem::Kind::ClientCert;
+    it.level = level_name(e.cert_from);
+    it.file = policy.resolve(n.cert_file);
+    if (!n.key_file.empty()) it.key_file = policy.resolve(n.key_file);
+    for (const fs::path* f : {&it.file, &it.key_file})
+      if (!f->empty() && !policy.allowed(*f)) it.file_blocked.push_back(*f);
+    it.key = cert_key(it.file, it.key_file);
+    if (!it.file_blocked.empty() || !listed(it.key)) {
+      it.text = "the client certificate " + to_utf8(it.file) +
+                (it.key_file.empty() ? std::string() : " with the key " + to_utf8(it.key_file)) +
+                (it.file_blocked.empty() ? "" : " (outside the workspace)");
+      out.push_back(std::move(it));
+    }
+  }
+  return out;
+}
+
+bool Workspace::allow_network_item(const NetworkItem& item, std::string* err) const {
+  for (const auto& f : item.file_blocked)
+    if (!allow_file(f, err)) return false;
+  // A CA file not read yet: only the file is allowed now; its content is asked about next.
+  if (item.kind == NetworkItem::Kind::Ca && (!item.file_blocked.empty() || item.fingerprint.empty())) return true;
+  if (item.key.empty()) return false;
+  std::vector<std::string> list = read_root_list(kAllowedNetworkFile, root_);
+  if (std::find(list.begin(), list.end(), item.key) != list.end()) return true;
+  if (item.kind == NetworkItem::Kind::Ca) {  // one approved version per CA file
+    const std::string suffix = " " + generic_utf8(item.file);
+    list.erase(std::remove_if(list.begin(), list.end(),
+                              [&](const std::string& k) {
+                                return k.rfind("ca ", 0) == 0 && k.size() > suffix.size() &&
+                                       k.compare(k.size() - suffix.size(), suffix.size(), suffix) == 0;
+                              }),
+               list.end());
+  }
+  list.push_back(item.key);
+  return write_root_list(kAllowedNetworkFile, root_, list, "network settings allowlist", err);
+}
+
+bool Workspace::disallow_network_item(const NetworkItem& item, std::string* err) const {
+  std::vector<std::string> list = read_root_list(kAllowedNetworkFile, root_);
+  const auto end = std::remove(list.begin(), list.end(), item.key);
+  if (end == list.end()) return true;
+  list.erase(end, list.end());
+  return write_root_list(kAllowedNetworkFile, root_, list, "network settings allowlist", err);
+}
+
+std::vector<std::string> Workspace::allowed_network_items() const {
+  return read_root_list(kAllowedNetworkFile, root_);
 }
 
 std::optional<HttpRequest> Workspace::http_to_send(const SavedRequest& r, std::string* err) const {
@@ -3397,6 +3783,81 @@ std::optional<HttpRequest> Workspace::http_to_send(const SavedRequest& r, std::s
           break;
         }
       if (!merged) x.http.headers.emplace_back("Cookie", jar_cookies);
+    }
+  }
+  // CA bundle, client certificate (mTLS) and proxy (NetworkSettings, already resolved and
+  // expanded): all come from workspace files, so each is used only once the user approved it
+  // (blocked_network_settings()); files read under the same policy as uploads, the passphrase
+  // from secrets.json. Fail closed: anything not approved stops the send, naming it.
+  {
+    const NetworkSettings& n = x.network;
+    const auto approved = read_root_list(kAllowedNetworkFile, root_);
+    auto listed = [&](const std::string& k) { return std::find(approved.begin(), approved.end(), k) != approved.end(); };
+    const char* how = ": request not sent. The user must allow it for this workspace first.";
+    if (!n.ca_file.empty()) {
+      if (!read_ref("CA certificate file", n.ca_file, x.http.ca_pem)) return std::nullopt;
+      const fs::path fp = policy.resolve(n.ca_file);
+      if (!listed(ca_key(x.http.ca_pem, fp))) {
+        if (err)
+          *err = "the workspace wants watt to trust the CA certificate file " + to_utf8(fp) + " (SHA-256 " +
+                 colon_hex(crypto::digest(crypto::Hash::Sha256, x.http.ca_pem)) +
+                 "), which is not approved (or changed since it was approved)" + how;
+        return std::nullopt;
+      }
+    }
+    if (n.ca_off) x.http.ca_pem.clear();
+    if (!n.cert_file.empty()) {
+      if (!read_ref("client certificate file", n.cert_file, x.http.client_cert)) return std::nullopt;
+      if (!n.key_file.empty() && !read_ref("client key file", n.key_file, x.http.client_key)) return std::nullopt;
+      const fs::path cf = policy.resolve(n.cert_file);
+      const fs::path kf = n.key_file.empty() ? fs::path() : policy.resolve(n.key_file);
+      if (!listed(cert_key(cf, kf))) {
+        if (err)
+          *err = "the workspace wants to present the client certificate " + to_utf8(cf) +
+                 (kf.empty() ? std::string() : " (key " + to_utf8(kf) + ")") + ", which is not approved" + how;
+        return std::nullopt;
+      }
+      x.http.client_key_passphrase = cert_passphrase(x.cert_from_key);
+    }
+    switch (n.proxy) {
+      case NetworkSettings::Proxy::System: x.http.proxy = HttpRequest::Proxy::System; break;
+      case NetworkSettings::Proxy::Off: x.http.proxy = HttpRequest::Proxy::Off; break;
+      case NetworkSettings::Proxy::Url:
+        x.http.proxy = n.proxy_url.empty() ? HttpRequest::Proxy::Off : HttpRequest::Proxy::Url;
+        break;
+      default: x.http.proxy = HttpRequest::Proxy::Env; break;
+    }
+    x.http.no_proxy = n.no_proxy;
+    x.http.proxy_url.clear();
+    if (has_ctl_break(n.proxy_url) || has_ctl_break(x.http.no_proxy)) {
+      if (err) *err = "the proxy setting contains a line break: request not sent.";
+      return std::nullopt;
+    }
+    if (x.http.proxy == HttpRequest::Proxy::Url) {
+      // A password typed into the proxy URL would sit in plain text in a git-tracked file.
+      if (const std::string pw = literal_proxy_password(effective_settings(r).network.proxy_url);
+          !pw.empty() && pw.find("{{") == std::string::npos) {
+        if (err)
+          *err = "the proxy URL holds a password in plain text in a workspace file (shared through git): put it "
+                 "in a secret variable, e.g. http://user:{{proxyPassword}}@host:port: request not sent.";
+        return std::nullopt;
+      }
+      bool creds = false;
+      std::string url;
+      const std::string origin = proxy_origin(n.proxy_url, &creds, &url);
+      if (origin.empty()) {
+        if (err)
+          *err = "the proxy URL must be a valid http://, https://, socks5:// or socks5h:// URL "
+                 "(scheme://host:port): request not sent.";
+        return std::nullopt;
+      }
+      if (!listed("proxy " + origin)) {
+        if (err)
+          *err = "the workspace wants to send all requests through the proxy " + origin +
+                 ", which is not approved" + how;
+        return std::nullopt;
+      }
+      x.http.proxy_url = std::move(url);  // rebuilt from the parsed parts: exactly the approved host
     }
   }
   // No header may carry a line break (header injection / request splitting), own or inherited.

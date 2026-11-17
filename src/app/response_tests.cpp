@@ -284,4 +284,72 @@ std::string path_string(const std::vector<PathStep>& path) {
   return s;
 }
 
+std::string json_path_miss(std::string_view text, const std::vector<PathStep>& path, const std::string& root) {
+  // The longest prefix of the path that exists, and the value there.
+  std::vector<PathStep> pre;
+  size_t at = json_locate(text, pre);
+  if (at == std::string_view::npos || at >= text.size()) return {};
+  size_t k = 0;
+  for (; k < path.size(); ++k) {
+    pre.push_back(path[k]);
+    const size_t next = json_locate(text, pre);
+    if (next == std::string_view::npos) {
+      pre.pop_back();
+      break;
+    }
+    at = next;
+  }
+  if (k == path.size() || at >= text.size()) return {};  // it is there
+  std::string where = path_string(pre);
+  where = root + where.substr(1);
+  const PathStep& st = path[k];
+  const char c = text[at];
+  const std::string_view rest = text.substr(at);
+  const bool literal = rest.rfind("true", 0) == 0 || rest.rfind("false", 0) == 0 || rest.rfind("null", 0) == 0;
+  if (!(c == '{' || c == '[' || c == '"' || c == '-' || (c >= '0' && c <= '9') || literal)) return {};  // not JSON
+  const char* type = c == '{' ? "an object" : c == '[' ? "an array" : c == '"' ? "a string"
+                     : c == 't' || c == 'f' ? "a boolean" : c == 'n' ? "null" : "a number";
+  if (c == '[' && !st.is_index) {
+    std::vector<PathStep> one = pre;
+    PathStep i0;
+    i0.is_index = true;
+    one.push_back(i0);
+    one.push_back(st);
+    std::string try_ = path_string(one);
+    return where + " is an array: try " + root + try_.substr(1);
+  }
+  if (c == '[') {
+    // Count the elements (a cheap skip over the array).
+    std::vector<PathStep> probe = pre;
+    PathStep ix;
+    ix.is_index = true;
+    long n = 0;
+    for (; n < 100000; ++n) {
+      ix.index = n;
+      probe.push_back(ix);
+      const bool there = json_locate(text, probe) != std::string_view::npos;
+      probe.pop_back();
+      if (!there) break;
+    }
+    return where + " has " + std::to_string(n) + (n == 1 ? " element" : " elements") + ", no [" +
+           std::to_string(st.index) + "]";
+  }
+  if (c == '{' && st.is_index) return where + " is an object, not an array";
+  if (c == '{') return where + " has no member \"" + st.key + "\"";
+  return where + " is " + type + ", not " + (st.is_index ? "an array" : "an object");
+}
+
+std::string capture_var_problem(std::string_view v, size_t max_len) {
+  if (v.empty()) return "no variable name";
+  if (v.size() > max_len) return "variable name longer than " + std::to_string(max_len) + " bytes";
+  if (v.find("{{") != std::string_view::npos || v.find("}}") != std::string_view::npos)
+    return "variable name contains braces";
+  for (const char c : v)
+    if (static_cast<unsigned char>(c) < 0x20) return "variable name contains a control character";
+  // (control characters are refused above: only a space can be outer here)
+  auto blank = [](char c) { return c == 0x20; };
+  if (blank(v.front()) || blank(v.back())) return "variable name has leading or trailing spaces";
+  return {};
+}
+
 }  // namespace watt::app::rv

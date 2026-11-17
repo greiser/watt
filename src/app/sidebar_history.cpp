@@ -4,11 +4,16 @@
 #include <wx/dc.h>
 #include <wx/control.h>
 #include <wx/menu.h>
+#include <wx/time.h>
 
+#include <algorithm>
 #include <ctime>
+#include <set>
 
+#include "app/history_summary.h"
 #include "app/sidebar_fuzzy.h"
 #include "app/sidebar_style.h"
+#include "core/model_history_store.h"
 
 namespace watt::app::sidebar {
 
@@ -16,7 +21,7 @@ namespace {
 
 // "GET https://host/x" -> "host/x"; "/pkg.Svc/M @ host:1" -> "pkg.Svc/M @ host:1".
 std::string target_of(const HistoryEntry& e) {
-  std::string s = e.summary;
+  std::string s(history_template(e));
   if (e.kind == RequestKind::Http) {
     const size_t sp = s.find(' ');
     if (sp != std::string::npos) s.erase(0, sp + 1);
@@ -33,8 +38,19 @@ std::string target_of(const HistoryEntry& e) {
 
 std::string method_of(const HistoryEntry& e) {
   if (e.kind != RequestKind::Http) return {};
-  const size_t sp = e.summary.find(' ');
-  return sp == std::string::npos ? e.summary : e.summary.substr(0, sp);
+  const std::string_view t = history_template(e);
+  return std::string(t.substr(0, t.find(' ')));
+}
+
+// Repeats group by where they went (method + sent URL / address), so "GET {{base}}/echo" and a
+// literal "GET http://127.0.0.1:18971/echo" sent to the same place fold into one run; entries
+// from before the sent target was recorded group by their template.
+std::string group_key(const HistoryEntry& e) {
+  const std::string_view sent = history_sent(e);
+  if (sent.empty()) return std::string(history_template(e));
+  const std::string_view t = history_template(e);
+  std::string head(e.kind == RequestKind::Grpc ? t.substr(0, t.find(" @ ")) : t.substr(0, t.find(' ')));
+  return head + ' ' + std::string(sent);
 }
 
 // Local time of an ISO UTC timestamp; false when it does not parse.
@@ -98,31 +114,65 @@ std::string history_when_label(const std::string& iso) {
   return buf;
 }
 
+
 HistoryList::HistoryList(wxWindow* parent)
     : wxVListBox(parent, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxBORDER_NONE | wxLB_SINGLE) {
   SetBackgroundColour(window_colour());
   // A click opens the row as a preview (the host reuses the preview tab or activates the tab
   // that already shows it, so clicks never pile up tabs); a double click or Enter keeps it.
+  // A click on a run's "x60" chip folds / unfolds the run instead.
   Bind(wxEVT_LEFT_DOWN, [this](wxMouseEvent& e) {
     const int hit = VirtualHitTest(e.GetPosition().y);
     click_opened_ = -1;
     if (!entry(hit)) return;  // a day header or empty space: nothing to select
+    if (on_chip(hit, e.GetPosition().x)) {
+      SetSelection(hit);
+      toggle_run(hit);
+      return;
+    }
     e.Skip();
     click_opened_ = hit;
     CallAfter([this, hit] { open_row(hit, false); });
   });
   Bind(wxEVT_LEFT_DCLICK, [this](wxMouseEvent& e) {
     const int hit = VirtualHitTest(e.GetPosition().y);
-    if (entry(hit)) open_row(hit, true);  // the host makes the preview permanent (no second tab)
-    click_opened_ = -1;
-    (void)e;
-  });
-  Bind(wxEVT_KEY_DOWN, [this](wxKeyEvent& e) {
-    if (e.GetKeyCode() == WXK_RETURN || e.GetKeyCode() == WXK_NUMPAD_ENTER) {
-      open_row(GetSelection(), true);
+    if (on_chip(hit, e.GetPosition().x)) {
+      toggle_run(hit);  // the second click of a fast double click on the chip
       return;
     }
-    e.Skip();
+    if (entry(hit)) open_row(hit, true);  // the host makes the preview permanent (no second tab)
+    click_opened_ = -1;
+  });
+  Bind(wxEVT_KEY_DOWN, [this](wxKeyEvent& e) {
+    const int sel = GetSelection();
+    const bool run = is_run(sel);
+    switch (e.GetKeyCode()) {
+      case WXK_RETURN:
+      case WXK_NUMPAD_ENTER:
+        open_row(sel, true);
+        return;
+      case WXK_DELETE:
+      case WXK_NUMPAD_DELETE:
+        if (entry(sel) && on_delete) on_delete(row_entries(sel));
+        return;
+      case WXK_RIGHT:
+      case WXK_NUMPAD_RIGHT:
+        if (run && !unfolded(sel)) toggle_run(sel);
+        return;
+      case WXK_LEFT:
+      case WXK_NUMPAD_LEFT:
+        if (run && unfolded(sel)) {
+          toggle_run(sel);
+        } else if (sel >= 0 && static_cast<size_t>(sel) < rows_.size() && rows_[static_cast<size_t>(sel)].child) {
+          int r = sel;
+          while (r > 0 && !is_run(r)) --r;
+          SetSelection(r);
+          toggle_run(r);
+        }
+        return;
+      default:
+        e.Skip();
+    }
   });
   // Day headers are not selectable (keyboard): step over them.
   Bind(wxEVT_LISTBOX, [this](wxCommandEvent& e) {
@@ -148,11 +198,41 @@ HistoryList::HistoryList(wxWindow* parent)
       UnsetToolTip();
       return;
     }
-    const Label& l = label(static_cast<size_t>(rows_[static_cast<size_t>(hit)].entry));
-    std::string tip = l.name.empty() ? h->summary : l.name + "\n" + h->summary;
-    if (!l.target.empty() && h->summary.find(l.target) == std::string::npos) tip += "\n= " + l.target;
-    tip += "\n" + status_text(h->kind, h->status) + "  \xC2\xB7  " + format_ms(h->total_ms) + "  \xC2\xB7  " +
-           h->when_iso;
+    const Row& row = rows_[static_cast<size_t>(hit)];
+    const Label& l = label(static_cast<size_t>(row.entry));
+    const std::string tmpl(history_template(*h));
+    std::string tip = l.name.empty() ? tmpl : l.name + "\n" + tmpl;
+    // Where it went at the time, and with which environment (not the one active now).
+    if (const std::string_view sent = history_sent(*h); !sent.empty()) {
+      if (tmpl.find(sent) == std::string::npos) tip += "\nSent to " + std::string(sent);
+      if (const std::string_view env = history_env(*h); !env.empty()) tip += "  (env " + std::string(env) + ")";
+      else if (tmpl.find("{{") != std::string::npos) tip += "  (no environment)";
+    } else if (tmpl.find("{{") != std::string::npos) {
+      tip += "\nSent before watt recorded the resolved target";
+    }
+    if (h->kind == RequestKind::Grpc && grpc_kind)
+      if (const std::string k = grpc_kind_name(grpc_kind(*h)); !k.empty()) tip += "\n" + k;
+    std::string when = h->when_iso;  // stored in UTC: shown in local time, like the rows
+    if (std::tm lt{}; local_time(h->when_iso, &lt, nullptr)) {
+      char buf[48];
+      std::strftime(buf, sizeof buf, "%Y-%m-%d %H:%M:%S", &lt);
+      when = buf;
+      if (const std::string ago = when_text(h->when_iso); !ago.empty() && ago.find(':') == std::string::npos)
+        when += " (" + (ago == "now" ? std::string("just now") : ago + " ago") + ")";
+    }
+    tip += "\n" + status_text(h->kind, h->status) + "  \xC2\xB7  " + format_ms(h->total_ms) + "  \xC2\xB7  " + when;
+    if (!row.run.empty()) {
+      double lo = 1e300, hi = 0, sum = 0;
+      for (int i : row.run) {
+        const double ms = all_[static_cast<size_t>(i)].total_ms;
+        lo = std::min(lo, ms);
+        hi = std::max(hi, ms);
+        sum += ms;
+      }
+      tip += "\n" + std::to_string(row.run.size()) + " sends in a row: min " + format_ms(lo) + ", avg " +
+             format_ms(sum / static_cast<double>(row.run.size())) + ", max " + format_ms(hi) +
+             "\nClick the count (or Right / Left) to show / fold them.";
+    }
     SetToolTip(wxString::FromUTF8(tip));
   });
   Bind(wxEVT_LEAVE_WINDOW, [this](wxMouseEvent& e) {
@@ -161,39 +241,116 @@ HistoryList::HistoryList(wxWindow* parent)
     hover_ = -1;
     if (old >= 0) RefreshRow(old);
   });
+  // The menu opens on the right button's release itself, not on the WM_CONTEXTMENU that
+  // follows it: a right click right after the pointer reached a row (its tooltip just being
+  // replaced) lost that message, and the row was selected with no menu. The tooltip is
+  // dropped first so it cannot cover the menu.
+  Bind(wxEVT_RIGHT_DOWN, [this](wxMouseEvent& e) {
+    right_row_ = VirtualHitTest(e.GetPosition().y);
+    UnsetToolTip();
+    if (entry(right_row_)) SetSelection(right_row_);
+    SetFocus();
+  });
+  Bind(wxEVT_RIGHT_UP, [this](wxMouseEvent& e) {
+    const int row = VirtualHitTest(e.GetPosition().y);
+    const int down = right_row_;
+    right_row_ = -1;
+    if (row != down || !entry(row)) return;
+    menu_shown_at_ = wxGetLocalTimeMillis();
+    show_menu(row);
+  });
+  // When the user last scrolled (wheel, scrollbar): prepend() keeps their position then.
+  Bind(wxEVT_MOUSEWHEEL, [this](wxMouseEvent& e) {
+    e.Skip();
+    user_scrolled_at_ = wxGetLocalTimeMillis();
+  });
+  auto scrolled = [this](wxScrollWinEvent& e) {
+    e.Skip();
+    user_scrolled_at_ = wxGetLocalTimeMillis();
+  };
+  Bind(wxEVT_SCROLLWIN_THUMBTRACK, scrolled);
+  Bind(wxEVT_SCROLLWIN_LINEUP, scrolled);
+  Bind(wxEVT_SCROLLWIN_LINEDOWN, scrolled);
+  Bind(wxEVT_SCROLLWIN_PAGEUP, scrolled);
+  Bind(wxEVT_SCROLLWIN_PAGEDOWN, scrolled);
   Bind(wxEVT_CONTEXT_MENU, [this](wxContextMenuEvent& e) {
     wxPoint p = e.GetPosition();
+    // The one a right click sends after its RIGHT_UP: that click has its menu already.
+    if (p != wxDefaultPosition && wxGetLocalTimeMillis() - menu_shown_at_ < 1000) return;
     int row = GetSelection();
     if (p != wxDefaultPosition) row = VirtualHitTest(ScreenToClient(p).y);
+    show_menu(row);
+  });
+}
+
+void HistoryList::show_menu(int row) {
+  {
     const HistoryEntry* h = entry(row);
     if (!h) return;
     SetSelection(row);
     const HistoryEntry copy = *h;
     const Label l = label(static_cast<size_t>(rows_[static_cast<size_t>(row)].entry));
+    const std::vector<HistoryEntry> members = row_entries(row);
+    const bool run = is_run(row);
+    const bool open = run && unfolded(row);
+    enum { kOpen = 1, kCopyUrl, kCopyResolved, kSaved, kSaveAs, kCurl, kFold, kDelete, kClear };
     wxMenu m;
-    m.Append(1, "Open as sent\tEnter");
-    m.Append(4, "Open saved request")->Enable(!has_saved || has_saved(copy));
+    m.Append(kOpen, "Open as sent\tEnter");
+    m.Append(kSaved, "Open saved request")->Enable(!has_saved || has_saved(copy));
+    m.Append(kSaveAs, wxString::FromUTF8("Save as request\xE2\x80\xA6"));
     m.AppendSeparator();
-    m.Append(2, "Copy URL / target");
-    m.Append(3, "Copy resolved URL / target");
+    m.Append(kCurl, copy.kind == RequestKind::Grpc ? "Copy as grpcurl" : "Copy as cURL");
+    m.Append(kCopyUrl, "Copy URL / target");
+    m.Append(kCopyResolved, "Copy resolved URL / target");
+    m.AppendSeparator();
+    if (run)
+      m.Append(kFold, open ? wxString::Format("Fold the %zu repeats\tLeft", rows_[static_cast<size_t>(row)].run.size())
+                           : wxString::Format("Show the %zu repeats\tRight", members.size()));
+    m.Append(kDelete, members.size() > 1 ? wxString::Format("Delete %zu entries\tDel", members.size())
+                                         : wxString("Delete entry\tDel"));
+    m.Append(kClear, wxString::FromUTF8("Clear history\xE2\x80\xA6"));
     const int id = GetPopupMenuSelectionFromUser(m);
-    if (id == 1 && on_open) on_open(copy, true, false);
-    if (id == 4 && on_open) on_open(copy, false, true);
+    switch (id) {
+      case kOpen:
+        if (on_open) on_open(copy, true, false);
+        return;
+      case kSaved:
+        if (on_open) on_open(copy, false, true);
+        return;
+      case kSaveAs:
+        if (on_save_as) on_save_as(copy);
+        return;
+      case kCurl:
+        if (on_copy_curl) on_copy_curl(copy);
+        return;
+      case kFold:
+        toggle_run(row);
+        return;
+      case kDelete:
+        if (on_delete) on_delete(members);
+        return;
+      case kClear:
+        if (on_clear) on_clear();
+        return;
+      default:
+        break;
+    }
     std::string s;
-    if (id == 2) {
-      s = copy.summary;
+    if (id == kCopyUrl) {
+      s = history_template(copy);
       if (copy.kind == RequestKind::Http) {
         const size_t sp = s.find(' ');
         if (sp != std::string::npos) s.erase(0, sp + 1);
       }
-    } else if (id == 3) {
-      s = l.target;
+    } else if (id == kCopyResolved) {
+      s = history_sent(copy);  // with its scheme, as sent
+      if (s.empty()) s = l.target;
     }
     if (!s.empty() && wxTheClipboard->Open()) {
       wxTheClipboard->SetData(new wxTextDataObject(wxString::FromUTF8(s)));
       wxTheClipboard->Close();
     }
-  });
+  }
 }
 
 void HistoryList::open_row(int row, bool permanent) {
@@ -201,6 +358,56 @@ void HistoryList::open_row(int row, bool permanent) {
     const HistoryEntry copy = *h;
     on_open(copy, permanent, false);
   }
+}
+
+bool HistoryList::is_run(int row) const {
+  return row >= 0 && static_cast<size_t>(row) < rows_.size() && !rows_[static_cast<size_t>(row)].run.empty();
+}
+
+bool HistoryList::unfolded(int row) const {
+  const std::string k = run_key(row);
+  return !k.empty() && std::find(unfolded_.begin(), unfolded_.end(), k) != unfolded_.end();
+}
+
+bool HistoryList::on_chip(int row, int x) const {
+  if (row < 0 || static_cast<size_t>(row) >= chip_x_.size() || !is_run(row)) return false;
+  const auto [l, r] = chip_x_[static_cast<size_t>(row)];
+  return r > l && x >= l - FromDIP(3) && x < r + FromDIP(3);
+}
+
+std::vector<HistoryEntry> HistoryList::row_entries(int row) const {
+  std::vector<HistoryEntry> out;
+  if (!entry(row)) return out;
+  const Row& r = rows_[static_cast<size_t>(row)];
+  if (is_run(row) && !unfolded(row)) {
+    for (int i : r.run) out.push_back(all_[static_cast<size_t>(i)]);
+  } else {
+    out.push_back(all_[static_cast<size_t>(r.entry)]);
+  }
+  return out;
+}
+
+std::string HistoryList::run_key(int row) const {
+  if (!is_run(row)) return {};
+  const HistoryEntry& oldest = all_[static_cast<size_t>(rows_[static_cast<size_t>(row)].run.back())];
+  return oldest.when_iso + "\x01" + oldest.summary;
+}
+
+void HistoryList::toggle_run(int row) {
+  const std::string k = run_key(row);
+  if (k.empty()) return;
+  auto it = std::find(unfolded_.begin(), unfolded_.end(), k);
+  if (it == unfolded_.end()) unfolded_.push_back(k);
+  else unfolded_.erase(it);
+  const size_t top = GetVisibleBegin();
+  refilter();
+  // The run row stays where it was (its entries come below it), and stays selected.
+  for (size_t r = 0; r < rows_.size(); ++r)
+    if (run_key(static_cast<int>(r)) == k) {
+      SetSelection(static_cast<int>(r));
+      break;
+    }
+  if (!rows_.empty()) ScrollToRow(std::min(top, rows_.size() - 1));
 }
 
 void HistoryList::set_entries(std::vector<HistoryEntry> newest_first) {
@@ -220,7 +427,12 @@ void HistoryList::prepend(const HistoryEntry& e) {
     all_.pop_back();
     labels_.pop_back();
   }
+  const size_t top = GetVisibleBegin();
   refilter();
+  // The new entry is in view: the list goes back to its top, unless the user is scrolling it
+  // right now (then their position is kept). Sends after clicking an older row used to land
+  // above the visible area with the panel looking unchanged.
+  if (top > 0 && wxGetLocalTimeMillis() - user_scrolled_at_ > 1500) ScrollToRow(0);
   if (sel_key.empty()) return;
   for (size_t r = 0; r < rows_.size(); ++r) {
     if (rows_[r].entry < 0) continue;
@@ -232,10 +444,47 @@ void HistoryList::prepend(const HistoryEntry& e) {
   }
 }
 
+void HistoryList::remove(const std::vector<HistoryEntry>& entries) {
+  if (entries.empty()) return;
+  std::set<std::string> keys;
+  for (const auto& e : entries) keys.insert(history_entry_key(e));
+  int sel = GetSelection();
+  std::vector<HistoryEntry> keep;
+  std::vector<Label> keep_labels;
+  keep.reserve(all_.size());
+  keep_labels.reserve(all_.size());
+  for (size_t i = 0; i < all_.size(); ++i) {
+    if (keys.count(history_entry_key(all_[i]))) continue;
+    keep.push_back(std::move(all_[i]));
+    keep_labels.push_back(std::move(labels_[i]));
+  }
+  all_ = std::move(keep);
+  labels_ = std::move(keep_labels);
+  refilter();
+  // The row that took the deleted one's place is selected (Del, Del, Del walks down the list).
+  const int n = static_cast<int>(rows_.size());
+  if (n == 0) return;
+  sel = std::min(std::max(sel, 0), n - 1);
+  if (!entry(sel)) sel = sel + 1 < n ? sel + 1 : sel - 1;
+  if (entry(sel)) SetSelection(sel);
+}
+
+void HistoryList::clear_all() {
+  all_.clear();
+  labels_.clear();
+  unfolded_.clear();
+  refilter();
+}
+
 void HistoryList::set_filter(const std::string& q) {
   if (q == filter_) return;
+  // The highlight stays on its entry: the rows are renumbered, and the same row number is
+  // another entry (after clearing the filter the first row was highlighted, not the open one).
+  const HistoryEntry* sel = entry(GetSelection());
+  const std::string when = sel ? sel->when_iso : std::string(), summary = sel ? sel->summary : std::string();
   filter_ = q;
   refilter();
+  select_entry(when, summary);
 }
 
 void HistoryList::relabel() {
@@ -260,24 +509,76 @@ void HistoryList::refilter() {
   rows_.clear();
   rows_.reserve(all_.size() + 8);
   shown_count_ = 0;
-  std::string day;
+  // The entries that pass the filter, with their day.
+  std::vector<int> shown;
+  std::vector<std::string> days;
+  shown.reserve(all_.size());
+  days.reserve(all_.size());
   for (size_t i = 0; i < all_.size(); ++i) {
     if (!filter_.empty()) {
       const Label& l = label(i);
-      if (!words_match(filter_, all_[i].summary + " " + l.name + " " + l.target)) continue;
+      // The template, the sent target and its environment (all in summary), and the name.
+      std::string hay = all_[i].summary;
+      for (char& c : hay)
+        if (c == kHistorySep) c = ' ';
+      if (!words_match(filter_, hay + " " + l.name + " " + l.target)) continue;
     }
-    std::string d = day_text(all_[i].when_iso);
-    if (rows_.empty() || d != day) {
-      day = d;
-      rows_.push_back(Row{-1, std::move(d)});
+    shown.push_back(static_cast<int>(i));
+    days.push_back(day_text(all_[i].when_iso));
+  }
+  // Consecutive repeats: same day, kind, summary, status and request name.
+  auto same = [&](size_t a, size_t b) {
+    const HistoryEntry& x = all_[static_cast<size_t>(shown[a])];
+    const HistoryEntry& y = all_[static_cast<size_t>(shown[b])];
+    if (days[a] != days[b] || x.kind != y.kind || x.status != y.status || group_key(x) != group_key(y)) return false;
+    return label(static_cast<size_t>(shown[a])).name == label(static_cast<size_t>(shown[b])).name;
+  };
+  std::string day;
+  for (size_t k = 0; k < shown.size();) {
+    size_t j = k + 1;
+    while (j < shown.size() && same(k, j)) ++j;
+    if (rows_.empty() || days[k] != day) {
+      day = days[k];
+      rows_.push_back(Row{-1, day, {}, false});
     }
-    rows_.push_back(Row{static_cast<int>(i), {}});
-    ++shown_count_;
+    if (j - k == 1) {
+      rows_.push_back(Row{shown[k], {}, {}, false});
+    } else {
+      Row r{shown[k], {}, {}, false};
+      r.run.assign(shown.begin() + static_cast<std::ptrdiff_t>(k), shown.begin() + static_cast<std::ptrdiff_t>(j));
+      const HistoryEntry& oldest = all_[static_cast<size_t>(r.run.back())];
+      const bool open =
+          std::find(unfolded_.begin(), unfolded_.end(), oldest.when_iso + "\x01" + oldest.summary) != unfolded_.end();
+      const std::vector<int> members = r.run;
+      rows_.push_back(std::move(r));
+      if (open)
+        for (int m : members) rows_.push_back(Row{m, {}, {}, true});
+    }
+    shown_count_ += j - k;
+    k = j;
   }
   hover_ = -1;
   click_opened_ = -1;
+  chip_x_.assign(rows_.size(), {0, 0});
   SetItemCount(rows_.size());
   Refresh();
+}
+
+void HistoryList::select_entry(const std::string& when_iso, const std::string& summary) {
+  int sel_row = wxNOT_FOUND;
+  auto is_sel = [&](int e) {
+    const HistoryEntry& x = all_[static_cast<size_t>(e)];
+    return x.when_iso == when_iso && x.summary == summary;
+  };
+  if (!when_iso.empty())
+    for (size_t r = 0; r < rows_.size() && sel_row == wxNOT_FOUND; ++r) {
+      if (rows_[r].entry < 0) continue;
+      if (is_sel(rows_[r].entry)) sel_row = static_cast<int>(r);
+      else if (!rows_[r].child)
+        for (int m : rows_[r].run)
+          if (is_sel(m)) sel_row = static_cast<int>(r);  // folded into a run row
+    }
+  if (sel_row != GetSelection()) SetSelection(sel_row);
 }
 
 const HistoryEntry* HistoryList::entry(int row) const {
@@ -286,8 +587,15 @@ const HistoryEntry* HistoryList::entry(int row) const {
   return e < 0 ? nullptr : &all_[static_cast<size_t>(e)];
 }
 
+int HistoryList::content_height(size_t max_rows) const {
+  int h = 0;
+  for (size_t i = 0; i < rows_.size() && i < max_rows; ++i) h += OnMeasureItem(i);
+  return h;
+}
+
 wxCoord HistoryList::OnMeasureItem(size_t n) const {
-  return FromDIP(n < rows_.size() && rows_[n].entry < 0 ? 24 : 38);
+  if (n < rows_.size() && (rows_[n].entry < 0 || rows_[n].child)) return FromDIP(24);
+  return FromDIP(38);
 }
 
 void HistoryList::OnDrawBackground(wxDC& dc, const wxRect& rect, size_t n) const {
@@ -305,6 +613,7 @@ void HistoryList::OnDrawItem(wxDC& dc, const wxRect& rect, size_t n) const {
   if (n >= rows_.size()) return;
   const int pad = FromDIP(10);
   const int right = rect.GetRight() - pad;
+  if (n < chip_x_.size()) chip_x_[n] = {0, 0};
   if (rows_[n].entry < 0) {
     wxFont f = GetFont();
     f.SetFractionalPointSize(f.GetFractionalPointSize() * 0.85);
@@ -316,12 +625,38 @@ void HistoryList::OnDrawItem(wxDC& dc, const wxRect& rect, size_t n) const {
     dc.SetFont(GetFont());
     return;
   }
-  const HistoryEntry& h = all_[static_cast<size_t>(rows_[n].entry)];
-  const Label& l = label(static_cast<size_t>(rows_[n].entry));
+  const Row& row = rows_[n];
+  const HistoryEntry& h = all_[static_cast<size_t>(row.entry)];
+  const Label& l = label(static_cast<size_t>(row.entry));
   const wxFont base = GetFont();
   wxFont small = base;
   small.SetFractionalPointSize(small.GetFractionalPointSize() * 0.88);
-  // Line 1: badge, name, status. Line 2 (dimmed, smaller): the target as sent, elapsed, time.
+  const int call_kind = h.kind == RequestKind::Grpc && grpc_kind ? grpc_kind(h) : -1;
+
+  if (row.child) {
+    // One entry of an unfolded run, on one line: a guide, the status, the time, when.
+    dc.SetPen(wxPen(mix(window_colour(), text_colour(), 0.25), FromDIP(1)));
+    const int gx = rect.x + pad + FromDIP(14);
+    dc.DrawLine(gx, rect.y, gx, rect.GetBottom() + 1);
+    dc.SetFont(small);
+    const int y = rect.y + (rect.height - dc.GetCharHeight()) / 2;
+    const wxString when = wxString::FromUTF8(history_when_label(h.when_iso));
+    dc.SetTextForeground(dim_colour());
+    dc.DrawText(when, right - dc.GetTextExtent(when).x, y);
+    dc.SetFont(small.Bold());
+    const wxString st = wxString::FromUTF8(status_text(h.kind, h.status));
+    dc.SetTextForeground(status_colour(h.kind, h.status));
+    const int tx = gx + FromDIP(10);
+    dc.DrawText(st, tx, y);
+    const int stw = dc.GetTextExtent(st).x;
+    dc.SetFont(small);
+    dc.SetTextForeground(mix(window_colour(), text_colour(), 0.8));
+    dc.DrawText(wxString::FromUTF8(format_ms(h.total_ms)), tx + stw + FromDIP(12), y);
+    return;
+  }
+
+  // Line 1: badge, name, (run count), status. Line 2 (dimmed, smaller): the target as sent,
+  // elapsed (a run: the average), time.
   dc.SetFont(base);
   const int h1 = dc.GetCharHeight();
   dc.SetFont(small);
@@ -329,19 +664,41 @@ void HistoryList::OnDrawItem(wxDC& dc, const wxRect& rect, size_t n) const {
   const int gap = FromDIP(1);
   const int y1 = rect.y + (rect.height - h1 - h2 - gap) / 2;
   const int y2 = y1 + h1 + gap;
-  draw_badge(dc, this, h.kind, method_of(h), rect.x + pad, y1, h1);
+  draw_badge(dc, this, h.kind, method_of(h), rect.x + pad, y1, h1, call_kind);
   const int tx = rect.x + pad + FromDIP(38);
 
   dc.SetFont(small.Bold());
   const wxString st = wxString::FromUTF8(status_text(h.kind, h.status));
-  const int stx = right - dc.GetTextExtent(st).x;
+  int stx = right - dc.GetTextExtent(st).x;
   dc.SetTextForeground(status_colour(h.kind, h.status));
   dc.DrawText(st, stx, y1 + (h1 - dc.GetCharHeight()) / 2);
+  if (!row.run.empty()) {
+    // "x60" chip left of the status (a triangle while unfolded): a click shows / folds the run.
+    const wxString c = wxString::FromUTF8(unfolded(static_cast<int>(n)) ? "\xE2\x96\xBE " : "\xC3\x97") +
+                       wxString::Format("%zu", row.run.size());
+    const wxSize cs = dc.GetTextExtent(c);
+    const int cw = cs.x + FromDIP(10), ch = cs.y + FromDIP(2);
+    const int cx = stx - FromDIP(8) - cw;
+    const int cy = y1 + (h1 - ch) / 2;
+    dc.SetPen(*wxTRANSPARENT_PEN);
+    dc.SetBrush(wxBrush(mix(window_colour(), text_colour(), IsSelected(n) ? 0.24 : 0.14)));
+    dc.DrawRoundedRectangle(cx, cy, cw, ch, FromDIP(3));
+    dc.SetTextForeground(mix(window_colour(), text_colour(), 0.9));
+    dc.DrawText(c, cx + FromDIP(5), cy + FromDIP(1));
+    if (n < chip_x_.size()) chip_x_[n] = {cx, cx + cw};
+    stx = cx;
+  }
 
   dc.SetFont(small);
   const wxString when = wxString::FromUTF8(when_text(h.when_iso));
-  const wxString ms = wxString::FromUTF8(format_ms(h.total_ms));
-  const wxString tail = ms + wxString::FromUTF8("  \xC2\xB7  ") + when;
+  double ms = h.total_ms;
+  if (!row.run.empty()) {
+    double sum = 0;
+    for (int i : row.run) sum += all_[static_cast<size_t>(i)].total_ms;
+    ms = sum / static_cast<double>(row.run.size());
+  }
+  const wxString mss = wxString::FromUTF8((row.run.empty() ? std::string() : std::string("avg ")) + format_ms(ms));
+  const wxString tail = mss + wxString::FromUTF8("  \xC2\xB7  ") + when;
   const int tailx = right - dc.GetTextExtent(tail).x;
   dc.SetTextForeground(dim_colour());
   dc.DrawText(tail, tailx, y2);

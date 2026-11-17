@@ -45,12 +45,15 @@
 #endif
 #include <security.h>
 #include <schannel.h>
+#include <ncrypt.h>
+#include <winhttp.h>
 
 #include <curl/curl.h>
 
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <mutex>
 #include <string>
@@ -61,6 +64,8 @@
 #pragma comment(lib, "winmm.lib")
 #pragma comment(lib, "secur32.lib")
 #pragma comment(lib, "crypt32.lib")
+#pragma comment(lib, "ncrypt.lib")
+#pragma comment(lib, "winhttp.lib")
 
 namespace watt {
 
@@ -416,8 +421,458 @@ std::shared_ptr<const TlsInfo> read_tls(curl_tlssessioninfo* si, CURL* easy, Ver
     if (cur) CertFreeCertificateContext(cur);
     CertFreeCertificateContext(leaf);
   }
+  // The client certificate Schannel presented (mutual TLS), if the server asked for one.
+  PCCERT_CONTEXT mine = nullptr;
+  if (QueryContextAttributesW(ctx, SECPKG_ATTR_LOCAL_CERT_CONTEXT, &mine) == SEC_E_OK && mine) {
+    t->client_cert_subject = simple_name(mine, false);
+    t->client_cert_issuer = simple_name(mine, true);
+    CertFreeCertificateContext(mine);
+  }
   t->read_ms = ms_between(t0, Clock::now());
   return t;
+}
+
+// ------------------------------------------------------------------ client certificates
+// Schannel takes a client certificate from memory only as PKCS#12, so a PEM certificate + key
+// is converted once: the key is imported into an ephemeral (never persisted) CNG key, attached
+// to the certificate in a memory store and exported as a PKCS#12 protected by kPfxPass.
+
+constexpr wchar_t kPfxPassW[] = L"watt-mtls";
+constexpr char kPfxPass[] = "watt-mtls";
+
+struct PemBlock {
+  std::string label;  // "CERTIFICATE", "PRIVATE KEY", ...
+  std::string der;
+};
+
+std::vector<PemBlock> pem_blocks(const std::string& text) {
+  std::vector<PemBlock> out;
+  size_t at = 0;
+  while ((at = text.find("-----BEGIN ", at)) != std::string::npos) {
+    const size_t lab = at + 11;
+    const size_t lab_end = text.find("-----", lab);
+    if (lab_end == std::string::npos) break;
+    const std::string label = text.substr(lab, lab_end - lab);
+    const std::string end_mark = "-----END " + label + "-----";
+    const size_t end = text.find(end_mark, lab_end);
+    if (end == std::string::npos) break;
+    const size_t body = lab_end + 5;
+    const std::string b64 = text.substr(body, end - body);
+    DWORD n = 0;
+    PemBlock b;
+    b.label = label;
+    if (CryptStringToBinaryA(b64.data(), static_cast<DWORD>(b64.size()), CRYPT_STRING_BASE64, nullptr, &n,
+                             nullptr, nullptr) && n) {
+      b.der.resize(n);
+      if (CryptStringToBinaryA(b64.data(), static_cast<DWORD>(b64.size()), CRYPT_STRING_BASE64,
+                               reinterpret_cast<BYTE*>(b.der.data()), &n, nullptr, nullptr)) {
+        b.der.resize(n);
+        out.push_back(std::move(b));
+      }
+    }
+    at = end + end_mark.size();
+  }
+  return out;
+}
+
+// DER of a PKCS#8 PrivateKeyInfo wrapping a PKCS#1 RSA key or a SEC1 EC key.
+bool wrap_pkcs8(const PemBlock& k, std::string& out) {
+  CRYPT_PRIVATE_KEY_INFO pki{};
+  BYTE rsa_null[] = {0x05, 0x00};
+  std::string params;
+  std::string oid;
+  if (k.label == "RSA PRIVATE KEY") {
+    oid = szOID_RSA_RSA;
+    pki.Algorithm.Parameters.pbData = rsa_null;
+    pki.Algorithm.Parameters.cbData = sizeof rsa_null;
+  } else {  // EC PRIVATE KEY: the curve comes from the SEC1 structure
+    CRYPT_ECC_PRIVATE_KEY_INFO* ec = nullptr;
+    DWORD n = 0;
+    if (!CryptDecodeObjectEx(X509_ASN_ENCODING, X509_ECC_PRIVATE_KEY, reinterpret_cast<const BYTE*>(k.der.data()),
+                             static_cast<DWORD>(k.der.size()), CRYPT_DECODE_ALLOC_FLAG, nullptr, &ec, &n) ||
+        !ec)
+      return false;
+    const std::string curve = ec->szCurveOid ? ec->szCurveOid : "";
+    LocalFree(ec);
+    if (curve.empty()) return false;
+    LPCSTR c = curve.c_str();
+    DWORD pn = 0;
+    if (!CryptEncodeObjectEx(X509_ASN_ENCODING, X509_OBJECT_IDENTIFIER, &c, 0, nullptr, nullptr, &pn)) return false;
+    params.resize(pn);
+    if (!CryptEncodeObjectEx(X509_ASN_ENCODING, X509_OBJECT_IDENTIFIER, &c, 0, nullptr,
+                             reinterpret_cast<BYTE*>(params.data()), &pn))
+      return false;
+    params.resize(pn);
+    oid = szOID_ECC_PUBLIC_KEY;
+    pki.Algorithm.Parameters.pbData = reinterpret_cast<BYTE*>(params.data());
+    pki.Algorithm.Parameters.cbData = static_cast<DWORD>(params.size());
+  }
+  pki.Algorithm.pszObjId = oid.data();
+  pki.PrivateKey.pbData = reinterpret_cast<BYTE*>(const_cast<char*>(k.der.data()));
+  pki.PrivateKey.cbData = static_cast<DWORD>(k.der.size());
+  DWORD n = 0;
+  if (!CryptEncodeObjectEx(X509_ASN_ENCODING, PKCS_PRIVATE_KEY_INFO, &pki, 0, nullptr, nullptr, &n)) return false;
+  out.resize(n);
+  if (!CryptEncodeObjectEx(X509_ASN_ENCODING, PKCS_PRIVATE_KEY_INFO, &pki, 0, nullptr,
+                           reinterpret_cast<BYTE*>(out.data()), &n))
+    return false;
+  out.resize(n);
+  return true;
+}
+
+std::wstring widen_utf8(const std::string& s) {
+  if (s.empty()) return {};
+  const int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), nullptr, 0);
+  std::wstring w(static_cast<size_t>(n), L' ');
+  MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), w.data(), n);
+  return w;
+}
+
+std::string hr_text(long st) {
+  char buf[16];
+  std::snprintf(buf, sizeof buf, "0x%08lx", static_cast<unsigned long>(st));
+  return buf;
+}
+
+// PEM certificate (+ chain) and private key -> PKCS#12 (password kPfxPass). false + err.
+bool pem_to_pfx(const std::string& cert_pem, const std::string& key_pem, const std::string& pass, std::string& pfx,
+                std::string& err) {
+  std::vector<PemBlock> certs, keys;
+  for (const std::string* t : {&cert_pem, &key_pem})
+    for (auto& b : pem_blocks(*t)) {
+      if (b.label == "CERTIFICATE" || b.label == "TRUSTED CERTIFICATE")
+        certs.push_back(std::move(b));
+      else if (b.label.find("PRIVATE KEY") != std::string::npos)
+        keys.push_back(std::move(b));
+    }
+  if (certs.empty()) {
+    err = "client certificate: no PEM \"BEGIN CERTIFICATE\" block found";
+    return false;
+  }
+  if (keys.empty()) {
+    err = "client certificate: no private key: pick a PEM key file (BEGIN PRIVATE KEY) or use a .pfx / .p12";
+    return false;
+  }
+  const PemBlock& k = keys.front();
+  std::string pkcs8;
+  const bool encrypted = k.label == "ENCRYPTED PRIVATE KEY";
+  if (k.label == "PRIVATE KEY" || encrypted) {
+    pkcs8 = k.der;
+  } else if (k.label == "RSA PRIVATE KEY" || k.label == "EC PRIVATE KEY") {
+    if (!wrap_pkcs8(k, pkcs8)) {
+      err = "client certificate: cannot read the " + k.label +
+            " (an encrypted legacy PEM key is not supported: convert it with openssl pkcs8 -topk8)";
+      return false;
+    }
+  } else {
+    err = "client certificate: unsupported key type \"" + k.label + "\"";
+    return false;
+  }
+  if (encrypted && pass.empty()) {
+    err = "client certificate: the private key is encrypted: enter its passphrase";
+    return false;
+  }
+  NCRYPT_PROV_HANDLE prov = 0;
+  SECURITY_STATUS st = NCryptOpenStorageProvider(&prov, MS_KEY_STORAGE_PROVIDER, 0);
+  if (st != ERROR_SUCCESS) {
+    err = "client certificate: no key storage provider (" + hr_text(st) + ")";
+    return false;
+  }
+  NCRYPT_KEY_HANDLE key = 0;
+  std::wstring wpass = widen_utf8(pass);
+  NCryptBuffer nb{static_cast<ULONG>((wpass.size() + 1) * sizeof(wchar_t)), NCRYPTBUFFER_PKCS_SECRET, wpass.data()};
+  NCryptBufferDesc desc{NCRYPTBUFFER_VERSION, 1, &nb};
+  st = NCryptImportKey(prov, 0, NCRYPT_PKCS8_PRIVATE_KEY_BLOB, encrypted ? &desc : nullptr, &key,
+                       reinterpret_cast<BYTE*>(pkcs8.data()), static_cast<DWORD>(pkcs8.size()),
+                       NCRYPT_DO_NOT_FINALIZE_FLAG);
+  SecureZeroMemory(wpass.data(), wpass.size() * sizeof(wchar_t));
+  NCryptFreeObject(prov);
+  if (st != ERROR_SUCCESS) {
+    err = encrypted ? "client certificate: cannot decrypt the private key: wrong passphrase? (" + hr_text(st) + ")"
+                    : "client certificate: cannot read the private key (" + hr_text(st) + ")";
+    return false;
+  }
+  DWORD policy = NCRYPT_ALLOW_EXPORT_FLAG | NCRYPT_ALLOW_PLAINTEXT_EXPORT_FLAG;
+  NCryptSetProperty(key, NCRYPT_EXPORT_POLICY_PROPERTY, reinterpret_cast<BYTE*>(&policy), sizeof policy, 0);
+  if ((st = NCryptFinalizeKey(key, 0)) != ERROR_SUCCESS) {
+    NCryptFreeObject(key);
+    err = "client certificate: cannot use the private key (" + hr_text(st) + ")";
+    return false;
+  }
+  // The key's public half, to find the certificate it belongs to (the PEM may list the chain first).
+  DWORD pn = 0;
+  std::string pub;
+  if (CryptExportPublicKeyInfo(key, 0, X509_ASN_ENCODING, nullptr, &pn)) {
+    pub.resize(pn);
+    if (!CryptExportPublicKeyInfo(key, 0, X509_ASN_ENCODING, reinterpret_cast<CERT_PUBLIC_KEY_INFO*>(pub.data()), &pn))
+      pub.clear();
+  }
+  HCERTSTORE store = CertOpenStore(CERT_STORE_PROV_MEMORY, 0, 0, CERT_STORE_CREATE_NEW_FLAG, nullptr);
+  if (!store) {
+    NCryptFreeObject(key);
+    err = "client certificate: cannot create a certificate store";
+    return false;
+  }
+  PCCERT_CONTEXT leaf = nullptr;
+  for (const auto& c : certs) {
+    PCCERT_CONTEXT cx = nullptr;
+    if (!CertAddEncodedCertificateToStore(store, X509_ASN_ENCODING, reinterpret_cast<const BYTE*>(c.der.data()),
+                                          static_cast<DWORD>(c.der.size()), CERT_STORE_ADD_ALWAYS, &cx) ||
+        !cx)
+      continue;
+    const bool match =
+        !pub.empty() && CertComparePublicKeyInfo(X509_ASN_ENCODING, &cx->pCertInfo->SubjectPublicKeyInfo,
+                                                 reinterpret_cast<CERT_PUBLIC_KEY_INFO*>(pub.data()));
+    if (!leaf && match)
+      leaf = cx;
+    else
+      CertFreeCertificateContext(cx);
+  }
+  bool ok = false;
+  if (!leaf) {
+    NCryptFreeObject(key);
+    err = "client certificate: the private key does not belong to any certificate in the PEM";
+  } else if (CERT_KEY_CONTEXT kc{sizeof kc, {key}, CERT_NCRYPT_KEY_SPEC};
+             !CertSetCertificateContextProperty(leaf, CERT_KEY_CONTEXT_PROP_ID, 0, &kc)) {
+    NCryptFreeObject(key);  // once the property is set, the certificate context owns the key
+    err = "client certificate: cannot attach the private key";
+  } else {
+    CRYPT_DATA_BLOB blob{};
+    const DWORD flags = EXPORT_PRIVATE_KEYS | REPORT_NO_PRIVATE_KEY | REPORT_NOT_ABLE_TO_EXPORT_PRIVATE_KEY;
+    if (PFXExportCertStoreEx(store, &blob, kPfxPassW, nullptr, flags) && blob.cbData) {
+      pfx.resize(blob.cbData);
+      blob.pbData = reinterpret_cast<BYTE*>(pfx.data());
+      ok = PFXExportCertStoreEx(store, &blob, kPfxPassW, nullptr, flags) != FALSE;
+      pfx.resize(blob.cbData);
+    }
+    if (!ok)
+      err = "client certificate: cannot package the certificate and key (" +
+            hr_text(static_cast<long>(GetLastError())) + ")";
+  }
+  if (leaf) CertFreeCertificateContext(leaf);
+  CertCloseStore(store, 0);
+  return ok;
+}
+
+// Schannel signs the TLS handshake in LSASS, which cannot reach a key that lives only in this
+// process (an ephemeral / PKCS12_NO_PERSIST_KEY import fails with SEC_E_UNKNOWN_CREDENTIALS or
+// SEC_E_INTERNAL_ERROR). So a client certificate from a file is imported once into the current
+// user's "watt" certificate store (certmgr.msc shows it), its key into the user's Windows key
+// store (DPAPI-protected, like any imported .pfx), and libcurl is pointed at it by thumbprint
+// ("CurrentUser\watt\<sha1>"). An already imported certificate with a usable key is reused.
+// "store:CurrentUser\MY\<sha1>" (HttpRequest::client_cert) names a certificate that is already
+// in a Windows store (smart card, enterprise enrolment) and is used as it is.
+std::string install_client_cert(const std::string& pfx, const std::string& pass, std::string& err) {
+  CRYPT_DATA_BLOB b{static_cast<DWORD>(pfx.size()), reinterpret_cast<BYTE*>(const_cast<char*>(pfx.data()))};
+  if (!PFXIsPFXBlob(&b)) {
+    err = "client certificate: the file is neither PEM (BEGIN CERTIFICATE) nor PKCS#12 (.pfx / .p12)";
+    return {};
+  }
+  std::wstring wpass = widen_utf8(pass);
+  auto wipe = [&] { SecureZeroMemory(wpass.data(), wpass.size() * sizeof(wchar_t)); };
+  // Read the certificate (no key persisted) to learn its thumbprint.
+  HCERTSTORE tmp = PFXImportCertStore(&b, wpass.c_str(), PKCS12_NO_PERSIST_KEY);
+  if (!tmp) {
+    const DWORD e = GetLastError();
+    wipe();
+    err = e == ERROR_INVALID_PASSWORD ? "client certificate: wrong passphrase for the PKCS#12 file"
+                                      : "client certificate: cannot read the PKCS#12 file (" + hr_text(static_cast<long>(e)) + ")";
+    return {};
+  }
+  BYTE sha1[20];
+  DWORD n = sizeof sha1;
+  PCCERT_CONTEXT c = CertFindCertificateInStore(tmp, X509_ASN_ENCODING | PKCS_7_ASN_ENCODING, 0,
+                                                CERT_FIND_HAS_PRIVATE_KEY, nullptr, nullptr);
+  const bool have = c && CertGetCertificateContextProperty(c, CERT_SHA1_HASH_PROP_ID, sha1, &n) && n == 20;
+  if (c) CertFreeCertificateContext(c);
+  CertCloseStore(tmp, 0);
+  if (!have) {
+    wipe();
+    err = "client certificate: the PKCS#12 file holds no certificate with a private key";
+    return {};
+  }
+  const std::string path = "CurrentUser\\watt\\" + hex_bytes(sha1, 20, false, false);
+  HCERTSTORE gs = CertOpenStore(CERT_STORE_PROV_SYSTEM_W, 0, 0, CERT_SYSTEM_STORE_CURRENT_USER, L"watt");
+  if (!gs) {
+    wipe();
+    err = "client certificate: cannot open the current user's watt certificate store";
+    return {};
+  }
+  CRYPT_HASH_BLOB hb{20, sha1};
+  bool ok = false;
+  if (PCCERT_CONTEXT ex = CertFindCertificateInStore(gs, X509_ASN_ENCODING | PKCS_7_ASN_ENCODING, 0,
+                                                     CERT_FIND_SHA1_HASH, &hb, nullptr)) {
+    HCRYPTPROV_OR_NCRYPT_KEY_HANDLE k = 0;
+    DWORD spec = 0;
+    BOOL must_free = FALSE;
+    ok = CryptAcquireCertificatePrivateKey(ex, CRYPT_ACQUIRE_SILENT_FLAG | CRYPT_ACQUIRE_PREFER_NCRYPT_KEY_FLAG, nullptr,
+                                           &k, &spec, &must_free) != FALSE;
+    if (ok && must_free) {
+      if (spec == CERT_NCRYPT_KEY_SPEC)
+        NCryptFreeObject(k);
+      else
+        CryptReleaseContext(k, 0);
+    }
+    if (!ok) CertDeleteCertificateFromStore(CertDuplicateCertificateContext(ex));  // its key is gone: re-import
+    CertFreeCertificateContext(ex);
+  }
+  if (!ok) {
+    HCERTSTORE ps = PFXImportCertStore(&b, wpass.c_str(), CRYPT_USER_KEYSET | PKCS12_ALWAYS_CNG_KSP);
+    if (ps) {
+      if (PCCERT_CONTEXT pc = CertFindCertificateInStore(ps, X509_ASN_ENCODING | PKCS_7_ASN_ENCODING, 0,
+                                                         CERT_FIND_SHA1_HASH, &hb, nullptr)) {
+        ok = CertAddCertificateContextToStore(gs, pc, CERT_STORE_ADD_REPLACE_EXISTING, nullptr) != FALSE;
+        CertFreeCertificateContext(pc);
+      }
+      CertCloseStore(ps, 0);
+    }
+    if (!ok) err = "client certificate: cannot import it into the Windows key store (" + hr_text(static_cast<long>(GetLastError())) + ")";
+  }
+  wipe();
+  CertCloseStore(gs, 0);
+  return ok ? path : std::string();
+}
+
+// What CURLOPT_SSLCERT gets for a request's client certificate ("" + err when it cannot be used).
+// Process-wide cache: every HttpClient (tab, runner worker) pays the conversion and the store
+// lookup once per distinct certificate.
+std::string client_cert_location(const HttpRequest& req, std::string& err) {
+  const std::string& c = req.client_cert;
+  if (c.rfind("store:", 0) == 0) return c.substr(6);
+  static std::mutex mu;
+  static std::vector<std::pair<std::string, std::string>> cache;  // cert \0 key \0 pass -> location
+  std::string id = c;
+  id += '\0';
+  id += req.client_key;
+  id += '\0';
+  id += req.client_key_passphrase;
+  {
+    std::lock_guard<std::mutex> lock(mu);
+    for (const auto& [k, v] : cache)
+      if (k == id) return v;
+  }
+  std::string loc;
+  if (c.find("-----BEGIN") != std::string::npos) {
+    std::string pfx;
+    if (pem_to_pfx(c, req.client_key, req.client_key_passphrase, pfx, err)) loc = install_client_cert(pfx, kPfxPass, err);
+    SecureZeroMemory(pfx.data(), pfx.size());
+  } else {
+    loc = install_client_cert(c, req.client_key_passphrase, err);
+  }
+  if (!loc.empty()) {
+    std::lock_guard<std::mutex> lock(mu);
+    if (cache.size() >= 16) cache.erase(cache.begin());
+    cache.emplace_back(std::move(id), loc);
+  }
+  return loc;
+}
+
+// ------------------------------------------------------------------ proxy
+
+// "scheme://user:pw@host:port/x" -> "scheme://host:port/x" (for display: never show credentials).
+std::string redact_proxy(std::string u) {
+  const size_t s = u.find("://");
+  const size_t from = s == std::string::npos ? 0 : s + 3;
+  const size_t slash = u.find('/', from);
+  const size_t at = u.rfind('@', slash == std::string::npos ? std::string::npos : slash);
+  if (at != std::string::npos && at >= from) u.erase(from, at + 1 - from);
+  return u;
+}
+
+std::vector<std::string> split_any(const std::string& s, std::string_view seps) {
+  std::vector<std::string> out;
+  size_t i = 0;
+  while (i < s.size()) {
+    const size_t j = s.find_first_of(seps, i);
+    std::string part = s.substr(i, j == std::string::npos ? std::string::npos : j - i);
+    if (!part.empty()) out.push_back(std::move(part));
+    if (j == std::string::npos) break;
+    i = j + 1;
+  }
+  return out;
+}
+
+// The current user's Windows proxy (Settings > Network > Proxy, Internet Options), read at most
+// every 10 s: static servers and the bypass list in curl's NOPROXY syntax.
+struct SystemProxy {
+  std::string http, https;  // "http://host:port" or ""
+  std::string bypass;       // curl NOPROXY list (loopback always included)
+};
+
+SystemProxy system_proxy() {
+  static std::mutex mu;
+  static SystemProxy cached;
+  static Clock::time_point at{};
+  static bool have = false;
+  std::lock_guard<std::mutex> lock(mu);
+  const auto now = Clock::now();
+  if (have && now - at < std::chrono::seconds(10)) return cached;
+  SystemProxy p;
+  p.bypass = "localhost,127.0.0.1,::1";
+  WINHTTP_CURRENT_USER_IE_PROXY_CONFIG cfg{};
+  if (WinHttpGetIEProxyConfigForCurrentUser(&cfg)) {
+    const std::string list = cfg.lpszProxy ? narrow(cfg.lpszProxy) : "";
+    const std::string bypass = cfg.lpszProxyBypass ? narrow(cfg.lpszProxyBypass) : "";
+    if (cfg.lpszProxy) GlobalFree(cfg.lpszProxy);
+    if (cfg.lpszProxyBypass) GlobalFree(cfg.lpszProxyBypass);
+    if (cfg.lpszAutoConfigUrl) GlobalFree(cfg.lpszAutoConfigUrl);
+    auto url = [](const std::string& v) { return v.find("://") == std::string::npos ? "http://" + v : v; };
+    for (const auto& e : split_any(list, "; \t")) {
+      const size_t eq = e.find('=');
+      if (eq == std::string::npos) {
+        p.http = p.https = url(e);
+        continue;
+      }
+      std::string k = e.substr(0, eq);
+      std::transform(k.begin(), k.end(), k.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+      const std::string v = e.substr(eq + 1);
+      if (v.empty()) continue;
+      if (k == "http")
+        p.http = url(v);
+      else if (k == "https")
+        p.https = url(v);
+      else if (k == "socks" && p.http.empty() && p.https.empty())
+        p.http = p.https = "socks4://" + v;
+    }
+    for (auto e : split_any(bypass, "; ,\t")) {
+      if (e == "<local>") continue;  // dotless names: curl has no syntax for them; loopback is listed
+      if (e.rfind("*.", 0) == 0) e.erase(0, 1);  // *.corp.com -> .corp.com (curl: domain and below)
+      if (e.size() > 2 && e.compare(e.size() - 2, 2, ".*") == 0) {  // 10.* / 192.168.* -> CIDR
+        std::string pre = e.substr(0, e.size() - 2);
+        int parts = 1;
+        for (char c : pre) parts += c == '.';
+        if (parts > 3 || pre.find_first_not_of("0123456789.") != std::string::npos) continue;
+        for (int i = parts; i < 4; ++i) pre += ".0";
+        e = pre + "/" + std::to_string(parts * 8);
+      } else if (e.find('*') != std::string::npos) {
+        continue;  // other wildcards cannot be expressed in curl's list
+      }
+      p.bypass += "," + e;
+    }
+  }
+  cached = p;
+  at = now;
+  have = true;
+  return p;
+}
+
+bool is_https_url(const std::string& url) {
+  return url.size() >= 6 && (url[0] == 'h' || url[0] == 'H') && (url[4] == 's' || url[4] == 'S') && url[5] == ':';
+}
+
+// The proxy an Env-mode request uses, as libcurl picks it (https_proxy / http_proxy / all_proxy).
+std::string env_proxy(const std::string& url) {
+  auto get = [](const char* n) -> std::string {
+    char buf[1024];
+    const DWORD k = GetEnvironmentVariableA(n, buf, sizeof buf);
+    return k > 0 && k < sizeof buf ? std::string(buf, k) : std::string();
+  };
+  const bool https = is_https_url(url);
+  std::string v = https ? get("https_proxy") : get("http_proxy");
+  if (v.empty() && https) v = get("HTTPS_PROXY");
+  if (v.empty()) v = get("all_proxy");
+  if (v.empty()) v = get("ALL_PROXY");
+  return v;
 }
 
 // One connection as this client saw it, plus the HttpResponse mirror strings ready to copy.
@@ -769,6 +1224,32 @@ constexpr const char* kUserAgent = "watt/0.1";
 
 }  // namespace
 
+std::vector<std::string> pem_certificate_subjects(std::string_view pem) {
+  std::vector<std::string> out;
+  constexpr std::string_view kBegin = "-----BEGIN CERTIFICATE-----", kEnd = "-----END CERTIFICATE-----";
+  for (size_t at = pem.find(kBegin); at != std::string_view::npos; at = pem.find(kBegin, at)) {
+    const size_t end = pem.find(kEnd, at);
+    if (end == std::string_view::npos) break;
+    const std::string block(pem.substr(at, end + kEnd.size() - at));
+    at = end + kEnd.size();
+    DWORD n = 0;
+    if (!CryptStringToBinaryA(block.c_str(), static_cast<DWORD>(block.size()), CRYPT_STRING_BASE64HEADER, nullptr, &n,
+                              nullptr, nullptr) || n == 0)
+      continue;
+    std::string der(n, char{});
+    if (!CryptStringToBinaryA(block.c_str(), static_cast<DWORD>(block.size()), CRYPT_STRING_BASE64HEADER,
+                              reinterpret_cast<BYTE*>(der.data()), &n, nullptr, nullptr))
+      continue;
+    PCCERT_CONTEXT c = CertCreateCertificateContext(X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
+                                                    reinterpret_cast<const BYTE*>(der.data()), n);
+    if (!c) continue;
+    std::string name = simple_name(c, false);
+    CertFreeCertificateContext(c);
+    out.push_back(name.empty() ? "(unnamed certificate)" : std::move(name));
+  }
+  return out;
+}
+
 struct HttpClient::Impl {
   CURL* easy = nullptr;
   CURLM* multi = nullptr;
@@ -850,7 +1331,62 @@ struct HttpClient::Impl {
     std::string custom;
     HttpRequest::Auth auth = HttpRequest::Auth::None;
     std::string auth_user, auth_password, aws_sigv4;
+    std::string cert, key, pass;  // client certificate as given (HttpRequest)
+    bool proxy_null = true;       // CURLOPT_PROXY unset (Env): libcurl reads the environment
+    std::string proxy, no_proxy;
   } last;
+  std::string cert_path;    // CURLOPT_SSLCERT for last.cert / key / pass ("CurrentUser\\watt\\<sha1>")
+  std::string cert_error;   // why that client certificate cannot be used ("" = fine)
+  std::string proxy_shown;  // the proxy applied for the current request, credentials removed
+
+  // Client certificate (mTLS): converted (PEM) or taken as is (PKCS#12) once per distinct value.
+  void apply_cert(const HttpRequest& req, bool all) {
+    CURL* h = easy;
+    // Only TLS uses it: a plain http:// request never pays for the conversion / store lookup.
+    static const std::string kNone;
+    const std::string& cert = is_https_url(req.url) ? req.client_cert : kNone;
+    if (!all && cert == last.cert && req.client_key == last.key && req.client_key_passphrase == last.pass)
+      return;
+    if (all && cert.empty()) return;
+    last.cert = cert;
+    last.key = req.client_key;
+    last.pass = req.client_key_passphrase;
+    cert_error.clear();
+    cert_path = cert.empty() ? std::string() : client_cert_location(req, cert_error);
+    curl_easy_setopt(h, CURLOPT_SSLCERT, cert_path.empty() ? nullptr : cert_path.c_str());
+  }
+
+  // Proxy: CURLOPT_PROXY / NOPROXY, set only when they change.
+  void apply_proxy(const HttpRequest& req, bool all) {
+    bool null = false;
+    std::string px, np;
+    switch (req.proxy) {
+      case HttpRequest::Proxy::Env: null = true; break;
+      case HttpRequest::Proxy::Off: break;  // "" = never a proxy, environment included
+      case HttpRequest::Proxy::Url:
+        px = req.proxy_url;
+        np = req.no_proxy;
+        break;
+      case HttpRequest::Proxy::System: {
+        const SystemProxy sp = system_proxy();
+        px = is_https_url(req.url) ? sp.https : sp.http;
+        np = sp.bypass;
+        if (!req.no_proxy.empty()) np += "," + req.no_proxy;
+        break;
+      }
+    }
+    proxy_shown = null ? std::string() : redact_proxy(px);
+    if (!all && null == last.proxy_null && px == last.proxy && np == last.no_proxy) return;
+    if (all && null) {
+      last.proxy_null = true;
+      return;
+    }
+    curl_easy_setopt(easy, CURLOPT_PROXY, null ? nullptr : px.c_str());
+    curl_easy_setopt(easy, CURLOPT_NOPROXY, null || np.empty() ? nullptr : np.c_str());
+    last.proxy_null = null;
+    last.proxy = std::move(px);
+    last.no_proxy = std::move(np);
+  }
 
   // Authentication options: only touched when they differ from the last request, so a request
   // without auth (the common case) costs four comparisons.
@@ -960,6 +1496,8 @@ struct HttpClient::Impl {
     if (all || follow != last.follow) curl_easy_setopt(h, CURLOPT_FOLLOWLOCATION, follow);
     last.follow = follow;
     apply_auth(req, all);
+    apply_cert(req, all);
+    apply_proxy(req, all);
     last.valid = true;
   }
 
@@ -1133,6 +1671,12 @@ HttpResponse HttpClient::send(const HttpRequest& req, const BodyChunkFn& on_chun
   // Every per-request option gets an explicit value (no curl_easy_reset, see the notes above);
   // curl never changes them itself, so only what differs from the last request is applied.
   im.apply(req);
+  if (!im.cert_error.empty()) {
+    resp.error = im.cert_error;
+    resp.conn.client_cert = true;
+    resp.timing.total_ms = resp.prepare_ms = ms_between(t0, Clock::now());
+    return resp;
+  }
   im.set_headers(req.headers);
 
   // Drive the transfer. curl starts its clock inside the first curl_multi_perform, so t_io
@@ -1266,6 +1810,13 @@ HttpResponse HttpClient::send(const HttpRequest& req, const BodyChunkFn& on_chun
     resp.conn.remote_port = resp.remote_port;
     resp.local_ip = resp.conn.local_ip;
     resp.local_port = resp.conn.local_port;
+  }
+  // Proxy and client certificate (mTLS) of this request, for the connection view.
+  resp.conn.client_cert = !req.client_cert.empty() && is_https_url(req.url);
+  if (req.proxy != HttpRequest::Proxy::Off) {
+    long used = 0;
+    if (curl_easy_getinfo(h, CURLINFO_USED_PROXY, &used) == CURLE_OK && used)
+      resp.conn.proxy = req.proxy == HttpRequest::Proxy::Env ? redact_proxy(env_proxy(req.url)) : im.proxy_shown;
   }
   if (resp.status != 0) {
     ctx.last_hdr_bytes = std::max<size_t>(resp.headers.text_bytes(), 64);

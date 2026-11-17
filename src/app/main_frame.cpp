@@ -4,11 +4,13 @@
 #include <wx/app.h>
 #include <wx/config.h>
 #include <wx/button.h>
+#include <wx/choice.h>
 #include <wx/dialog.h>
 #include <wx/display.h>
 #include <wx/msgdlg.h>
 #include <wx/sizer.h>
 #include <wx/stattext.h>
+#include <wx/textctrl.h>
 #include <wx/timer.h>
 #include <wx/wupdlock.h>
 
@@ -20,6 +22,7 @@
 #include <set>
 #include <thread>
 
+#include "app/history_summary.h"
 #include "app/request_tab.h"
 #include "app/response_widgets.h"  // rv::Theme (the "+" button)
 #include "app/runner_view.h"
@@ -37,7 +40,7 @@ namespace watt::app {
 namespace {
 
 enum {
-  ID_SEND = wxID_HIGHEST + 100,
+  ID_SEND = MainFrame::kSendCommand,
   ID_NEW_TAB,
   ID_NEW_GRPC_TAB,
   ID_CLOSE_TAB,
@@ -107,7 +110,34 @@ class PlusTabArt : public wxAuiFlatTabArt {
     if (out) *out = r;
   }
 
+  // A preview tab (a single click in the tree or the history: the next one replaces it) has its
+  // title in italics, as in VS Code and Postman, instead of a cryptic prefix; its tooltip says
+  // what that means.
+  int DrawPageTab(wxDC& dc, wxWindow* wnd, wxAuiNotebookPage& page, const wxRect& rect) override {
+    Italic it(this, page);
+    return wxAuiFlatTabArt::DrawPageTab(dc, wnd, page, rect);
+  }
+  wxSize GetPageTabSize(wxReadOnlyDC& dc, wxWindow* wnd, const wxAuiNotebookPage& page, int* x_extent) override {
+    Italic it(this, page);
+    return wxAuiFlatTabArt::GetPageTabSize(dc, wnd, page, x_extent);
+  }
+
  private:
+  struct Italic {
+    PlusTabArt* a;
+    bool on;
+    wxFont n, s, m;
+    Italic(PlusTabArt* art, const wxAuiNotebookPage& page) : a(art) {
+      const auto* t = dynamic_cast<const RequestTab*>(page.window);
+      on = t && t->preview();
+      if (!on) return;
+      n = a->m_normalFont, s = a->m_selectedFont, m = a->m_measuringFont;
+      a->m_normalFont = n.Italic(), a->m_selectedFont = s.Italic(), a->m_measuringFont = m.Italic();
+    }
+    ~Italic() {
+      if (on) a->m_normalFont = n, a->m_selectedFont = s, a->m_measuringFont = m;
+    }
+  };
   static wxRect place(wxWindow* wnd, const wxRect& in, int orientation) {
     const int w = wnd->FromDIP(26), h = std::min(in.height, wnd->FromDIP(24));
     const int y = in.y + (in.height - h) / 2;
@@ -169,6 +199,70 @@ int ask_save(wxWindow* parent, const wxString& what) {
   dlg.Fit();
   dlg.CentreOnParent();
   return dlg.ShowModal();
+}
+
+void gather_folders(const CollectionNode& n, const std::string& prefix, std::vector<std::pair<std::string, std::filesystem::path>>& out) {
+  for (const auto& c : n.children) {
+    if (!c.is_folder) continue;
+    const std::string label = prefix.empty() ? c.name : prefix + " / " + c.name;
+    out.emplace_back(label, c.path);
+    gather_folders(c, label, out);
+  }
+}
+
+// First save of an unsaved request (Postman's Save dialog): its name and the folder it goes to.
+bool ask_save_target(wxWindow* parent, const Workspace& ws, const std::string& suggested,
+                     const std::filesystem::path& folder, std::string* name, std::filesystem::path* chosen) {
+  const auto& th = rv::Theme::get();
+  wxDialog dlg(parent, wxID_ANY, "Save request", wxDefaultPosition, wxDefaultSize, wxCAPTION | wxCLOSE_BOX);
+  dlg.SetBackgroundColour(th.bg);
+  auto* sz = new wxBoxSizer(wxVERTICAL);
+  auto label = [&](const char* s) {
+    auto* t = new wxStaticText(&dlg, wxID_ANY, s);
+    t->SetForegroundColour(th.dim);
+    sz->Add(t, 0, wxLEFT | wxRIGHT | wxTOP, dlg.FromDIP(18));
+    sz->AddSpacer(dlg.FromDIP(4));
+  };
+  label("Name");
+  auto* edit = new wxTextCtrl(&dlg, wxID_ANY, wxString::FromUTF8(suggested), wxDefaultPosition,
+                              wxSize(dlg.FromDIP(360), -1), wxTE_PROCESS_ENTER);
+  sz->Add(edit, 0, wxEXPAND | wxLEFT | wxRIGHT, dlg.FromDIP(18));
+  label("Folder");
+  std::vector<std::pair<std::string, std::filesystem::path>> folders{{"Collection root", ws.root()}};
+  gather_folders(ws.tree(0), "", folders);
+  auto* pick = new wxChoice(&dlg, wxID_ANY);
+  int sel = 0;
+  for (size_t i = 0; i < folders.size(); ++i) {
+    pick->Append(wxString::FromUTF8(folders[i].first));
+    std::error_code ec;
+    if (!folder.empty() && std::filesystem::equivalent(folders[i].second, folder, ec)) sel = static_cast<int>(i);
+  }
+  pick->SetSelection(sel);
+  sz->Add(pick, 0, wxEXPAND | wxLEFT | wxRIGHT, dlg.FromDIP(18));
+  auto* row = new wxBoxSizer(wxHORIZONTAL);
+  auto* save = new wxButton(&dlg, wxID_OK, "Save");
+  auto* cancel = new wxButton(&dlg, wxID_CANCEL, "Cancel");
+  row->AddStretchSpacer();
+  row->Add(save, 0, wxRIGHT, dlg.FromDIP(8));
+  row->Add(cancel);
+  sz->Add(row, 0, wxEXPAND | wxALL, dlg.FromDIP(18));
+  auto valid = [edit] { return !edit->GetValue().Strip(wxString::both).empty(); };
+  save->Bind(wxEVT_UPDATE_UI, [valid](wxUpdateUIEvent& e) { e.Enable(valid()); });
+  save->Bind(wxEVT_BUTTON, [&dlg](wxCommandEvent&) { dlg.EndModal(wxID_OK); });
+  edit->Bind(wxEVT_TEXT_ENTER, [&dlg, valid](wxCommandEvent&) {
+    if (valid()) dlg.EndModal(wxID_OK);
+  });
+  save->SetDefault();
+  dlg.SetEscapeId(wxID_CANCEL);
+  dlg.SetSizerAndFit(sz);
+  dlg.CentreOnParent();
+  edit->SetFocus();
+  edit->SelectAll();
+  if (dlg.ShowModal() != wxID_OK) return false;
+  *name = edit->GetValue().Strip(wxString::both).utf8_string();
+  const int s = pick->GetSelection();
+  *chosen = folders[static_cast<size_t>(s < 0 ? 0 : s)].second;
+  return true;
 }
 
 std::string focus_desc() {
@@ -278,7 +372,10 @@ MainFrame::MainFrame(std::filesystem::path workspace_dir)
   };
   SetAcceleratorTable(wxAcceleratorTable(static_cast<int>(std::size(acc)), acc));
 
-  Bind(wxEVT_MENU, [this](wxCommandEvent&) { if (auto* t = current_tab()) t->send(); }, ID_SEND);
+  Bind(wxEVT_MENU, [this](wxCommandEvent&) {
+    if (auto* t = current_tab()) t->send();
+    else if (const int s = nb_->GetSelection(); s >= 0) runner_shortcut(nb_->GetPage(static_cast<size_t>(s)), false);
+  }, ID_SEND);
   Bind(wxEVT_MENU, [this](wxCommandEvent&) { new_request(RequestKind::Http, {}); }, ID_NEW_TAB);
   Bind(wxEVT_MENU, [this](wxCommandEvent&) { new_request(RequestKind::Grpc, {}); }, ID_NEW_GRPC_TAB);
   Bind(wxEVT_MENU, [this](wxCommandEvent&) { if (nb_->GetSelection() >= 0) close_tab(nb_->GetSelection()); }, ID_CLOSE_TAB);
@@ -296,8 +393,8 @@ MainFrame::MainFrame(std::filesystem::path workspace_dir)
   nb_->Bind(wxEVT_AUINOTEBOOK_PAGE_CLOSE, [this](wxAuiNotebookEvent& e) {
     const int idx = e.GetSelection();
     if (idx < 0 || idx >= static_cast<int>(nb_->GetPageCount())) return;
-    auto* t = static_cast<RequestTab*>(nb_->GetPage(idx));
-    if (!t->dirty()) return;  // not vetoed: the notebook closes it
+    auto* t = dynamic_cast<RequestTab*>(nb_->GetPage(idx));
+    if (!t || !t->dirty()) return;  // not vetoed: the notebook closes it (a runner tab too)
     nb_->SetSelection(idx);
     wxString what = t->title();
     what.Replace(L" ●", "");  // the unsaved-changes dot
@@ -408,8 +505,10 @@ void MainFrame::first_idle() {
   }
   // Give the first tab its curl handle (on its worker) so its first send does not create one.
   if (auto* t = current_tab()) t->warm_up();
-  for (size_t i = 0; i < nb_->GetPageCount(); ++i)
-    if (static_cast<RequestTab*>(nb_->GetPage(i))->request_kind() == RequestKind::Grpc) want_grpc_spare_ = true;
+  // A spare gRPC tab too (built last, in a quiet moment, its engine parked until used): the
+  // first Ctrl+Shift+T or gRPC request / history entry opened in a session used to build the
+  // gRPC editor on the spot (52-86 ms on the UI thread).
+  want_grpc_spare_ = true;
   // Well after start-up has settled (the window is usable long before), in a quiet moment.
   prebuild_later(kQuietMs);
   if (!startup::self_test_file().empty()) self_test();
@@ -480,7 +579,7 @@ void MainFrame::self_test() {
               check("ctrl_t_500ms", L"http://127.0.0.1:1/t500");
               bool found = false;
               if (ws_)
-                for (const auto& h : ws_->history(20)) found = found || h.summary == "GET http://127.0.0.1:1/launch";
+                for (const auto& h : ws_->history(20)) found = found || history_template(h) == "GET http://127.0.0.1:1/launch";
               res->failed += !found || !early;
               res->json += wxString::Format(",\"send_before_workspace\":{\"ok\":%s,\"workspace_was_open\":%s}",
                                             found && early ? "true" : "false", early ? "false" : "true").utf8_string();
@@ -538,6 +637,7 @@ void MainFrame::workspace_opened(std::unique_ptr<Workspace> ws, const std::strin
     sidebar_->set_workspace(ws_.get());
     startup::mark("sidebar_workspace_set");
     restore_session();
+    vars_changed();  // tabs restored before the workspace opened showed {{vars}} unresolved
     if (auto* t = current_tab()) sidebar_->select_file(t->file());
     startup::mark("session_restored");
     startup::flush();
@@ -693,8 +793,8 @@ std::shared_ptr<MainFrame::SessionSnapshot> MainFrame::snapshot_session() {
   s->ws = std::make_shared<Workspace>(*ws_);
   const int sel = nb_->GetSelection();
   for (size_t i = 0; i < nb_->GetPageCount(); ++i) {
-    auto* t = static_cast<RequestTab*>(nb_->GetPage(i));
-    if (t->pristine()) continue;
+    auto* t = dynamic_cast<RequestTab*>(nb_->GetPage(i));
+    if (!t || t->pristine()) continue;  // a runner tab is not part of the session
     SessionSnapshot::Tab st;
     st.file = t->file();
     st.dirty = t->dirty();
@@ -885,31 +985,51 @@ TabContext MainFrame::tab_context() {
   ctx.grpc = &MainFrame::grpc;
   ctx.history_added = [this](const HistoryEntry& e) { sidebar_->history_added(e); };
   ctx.when_workspace = [this](std::function<void()> fn) { return when_workspace(std::move(fn)); };
+  ctx.snapshot_origin = [this](const SavedRequest& r) {
+    return sidebar_ ? sidebar_->snapshot_origin(r.file, r.id) : std::filesystem::path();
+  };
   return ctx;
 }
 
 RequestTab* MainFrame::add_tab(SavedRequest r, bool preview, bool lazy, int at, bool park) {
+  // A tab shown now (a request or history entry opened, not a restored one) takes the spare of
+  // its kind when there is one: its editor and response view are built already, so opening the
+  // first gRPC request is a load into a finished editor, not a 60-85 ms build on the UI thread.
+  if (!lazy && !park && at < 0)
+    if (RequestTab*& spare = spare_[r.kind == RequestKind::Http ? 0 : 1]) {
+      RequestTab* t = std::exchange(spare, nullptr);
+      t->set_request(std::move(r), preview);
+      t->wake_grpc();
+      t->Reparent(nb_);
+      nb_->AddPage(t, t->title(), true);
+      t->Show();
+      if (preview) update_title(t);
+      t->focus_url();
+      prebuild_later(kQuietMs);
+      return t;
+    }
   auto* t = new RequestTab(nb_, tab_context(), std::move(r), preview, /*lazy=*/true);
   if (park) t->park_grpc();
   if (!lazy) t->realize();
   hook_tab(t);
   wxString title = t->title();
-  if (preview) title = "~ " + title;
   if (lazy) {  // a restored background tab: not selected, built when first shown
     if (at >= 0)
       nb_->InsertPage(static_cast<size_t>(at), t, title, false);
     else
       nb_->AddPage(t, title, false);
+    if (preview) update_title(t);  // its tooltip
     return t;
   }
   nb_->AddPage(t, title, true);
+  if (preview) update_title(t);
   t->focus_url();
   return t;
 }
 
 RequestTab* MainFrame::current_tab() const {
   const int s = nb_->GetSelection();
-  return s >= 0 ? static_cast<RequestTab*>(nb_->GetPage(s)) : nullptr;
+  return s >= 0 ? dynamic_cast<RequestTab*>(nb_->GetPage(s)) : nullptr;  // null: a runner tab
 }
 
 int MainFrame::tab_index(RequestTab* t) const { return nb_->GetPageIndex(t); }
@@ -927,15 +1047,21 @@ void MainFrame::hook_tab(RequestTab* t) {
 void MainFrame::update_title(RequestTab* t) {
   const int i = tab_index(t);
   if (i < 0) return;
-  wxString s = t->title();
-  if (t->preview()) s = "~ " + s;
+  const wxString s = t->title();
+  const wxString tip = t->preview() ? wxString::FromUTF8("Preview (italic): the next request you open replaces it. "
+                                                         "Double-click, edit or send to keep it.")
+                                    : wxString();
   if (nb_->GetPageText(i) != s) nb_->SetPageText(i, s);
+  if (nb_->GetPageToolTip(i) != tip) {
+    nb_->SetPageToolTip(i, tip);
+    nb_->Refresh(false);  // italics on / off: the caption may be unchanged
+  }
 }
 
 bool MainFrame::close_tab(int idx) {
   if (idx < 0 || idx >= static_cast<int>(nb_->GetPageCount())) return false;
-  auto* t = static_cast<RequestTab*>(nb_->GetPage(idx));
-  if (t->dirty()) {
+  auto* t = dynamic_cast<RequestTab*>(nb_->GetPage(idx));
+  if (t && t->dirty()) {
     nb_->SetSelection(idx);
     wxString what = t->title();
     what.Replace(L" ●", "");  // the unsaved-changes dot
@@ -958,6 +1084,12 @@ void MainFrame::save_current() {
   if (!ws_) {
     wxMessageBox("The workspace is still opening; try again in a moment.", "watt", wxOK, this);
     return;
+  }
+  if (t->file().empty()) {
+    std::string name;
+    std::filesystem::path folder;
+    if (!ask_save_target(this, *ws_, t->suggested_name(), t->save_folder(), &name, &folder)) return;
+    t->set_save_target(name, folder);
   }
   std::string err;
   if (!t->save(*ws_, &err)) {
@@ -993,7 +1125,8 @@ void MainFrame::on_close(wxCloseEvent& e) {
   // VS Code's unsaved tabs): ask only if that could not be written.
   const bool kept = save_session();
   size_t dirty = 0, shown_dirty = 0;
-  for (size_t i = 0; i < nb_->GetPageCount(); ++i) shown_dirty += static_cast<RequestTab*>(nb_->GetPage(i))->dirty();
+  for (size_t i = 0; i < nb_->GetPageCount(); ++i)
+    if (auto* t = dynamic_cast<RequestTab*>(nb_->GetPage(i))) shown_dirty += t->dirty();
   // Tabs of other workspaces opened in this window (the sidebar keeps them as hidden children
   // of the notebook) are not in this workspace's session: those still need the question.
   for (wxWindow* w : nb_->GetChildren())
@@ -1015,8 +1148,8 @@ void MainFrame::on_close(wxCloseEvent& e) {
 
 void MainFrame::open_request(const std::filesystem::path& file, bool preview) {
   for (size_t i = 0; i < nb_->GetPageCount(); ++i) {
-    auto* t = static_cast<RequestTab*>(nb_->GetPage(i));
-    if (t->file() == file) {
+    auto* t = dynamic_cast<RequestTab*>(nb_->GetPage(i));
+    if (t && t->file() == file) {
       nb_->SetSelection(i);
       if (!preview) t->make_permanent();
       return;
@@ -1031,8 +1164,8 @@ void MainFrame::open_request(const std::filesystem::path& file, bool preview) {
   }
   if (preview) {
     for (size_t i = 0; i < nb_->GetPageCount(); ++i) {
-      auto* t = static_cast<RequestTab*>(nb_->GetPage(i));
-      if (t->preview() && !t->dirty() && !t->in_flight()) {
+      auto* t = dynamic_cast<RequestTab*>(nb_->GetPage(i));
+      if (t && t->preview() && !t->dirty() && !t->in_flight()) {
         t->set_request(std::move(*r), true);
         nb_->SetSelection(i);
         return;
@@ -1112,7 +1245,8 @@ void MainFrame::prebuild_step() {
   // Between slices: let paints, timers and the tabs' own deferred events run first.
   constexpr int kNext = 30;
   for (size_t i = 0; i < nb_->GetPageCount(); ++i) {
-    auto* t = static_cast<RequestTab*>(nb_->GetPage(i));
+    auto* t = dynamic_cast<RequestTab*>(nb_->GetPage(i));
+    if (!t) continue;
     if (!t->realized()) {
       t->realize();  // a parked gRPC tab stays parked: no engine until it is used
       prebuild_later(kNext);
@@ -1149,8 +1283,8 @@ void MainFrame::prebuild_step() {
 
 void MainFrame::file_moved(const std::filesystem::path& from, const std::filesystem::path& to) {
   for (size_t i = 0; i < nb_->GetPageCount();) {
-    auto* t = static_cast<RequestTab*>(nb_->GetPage(i));
-    if (t->file() == from) {
+    auto* t = dynamic_cast<RequestTab*>(nb_->GetPage(i));
+    if (t && t->file() == from) {
       if (to.empty() && !t->dirty()) {
         nb_->DeletePage(i);
         continue;
@@ -1167,6 +1301,12 @@ void MainFrame::environment_changed() {
   // sidebar also calls this after switching to another workspace: bring back that workspace's
   // last session the first time it is opened in this process.
   if (ws_ && !restored_roots_.count(ws_->root())) restore_session();
+  vars_changed();
+}
+
+void MainFrame::vars_changed() {
+  for (size_t i = 0; i < nb_->GetPageCount(); ++i)
+    if (auto* t = dynamic_cast<RequestTab*>(nb_->GetPage(i))) t->vars_changed();
 }
 
 void MainFrame::run_folder(const std::filesystem::path& folder) {

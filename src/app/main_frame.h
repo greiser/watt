@@ -48,6 +48,10 @@ class MainFrame : public wxFrame, public SidebarHost {
   explicit MainFrame(std::filesystem::path workspace_dir);
   ~MainFrame() override;
 
+  // The frame's "send the active tab" command (Ctrl+Enter). A control of a hidden tab that still
+  // has the keyboard focus posts it instead of sending its own tab.
+  static constexpr int kSendCommand = wxID_HIGHEST + 100;
+
   // Process-wide gRPC engine, created on first use (thread-safe). Never at start-up: an HTTP-only
   // session never starts the gRPC runtime or loads its (delay-loaded) DLLs.
   static std::shared_ptr<GrpcClient> grpc();
@@ -65,6 +69,7 @@ class MainFrame : public wxFrame, public SidebarHost {
   void new_request(RequestKind kind, const std::filesystem::path& folder) override;
   void file_moved(const std::filesystem::path& from, const std::filesystem::path& to) override;
   void environment_changed() override;
+  void folder_settings_changed() override { vars_changed(); }
   void run_folder(const std::filesystem::path& folder) override;
 
  private:
@@ -80,6 +85,7 @@ class MainFrame : public wxFrame, public SidebarHost {
   void hook_tab(RequestTab* t);  // title and session callbacks
   bool close_tab(int idx);   // false if the user cancelled
   void save_current();
+  void vars_changed();
   void quick_open();
   void workspace_opened(std::unique_ptr<Workspace> ws, const std::string& err);
   bool when_workspace(std::function<void()> fn);  // see TabContext::when_workspace
