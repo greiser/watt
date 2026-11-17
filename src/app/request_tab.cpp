@@ -73,6 +73,25 @@ bool needs_workspace(const SavedRequest& r) {
   return false;
 }
 
+// Asks once per OS environment variable the request would read from outside the workspace
+// (Workspace::blocked_env_vars). Expansion never resolves a non-allowed one either way; this is
+// the consent prompt so the request is not sent with a literal {{process.env.X}} instead.
+bool confirm_env_vars(const Workspace& ws, const SavedRequest& r, wxWindow* parent, std::string* err) {
+  for (const auto& name : ws.blocked_env_vars(r)) {
+    const auto ans = wxMessageBox(
+        wxString::Format("This request reads the environment variable\n\n%s\n\nfrom your Windows "
+                         "environment, outside the workspace. Send its value with this request?",
+                         wxString::FromUTF8(name)),
+        "watt", wxYES_NO | wxNO_DEFAULT | wxICON_WARNING, parent);
+    std::string e;
+    if (ans != wxYES || !ws.allow_env_var(name, &e)) {
+      *err = e.empty() ? "Environment variable not allowed: " + name : e;
+      return false;
+    }
+  }
+  return true;
+}
+
 bool grpc_has_vars(const SavedRequest& r) {
   auto has_var = [](const std::string& s) { return s.find("{{") != std::string::npos; };
   if (has_var(r.grpc_target.address) || has_var(r.grpc_target.authority) || has_var(r.grpc_method) ||
@@ -376,17 +395,9 @@ void RequestTab::send_http(Clock::time_point click) {
   // (Workspace::blocked_files / blocked_env_vars). http_to_send() refuses them regardless, so
   // this is the prompt, not the gate. Only requests that go through http_to_send can reach them.
   if (ws && needs_workspace(req_)) {
-    for (const auto& name : ws->blocked_env_vars(req_)) {
-      const auto ans = wxMessageBox(
-          wxString::Format("This request reads the environment variable\n\n%s\n\nfrom your Windows "
-                           "environment, outside the workspace. Send its value with this request?",
-                           wxString::FromUTF8(name)),
-          "watt", wxYES_NO | wxNO_DEFAULT | wxICON_WARNING, this);
-      std::string err;
-      if (ans != wxYES || !ws->allow_env_var(name, &err)) {
-        resp_->show_error(err.empty() ? "Environment variable not allowed: " + name : err);
-        return;
-      }
+    if (std::string err; !confirm_env_vars(*ws, req_, this, &err)) {
+      resp_->show_error(err);
+      return;
     }
     for (const auto& p : ws->blocked_files(req_)) {
       const auto ans = wxMessageBox(
@@ -472,6 +483,12 @@ void RequestTab::send_grpc(Clock::time_point click) {
     return;
   }
   Workspace* ws = ctx_.workspace ? ctx_.workspace() : nullptr;
+  if (ws && grpc_has_vars(req_)) {
+    if (std::string err; !confirm_env_vars(*ws, req_, this, &err)) {
+      resp_->show_error(err);
+      return;
+    }
+  }
   const uint64_t gen = ++gen_;
   in_flight_ = true;
   sent_at_ = click;

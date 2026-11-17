@@ -464,6 +464,22 @@ TEST_CASE("OS environment variables expand only once allowed for the workspace",
   CHECK_FALSE(ws->http_to_send(r, &err));
   CHECK_THAT(err, ContainsSubstring("WATT_TEST_OS_SECRET"));
   CHECK_THAT(err, !ContainsSubstring(value));
+  // gRPC fields: expanded() (what the gRPC send, schema load and preconnect use) never resolves a
+  // non-allowed OS variable, and blocked_env_vars() reports it for the consent prompt.
+  {
+    SavedRequest g;
+    g.kind = RequestKind::Grpc;
+    g.grpc_target.address = "{{process.env.WATT_TEST_OS_SECRET}}.h.test:443";
+    g.grpc_target.authority = "{{$env.WATT_TEST_OS_SECRET}}";
+    g.grpc_method = "/x.Y/{{process.env.WATT_TEST_OS_SECRET}}";
+    g.grpc_body = "{\"k\": \"{{indirect}}\"}";
+    g.grpc_opts.metadata = {{"x-key", "{{process.env.WATT_TEST_OS_SECRET}}"}};
+    const SavedRequest e = ws->expanded(g);
+    for (const std::string* s : {&e.grpc_target.address, &e.grpc_target.authority, &e.grpc_method, &e.grpc_body})
+      CHECK_THAT(*s, !ContainsSubstring(value));
+    for (const auto& [k, v] : e.grpc_opts.metadata) CHECK_THAT(v, !ContainsSubstring(value));
+    CHECK(ws->blocked_env_vars(g) == std::vector<std::string>{"WATT_TEST_OS_SECRET"});
+  }
   // Only through the body: blocked too.
   SavedRequest b = r;
   b.http.headers.clear();
