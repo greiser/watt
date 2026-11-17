@@ -217,6 +217,12 @@ MainFrame::MainFrame(std::filesystem::path workspace_dir)
   nb_ = new wxAuiNotebook(this, wxID_ANY, wxDefaultPosition, wxDefaultSize,
                           wxAUI_NB_TOP | wxAUI_NB_TAB_MOVE | wxAUI_NB_SCROLL_BUTTONS | wxAUI_NB_CLOSE_ON_ALL_TABS |
                               wxAUI_NB_MIDDLE_CLICK_CLOSE | wxAUI_NB_WINDOWLIST_BUTTON | wxBORDER_NONE);
+  // Prebuilt spare tabs live here, not as hidden non-page children of the notebook:
+  // wxAuiNotebook walks its children when it removes empty tab frames, and stray RequestTab
+  // children coincided with an AV in RemoveEmptyTabFrames during DeletePage. AddPage
+  // reparents a spare into the notebook when it is used.
+  spare_park_ = new wxWindow(this, wxID_ANY, wxDefaultPosition, wxSize(1, 1));
+  spare_park_->Hide();
   aui_.AddPane(sidebar_->window(), wxAuiPaneInfo()
                                        .Name("sidebar")
                                        .Left()
@@ -1068,6 +1074,7 @@ void MainFrame::new_request(RequestKind kind, const std::filesystem::path& folde
     t = std::exchange(spare, nullptr);
     t->set_request(std::move(r), false);  // the gRPC editor fills in the last address used
     t->wake_grpc();
+    t->Reparent(nb_);  // from spare_park_ (AddPage would too; explicit for clarity)
     nb_->AddPage(t, t->title(), true);
     t->Show();
     t->focus_url();
@@ -1122,9 +1129,8 @@ void MainFrame::prebuild_step() {
     if (!spare_[k]) {
       SavedRequest r;
       r.kind = k == 0 ? RequestKind::Http : RequestKind::Grpc;
-      // A hidden child of the notebook, not a page (like the tabs of another workspace the
-      // sidebar keeps): sized and shown when new_request adds it.
-      auto* t = new RequestTab(nb_, tab_context(), std::move(r), false, /*lazy=*/true);
+      // Parked outside the notebook (see spare_park_): sized and shown when new_request adds it.
+      auto* t = new RequestTab(spare_park_, tab_context(), std::move(r), false, /*lazy=*/true);
       t->Hide();
       hook_tab(t);
       t->park_grpc();
