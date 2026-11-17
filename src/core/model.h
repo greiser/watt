@@ -26,6 +26,7 @@
 #include <string>
 #include <vector>
 
+#include "core/asserts.h"
 #include "core/grpc_client.h"
 #include "core/http_client.h"
 #include "core/model_form.h"
@@ -71,6 +72,8 @@ struct CurlData {
 struct SavedRequest {
   std::string id;                 // stable uuid
   std::string name;
+  // Free-form notes about the request (Bruno's / Insomnia's Docs tab), Markdown by convention.
+  std::string docs;
   std::filesystem::path file;     // absolute path of the .req.json (empty if unsaved)
   RequestKind kind = RequestKind::Http;
   // HTTP
@@ -83,6 +86,10 @@ struct SavedRequest {
   // param or Bruno's ~param): decoded key / value as shown. http.url holds only the sent ones, so
   // nothing on the send path reads these.
   std::vector<std::pair<std::string, std::string>> disabled_params;
+  // Path variables (Postman's Path Variables, Insomnia / Bruno's path params): the value of each
+  // "/:name" segment of http.url, which keeps the ":name" template. The editor substitutes the
+  // URL-encoded values when it sends or exports the request.
+  std::vector<std::pair<std::string, std::string>> path_params;
   // multipart/form-data parts. When not empty they replace http.body: the body is built from
   // them (files read) at send time, see Workspace::http_to_send(). Stored in the .req.json with
   // file parts as path references.
@@ -106,6 +113,10 @@ struct SavedRequest {
   GrpcCallOptions grpc_opts;
   std::vector<std::string> proto_files;   // empty => use reflection
   std::vector<std::string> import_dirs;
+  // Response checks (Bruno's Assert tab / Postman's Tests) and post-response captures (Bruno's
+  // vars:post-response), both kinds of request; see core/asserts.h. Saved only when not empty.
+  std::vector<Assertion> asserts;
+  std::vector<Capture> captures;
 };
 
 struct Environment {
@@ -171,6 +182,9 @@ class Workspace {
   std::string active_env;        // saved in .watt/state.json: switching never dirties git
   std::map<std::string, std::string> globals;
   std::map<std::string, std::string> dotenv;  // <ws>/.env, read by open()
+  // Runtime variables (Bruno's bru.setVar): set by Capture::Runtime captures (apply_captures),
+  // looked up by expand() before the active environment, never saved.
+  std::map<std::string, std::string> runtime_vars;
   bool save_settings(std::string* err = nullptr) const;
 
   void append_history(const HistoryEntry& e);
@@ -180,7 +194,8 @@ class Workspace {
   // (history was trimmed): list again.
   std::optional<SavedRequest> history_request(const HistoryEntry& e) const;
 
-  // {{var}} substitution using active env then globals. Unknown vars are left as-is.
+  // {{var}} substitution using runtime_vars, then the active env, then globals. Unknown vars are
+  // left as-is.
   std::string expand(const std::string& s) const;
   SavedRequest expanded(const SavedRequest& r) const;
   // What to hand to HttpClient::send(): expanded(r).http, plus the multipart body built from

@@ -56,6 +56,9 @@
 //   curl file references, read at send time: "body_data": [[option, value], ...] (option: data,
 //   data-binary, data-raw, data-urlencode, json; no body stored then), "header_files": [paths]
 //   (curl -H @file), "cookie_files": [paths] (curl -b file).
+// After "http" / "grpc", only when not empty (see core/asserts.h):
+//   "asserts": [[target, "op value"] | [target, "op value", false] (disabled), ...]
+//   "captures": [{var, from: target, scope: environment|globals|runtime, enabled?}, ...]
 // .watt/history/<seq>.jsonl: segments of at most 1000 entries, one small compact JSON object
 //   per line (when, kind, summary, status, total_ms, req: [offset, length]), oldest first,
 //   appended to the newest segment only. The request itself is a line of <seq>.req.jsonl
@@ -457,6 +460,7 @@ Value request_value(const SavedRequest& r, Alloc& a, bool lines, size_t body_cap
   o.AddMember("version", 1, a);
   o.AddMember("id", jstr(r.id, a), a);
   o.AddMember("name", jstr(r.name, a), a);
+  if (!r.docs.empty()) o.AddMember("docs", jstr(r.docs, a), a);
   o.AddMember("kind", Value(rapidjson::StringRef(r.kind == RequestKind::Grpc ? "grpc" : "http")), a);
   Value http = http_section(r.http, a, lines, body_cap);
   // A disabled header is [name, value, false], in its place.
@@ -472,6 +476,7 @@ Value request_value(const SavedRequest& r, Alloc& a, bool lines, size_t body_cap
   if (!r.body_file.empty()) http.AddMember("body_file", jstr(r.body_file, a), a);
   if (!r.body_data.empty()) http.AddMember("body_data", curl_data_value(r.body_data, a), a);
   if (!r.disabled_params.empty()) http.AddMember("disabled_params", pairs_value(r.disabled_params, a), a);
+  if (!r.path_params.empty()) http.AddMember("path_params", pairs_value(r.path_params, a), a);
   if (!r.header_files.empty()) http.AddMember("header_files", strings_value(r.header_files, a), a);
   if (!r.cookie_files.empty()) http.AddMember("cookie_files", strings_value(r.cookie_files, a), a);
   if (!r.form.empty()) http.AddMember("form", form_value(r.form, a), a);
@@ -489,12 +494,37 @@ Value request_value(const SavedRequest& r, Alloc& a, bool lines, size_t body_cap
   Value grpc = grpc_section(r, a, lines, body_cap);
   if (r.kind == RequestKind::Grpc || detail::json_compact(grpc) != default_grpc_json())
     o.AddMember("grpc", grpc, a);
+  // Last, and only when present, so files without them keep their bytes. One line per row, as
+  // in .bru files: an assertion is [target, "op value"] (+ false when disabled).
+  if (!r.asserts.empty()) {
+    Value arr(rapidjson::kArrayType);
+    for (const auto& as : r.asserts) {
+      Value e(rapidjson::kArrayType);
+      e.PushBack(jstr(as.target, a), a).PushBack(jstr(assert_op_value(as), a), a);
+      if (!as.enabled) e.PushBack(false, a);
+      arr.PushBack(e, a);
+    }
+    o.AddMember("asserts", arr, a);
+  }
+  if (!r.captures.empty()) {
+    Value arr(rapidjson::kArrayType);
+    for (const auto& c : r.captures) {
+      Value e(rapidjson::kObjectType);
+      e.AddMember("var", jstr(c.var, a), a);
+      e.AddMember("from", jstr(c.target, a), a);
+      e.AddMember("scope", Value(rapidjson::StringRef(capture_scope_name(c.scope))), a);
+      if (!c.enabled) e.AddMember("enabled", false, a);
+      arr.PushBack(e, a);
+    }
+    o.AddMember("captures", arr, a);
+  }
   return o;
 }
 
 void request_from_value(const Value& o, SavedRequest& r) {
   r.id = get_str(o, "id");
   r.name = get_str(o, "name");
+  r.docs = get_str(o, "docs");
   r.kind = get_str(o, "kind") == "grpc" ? RequestKind::Grpc : RequestKind::Http;
   if (const Value* h = get_obj(o, "http")) {
     r.http.method = get_str(*h, "method", "GET");
@@ -522,6 +552,7 @@ void request_from_value(const Value& o, SavedRequest& r) {
     r.body_file = get_str(*h, "body_file");
     r.body_data = curl_data_from(*h);
     r.disabled_params = pairs_from(*h, "disabled_params");
+    r.path_params = pairs_from(*h, "path_params");
     r.header_files = strings_from(*h, "header_files");
     r.cookie_files = strings_from(*h, "cookie_files");
     if (const Value* auth = get_obj(*h, "auth"); auth && get_str(*auth, "type", "basic") == "basic") {
@@ -545,6 +576,33 @@ void request_from_value(const Value& o, SavedRequest& r) {
     r.proto_files = strings_from(*g, "proto_files");
     r.import_dirs = strings_from(*g, "import_dirs");
   }
+  // [target, "op value"(, false)]; [target, op, value(, false)] is read too.
+  if (const Value* as = get_arr(o, "asserts"))
+    for (const auto& e : as->GetArray()) {
+      if (!e.IsArray() || e.Size() < 2 || !e[0].IsString() || !e[1].IsString()) continue;
+      Assertion x;
+      x.target.assign(e[0].GetString(), e[0].GetStringLength());
+      const std::string second(e[1].GetString(), e[1].GetStringLength());
+      if (e.Size() >= 3 && e[2].IsString()) {
+        x.op = second;
+        x.value.assign(e[2].GetString(), e[2].GetStringLength());
+      } else {
+        set_assert_op_value(x, second);
+      }
+      const Value& last = e[e.Size() - 1];
+      x.enabled = !(e.Size() >= 3 && last.IsBool() && !last.GetBool());
+      r.asserts.push_back(std::move(x));
+    }
+  if (const Value* cs = get_arr(o, "captures"))
+    for (const auto& e : cs->GetArray()) {
+      if (!e.IsObject()) continue;
+      Capture c;
+      c.var = get_str(e, "var");
+      c.target = get_str(e, "from");
+      c.scope = capture_scope_from(get_str(e, "scope"));
+      c.enabled = get_bool(e, "enabled", true);
+      r.captures.push_back(std::move(c));
+    }
 }
 
 std::string parse_error_text(const rapidjson::Document& d, const fs::path& file) {
@@ -1967,6 +2025,13 @@ std::string Workspace::expand(const std::string& s) const {
         break;
       }
   auto lookup = [&](const std::string& name, std::string& value) -> bool {
+    if (!runtime_vars.empty()) {
+      auto it = runtime_vars.find(name);
+      if (it != runtime_vars.end()) {
+        value = it->second;
+        return true;
+      }
+    }
     if (env) {
       auto it = env->vars.find(name);
       if (it != env->vars.end()) {

@@ -37,6 +37,7 @@ endif()
 find_package(gRPC CONFIG REQUIRED)
 find_package(protobuf CONFIG REQUIRED)
 find_package(RapidJSON CONFIG REQUIRED)
+find_package(re2 CONFIG REQUIRED)  # assertion regexes (core/asserts.cpp); gRPC links the same re2
 find_package(wxWidgets CONFIG REQUIRED)
 find_package(Catch2 3 CONFIG REQUIRED)
 
@@ -61,7 +62,7 @@ foreach(part http grpc model)
 endforeach()
 target_link_libraries(watt_http PUBLIC watt_curl)
 target_link_libraries(watt_grpc PUBLIC watt_http gRPC::grpc++ gRPC::grpc++_reflection protobuf::libprotobuf rapidjson)  # watt_http: gRPC-Web
-target_link_libraries(watt_model PUBLIC rapidjson)
+target_link_libraries(watt_model PUBLIC rapidjson re2::re2)
 add_library(watt_core INTERFACE)
 target_link_libraries(watt_core INTERFACE watt_http watt_grpc watt_model)
 
