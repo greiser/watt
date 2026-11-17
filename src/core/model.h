@@ -10,12 +10,15 @@
 //                                      environment), secrets.json (secret values, DPAPI-sealed on
 //                                      Windows)
 // Per user, outside every workspace (a cloned repo cannot plant it): <config>/allowed_files.json,
-// files a workspace may upload from outside its root, see Workspace::blocked_files().
+// files a workspace may upload from outside its root, see Workspace::blocked_files(), and
+// <config>/allowed_env.json, OS environment variables it may expand, see blocked_env_vars().
 // <config> = %APPDATA%\watt (POSIX: $XDG_CONFIG_HOME/watt or ~/.config/watt, 0700 / 0600).
 // Variables: {{name}} substituted from the active environment, then workspace globals, then
-// dynamic variables ({{$guid}}, {{process.env.X}} from .env or the OS environment, ...).
+// dynamic variables ({{$guid}}, {{process.env.X}} from .env, or from the OS environment only for
+// names the user allowed for this workspace, ...).
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <map>
 #include <memory>
 #include <optional>
@@ -47,6 +50,24 @@ struct BasicAuth {
   bool operator==(const BasicAuth&) const = default;
 };
 
+// One curl -d family argument kept as written because it reads a file (-d @f, --data-binary @f,
+// --json @f, --data-urlencode name@f): nothing is read when a command is imported, the file is
+// read when the request is sent (Workspace::http_to_send(), under the upload policy of
+// blocked_files()) and processed as curl does (-d strips CR and LF, --data-urlencode encodes).
+// A request keeps all its -d family arguments this way, in order, when any of them is a file.
+struct CurlData {
+  enum class Kind {
+    Data,       // -d / --data / --data-ascii: "@file" = the file without CR and LF, else the text
+    Binary,     // --data-binary: "@file" = the file as it is
+    Raw,        // --data-raw: the text, never a file
+    UrlEncode,  // --data-urlencode: content | =content | name=content | @file | name@file
+    Json,       // --json: "@file" = the file as it is; concatenated, not joined with '&'
+  };
+  Kind kind = Kind::Data;
+  std::string value;  // as written ({{vars}} allowed; relative paths against the workspace root)
+  bool operator==(const CurlData&) const = default;
+};
+
 struct SavedRequest {
   std::string id;                 // stable uuid
   std::string name;
@@ -66,6 +87,14 @@ struct SavedRequest {
   // A file sent as the raw body (curl -T), read at send time like form files (relative paths
   // against the workspace root; may hold {{vars}}). When set, http.body is not saved.
   std::string body_file;
+  // curl -d family arguments read at send time (see CurlData). When not empty (and there is no
+  // form and no body_file) the body is built from them and http.body is not saved.
+  std::vector<CurlData> body_data;
+  // curl -H @file: header lines read from these files at send time (a header from a file
+  // replaces a header of the same name). curl -b file: Netscape cookie jars read at send time;
+  // their cookies for the URL go first in the Cookie header. Same file policy as body_file.
+  std::vector<std::string> header_files;
+  std::vector<std::string> cookie_files;
   // gRPC
   GrpcTarget grpc_target;
   std::string grpc_method;        // full path "/pkg.Svc/Method"
@@ -151,12 +180,14 @@ class Workspace {
   std::string expand(const std::string& s) const;
   SavedRequest expanded(const SavedRequest& r) const;
   // What to hand to HttpClient::send(): expanded(r).http, plus the multipart body built from
-  // r.form (files read now, relative paths against the workspace root only). nullopt if a form
-  // file cannot be read, or if a form file or body_file is not allowed (see blocked_files()):
-  // then *err names the path and the request must not be sent.
+  // r.form, body_file or body_data, and the headers / cookies of header_files / cookie_files
+  // (files read now, relative paths against the workspace root only). nullopt if one of these
+  // files cannot be read or is not allowed (see blocked_files()): then *err names the path and
+  // the request must not be sent.
   std::optional<HttpRequest> http_to_send(const SavedRequest& r, std::string* err = nullptr) const;
 
-  // Files a request uploads (form file parts, body_file) must be inside the workspace root once
+  // Files a request uploads (form file parts, body_file, body_data, header_files, cookie_files)
+  // must be inside the workspace root once
   // {{vars}} are expanded and symlinks resolved (fs::weakly_canonical), and not in its personal
   // .watt/, .git/ or .env. Anything else is sent only if the user allowed it for this workspace
   // in the per-user allowlist <user_config_dir()>/allowed_files.json ({version, workspaces:
@@ -179,12 +210,27 @@ class Workspace {
   // Where per-user watt settings live: %APPDATA%\watt, $XDG_CONFIG_HOME/watt or
   // ~/.config/watt. set_user_config_dir() overrides it for the process (tests; empty path:
   // back to the default).
+  // {{process.env.X}} / {{$env.X}} take X from <ws>/.env ({{process.env.X}} only; meant for this
+  // workspace's requests), else from the OS environment, but only if the user allowed X for this
+  // workspace in the per-user <user_config_dir()>/allowed_env.json ({version, workspaces:
+  // {resolved root: [names]}}; never read from the workspace, so a cloned one cannot make Send
+  // leak e.g. AWS_SECRET_ACCESS_KEY). Otherwise the placeholder is left as-is.
+  // The OS environment variables `r` references (after expansion) that are set but not allowed:
+  // before sending, the UI asks "this request wants to read the environment variable X: allow?"
+  // and calls allow_env_var() for each one accepted. http_to_send() refuses to send while any is
+  // left, naming it.
+  std::vector<std::string> blocked_env_vars(const SavedRequest& r) const;
+  bool is_env_var_allowed(const std::string& name) const;
+  bool allow_env_var(const std::string& name, std::string* err = nullptr) const;
+  bool disallow_env_var(const std::string& name, std::string* err = nullptr) const;
+  std::vector<std::string> allowed_env_vars() const;
   static std::filesystem::path user_config_dir();
   static void set_user_config_dir(const std::filesystem::path& dir);
 
  private:
   void note_saved(const std::filesystem::path& file, const SavedRequest& r) const;
   bool write_allowlist(const std::vector<std::filesystem::path>& files, std::string* err) const;
+  std::vector<std::string> env_refs_left(const SavedRequest& expanded_request) const;
 
   // Sealed secret values as read or last written: "env\0var" -> {plain, stored}. A value that
   // did not change is written back with the same ciphertext (DPAPI output is randomized), so a
@@ -214,13 +260,23 @@ inline constexpr char kRemoveHeader[] = " ";
 // references, see model_form.h) and warnings for the import UI where curl itself would send
 // something other than what the command seems to say (e.g. -b next to -H 'Cookie: ...', -G
 // next to --url-query, a form file that does not exist).
+// No local file is ever read by the import (a pasted `curl -d @~/.ssh/id_rsa ...` must not copy
+// the key into a request that may be committed): every file the command names is kept as a
+// reference (body_file, body_data, header_files, cookie_files, form file parts) and read at send
+// time by Workspace::http_to_send(), where blocked_files() asks the user about files outside the
+// workspace. Only data piped into the command itself (@- after `printf ... |`) is inlined.
 struct CurlImport {
   HttpRequest http;               // with form parts, http.body is empty
   std::vector<FormPart> form;
   BasicAuth basic_auth;           // -u user:password (not also in http.headers)
-  // -T file: the file as given. http.body holds its content as read now; a SavedRequest keeps
-  // the reference (SavedRequest::body_file) and reads the file at send time.
+  // -T file, or a single --data-binary @file: the file as given (http.body is empty); a
+  // SavedRequest keeps the reference (SavedRequest::body_file) and reads the file at send time.
   std::string body_file;
+  // The -d family arguments when any of them reads a file (http.body is empty then); see
+  // SavedRequest::body_data. -H @file and -b file references, see SavedRequest.
+  std::vector<CurlData> body_data;
+  std::vector<std::string> header_files;
+  std::vector<std::string> cookie_files;
   std::vector<std::string> warnings;
   // Browser "Copy as cURL (cmd)" doubles every backslash, but curl.exe (MS CRT argv rules)
   // halves them only before a '"'. This is how many more backslashes curl.exe sends than the
@@ -234,8 +290,9 @@ struct CurlImport {
 enum class CmdBackslashes { AsCurlExe, AsBrowserMeant };
 std::optional<CurlImport> parse_curl(const std::string& cmd, std::string* err = nullptr,
                                      CmdBackslashes bs = CmdBackslashes::AsCurlExe);
-// parse_curl() with the form already built into http.body (files read relative to the current
-// directory): ready to send, but the parts are flattened. Prefer parse_curl() for saving.
+// parse_curl() with the form already built into http.body and basic auth as a header. It reads
+// no file either: file form parts are sent empty and body_data / header_files / cookie_files /
+// body_file are left out. Prefer parse_curl() (and Workspace::http_to_send()).
 std::optional<HttpRequest> parse_curl_command(const std::string& cmd, std::string* err = nullptr);
 // Shell the exported command is written for: bash ('...' quoting, \ continuations), cmd.exe
 // ("..." with ^ continuations) or PowerShell (curl.exe, '...' quoting, ` continuations).
@@ -248,12 +305,29 @@ std::string to_curl_command(const HttpRequest& r, const std::vector<FormPart>& f
 // With basic auth: exported as -u 'user:password'.
 std::string to_curl_command(const HttpRequest& r, const std::vector<FormPart>& form, const BasicAuth& auth,
                             CurlShell shell = CurlShell::Bash);
-// The whole saved request: with body_file set, the body is exported as -T file.
+// The whole saved request: with body_file set, the body is exported as -T file (or
+// --data-binary @file); body_data, header_files and cookie_files as the -d family / -H @file /
+// -b file arguments they came from.
 std::string to_curl_command(const SavedRequest& r, CurlShell shell = CurlShell::Bash);
 // Why `shell` cannot carry this request exactly (empty if it can): cmd.exe has no way to pass
 // a CR or a NUL and garbles non-ASCII text, Windows PowerShell 5.1 cannot pass a NUL, and no
 // shell can pass a NUL in an argument. The UI warns and suggests another shell.
 std::string curl_export_problem(const HttpRequest& r, const std::vector<FormPart>& form, CurlShell shell);
 std::string to_grpcurl_command(const SavedRequest& r);
+
+// Send-time helpers for curl file references (used by Workspace::http_to_send()).
+// The body curl sends for these -d family arguments; `read(path, out)` reads a file reference
+// (false: *err names it). curl's rules: --json values are concatenated (then the first other
+// value is appended), the rest joined with '&'.
+bool build_curl_data_body(const std::vector<CurlData>& data,
+                          const std::function<bool(const std::string& path, std::string& out)>& read,
+                          std::string& body);
+// The file a -d family argument reads ("" if none).
+std::string curl_data_file(const CurlData& d);
+// Adds the header lines of a curl -H @file (one header per line, blank lines skipped, curl's
+// "Name:" / "Name;" conventions). A header replaces earlier headers of the same name.
+void add_curl_header_file(std::vector<Header>& headers, const std::string& content);
+// The cookies of a Netscape cookie file (curl -b file) that curl sends to `url`, "a=1; b=2".
+std::string curl_jar_cookies(const std::string& jar, const std::string& url);
 
 }  // namespace watt

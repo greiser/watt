@@ -53,6 +53,9 @@
 //   "http" may carry "form": [{name, value|file|file_content, filename?, type?, literal?,
 //   enabled?}]: file parts are path references (relative to the workspace root when inside it).
 //   and "auth": {type: "basic", enabled?, user, password} (user and password may be {{vars}}).
+//   curl file references, read at send time: "body_data": [[option, value], ...] (option: data,
+//   data-binary, data-raw, data-urlencode, json; no body stored then), "header_files": [paths]
+//   (curl -H @file), "cookie_files": [paths] (curl -b file).
 // .watt/history/<seq>.jsonl: segments of at most 1000 entries, one small compact JSON object
 //   per line (when, kind, summary, status, total_ms, req: [offset, length]), oldest first,
 //   appended to the newest segment only. The request itself is a line of <seq>.req.jsonl
@@ -417,6 +420,35 @@ std::vector<FormPart> form_from(const Value& o) {
   return out;
 }
 
+constexpr const char* kCurlDataOpts[] = {"data", "data-binary", "data-raw", "data-urlencode", "json"};
+
+Value curl_data_value(const std::vector<CurlData>& data, Alloc& a) {
+  Value arr(rapidjson::kArrayType);
+  for (const auto& d : data) {
+    Value e(rapidjson::kArrayType);
+    e.PushBack(Value(rapidjson::StringRef(kCurlDataOpts[static_cast<int>(d.kind)])), a);
+    e.PushBack(jstr(d.value, a), a);
+    arr.PushBack(e, a);
+  }
+  return arr;
+}
+
+std::vector<CurlData> curl_data_from(const Value& o) {
+  std::vector<CurlData> out;
+  const Value* arr = get_arr(o, "body_data");
+  if (!arr) return out;
+  for (const auto& e : arr->GetArray()) {
+    if (!e.IsArray() || e.Size() < 2 || !e[0].IsString() || !e[1].IsString()) continue;
+    const std::string opt(e[0].GetString(), e[0].GetStringLength());
+    for (int k = 0; k < static_cast<int>(std::size(kCurlDataOpts)); ++k)
+      if (opt == kCurlDataOpts[k]) {
+        out.push_back(CurlData{static_cast<CurlData::Kind>(k), std::string(e[1].GetString(), e[1].GetStringLength())});
+        break;
+      }
+  }
+  return out;
+}
+
 Value request_value(const SavedRequest& r, Alloc& a, bool lines, size_t body_cap) {
   Value o(rapidjson::kObjectType);
   o.AddMember("version", 1, a);
@@ -429,12 +461,15 @@ Value request_value(const SavedRequest& r, Alloc& a, bool lines, size_t body_cap
     if (auto hs = http.FindMember("headers"); hs != http.MemberEnd())
       for (size_t k : r.disabled_headers)
         if (k < hs->value.Size()) hs->value[static_cast<SizeType>(k)].PushBack(false, a);
-  if (!r.body_file.empty() || !r.form.empty()) {
-    // The body is the file (read at send time) or built from the form parts: not stored.
+  if (!r.body_file.empty() || !r.form.empty() || !r.body_data.empty()) {
+    // The body is the file (read at send time) or built from the form parts / curl data: not stored.
     http.RemoveMember("body");
     http.RemoveMember("body_base64");
   }
   if (!r.body_file.empty()) http.AddMember("body_file", jstr(r.body_file, a), a);
+  if (!r.body_data.empty()) http.AddMember("body_data", curl_data_value(r.body_data, a), a);
+  if (!r.header_files.empty()) http.AddMember("header_files", strings_value(r.header_files, a), a);
+  if (!r.cookie_files.empty()) http.AddMember("cookie_files", strings_value(r.cookie_files, a), a);
   if (!r.form.empty()) http.AddMember("form", form_value(r.form, a), a);
   const BasicAuth& ba = r.basic_auth;
   if (ba.enabled || !ba.user.empty() || !ba.password.empty()) {
@@ -481,6 +516,9 @@ void request_from_value(const Value& o, SavedRequest& r) {
     r.http.fresh_connection = get_bool(*h, "fresh_connection", r.http.fresh_connection);
     r.form = form_from(*h);
     r.body_file = get_str(*h, "body_file");
+    r.body_data = curl_data_from(*h);
+    r.header_files = strings_from(*h, "header_files");
+    r.cookie_files = strings_from(*h, "cookie_files");
     if (const Value* auth = get_obj(*h, "auth"); auth && get_str(*auth, "type", "basic") == "basic") {
       r.basic_auth.enabled = get_bool(*auth, "enabled", true);
       r.basic_auth.user = get_str(*auth, "user");
@@ -1199,9 +1237,20 @@ bool Workspace::save_request(SavedRequest& r, std::string* err) {
     const fs::path fp = from_utf8(p.value);
     if (fp.is_absolute() && is_inside(root_, fp)) p.value = generic_utf8(fp.lexically_normal().lexically_relative(root_));
   }
-  if (!r.body_file.empty() && r.body_file.find("{{") == std::string::npos) {
-    const fs::path fp = from_utf8(r.body_file);
-    if (fp.is_absolute() && is_inside(root_, fp)) r.body_file = generic_utf8(fp.lexically_normal().lexically_relative(root_));
+  auto relative = [&](std::string& ref) {
+    if (ref.empty() || ref.find("{{") != std::string::npos) return;
+    const fs::path fp = from_utf8(ref);
+    if (fp.is_absolute() && is_inside(root_, fp)) ref = generic_utf8(fp.lexically_normal().lexically_relative(root_));
+  };
+  relative(r.body_file);
+  for (auto& f : r.header_files) relative(f);
+  for (auto& f : r.cookie_files) relative(f);
+  for (auto& d : r.body_data) {  // the file part of "@file" / "name@file"
+    std::string f = curl_data_file(d);
+    if (f.empty()) continue;
+    const std::string head = d.value.substr(0, d.value.size() - f.size());
+    relative(f);
+    d.value = head + f;
   }
 
   rapidjson::Document d;
@@ -1864,21 +1913,45 @@ bool dynamic_var(const std::string& name, std::string& out) {
     out = std::to_string(rng()() % 1001);
     return true;
   }
-  if (name.rfind("process.env.", 0) == 0 || name.rfind("$env.", 0) == 0) {
-    const std::string var = name.substr(name.find('.', name[0] == '$' ? 0 : 8) + 1);
-    if (var.empty()) return false;
-    std::string v = get_env(var);
-    if (v.empty()) return false;  // unset: leave the placeholder visible
-    out = std::move(v);
-    return true;
-  }
   return false;
 }
+
+// "process.env.X" / "$env.X" -> "X" (empty for any other name).
+std::string os_env_name(std::string_view name) {
+  for (std::string_view prefix : {std::string_view("process.env."), std::string_view("$env.")})
+    if (name.substr(0, prefix.size()) == prefix) return std::string(name.substr(prefix.size()));
+  return {};
+}
+
+bool same_env_name(const std::string& a, const std::string& b) {
+#ifdef _WIN32
+  return lower_ascii(a) == lower_ascii(b);  // Windows environment names are case-insensitive
+#else
+  return a == b;
+#endif
+}
+
+// The OS environment variables still referenced ({{process.env.X}} / {{$env.X}} left in an
+// expanded string), in order of appearance.
+void collect_env_refs(const std::string& s, std::vector<std::string>& out) {
+  for (size_t open = s.find("{{"); open != std::string::npos; open = s.find("{{", open + 2)) {
+    const size_t close = s.find("}}", open + 2);
+    if (close == std::string::npos) return;
+    const std::string var = os_env_name(trim(std::string_view(s).substr(open + 2, close - open - 2)));
+    if (var.empty()) continue;
+    if (std::none_of(out.begin(), out.end(), [&](const std::string& o) { return same_env_name(o, var); }))
+      out.push_back(var);
+  }
+}
+
+std::vector<std::string> read_env_allowlist(const fs::path& root);  // below, with the upload allowlist
+fs::path resolved_path(const fs::path& p);
 
 }  // namespace
 
 std::string Workspace::expand(const std::string& s) const {
   if (s.find("{{") == std::string::npos) return s;
+  std::optional<std::vector<std::string>> env_allowed;  // read when an OS variable is met
   const Environment* env = nullptr;
   if (!active_env.empty())
     for (const auto& e : envs_)
@@ -1905,6 +1978,17 @@ std::string Workspace::expand(const std::string& s) const {
         value = d->second;
         return true;
       }
+    }
+    // The OS environment only for names the user allowed for this workspace (see
+    // blocked_env_vars()): a cloned workspace must not send e.g. AWS_SECRET_ACCESS_KEY.
+    if (const std::string var = os_env_name(name); !var.empty()) {
+      if (!env_allowed) env_allowed = read_env_allowlist(root_);
+      if (std::none_of(env_allowed->begin(), env_allowed->end(), [&](const std::string& a) { return same_env_name(a, var); }))
+        return false;
+      std::string v = get_env(var);
+      if (v.empty()) return false;  // unset: leave the placeholder visible
+      value = std::move(v);
+      return true;
     }
     return dynamic_var(name, value);
   };
@@ -2017,6 +2101,9 @@ fs::path default_config_dir() {
 }
 
 constexpr const char* kAllowedFilesFile = "allowed_files.json";  // in Workspace::user_config_dir()
+// OS environment variables a workspace may expand: { "version": 1, "workspaces": { "<resolved
+// root>": ["NAME", ...] } }, next to allowed_files.json and for the same reason.
+constexpr const char* kAllowedEnvFile = "allowed_env.json";
 
 bool same_path(const fs::path& a, const fs::path& b) {
 #ifdef _WIN32
@@ -2059,6 +2146,60 @@ std::vector<fs::path> read_allowlist(const fs::path& resolved_root) {
       for (const auto& f : it->value.GetArray())
         if (f.IsString()) out.push_back(from_utf8(std::string(f.GetString(), f.GetStringLength())));
   return out;
+}
+
+std::vector<std::string> read_env_allowlist(const fs::path& root) {
+  std::vector<std::string> out;
+  const fs::path dir = Workspace::user_config_dir();
+  if (dir.empty()) return out;
+  const fs::path rroot = resolved_path(root);
+  rapidjson::Document d;
+  std::lock_guard<std::mutex> lock(config_mutex());
+  if (!parse_json_file(dir / kAllowedEnvFile, d)) return out;
+  const Value* wss = get_obj(d, "workspaces");
+  if (!wss) return out;
+  for (auto it = wss->MemberBegin(); it != wss->MemberEnd(); ++it)
+    if (it->value.IsArray() && is_root_key(it->name, rroot))
+      for (const auto& f : it->value.GetArray())
+        if (f.IsString()) out.emplace_back(f.GetString(), f.GetStringLength());
+  return out;
+}
+
+// Replaces `root`'s entry in <user_config_dir()>/<file> (other workspaces kept), owner-only.
+bool write_root_list(const char* file, const fs::path& root, const std::vector<std::string>& items, const char* what,
+                     std::string* err) {
+  const fs::path dir = Workspace::user_config_dir();
+  if (dir.empty()) {
+    if (err) *err = std::string("no per-user config directory (APPDATA / HOME not set): cannot store the ") + what;
+    return false;
+  }
+  const fs::path rroot = resolved_path(root);
+  std::lock_guard<std::mutex> lock(config_mutex());
+  rapidjson::Document d;
+  if (!parse_json_file(dir / file, d)) d.SetObject();
+  auto& a = d.GetAllocator();
+  if (!d.HasMember("version")) d.AddMember("version", 1, a);
+  if (!get_obj(d, "workspaces")) {
+    d.RemoveMember("workspaces");
+    d.AddMember("workspaces", Value(rapidjson::kObjectType), a);
+  }
+  Value& wss = d["workspaces"];
+  for (auto it = wss.MemberBegin(); it != wss.MemberEnd();) {  // this root's old entry
+    if (is_root_key(it->name, rroot)) it = wss.EraseMember(it);
+    else ++it;
+  }
+  if (!items.empty()) {
+    Value arr(rapidjson::kArrayType);
+    for (const auto& f : items) arr.PushBack(jstr(f, a), a);
+    wss.AddMember(jstr(root_key(rroot), a), arr, a);
+  }
+  // Owner-only, like .watt: the directory (protected DACL / 0700) and the file (0600 on POSIX).
+  std::error_code ec;
+  if (!fs::is_directory(dir, ec)) {
+    detail::ensure_dir(dir.parent_path());
+    detail::create_private_dir(dir);
+  }
+  return detail::write_file_atomic(dir / file, detail::json_pretty(d), err, true);
 }
 
 // Which files a send may read (see Workspace::blocked_files()). The allowlist is read only when a
@@ -2128,7 +2269,12 @@ std::vector<fs::path> Workspace::blocked_files(const SavedRequest& r) const {
       if (p.enabled && p.kind != FormPart::Kind::Text) check(policy.resolve(p.value));
   } else if (!x.body_file.empty()) {
     check(policy.resolve(expand(x.body_file)));
+  } else {
+    for (const auto& d : x.body_data)
+      if (const std::string f = curl_data_file(CurlData{d.kind, expand(d.value)}); !f.empty()) check(policy.resolve(f));
   }
+  for (const auto& f : x.header_files) check(policy.resolve(expand(f)));
+  for (const auto& f : x.cookie_files) check(policy.resolve(expand(f)));
   return out;
 }
 
@@ -2141,38 +2287,71 @@ std::vector<fs::path> Workspace::allowed_files() const { return read_allowlist(r
 
 // Replaces this workspace's entry (read-modify-write of the per-user file; other workspaces kept).
 bool Workspace::write_allowlist(const std::vector<fs::path>& files, std::string* err) const {
-  const fs::path dir = user_config_dir();
-  if (dir.empty()) {
-    if (err) *err = "no per-user config directory (APPDATA / HOME not set): cannot store the upload allowlist";
-    return false;
+  std::vector<std::string> items;
+  for (const auto& f : files) items.push_back(generic_utf8(f));
+  return write_root_list(kAllowedFilesFile, root_, items, "upload allowlist", err);
+}
+
+std::vector<std::string> Workspace::blocked_env_vars(const SavedRequest& r) const { return env_refs_left(expanded(r)); }
+
+std::vector<std::string> Workspace::env_refs_left(const SavedRequest& x) const {
+  std::vector<std::string> refs;
+  auto scan = [&](const std::string& s) { collect_env_refs(s, refs); };
+  scan(x.http.url);
+  for (const auto& [k, v] : x.http.headers) {
+    scan(k);
+    scan(v);
   }
-  const fs::path rroot = resolved_path(root_);
-  std::lock_guard<std::mutex> lock(config_mutex());
-  rapidjson::Document d;
-  if (!parse_json_file(dir / kAllowedFilesFile, d)) d.SetObject();
-  auto& a = d.GetAllocator();
-  if (!d.HasMember("version")) d.AddMember("version", 1, a);
-  if (!get_obj(d, "workspaces")) {
-    d.RemoveMember("workspaces");
-    d.AddMember("workspaces", Value(rapidjson::kObjectType), a);
+  scan(x.http.body);
+  scan(x.basic_auth.user);
+  scan(x.basic_auth.password);
+  for (const auto& p : x.form) {
+    scan(p.name);
+    scan(p.value);
+    scan(p.filename);
+    scan(p.type);
   }
-  Value& wss = d["workspaces"];
-  for (auto it = wss.MemberBegin(); it != wss.MemberEnd();) {  // this root's old entry
-    if (is_root_key(it->name, rroot)) it = wss.EraseMember(it);
-    else ++it;
+  scan(expand(x.body_file));
+  for (const auto& d : x.body_data) scan(expand(d.value));
+  for (const auto& f : x.header_files) scan(expand(f));
+  for (const auto& f : x.cookie_files) scan(expand(f));
+  scan(x.grpc_target.address);
+  scan(x.grpc_target.authority);
+  scan(x.grpc_method);
+  scan(x.grpc_body);
+  for (const auto& [k, v] : x.grpc_opts.metadata) {
+    scan(k);
+    scan(v);
   }
-  if (!files.empty()) {
-    Value arr(rapidjson::kArrayType);
-    for (const auto& f : files) arr.PushBack(jstr(generic_utf8(f), a), a);
-    wss.AddMember(jstr(root_key(rroot), a), arr, a);
-  }
-  // Owner-only, like .watt: the directory (protected DACL / 0700) and the file (0600 on POSIX).
-  std::error_code ec;
-  if (!fs::is_directory(dir, ec)) {
-    detail::ensure_dir(dir.parent_path());
-    detail::create_private_dir(dir);
-  }
-  return detail::write_file_atomic(dir / kAllowedFilesFile, detail::json_pretty(d), err, true);
+  for (const auto& p : x.proto_files) scan(p);
+  for (const auto& p : x.import_dirs) scan(p);
+  // Left unresolved and set in the OS environment: not allowed (an allowed one was expanded; an
+  // unset one has nothing to leak and stays visible as {{...}}).
+  std::erase_if(refs, [](const std::string& v) { return get_env(v).empty(); });
+  return refs;
+}
+
+bool Workspace::is_env_var_allowed(const std::string& name) const {
+  const auto list = read_env_allowlist(root_);
+  return std::any_of(list.begin(), list.end(), [&](const std::string& a) { return same_env_name(a, name); });
+}
+
+std::vector<std::string> Workspace::allowed_env_vars() const { return read_env_allowlist(root_); }
+
+bool Workspace::allow_env_var(const std::string& name, std::string* err) const {
+  if (name.empty()) return true;
+  std::vector<std::string> list = read_env_allowlist(root_);
+  if (std::any_of(list.begin(), list.end(), [&](const std::string& a) { return same_env_name(a, name); })) return true;
+  list.push_back(name);
+  return write_root_list(kAllowedEnvFile, root_, list, "environment variable allowlist", err);
+}
+
+bool Workspace::disallow_env_var(const std::string& name, std::string* err) const {
+  std::vector<std::string> list = read_env_allowlist(root_);
+  const auto end = std::remove_if(list.begin(), list.end(), [&](const std::string& a) { return same_env_name(a, name); });
+  if (end == list.end()) return true;
+  list.erase(end, list.end());
+  return write_root_list(kAllowedEnvFile, root_, list, "environment variable allowlist", err);
 }
 
 bool Workspace::allow_file(const fs::path& file, std::string* err) const {
@@ -2197,7 +2376,15 @@ bool Workspace::disallow_file(const fs::path& file, std::string* err) const {
 }
 
 std::optional<HttpRequest> Workspace::http_to_send(const SavedRequest& r, std::string* err) const {
+  // An OS environment variable this workspace may not read: not sent (the UI asks first).
   SavedRequest x = expanded(r);
+  if (const auto env = env_refs_left(x); !env.empty()) {
+    if (err)
+      *err = "the request uses the environment variable " + env.front() +
+             " ({{process.env." + env.front() + "}}), which this workspace may not read: request not sent. The user "
+             "must allow it for this workspace first.";
+    return std::nullopt;
+  }
   if (!x.disabled_headers.empty()) {
     std::vector<Header> on;
     for (size_t k = 0; k < x.http.headers.size(); ++k)
@@ -2234,6 +2421,54 @@ std::optional<HttpRequest> Workspace::http_to_send(const SavedRequest& r, std::s
     if (!detail::read_file(fp, x.http.body)) {
       if (err) *err = "cannot read body file " + to_utf8(fp);
       return std::nullopt;
+    }
+  }
+  // curl -d @file, -H @file, -b file: each file checked, then read (as curl reads it).
+  auto read_ref = [&](const std::string& what, const std::string& ref, std::string& out) {
+    const fs::path fp = policy.resolve(ref);
+    if (!policy.allowed(fp)) {
+      if (err) *err = policy.blocked_message(what, fp);
+      return false;
+    }
+    if (!detail::read_file(fp, out)) {
+      if (err) *err = "cannot read " + what + " " + to_utf8(fp);
+      return false;
+    }
+    return true;
+  };
+  if (!any && x.body_file.empty() && !x.body_data.empty()) {
+    std::vector<CurlData> data = x.body_data;
+    for (auto& d : data) d.value = expand(d.value);
+    if (!build_curl_data_body(data, [&](const std::string& f, std::string& out) { return read_ref("data file", f, out); },
+                              x.http.body))
+      return std::nullopt;
+  }
+  bool file_cookie = false;  // a Cookie header from a header file: curl then drops the -b cookies
+  for (const auto& f : x.header_files) {
+    std::string content;
+    if (!read_ref("header file", expand(f), content)) return std::nullopt;
+    std::vector<Header> from_file;
+    add_curl_header_file(from_file, content);
+    for (const auto& [k, v] : from_file) file_cookie = file_cookie || lower_ascii(k) == "cookie";
+    add_curl_header_file(x.http.headers, content);
+  }
+  if (!file_cookie && !x.cookie_files.empty()) {
+    std::string jar_cookies;
+    for (const auto& f : x.cookie_files) {
+      std::string jar;
+      if (!read_ref("cookie file", expand(f), jar)) return std::nullopt;
+      const std::string c = curl_jar_cookies(jar, x.http.url);
+      if (!c.empty()) jar_cookies += (jar_cookies.empty() ? "" : "; ") + c;
+    }
+    if (!jar_cookies.empty()) {
+      bool merged = false;  // the jar's cookies go first, as curl's
+      for (auto& [k, v] : x.http.headers)
+        if (lower_ascii(k) == "cookie") {
+          v = v.empty() ? jar_cookies : jar_cookies + "; " + v;
+          merged = true;
+          break;
+        }
+      if (!merged) x.http.headers.emplace_back("Cookie", jar_cookies);
     }
   }
   if (x.basic_auth.enabled) {

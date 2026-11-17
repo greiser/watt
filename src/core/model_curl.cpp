@@ -589,55 +589,24 @@ std::string url_encode(const std::string& s) {
 // Data piped into curl (`printf %b '...' | curl ... --data-binary @-`), while parsing.
 thread_local const std::string* t_stdin = nullptr;
 
-bool read_whole(const std::string& path, std::string& out) {
-  if (path == "-") {  // stdin: only what the command itself pipes in
-    if (!t_stdin) return false;
+// --data-urlencode content | =content | name=content | @file | name@file: where the '@' of a
+// file reference is (npos for content).
+size_t urlencode_at(const std::string& v) {
+  const size_t eq = v.find('=');
+  const size_t at = v.find('@');
+  if (at == std::string::npos || (eq != std::string::npos && eq < at)) return std::string::npos;
+  return at;
+}
+
+// What an import reads for "@-": only data the command itself pipes in (`printf ... | curl`).
+bool read_stdin(std::string& out, std::vector<std::string>& warnings) {
+  if (t_stdin) {
     out = *t_stdin;
     return true;
   }
-  return detail::read_file(detail::from_utf8(path), out);
-}
-
-std::string unreadable(const std::string& path) {
-  return path == "-" ? "stdin (not available here)" : "'" + path + "' (cannot be read)";
-}
-
-// -d @file: curl strips CR and LF from the file. --data-binary @file keeps it as-is. A file
-// that cannot be read sends nothing, as curl does (it warns and sends an empty body).
-std::string data_arg(const std::string& v, bool at_file, bool strip_newlines, std::vector<std::string>& warnings) {
-  if (!at_file || v.empty() || v[0] != '@') return v;
-  std::string content;
-  if (!read_whole(v.substr(1), content)) {
-    warnings.push_back("data file " + unreadable(v.substr(1)) + ": curl sends nothing for it (an empty body)");
-    return {};
-  }
-  if (strip_newlines) std::erase_if(content, [](char c) { return c == '\r' || c == '\n'; });
-  return content;
-}
-
-std::string data_urlencode_arg(const std::string& v, std::vector<std::string>& warnings) {
-  // content | =content | name=content | @file | name@file
-  const size_t eq = v.find('=');
-  const size_t at = v.find('@');
-  if (eq != std::string::npos && (at == std::string::npos || eq < at)) {
-    const std::string name = v.substr(0, eq);
-    const std::string enc = url_encode(v.substr(eq + 1));
-    return name.empty() ? enc : name + "=" + enc;
-  }
-  if (at != std::string::npos) {
-    std::string content;
-    const std::string name = v.substr(0, at);
-    if (!read_whole(v.substr(at + 1), content))
-      warnings.push_back("--data-urlencode file " + unreadable(v.substr(at + 1)) + ": curl sends it as empty");
-    return name.empty() ? url_encode(content) : name + "=" + url_encode(content);
-  }
-  return url_encode(v);
-}
-
-// --url-query: like --data-urlencode, except that a leading '+' means "already encoded".
-std::string url_query_arg(const std::string& v, std::vector<std::string>& warnings) {
-  if (!v.empty() && v[0] == '+') return v.substr(1);
-  return data_urlencode_arg(v, warnings);
+  warnings.push_back("data from stdin (not available here): curl sends nothing for it");
+  out.clear();
+  return true;
 }
 
 // Cookies of a Netscape cookie file (curl -b file, written by curl -c or a browser export)
@@ -763,6 +732,18 @@ void add_header_line(std::vector<Header>& headers, const std::string& line, std:
   // "Name:" with nothing after the colon removes a header curl would add by default.
   if (value.find_first_not_of(" \t") == std::string::npos) value = kRemoveHeader;
   if (!name.empty()) headers.emplace_back(std::move(name), std::move(value));
+}
+
+// The lines of a curl -H @file (LF or CRLF, blank lines skipped).
+void add_header_lines(std::vector<Header>& headers, const std::string& content, std::vector<std::string>& warnings) {
+  size_t p = 0;
+  while (p < content.size()) {
+    size_t e = content.find('\n', p);
+    if (e == std::string::npos) e = content.size();
+    const std::string line = content.substr(p, e - p);
+    if (!line.empty() && line != "\r") add_header_line(headers, line, warnings);
+    p = e + 1;
+  }
 }
 
 // One word of a -F value, as curl's tool reads it: "..." (with \" and \ escapes) when the
@@ -1103,6 +1084,83 @@ std::string printf_b_decode(const std::string& s) {
 
 }  // namespace
 
+std::string curl_data_file(const CurlData& d) {
+  switch (d.kind) {
+    case CurlData::Kind::Raw: return {};
+    case CurlData::Kind::UrlEncode: {
+      const size_t at = urlencode_at(d.value);
+      return at == std::string::npos ? std::string() : d.value.substr(at + 1);
+    }
+    default: return d.value.size() > 1 && d.value[0] == '@' ? d.value.substr(1) : std::string();
+  }
+}
+
+bool build_curl_data_body(const std::vector<CurlData>& data,
+                          const std::function<bool(const std::string& path, std::string& out)>& read,
+                          std::string& body) {
+  std::string json;
+  bool has_json = false;
+  std::vector<std::string> parts;
+  for (const auto& d : data) {
+    const std::string file = curl_data_file(d);
+    std::string content;
+    if (!file.empty() && !read(file, content)) return false;
+    std::string piece;
+    switch (d.kind) {
+      case CurlData::Kind::Raw: piece = d.value; break;
+      case CurlData::Kind::Data:
+        // -d @file: curl strips CR and LF from the file. --data-binary / --json keep it as-is.
+        piece = file.empty() ? d.value : content;
+        if (!file.empty()) std::erase_if(piece, [](char c) { return c == '\r' || c == '\n'; });
+        break;
+      case CurlData::Kind::Binary:
+      case CurlData::Kind::Json: piece = file.empty() ? d.value : content; break;
+      case CurlData::Kind::UrlEncode: {
+        // content | =content | name=content | @file | name@file
+        if (const size_t at = urlencode_at(d.value); at != std::string::npos) {
+          const std::string name = d.value.substr(0, at);
+          piece = name.empty() ? url_encode(content) : name + "=" + url_encode(content);
+        } else if (const size_t eq = d.value.find('='); eq != std::string::npos) {
+          const std::string name = d.value.substr(0, eq);
+          const std::string enc = url_encode(d.value.substr(eq + 1));
+          piece = name.empty() ? enc : name + "=" + enc;
+        } else {
+          piece = url_encode(d.value);
+        }
+        break;
+      }
+    }
+    if (d.kind == CurlData::Kind::Json) {
+      json += piece;
+      has_json = true;
+    } else {
+      parts.push_back(std::move(piece));
+    }
+  }
+  body.clear();
+  if (has_json) {
+    body = json;
+    if (!parts.empty()) body += parts.front();
+  } else {
+    for (size_t k = 0; k < parts.size(); ++k) body += (k ? "&" : "") + parts[k];
+  }
+  return true;
+}
+
+void add_curl_header_file(std::vector<Header>& headers, const std::string& content) {
+  std::vector<Header> add;
+  std::vector<std::string> ignored;
+  add_header_lines(add, content, ignored);
+  // As curl's custom headers replace the ones it would add (Content-Type of -d, ...).
+  for (const auto& [k, v] : add) {
+    const std::string l = lower(k);
+    std::erase_if(headers, [&](const Header& h) { return lower(h.first) == l; });
+  }
+  for (auto& h : add) headers.push_back(std::move(h));
+}
+
+std::string curl_jar_cookies(const std::string& jar, const std::string& url) { return jar_cookies(jar, url); }
+
 // ==================================================================== parse
 
 std::optional<CurlImport> parse_curl(const std::string& cmd_in, std::string* err, CmdBackslashes bs) {
@@ -1242,27 +1300,30 @@ std::optional<CurlImport> parse_curl(const std::string& cmd_in, std::string* err
   }
   r.follow_redirects = false;  // curl only follows with -L
   std::string method, url;
-  std::vector<std::string> data;   // -d family, joined with '&'
-  std::string json;                // --json, concatenated
+  // The -d family in order. No file is read here (see CurlImport): file references stay as
+  // written, data piped into the command ("@-") is inlined.
+  std::vector<CurlData> data;
   bool has_json = false, has_data = false, get = false, head = false;
   std::vector<FormPart>& form = out.form;
-  std::string user, upload;
+  std::string user, upload;  // upload: -T - (stdin) only
   bool has_upload = false, compressed = false, globoff = false;
   std::vector<std::string> url_query;
   std::vector<std::string> cookies;
   std::vector<std::string> cookie_files;
   std::string auth_scheme;  // --digest, --ntlm, ... (watt sends Basic only)
   bool agent_from_A = false;  // a User-Agent header added by -A (the last -A wins)
-  // The last -d family value, when it is a readable @file whose bytes are sent as they are
-  // (--data-binary @f, or -d @f without CR/LF): kept as a file reference, like -T.
-  std::string data_file;
-  auto note_data_file = [&](const std::string& v, bool strip_newlines) {
-    data_file.clear();
-    if (v.size() < 2 || v[0] != '@' || v == "@-") return;
-    std::string content;
-    if (!read_whole(v.substr(1), content)) return;
-    if (strip_newlines && content.find_first_of("\r\n") != std::string::npos) return;
-    data_file = v.substr(1);
+  auto stdin_reader = [&](const std::string&, std::string& content) { return read_stdin(content, warnings); };
+  auto add_data = [&](CurlData::Kind kind, const std::string& v) {
+    CurlData d{kind, v};
+    if (curl_data_file(d) == "-") {  // piped in: inline it now (as a value that reads no file)
+      std::string piece;
+      build_curl_data_body({d}, stdin_reader, piece);
+      d = CurlData{kind == CurlData::Kind::Json ? kind : CurlData::Kind::Raw, piece};
+    }
+    data.push_back(std::move(d));
+  };
+  auto deferred = [&](const std::string& what, const std::string& path) {
+    warnings.push_back(what + " '" + path + "' is read when the request is sent, not now");
   };
   for (const auto& [as_written, imported] : notes.vars)
     warnings.push_back("shell variable " + as_written + ": the shell would expand it; imported as " + imported +
@@ -1294,45 +1355,35 @@ std::optional<CurlImport> parse_curl(const std::string& cmd_in, std::string* err
       method = val;
     } else if (opt == "--header") {
       if (!arg()) return false;
-      if (!val.empty() && val[0] == '@') {
+      if (val == "@-") {
         std::string content;
-        if (!read_whole(val.substr(1), content)) {
-          warnings.push_back("header file " + unreadable(val.substr(1)) + ": curl stops with an error");
-        } else {
-          size_t p = 0;
-          while (p < content.size()) {
-            size_t e = content.find('\n', p);
-            if (e == std::string::npos) e = content.size();
-            const std::string line = content.substr(p, e - p);
-            if (!line.empty() && line != "\r") add_header_line(r.headers, line, warnings);
-            p = e + 1;
-          }
-        }
+        read_stdin(content, warnings);
+        add_header_lines(r.headers, content, warnings);
+      } else if (!val.empty() && val[0] == '@') {
+        out.header_files.push_back(val.substr(1));
+        deferred("header file", val.substr(1));
       } else {
         add_header_line(r.headers, val, warnings);
       }
     } else if (opt == "--data" || opt == "--data-ascii") {
       if (!arg()) return false;
-      note_data_file(val, true);
-      data.push_back(data_arg(val, true, true, warnings));
+      add_data(CurlData::Kind::Data, val);
       has_data = true;
     } else if (opt == "--data-raw") {
       if (!arg()) return false;
-      data_file.clear();
-      data.push_back(val);
+      add_data(CurlData::Kind::Raw, val);
       has_data = true;
     } else if (opt == "--data-binary") {
       if (!arg()) return false;
-      note_data_file(val, false);
-      data.push_back(data_arg(val, true, false, warnings));
+      add_data(CurlData::Kind::Binary, val);
       has_data = true;
     } else if (opt == "--data-urlencode") {
       if (!arg()) return false;
-      data.push_back(data_urlencode_arg(val, warnings));
+      add_data(CurlData::Kind::UrlEncode, val);
       has_data = true;
     } else if (opt == "--json") {
       if (!arg()) return false;
-      json += data_arg(val, true, false, warnings);
+      add_data(CurlData::Kind::Json, val);
       has_json = true;
     } else if (opt == "--form" || opt == "--form-string") {
       if (!arg()) return false;
@@ -1375,15 +1426,29 @@ std::optional<CurlImport> parse_curl(const std::string& cmd_in, std::string* err
       if (url.empty()) url = val;
     } else if (opt == "--url-query") {
       if (!arg()) return false;
-      url_query.push_back(url_query_arg(val, warnings));
+      // Like --data-urlencode, except that a leading '+' means "already encoded". The query is
+      // built now, so a file in it cannot be kept: refused (the file is not read).
+      if (!val.empty() && val[0] == '+') {
+        url_query.push_back(val.substr(1));
+      } else {
+        const CurlData d{CurlData::Kind::UrlEncode, val};
+        const std::string f = curl_data_file(d);
+        if (!f.empty() && f != "-") {
+          warnings.push_back("--url-query file '" + f + "' is not imported: watt does not read files on import, "
+                             "and the query cannot refer to one (add the value to the URL)");
+        } else {
+          std::string q;
+          build_curl_data_body({d}, stdin_reader, q);
+          url_query.push_back(std::move(q));
+        }
+      }
     } else if (opt == "--upload-file") {
       if (!arg()) return false;
       has_upload = true;
       out.body_file = val;
-      if (!read_whole(val, upload)) {
-        upload.clear();
-        warnings.push_back("upload file " + unreadable(val) + ": curl stops with an error");
-      }
+      upload.clear();
+      if (val == "-") read_stdin(upload, warnings);
+      else deferred("upload file", val);
     } else if (opt == "--max-time") {
       if (!arg()) return false;
       try {
@@ -1505,13 +1570,22 @@ std::optional<CurlImport> parse_curl(const std::string& cmd_in, std::string* err
     else if (url.back() == '/') url += base;
   }
 
-  std::string body;
-  if (has_json) {
-    body = json;
-    if (!data.empty()) body += data.front();
-  } else if (has_data) {
-    for (size_t k = 0; k < data.size(); ++k) body += (k ? "&" : "") + data[k];
+  bool data_files = false;
+  for (const auto& d : data) data_files = data_files || !curl_data_file(d).empty();
+  if (data_files && get) {
+    // -G puts the data into the URL query, which is built now: a file there cannot be kept.
+    std::erase_if(data, [&](const CurlData& d) {
+      const std::string f = curl_data_file(d);
+      if (f.empty()) return false;
+      warnings.push_back("-G data file '" + f + "' is not imported: watt does not read files on import, "
+                         "and the query cannot refer to one (add the value to the URL)");
+      return true;
+    });
+    data_files = false;
   }
+  std::string body;
+  // With a file among them, the body is built when sending (SavedRequest::body_data).
+  if (!data_files) build_curl_data_body(data, stdin_reader, body);
 
   auto add_query = [&](const std::string& q) {
     if (q.empty()) return;
@@ -1548,10 +1622,16 @@ std::optional<CurlImport> parse_curl(const std::string& cmd_in, std::string* err
     if (!has_header(r.headers, "Content-Type")) r.headers.emplace_back("Content-Type", kRemoveHeader);
   }
   if (!has_upload || !form.empty()) out.body_file.clear();
-  // A body that is one whole file (-d @f / --data-binary @f): keep the reference, so the
-  // saved request reads the file at send time instead of holding (maybe binary) bytes.
-  if (!has_upload && has_data && !has_json && form.empty() && data.size() == 1 && !data_file.empty())
-    out.body_file = data_file;
+  // A body that reads files (-d @f, --data-binary @f, ...): kept as references, read when sent.
+  // A single --data-binary @f is the body file as it is (like -T).
+  if (!has_upload && (has_data || has_json) && form.empty() && data_files) {
+    for (const auto& d : data)
+      if (const std::string f = curl_data_file(d); !f.empty()) deferred("data file", f);
+    if (data.size() == 1 && data[0].kind == CurlData::Kind::Binary) out.body_file = curl_data_file(data[0]);
+    else out.body_data = data;
+  } else {
+    data_files = false;
+  }
 
   if (!method.empty()) r.method = method;
   else if (head) r.method = "HEAD";
@@ -1583,19 +1663,22 @@ std::optional<CurlImport> parse_curl(const std::string& cmd_in, std::string* err
   }
   size_t jar_count = 0;
   for (const auto& f : cookie_files) {
-    std::string jar;
-    if (!read_whole(f, jar)) {
-      warnings.push_back("cookie file " + unreadable(f) + ": curl sends no cookies from it");
+    if (f != "-") {  // a jar file: read when sent, its cookies then go first (as curl's)
+      out.cookie_files.push_back(f);
       continue;
     }
+    std::string jar;
+    read_stdin(jar, warnings);
     const std::string c = jar_cookies(jar, url);
     if (!c.empty()) cookies.insert(cookies.begin() + static_cast<std::ptrdiff_t>(jar_count++), c);  // curl: jar first
   }
-  if (!cookies.empty() && has_header(r.headers, "Cookie")) {
+  if ((!cookies.empty() || !out.cookie_files.empty()) && has_header(r.headers, "Cookie")) {
     // curl sends only the custom header and drops the -b cookies.
     warnings.push_back("-b cookies are not sent because the command also sets a Cookie header (curl does the same)");
     cookies.clear();
+    out.cookie_files.clear();
   }
+  for (const auto& f : out.cookie_files) deferred("cookie file", f);
   if (!cookies.empty()) {
     std::string joined;
     for (const auto& c : cookies) joined += (joined.empty() ? "" : "; ") + c;
@@ -1610,7 +1693,7 @@ std::optional<CurlImport> parse_curl(const std::string& cmd_in, std::string* err
   }
   // -d '' (or an empty @file): curl still sends a body, Content-Length: 0. HttpRequest has no
   // has_body flag, so the explicit header carries it; to_curl_command turns it back into -d ''.
-  if ((has_data || has_json) && body.empty() && form.empty() && !has_upload &&
+  if ((has_data || has_json) && body.empty() && form.empty() && !has_upload && !data_files &&
       !has_header(r.headers, "Content-Length"))
     r.headers.emplace_back("Content-Length", "0");
   // Accept-Encoding is kept exactly as given (browsers list br and zstd): it is part of the
@@ -1628,23 +1711,20 @@ std::optional<HttpRequest> parse_curl_command(const std::string& cmd, std::strin
   if (imp->basic_auth.enabled)
     imp->http.headers.emplace_back("Authorization",
                                    "Basic " + base64(imp->basic_auth.user + ":" + imp->basic_auth.password));
-  if (!imp->form.empty() && !build_form_body(imp->form, imp->http, {}, err)) {
-    // A missing file: still return the request, the part sends as empty.
+  if (!imp->form.empty()) {
+    // No file is read (see CurlImport): a file part is sent empty, with its file name and type.
     std::vector<FormPart> parts = imp->form;
     for (auto& p : parts)
       if (p.kind != FormPart::Kind::Text) {
-        std::string tmp;
-        if (!detail::read_file(detail::from_utf8(p.value), tmp)) {
-          if (p.kind == FormPart::Kind::File && p.filename.empty()) {
-            const size_t slash = p.value.find_last_of("/\\");
-            p.filename = slash == std::string::npos ? p.value : p.value.substr(slash + 1);
-          }
-          if (p.type.empty()) p.type = form_part_content_type(p);
-          p.kind = FormPart::Kind::Text;
-          p.value.clear();
+        if (p.kind == FormPart::Kind::File && p.filename.empty()) {
+          const size_t slash = p.value.find_last_of("/\\");
+          p.filename = slash == std::string::npos ? p.value : p.value.substr(slash + 1);
         }
+        if (p.type.empty()) p.type = form_part_content_type(p);
+        p.kind = FormPart::Kind::Text;
+        p.value.clear();
       }
-    build_form_body(parts, imp->http, {}, nullptr);
+    if (!build_form_body(parts, imp->http, {}, err)) return std::nullopt;
   }
   return std::move(imp->http);
 }
@@ -1659,9 +1739,11 @@ std::string to_curl_command(const HttpRequest& r, const std::vector<FormPart>& f
 
 namespace {
 
-// upload: export the body as -T <file> (SavedRequest::body_file) instead of the bytes.
+// upload: export the body as -T <file> (SavedRequest::body_file) instead of the bytes. refs: the
+// saved request's other file references (body_data, header_files, cookie_files), exported as the
+// arguments they came from.
 std::string to_curl_impl(const HttpRequest& r, const std::vector<FormPart>& form, const BasicAuth& auth, CurlShell shell,
-                         const std::string* upload) {
+                         const std::string* upload, const SavedRequest* refs = nullptr) {
   bool legacy = false;  // PowerShell: arguments are pre-quoted for the CRT
   auto q = [&](const std::string& s) -> std::string {
     switch (shell) {
@@ -1679,10 +1761,12 @@ std::string to_curl_impl(const HttpRequest& r, const std::vector<FormPart>& form
   for (const auto& p : form) has_form = has_form || p.enabled;
   if (has_form) empty_body = false;
   if (upload) empty_body = false;
-  const bool has_body = !upload && (has_form || !r.body.empty() || empty_body);
+  const bool data_refs = refs && !refs->body_data.empty() && !has_form && !upload;
+  if (data_refs) empty_body = false;
+  const bool has_body = !upload && (has_form || data_refs || !r.body.empty() || empty_body);
   // No shell can put a NUL byte into an argument: bash pipes such a body in through printf,
   // PowerShell writes it to a temp file first (cmd.exe cannot, see curl_export_problem).
-  const bool binary = !upload && !has_form && r.body.find('\0') != std::string::npos;
+  const bool binary = !upload && !has_form && !data_refs && r.body.find('\0') != std::string::npos;
   const bool piped = binary && shell == CurlShell::Bash;
   const bool ps_file = binary && shell == CurlShell::PowerShell;
 
@@ -1712,6 +1796,20 @@ std::string to_curl_impl(const HttpRequest& r, const std::vector<FormPart>& form
     out += sep;
     out += "-H " + q(v.empty() ? k + ";" : is_remove_marker(v) ? k + ":" : k + ": " + v);
   }
+  // PowerShell reads a bare @name as splatting: quote it.
+  auto qa = [&](const std::string& s) {
+    return shell == CurlShell::PowerShell && !s.empty() && s[0] == '@' && plain_word(s) ? "'" + s + "'" : q(s);
+  };
+  if (refs) {
+    for (const auto& f : refs->header_files) {
+      out += sep;
+      out += "-H " + qa("@" + f);
+    }
+    for (const auto& f : refs->cookie_files) {
+      out += sep;
+      out += "-b " + q(f);
+    }
+  }
   if (auth.enabled) {
     out += sep;
     out += "-u " + q(auth.user + ":" + auth.password);
@@ -1720,10 +1818,14 @@ std::string to_curl_impl(const HttpRequest& r, const std::vector<FormPart>& form
     out += sep;
     out += "-T " + q(*upload);
   } else if (upload) {
-    // PowerShell reads a bare @name as splatting: quote it.
-    const std::string at = "@" + *upload;
     out += sep;
-    out += "--data-binary " + (shell == CurlShell::PowerShell && plain_word(at) ? "'" + at + "'" : q(at));
+    out += "--data-binary " + qa("@" + *upload);
+  } else if (data_refs) {
+    for (const auto& d : refs->body_data) {
+      static constexpr const char* opts[] = {"-d", "--data-binary", "--data-raw", "--data-urlencode", "--json"};
+      out += sep;
+      out += std::string(opts[static_cast<int>(d.kind)]) + " " + qa(d.value);
+    }
   } else if (has_form) {
     for (const auto& p : form) {
       if (!p.enabled) continue;
@@ -1778,12 +1880,12 @@ std::string to_curl_command(const SavedRequest& r, CurlShell shell) {
   bool has_form = false;
   for (const auto& p : r.form) has_form = has_form || p.enabled;
   const std::string* file = r.body_file.empty() || has_form ? nullptr : &r.body_file;
-  if (r.disabled_headers.empty()) return to_curl_impl(r.http, r.form, r.basic_auth, shell, file);
+  if (r.disabled_headers.empty()) return to_curl_impl(r.http, r.form, r.basic_auth, shell, file, &r);
   HttpRequest h = r.http;  // disabled headers are not sent, so not exported
   h.headers.clear();
   for (size_t k = 0; k < r.http.headers.size(); ++k)
     if (!r.disabled_headers.count(k)) h.headers.push_back(r.http.headers[k]);
-  return to_curl_impl(h, r.form, r.basic_auth, shell, file);
+  return to_curl_impl(h, r.form, r.basic_auth, shell, file, &r);
 }
 
 std::string curl_export_problem(const HttpRequest& r, const std::vector<FormPart>& form, CurlShell shell) {

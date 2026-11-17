@@ -409,6 +409,101 @@ TEST_CASE(".env feeds {{process.env.X}}", "[workspace][env]") {
   CHECK(ws->expand("{{process.env.NOPE_NOT_SET_42}}") == "{{process.env.NOPE_NOT_SET_42}}");
 }
 
+namespace {
+
+// Sets an OS environment variable of the test process for the scope (empty value: unset).
+struct ScopedEnv {
+  std::string name;
+  ScopedEnv(std::string n, const std::string& value) : name(std::move(n)) { set(value); }
+  ~ScopedEnv() { set({}); }
+  void set(const std::string& value) const {
+#ifdef _WIN32
+    _putenv_s(name.c_str(), value.c_str());
+#else
+    if (value.empty()) unsetenv(name.c_str());
+    else setenv(name.c_str(), value.c_str(), 1);
+#endif
+  }
+};
+
+}  // namespace
+
+TEST_CASE("OS environment variables expand only once allowed for the workspace", "[workspace][env][security]") {
+  TempDir t;
+  TempDir cfg;
+  ConfigDirOverride use_cfg(cfg.path / "watt");
+  const fs::path root = t.path / "ws";
+  Workspace::create(root);
+  spit(root / ".env", "DOT_ONLY=from-dotenv\nWATT_TEST_BOTH=dot\n");
+  const std::string value = "os-secret-4b9e";
+  ScopedEnv secret("WATT_TEST_OS_SECRET", value);
+  ScopedEnv both("WATT_TEST_BOTH", "os");
+  // A planted allowlist inside the workspace (any name a newer version might use) is ignored.
+  const std::string planted = "{\"version\": 1, \"workspaces\": {\"" + root.generic_string() + "\": [\"WATT_TEST_OS_SECRET\"], \"" +
+                              fs::weakly_canonical(root).generic_string() + "\": [\"WATT_TEST_OS_SECRET\"]}}";
+  for (const char* f : {".watt/allowed_env.json", "allowed_env.json", ".watt/allowed_files.json"}) spit(root / f, planted);
+  auto ws = Workspace::open(root);
+  REQUIRE(ws);
+
+  // Not expanded without opt-in, under either name.
+  CHECK(ws->expand("{{process.env.WATT_TEST_OS_SECRET}}") == "{{process.env.WATT_TEST_OS_SECRET}}");
+  CHECK(ws->expand("{{$env.WATT_TEST_OS_SECRET}}") == "{{$env.WATT_TEST_OS_SECRET}}");
+  CHECK_FALSE(ws->is_env_var_allowed("WATT_TEST_OS_SECRET"));
+  // .env values are the workspace's own: they still expand (and win over the OS environment).
+  CHECK(ws->expand("{{process.env.DOT_ONLY}}") == "from-dotenv");
+  CHECK(ws->expand("{{process.env.WATT_TEST_BOTH}}") == "dot");
+
+  SavedRequest r;
+  r.http.method = "POST";
+  r.http.url = "https://h.test/{{process.env.DOT_ONLY}}";
+  r.http.headers = {{"X-Key", "{{process.env.WATT_TEST_OS_SECRET}}"}, {"X-Unset", "{{process.env.WATT_SURELY_UNSET_VAR}}"}};
+  r.http.body = "{\"k\": \"{{indirect}}\"}";
+  ws->globals["indirect"] = "{{$env.WATT_TEST_OS_SECRET}}";  // through another variable
+  CHECK(ws->blocked_env_vars(r) == std::vector<std::string>{"WATT_TEST_OS_SECRET"});
+  std::string err;
+  CHECK_FALSE(ws->http_to_send(r, &err));
+  CHECK_THAT(err, ContainsSubstring("WATT_TEST_OS_SECRET"));
+  CHECK_THAT(err, !ContainsSubstring(value));
+  // Only through the body: blocked too.
+  SavedRequest b = r;
+  b.http.headers.clear();
+  CHECK(ws->blocked_env_vars(b) == std::vector<std::string>{"WATT_TEST_OS_SECRET"});
+  CHECK_FALSE(ws->http_to_send(b));
+  // An unset variable has nothing to leak: sent with its placeholder.
+  SavedRequest u = r;
+  u.http.headers = {{"X-Unset", "{{process.env.WATT_SURELY_UNSET_VAR}}"}};
+  u.http.body.clear();
+  CHECK(ws->blocked_env_vars(u).empty());
+  auto h = ws->http_to_send(u, &err);
+  REQUIRE(h);
+  CHECK(h->url == "https://h.test/from-dotenv");
+  CHECK(header(*h, "X-Unset") == "{{process.env.WATT_SURELY_UNSET_VAR}}");
+
+  // The user allows it: stored per user (not in the workspace), then expanded and sent.
+  REQUIRE(ws->allow_env_var("WATT_TEST_OS_SECRET", &err));
+  CHECK(ws->is_env_var_allowed("WATT_TEST_OS_SECRET"));
+  CHECK(ws->allowed_env_vars() == std::vector<std::string>{"WATT_TEST_OS_SECRET"});
+  CHECK(ws->expand("{{process.env.WATT_TEST_OS_SECRET}}") == value);
+  CHECK(ws->expand("{{$env.WATT_TEST_OS_SECRET}}") == value);
+  CHECK(ws->blocked_env_vars(r).empty());
+  h = ws->http_to_send(r, &err);
+  REQUIRE(h);
+  CHECK(header(*h, "X-Key") == value);
+  CHECK(h->body == "{\"k\": \"" + value + "\"}");
+  CHECK_THAT(slurp(cfg.path / "watt" / "allowed_env.json"), ContainsSubstring("WATT_TEST_OS_SECRET"));
+  CHECK(ws->expand("{{process.env.WATT_TEST_BOTH}}") == "dot");
+  // Another workspace is not covered by it.
+  Workspace other = Workspace::create(t.path / "other");
+  CHECK(other.expand("{{process.env.WATT_TEST_OS_SECRET}}") == "{{process.env.WATT_TEST_OS_SECRET}}");
+  CHECK(other.blocked_env_vars(r) == std::vector<std::string>{"WATT_TEST_OS_SECRET"});
+  // The upload allowlist is untouched; disallowing puts the block back.
+  CHECK(ws->allowed_files().empty());
+  REQUIRE(ws->disallow_env_var("WATT_TEST_OS_SECRET", &err));
+  CHECK(ws->allowed_env_vars().empty());
+  CHECK(ws->blocked_env_vars(r) == std::vector<std::string>{"WATT_TEST_OS_SECRET"});
+  CHECK_FALSE(ws->http_to_send(r));
+}
+
 TEST_CASE("settings keep unknown keys", "[workspace]") {
   TempDir t;
   spit(t.path / "watt.json", R"({"version":1,"active_env":"","future_feature":{"x":[1,2,3]},"globals":{"k":"v"}})");
@@ -1230,8 +1325,8 @@ TEST_CASE("{{var}} expansion", "[vars]") {
   CHECK(std::stoll(ws.expand("{{$timestamp}}")) > 1700000000);
   CHECK_THAT(ws.expand("{{$isoTimestamp}}"), StartsWith("20"));
 #ifdef _WIN32
-  CHECK_FALSE(ws.expand("{{process.env.SystemRoot}}").empty());
-  CHECK(ws.expand("{{process.env.SystemRoot}}") != "{{process.env.SystemRoot}}");
+  // The OS environment only for variables the user allowed for this workspace (see [env]).
+  CHECK(ws.expand("{{process.env.SystemRoot}}") == "{{process.env.SystemRoot}}");
 #endif
   CHECK(ws.expand("{{process.env.WATT_SURELY_UNSET_VAR}}") == "{{process.env.WATT_SURELY_UNSET_VAR}}");
 }
@@ -1722,16 +1817,17 @@ TEST_CASE("curl: options engineers use", "[curl]") {
     CHECK(r->body == "--" + boundary + "\r\nContent-Disposition: form-data; name=\"name\"\r\n\r\nwatt\r\n--" + boundary +
                          "\r\nContent-Disposition: form-data; name=\"note\"\r\n\r\na b\r\n--" + boundary + "--\r\n");
   }
-  SECTION("-d @file reads the file") {
+  SECTION("-d @file is not read on import") {
     TempDir t;
     spit(t.path / "body.json", "{\n\"a\": 1\n}\n");
     const std::string p = (t.path / "body.json").generic_string();
     auto r = parse_curl_command("curl https://h.test -d @'" + p + "'");
     REQUIRE(r);
-    CHECK(r->body == "{\"a\": 1}");  // -d strips newlines like curl does
+    CHECK(r->method == "POST");
+    CHECK(r->body.empty());  // read at send time (Workspace::http_to_send), never on import
     r = parse_curl_command("curl https://h.test --data-binary @'" + p + "'");
     REQUIRE(r);
-    CHECK(r->body == "{\n\"a\": 1\n}\n");
+    CHECK(r->body.empty());
     r = parse_curl_command("curl https://h.test --data-raw @literal");
     REQUIRE(r);
     CHECK(r->body == "@literal");
@@ -1967,10 +2063,11 @@ TEST_CASE("curl -F keeps structured parts and file references", "[curl][form]") 
   CHECK_THAT(bash, ContainsSubstring("-F 'q=\"semi;colon\";type=text/x-a'"));
   CHECK_THAT(bash, ContainsSubstring("-F 'name=John Doe'"));
 
-  // parse_curl_command keeps its contract: a ready-to-send body.
+  // parse_curl_command builds the multipart body but reads no file: the part goes out empty.
   auto flat = parse_curl_command("curl https://h.test -F 'f=@" + png + "'");
   REQUIRE(flat);
-  CHECK_THAT(flat->body, ContainsSubstring(png_bytes));
+  CHECK_THAT(flat->body, ContainsSubstring("name=\"f\"; filename=\"a.png\""));
+  CHECK_THAT(flat->body, !ContainsSubstring(png_bytes));
 }
 
 TEST_CASE("form parts are saved as file references and built at send time", "[workspace][form]") {
@@ -2228,7 +2325,7 @@ TEST_CASE("curl: -e ;auto, -H without a colon, and @file bodies", "[curl]") {
     auto imp = parse_curl("curl https://h.test/up --data-binary '@" + bin.string() + "'");
     REQUIRE(imp);
     CHECK(imp->http.method == "POST");
-    CHECK(imp->http.body == bytes);
+    CHECK(imp->http.body.empty());  // not read on import
     CHECK(imp->body_file == bin.string());
     SavedRequest r;
     r.name = "bin";
@@ -2250,20 +2347,24 @@ TEST_CASE("curl: -e ;auto, -H without a colon, and @file bodies", "[curl]") {
           "curl https://h.test/up \\\n  -H 'Content-Type: application/x-www-form-urlencoded' \\\n  --data-binary @body.bin");
     CHECK_THAT(to_curl_command(*loaded, CurlShell::PowerShell), ContainsSubstring("--data-binary '@body.bin'"));
     CHECK_THAT(to_curl_command(*loaded, CurlShell::Cmd), ContainsSubstring("--data-binary @body.bin"));
-    // -d @file without line breaks is the same; with them (curl strips CR/LF) the bytes are inlined.
-    spit(t.path / "one.txt", "a=1&b=2");
-    imp = parse_curl("curl https://h.test/ -d '@" + (t.path / "one.txt").string() + "'");
-    REQUIRE(imp);
-    CHECK(imp->body_file == (t.path / "one.txt").string());
+    // -d @file is kept as a -d reference (curl strips CR/LF when it reads it, at send time).
     spit(t.path / "two.txt", "a=1\r\n&b=2\n");
-    imp = parse_curl("curl https://h.test/ -d '@" + (t.path / "two.txt").string() + "'");
+    const std::string two = (t.path / "two.txt").string();
+    imp = parse_curl("curl https://h.test/ -d '@" + two + "'");
     REQUIRE(imp);
     CHECK(imp->body_file.empty());
-    CHECK(imp->http.body == "a=1&b=2");
-    // Several -d values are joined with '&': inline.
-    imp = parse_curl("curl https://h.test/ -d '@" + (t.path / "one.txt").string() + "' -d c=3");
+    CHECK(imp->http.body.empty());
+    CHECK(imp->body_data == std::vector<CurlData>{{CurlData::Kind::Data, "@" + two}});
+    SavedRequest d;
+    d.http = imp->http;
+    d.body_data = imp->body_data;
+    CHECK(ws.http_to_send(d)->body == "a=1&b=2");
+    // Several -d values are joined with '&', when sent.
+    imp = parse_curl("curl https://h.test/ -d '@" + two + "' -d c=3");
     CHECK(imp->body_file.empty());
-    CHECK(imp->http.body == "a=1&b=2&c=3");
+    CHECK(imp->http.body.empty());
+    d.body_data = imp->body_data;
+    CHECK(ws.http_to_send(d)->body == "a=1&b=2&c=3");
     // -X PUT with a file body to a URL ending in '/': not -T (that would append the file name).
     SavedRequest p;
     p.http.method = "PUT";
@@ -2427,25 +2528,30 @@ TEST_CASE("curl: shells expand variables, curl reads files: imported as they wou
     CHECK(imp->http.body == "{\"a\":1}");
     CHECK(any_warning(*imp, "quotes stripped"));
   }
-  SECTION("a missing @file sends what curl sends, with a warning") {
+  SECTION("a missing @file is kept as a reference, with a warning naming it") {
     auto imp = parse_curl("curl -d @watt-missing.json https://h.test/");
     REQUIRE(imp);
     CHECK(imp->http.body.empty());
-    CHECK(header(imp->http, "Content-Length") == "0");  // curl: an empty POST
+    CHECK(header(imp->http, "Content-Length") == "<missing>");  // the body is built when sent
+    CHECK(imp->body_data.size() == 1);
     CHECK(any_warning(*imp, "watt-missing.json"));
     imp = parse_curl("curl --data-binary @watt-missing.bin https://h.test/");
     CHECK(imp->http.body.empty());
+    CHECK(imp->body_file == "watt-missing.bin");
     CHECK(any_warning(*imp, "watt-missing.bin"));
     imp = parse_curl("curl --data-urlencode 'x@watt-missing.txt' https://h.test/");
-    CHECK(imp->http.body == "x=");
+    CHECK(imp->http.body.empty());
+    CHECK(imp->body_data == std::vector<CurlData>{{CurlData::Kind::UrlEncode, "x@watt-missing.txt"}});
     CHECK(any_warning(*imp, "watt-missing.txt"));
     imp = parse_curl("curl -H @watt-missing-h.txt https://h.test/");
+    CHECK(imp->header_files == std::vector<std::string>{"watt-missing-h.txt"});
     CHECK(any_warning(*imp, "watt-missing-h.txt"));
     imp = parse_curl("curl -T watt-missing-up.bin https://h.test/");
     CHECK(any_warning(*imp, "watt-missing-up.bin"));
   }
-  SECTION("-b cookie-file sends the jar's cookies for this URL") {
+  SECTION("-b cookie-file sends the jar's cookies for this URL, read when sent") {
     TempDir t;
+    Workspace ws = Workspace::create(t.path);
     const fs::path jar = t.path / "cookies.txt";
     spit(jar,
          "# Netscape HTTP Cookie File\n"
@@ -2457,11 +2563,26 @@ TEST_CASE("curl: shells expand variables, curl reads files: imported as they wou
          "other.test\tFALSE\t/\tFALSE\t0\tother\tno\n"
          "h.test\tFALSE\t/admin\tFALSE\t0\tadmin\tno\n"
          "h.test\tFALSE\t/\tFALSE\t0\tempty\t\n");
+    auto send = [&](const CurlImport& imp) {
+      SavedRequest r;
+      r.http = imp.http;
+      r.cookie_files = imp.cookie_files;
+      auto h = ws.http_to_send(r);
+      REQUIRE(h);
+      return header(*h, "Cookie");
+    };
     auto imp = parse_curl("curl -b '" + jar.string() + "' http://www.h.test/api/v1");
     REQUIRE(imp);
-    CHECK(header(imp->http, "Cookie") == "api=1");  // www.h.test: only the subdomain cookie
+    CHECK(header(imp->http, "Cookie") == "<missing>");  // not read on import
+    CHECK(imp->cookie_files == std::vector<std::string>{jar.string()});
+    CHECK(send(*imp) == "api=1");  // www.h.test: only the subdomain cookie
     imp = parse_curl("curl -b '" + jar.string() + "' -b 'x=1' https://h.test/api/v1");
-    CHECK(header(imp->http, "Cookie") == "sid=abc; api=1; httponly=yes; secure=only-https; empty=; x=1");
+    CHECK(header(imp->http, "Cookie") == "x=1");
+    CHECK(send(*imp) == "sid=abc; api=1; httponly=yes; secure=only-https; empty=; x=1");
+    // A Cookie header: curl drops all -b cookies.
+    imp = parse_curl("curl -b '" + jar.string() + "' -H 'Cookie: c=1' https://h.test/api/v1");
+    CHECK(imp->cookie_files.empty());
+    CHECK(send(*imp) == "c=1");
     imp = parse_curl("curl -b watt-missing-jar.txt https://h.test/");
     CHECK(header(imp->http, "Cookie") == "<missing>");
     CHECK(any_warning(*imp, "watt-missing-jar.txt"));
@@ -2504,7 +2625,7 @@ TEST_CASE("curl: shells expand variables, curl reads files: imported as they wou
     CHECK(imp->http.url == "https://h.test/dir/up.bin");
     CHECK(imp->http.method == "PUT");
     CHECK(header(imp->http, "Content-Type") == kRemoveHeader);
-    CHECK(imp->http.body == std::string("x\0yz", 4));
+    CHECK(imp->http.body.empty());  // not read on import
     CHECK(imp->body_file == up.string());
     CHECK(parse_curl("curl -T '" + up.string() + "' https://h.test")->http.url == "https://h.test/up.bin");
     CHECK(parse_curl("curl -T '" + up.string() + "' https://h.test/named")->http.url == "https://h.test/named");
@@ -2536,6 +2657,266 @@ TEST_CASE("curl: shells expand variables, curl reads files: imported as they wou
     CHECK_FALSE(ws.http_to_send(*loaded, &err));
     CHECK_THAT(err, ContainsSubstring("nope.bin"));
   }
+}
+
+namespace {
+
+// What an import keeps, as one saved request (every file reference included).
+SavedRequest saved_from(const CurlImport& imp) {
+  SavedRequest r;
+  r.name = "imported";
+  r.http = imp.http;
+  r.form = imp.form;
+  r.basic_auth = imp.basic_auth;
+  r.body_file = imp.body_file;
+  r.body_data = imp.body_data;
+  r.header_files = imp.header_files;
+  r.cookie_files = imp.cookie_files;
+  return r;
+}
+
+// Every string an imported request carries.
+std::string all_text(const SavedRequest& r) {
+  std::string s = r.http.method + "\n" + r.http.url + "\n" + r.http.body + "\n" + r.body_file + "\n";
+  for (const auto& [k, v] : r.http.headers) s += k + ": " + v + "\n";
+  for (const auto& p : r.form) s += p.name + "=" + p.value + ";" + p.filename + ";" + p.type + "\n";
+  for (const auto& d : r.body_data) s += d.value + "\n";
+  for (const auto& f : r.header_files) s += f + "\n";
+  for (const auto& f : r.cookie_files) s += f + "\n";
+  return s + r.basic_auth.user + ":" + r.basic_auth.password;
+}
+
+}  // namespace
+
+TEST_CASE("curl import never reads a local file", "[curl][security]") {
+  TempDir t;
+  Workspace ws = Workspace::create(t.path / "ws");
+  const std::string secret = "SENTINEL-6d1f-PRIVATE-KEY";
+  const fs::path sentinel = t.path / "outside" / "id_rsa";
+  // Content that would be valid for every option (a header line, a cookie jar line, a body).
+  spit(sentinel, "X-Secret: " + secret + "\nh.test\tFALSE\t/\tFALSE\t0\tk\t" + secret + "\n");
+  const fs::path missing = t.path / "nope" / "missing.txt";
+  for (const fs::path& file : {sentinel, missing}) {
+    const std::string p = file.generic_string();
+    const std::vector<std::string> cmds = {
+        "curl https://h.test/ -d '@" + p + "'",
+        "curl https://h.test/ --data-ascii '@" + p + "'",
+        "curl https://h.test/ --data-binary '@" + p + "'",
+        "curl https://h.test/ --json '@" + p + "'",
+        "curl https://h.test/ --data-urlencode 'n@" + p + "'",
+        "curl https://h.test/ --data-urlencode '@" + p + "'",
+        "curl https://h.test/ -d a=1 --data-binary '@" + p + "' --data-raw z",
+        "curl https://h.test/ -H '@" + p + "'",
+        "curl https://h.test/ '-H@" + p + "'",
+        "curl https://h.test/ -b '" + p + "'",
+        "curl https://h.test/ -b '" + p + "' -b x=1",
+        "curl https://h.test/up -T '" + p + "'",
+        "curl https://h.test/ -F 'f=@" + p + "'",
+        "curl https://h.test/ -F 'f=<" + p + "'",
+        "curl https://h.test/ --url-query 'n@" + p + "'",
+        "curl https://h.test/ -G -d '@" + p + "'",
+        "curl https://h.test/ -G --data-urlencode 'n@" + p + "'",
+    };
+    for (const auto& cmd : cmds) {
+      INFO(cmd);
+      std::string err;
+      auto imp = parse_curl(cmd, &err);
+      INFO(err);
+      REQUIRE(imp);
+      SavedRequest r = saved_from(*imp);
+      CHECK_THAT(all_text(r), !ContainsSubstring(secret));
+      // Every file the command names is either kept as a reference or refused, by name.
+      if (cmd.find(" -F ") == std::string::npos) CHECK(any_warning(*imp, p));
+      auto flat = parse_curl_command(cmd, &err);
+      REQUIRE(flat);
+      SavedRequest f;
+      f.http = *flat;
+      CHECK_THAT(all_text(f), !ContainsSubstring(secret));
+      // Nor does the saved request (or its export) hold it.
+      r.file.clear();
+      REQUIRE(ws.save_request(r, &err));
+      CHECK_THAT(slurp(r.file), !ContainsSubstring(secret));
+      for (auto sh : {CurlShell::Bash, CurlShell::Cmd, CurlShell::PowerShell})
+        CHECK_THAT(to_curl_command(r, sh), !ContainsSubstring(secret));
+      fs::remove(r.file);
+    }
+  }
+  // The references are kept as written.
+  const std::string p = sentinel.generic_string();
+  auto imp = parse_curl("curl https://h.test/ -d '@" + p + "' --data-urlencode 'n@" + p + "' -H '@" + p + "' -b '" + p + "'");
+  REQUIRE(imp);
+  CHECK(imp->body_data == std::vector<CurlData>{{CurlData::Kind::Data, "@" + p}, {CurlData::Kind::UrlEncode, "n@" + p}});
+  CHECK(imp->header_files == std::vector<std::string>{p});
+  CHECK(imp->cookie_files == std::vector<std::string>{p});
+  // Data piped into the command itself is still inlined (it is not a file).
+  imp = parse_curl("printf %b 'a\\nb' | curl https://h.test/ --data-binary @- -d @-");
+  REQUIRE(imp);
+  CHECK(imp->body_data.empty());
+  CHECK(imp->body_file.empty());
+  CHECK(imp->http.body == "a\nb&ab");
+}
+
+TEST_CASE("curl file references are read when sent, as curl reads them", "[curl][workspace]") {
+  TempDir t;
+  Workspace ws = Workspace::create(t.path);
+  spit(t.path / "data" / "crlf.txt", "a=1\r\n&b=2\n");
+  const std::string bin("x\0\r\ny", 5);
+  spit(t.path / "data" / "bin.bin", bin);
+  spit(t.path / "data" / "text.txt", "hello world&=\xC3\xBC\n");
+  const std::string enc = "hello+world%26%3D%C3%BC%0A";
+  spit(t.path / "data" / "body.json", "{\"k\": 1}\n");
+  spit(t.path / "data" / "h.txt", "X-From-File: 1\r\nContent-Type: text/plain\r\n\r\nX-Empty;\n");
+  spit(t.path / "data" / "jar.txt", "h.test\tFALSE\t/\tFALSE\t0\ts\t1\nother.test\tFALSE\t/\tFALSE\t0\to\tno\n");
+
+  // Imported, saved, loaded back and sent.
+  auto send = [&](const std::string& cmd, SavedRequest* out = nullptr) {
+    INFO(cmd);
+    std::string err;
+    auto imp = parse_curl(cmd, &err);
+    REQUIRE(imp);
+    SavedRequest r = saved_from(*imp);
+    REQUIRE(ws.save_request(r, &err));
+    auto loaded = ws.load_request(r.file, &err);
+    REQUIRE(loaded);
+    auto h = ws.http_to_send(*loaded, &err);
+    INFO(err);
+    REQUIRE(h);
+    if (out) *out = *loaded;
+    fs::remove(r.file);
+    return *h;
+  };
+  HttpRequest h = send("curl https://h.test/ -d @data/crlf.txt");
+  CHECK(h.method == "POST");
+  CHECK(h.body == "a=1&b=2");  // -d strips CR and LF
+  CHECK(header(h, "Content-Type") == "application/x-www-form-urlencoded");
+  CHECK(send("curl https://h.test/ --data-ascii @data/crlf.txt").body == "a=1&b=2");
+  CHECK(send("curl https://h.test/ --data-binary @data/bin.bin").body == bin);
+  CHECK(send("curl https://h.test/ --data-binary @data/bin.bin --data-binary @data/bin.bin").body == bin + "&" + bin);
+  CHECK(send("curl https://h.test/ --data-urlencode greeting@data/text.txt").body == "greeting=" + enc);
+  CHECK(send("curl https://h.test/ --data-urlencode @data/text.txt").body == enc);
+  CHECK(send("curl https://h.test/ -d a=1 --data-urlencode n@data/text.txt -d @data/crlf.txt --data-raw @z").body ==
+        "a=1&n=" + enc + "&a=1&b=2&@z");
+  h = send("curl https://h.test/ --json @data/body.json");
+  CHECK(h.body == "{\"k\": 1}\n");
+  CHECK(header(h, "Content-Type") == "application/json");
+  CHECK(send("curl https://h.test/ --json '[' --json @data/body.json --json ']'").body == "[{\"k\": 1}\n]");
+  // -H @file: its headers replace the ones of the same name (curl's custom headers win).
+  h = send("curl https://h.test/ -H @data/h.txt -d x=1");
+  CHECK(h.body == "x=1");
+  CHECK(header(h, "X-From-File") == "1");
+  CHECK(header(h, "Content-Type") == "text/plain");
+  CHECK(count_header(h, "Content-Type") == 1);
+  CHECK(header(h, "X-Empty").empty());
+  // -b jar: the cookies for this URL, first, then the -b name=value ones.
+  CHECK(header(send("curl https://h.test/ -b data/jar.txt -b y=2"), "Cookie") == "s=1; y=2");
+  CHECK(header(send("curl https://h.test/ -b data/jar.txt"), "Cookie") == "s=1");
+  CHECK(header(send("curl https://other.test/ -b data/jar.txt"), "Cookie") == "o=no");
+
+  // Absolute paths inside the workspace are saved relative; the file is read on each send.
+  SavedRequest saved;
+  const std::string abs = (t.path / "data").generic_string();
+  send("curl https://h.test/ -d '@" + abs + "/crlf.txt' --data-urlencode 'greeting@" + abs + "/text.txt' -H '@" + abs +
+           "/h.txt' -b '" + abs + "/jar.txt'",
+       &saved);
+  CHECK(saved.body_data == std::vector<CurlData>{{CurlData::Kind::Data, "@data/crlf.txt"},
+                                                 {CurlData::Kind::UrlEncode, "greeting@data/text.txt"}});
+  CHECK(saved.header_files == std::vector<std::string>{"data/h.txt"});
+  CHECK(saved.cookie_files == std::vector<std::string>{"data/jar.txt"});
+  spit(t.path / "data" / "crlf.txt", "changed=1\n");
+  h = *ws.http_to_send(saved);
+  CHECK(h.body == "changed=1&greeting=" + enc);
+  CHECK(header(h, "Cookie") == "s=1");
+  // A file that is gone fails the send, naming it.
+  fs::remove(t.path / "data" / "crlf.txt");
+  std::string err;
+  CHECK_FALSE(ws.http_to_send(saved, &err));
+  CHECK_THAT(err, ContainsSubstring("crlf.txt"));
+
+  // Exported as the arguments they came from, and imported back to the same references.
+  const std::string bash = to_curl_command(saved);
+  CHECK(bash ==
+        "curl https://h.test/ \\\n  -H 'Content-Type: application/x-www-form-urlencoded' \\\n  -H @data/h.txt \\\n"
+        "  -b data/jar.txt \\\n  -d @data/crlf.txt \\\n  --data-urlencode greeting@data/text.txt");
+  for (auto sh : {CurlShell::Bash, CurlShell::Cmd, CurlShell::PowerShell}) {
+    const std::string cmd = to_curl_command(saved, sh);
+    INFO(cmd);
+    auto back = parse_curl(cmd);
+    REQUIRE(back);
+    CHECK(back->body_data == saved.body_data);
+    CHECK(back->header_files == saved.header_files);
+    CHECK(back->cookie_files == saved.cookie_files);
+    CHECK(back->http.method == "POST");
+    CHECK(back->http.headers == saved.http.headers);
+    SavedRequest again = saved_from(*back);
+    CHECK(to_curl_command(again, sh) == cmd);
+  }
+  CHECK_THAT(to_curl_command(saved, CurlShell::PowerShell), ContainsSubstring("-d '@data/crlf.txt'"));
+  CHECK_THAT(to_curl_command(saved, CurlShell::PowerShell), ContainsSubstring("-H '@data/h.txt'"));
+  SavedRequest js;
+  send("curl https://h.test/ --json @data/body.json", &js);
+  CHECK_THAT(to_curl_command(js), EndsWith("--json @data/body.json"));
+  CHECK(slurp(t.path / "data" / "body.json") == "{\"k\": 1}\n");
+}
+
+TEST_CASE("curl file references outside the workspace are blocked until allowed", "[curl][workspace][security]") {
+  TempDir t;
+  TempDir cfg;
+  ConfigDirOverride use_cfg(cfg.path / "watt");
+  const fs::path root = t.path / "ws";
+  Workspace ws = Workspace::create(root);
+  const fs::path secret = t.path / "outside" / "id_rsa";
+  spit(secret, "PRIVATEKEY\n");
+  spit(root / ".env", "TOKEN=x\n");
+  const std::string s = secret.generic_string();
+  const std::vector<std::string> cmds = {
+      "curl https://h.test/ -d '@" + s + "'",
+      "curl https://h.test/ --data-binary '@" + s + "'",
+      "curl https://h.test/ -d a=1 --data-binary '@" + s + "'",
+      "curl https://h.test/ --json '@" + s + "'",
+      "curl https://h.test/ --data-urlencode 'k@" + s + "'",
+      "curl https://h.test/ -H '@" + s + "'",
+      "curl https://h.test/ -b '" + s + "'",
+      "curl https://h.test/up -T '" + s + "'",
+      "curl https://h.test/ -d @../outside/id_rsa",
+  };
+  for (const auto& cmd : cmds) {
+    INFO(cmd);
+    auto imp = parse_curl(cmd);
+    REQUIRE(imp);
+    const SavedRequest r = saved_from(*imp);
+    auto blocked = ws.blocked_files(r);
+    REQUIRE(blocked.size() == 1);
+    CHECK(blocked[0].filename() == "id_rsa");
+    CHECK(blocked[0].is_absolute());
+    std::string err;
+    CHECK_FALSE(ws.http_to_send(r, &err));
+    CHECK_THAT(err, ContainsSubstring("id_rsa"));
+    CHECK_THAT(err, ContainsSubstring("outside the workspace"));
+  }
+  // The workspace's private files are not sent either.
+  for (const std::string cmd : {"curl https://h.test/ -d @.env", "curl https://h.test/ -H @.env",
+                                "curl https://h.test/ -b .env", "curl https://h.test/ --data-urlencode k@.env"}) {
+    INFO(cmd);
+    const SavedRequest r = saved_from(*parse_curl(cmd));
+    CHECK(ws.blocked_files(r).size() == 1);
+    CHECK_FALSE(ws.http_to_send(r));
+  }
+  // {{vars}} in a reference are expanded before the check.
+  SavedRequest v;
+  v.http.method = "POST";
+  v.http.url = "https://h.test/";
+  v.body_data = {{CurlData::Kind::Data, "@{{key}}"}};
+  ws.globals["key"] = s;
+  CHECK(ws.blocked_files(v).size() == 1);
+  CHECK_FALSE(ws.http_to_send(v));
+  // Once the user allows the file, it is sent.
+  std::string err;
+  REQUIRE(ws.allow_file(secret, &err));
+  CHECK(ws.blocked_files(v).empty());
+  CHECK(ws.http_to_send(v)->body == "PRIVATEKEY");
+  const SavedRequest k = saved_from(*parse_curl("curl https://h.test/ --data-urlencode 'k@" + s + "'"));
+  CHECK(ws.blocked_files(k).empty());
+  CHECK(ws.http_to_send(k)->body == "k=PRIVATEKEY%0A");
 }
 
 TEST_CASE("to_grpcurl_command", "[export]") {
@@ -2664,6 +3045,9 @@ TEST_CASE("export a curl command from a file", "[.roundtrip]") {
   r.form = imp->form;
   r.basic_auth = imp->basic_auth;
   r.body_file = imp->body_file;
+  r.body_data = imp->body_data;
+  r.header_files = imp->header_files;
+  r.cookie_files = imp->cookie_files;
   spit(std::string(in) + ".sh", to_curl_command(r, CurlShell::Bash) + "\n");
   spit(std::string(in) + ".cmd.txt", to_curl_command(r, CurlShell::Cmd) + "\n");
   spit(std::string(in) + ".ps1", to_curl_command(r, CurlShell::PowerShell) + "\n");
