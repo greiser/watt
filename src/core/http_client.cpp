@@ -562,6 +562,11 @@ struct HttpClient::Impl {
     // callback would only add calls on every perform.
     curl_easy_setopt(h, CURLOPT_SSL_OPTIONS, static_cast<long>(CURLSSLOPT_NATIVE_CA));
     curl_easy_setopt(h, CURLOPT_MAXREDIRS, 30L);
+    // Only HTTP(S), for the request and for every redirect hop. libcurl is built with other
+    // protocols (file://, smb://, ...); a URL or a Location header must never reach them
+    // (local file reads, UNC/SMB NTLM credential leaks).
+    curl_easy_setopt(h, CURLOPT_PROTOCOLS_STR, "http,https");
+    curl_easy_setopt(h, CURLOPT_REDIR_PROTOCOLS_STR, "http,https");
     // Like curl (curl/x) and Postman (PostmanRuntime/x), every request names its client: some
     // APIs refuse requests without one (api.github.com answers 403). A User-Agent header in the
     // request replaces it; an empty one ("User-Agent" with no value) sends it empty.

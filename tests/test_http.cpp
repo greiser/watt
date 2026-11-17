@@ -198,6 +198,27 @@ TEST_CASE("redirects", "[http]") {
   CHECK(s.body.find("\"method\":\"GET\"") != std::string::npos);
 }
 
+TEST_CASE("only http and https are reachable, directly or by redirect", "[http][security]") {
+  HttpClient c;
+  // win.ini exists on every Windows install; its content must never come back as a body.
+  for (const char* u : {"file:///C:/Windows/win.ini", "FILE:///C:/Windows/win.ini",
+                        "smb://127.0.0.1/c$/x", "ftp://127.0.0.1/x", "dict://127.0.0.1:1/x"}) {
+    HttpRequest r;
+    r.url = u;
+    auto resp = c.send(r);
+    INFO(u << " -> " << resp.error);
+    CHECK_FALSE(resp.ok);
+    CHECK(resp.body.find("[fonts]") == std::string::npos);
+  }
+  // A server-controlled Location must not pivot into file:// either.
+  auto red = c.send(get("/status/302?location=file:///C:/Windows/win.ini"));
+  INFO(red.error);
+  CHECK_FALSE(red.ok);
+  CHECK(red.body.find("[fonts]") == std::string::npos);
+  // The client still works for http afterwards (options are persistent, not per-request).
+  CHECK(c.send(get("/status/200")).status == 200);
+}
+
 TEST_CASE("timeouts", "[http]") {
   HttpClient c;
   HttpRequest req = get("/delay/2000");
