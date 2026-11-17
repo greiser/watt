@@ -737,8 +737,10 @@ std::string install_client_cert(const std::string& pfx, const std::string& pass,
 // Process-wide cache: every HttpClient (tab, runner worker) pays the conversion and the store
 // lookup once per distinct certificate.
 std::string client_cert_location(const HttpRequest& req, std::string& err) {
+  // client_cert is always certificate DATA (PEM or PKCS#12), never a reference to a certificate
+  // in the user's store: it is read from workspace files, so a "store:..." shortcut would let a
+  // cloned repo present the user's own personal certificate to its server.
   const std::string& c = req.client_cert;
-  if (c.rfind("store:", 0) == 0) return c.substr(6);
   static std::mutex mu;
   static std::vector<std::pair<std::string, std::string>> cache;  // cert \0 key \0 pass -> location
   std::string id = c;

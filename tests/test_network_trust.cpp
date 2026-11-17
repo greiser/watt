@@ -175,6 +175,48 @@ TEST_CASE("network trust: CA approval is bound to the file's content", "[network
   CHECK(t.ws.allowed_network_items().size() == 1);  // the old version's approval was replaced
 }
 
+TEST_CASE("network trust: client certificate approval is bound to the files' content", "[network][consent]") {
+  TestConfigDir cfg;
+  TempWs t;
+  write(t.root / "certs" / "client.pem", kCaPem);
+  write(t.root / "certs" / "client.key", "key-v1");
+  FolderSettings coll;
+  coll.network.cert_file = "certs/client.pem";
+  coll.network.key_file = "certs/client.key";
+  REQUIRE(t.ws.save_collection_settings(coll));
+  const SavedRequest r = request(t);
+
+  auto items = t.ws.blocked_network_settings(r);
+  REQUIRE(items.size() == 1);
+  CHECK(items[0].kind == Item::Kind::ClientCert);
+  CHECK_THAT(items[0].key, ContainsSubstring("sha256:"));
+  std::string err;
+  CHECK_FALSE(t.ws.http_to_send(r, &err));
+  REQUIRE(t.ws.allow_network_item(items[0]));
+  CHECK(t.ws.blocked_network_settings(r).empty());
+  REQUIRE(t.ws.http_to_send(r, &err));
+
+  // A changed key (or certificate) must be approved again.
+  write(t.root / "certs" / "client.key", "key-v2");
+  CHECK_FALSE(t.ws.http_to_send(r, &err));
+  CHECK(t.ws.blocked_network_settings(r).size() == 1);
+
+  // File content is always certificate data: a "store:" reference read from a workspace file is
+  // passed on as bytes (and fails as a certificate), never used to pick a cert from the user's store.
+  write(t.root / "certs" / "client.pem", "store:CurrentUser\\MY\\0123456789abcdef");
+  for (const auto& it : t.ws.blocked_network_settings(r)) REQUIRE(t.ws.allow_network_item(it));
+  auto h = t.ws.http_to_send(r, &err);
+  REQUIRE(h);
+  CHECK(h->client_cert == "store:CurrentUser\\MY\\0123456789abcdef");
+  HttpClient c;
+  HttpRequest q;
+  q.url = "https://127.0.0.1:1/";
+  q.client_cert = h->client_cert;
+  q.timeout_ms = 2000;
+  const auto resp = c.send(q);
+  CHECK_FALSE(resp.ok);  // not a usable certificate: refused, not resolved from the store
+}
+
 TEST_CASE("network trust: a UNC CA path is judged from its text and never touched", "[network][consent]") {
   TestConfigDir cfg;
   TempWs t;

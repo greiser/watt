@@ -3503,9 +3503,16 @@ std::string ca_key(const std::string& pem, const fs::path& file) {
   return "ca sha256:" + crypto::hex(crypto::digest(crypto::Hash::Sha256, pem)) + " " + generic_utf8(file);
 }
 
-std::string cert_key(const fs::path& cert, const fs::path& key) {
-  std::string k = "cert " + generic_utf8(cert);
+// Approval of a client certificate is bound to what the files hold (like ca_key): a changed
+// certificate or key must be approved again.
+std::string cert_key(const fs::path& cert, const fs::path& key, const std::string& cert_bytes,
+                     const std::string& key_bytes) {
+  std::string both = cert_bytes;
+  both += '\0';
+  both += key_bytes;
+  std::string k = "cert sha256:" + crypto::hex(crypto::digest(crypto::Hash::Sha256, both)) + " " + generic_utf8(cert);
   if (!key.empty()) k += " key " + generic_utf8(key);
+  SecureZeroMemory(both.data(), both.size());
   return k;
 }
 
@@ -3638,8 +3645,17 @@ std::vector<Workspace::NetworkItem> Workspace::blocked_network_settings(const Sa
     if (!n.key_file.empty()) it.key_file = policy.resolve(n.key_file);
     for (const fs::path* f : {&it.file, &it.key_file})
       if (!f->empty() && !policy.allowed(*f)) it.file_blocked.push_back(*f);
-    it.key = cert_key(it.file, it.key_file);
-    if (!it.file_blocked.empty() || !listed(it.key)) {
+    bool show = !it.file_blocked.empty();  // outside the workspace: allow reading first
+    if (!show) {
+      std::string cb, kb;
+      if (detail::read_file(it.file, cb) && (it.key_file.empty() || detail::read_file(it.key_file, kb))) {
+        it.key = cert_key(it.file, it.key_file, cb, kb);
+        it.fingerprint = colon_hex(crypto::digest(crypto::Hash::Sha256, cb));
+        show = !listed(it.key);
+      }
+      SecureZeroMemory(kb.data(), kb.size());
+    }
+    if (show) {
       it.text = "the client certificate " + to_utf8(it.file) +
                 (it.key_file.empty() ? std::string() : " with the key " + to_utf8(it.key_file)) +
                 (it.file_blocked.empty() ? "" : " (outside the workspace)");
@@ -3652,8 +3668,11 @@ std::vector<Workspace::NetworkItem> Workspace::blocked_network_settings(const Sa
 bool Workspace::allow_network_item(const NetworkItem& item, std::string* err) const {
   for (const auto& f : item.file_blocked)
     if (!allow_file(f, err)) return false;
-  // A CA file not read yet: only the file is allowed now; its content is asked about next.
-  if (item.kind == NetworkItem::Kind::Ca && (!item.file_blocked.empty() || item.fingerprint.empty())) return true;
+  // A CA / client certificate file not read yet: only the file is allowed now; its content is
+  // asked about next (approvals are bound to the content's SHA-256).
+  if ((item.kind == NetworkItem::Kind::Ca || item.kind == NetworkItem::Kind::ClientCert) &&
+      (!item.file_blocked.empty() || item.fingerprint.empty()))
+    return true;
   if (item.key.empty()) return false;
   std::vector<std::string> list = read_root_list(kAllowedNetworkFile, root_);
   if (std::find(list.begin(), list.end(), item.key) != list.end()) return true;
@@ -3811,7 +3830,7 @@ std::optional<HttpRequest> Workspace::http_to_send(const SavedRequest& r, std::s
       if (!n.key_file.empty() && !read_ref("client key file", n.key_file, x.http.client_key)) return std::nullopt;
       const fs::path cf = policy.resolve(n.cert_file);
       const fs::path kf = n.key_file.empty() ? fs::path() : policy.resolve(n.key_file);
-      if (!listed(cert_key(cf, kf))) {
+      if (!listed(cert_key(cf, kf, x.http.client_cert, x.http.client_key))) {
         if (err)
           *err = "the workspace wants to present the client certificate " + to_utf8(cf) +
                  (kf.empty() ? std::string() : " (key " + to_utf8(kf) + ")") + ", which is not approved" + how;
