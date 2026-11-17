@@ -198,6 +198,25 @@ TEST_CASE("redirects", "[http]") {
   CHECK(s.body.find("\"method\":\"GET\"") != std::string::npos);
 }
 
+TEST_CASE("the method must be an HTTP token", "[http][security]") {
+  HttpClient c;
+  for (const char* bad : {"GET / HTTP/1.1\r\nHost: x\r\n\r\nGET", "GET\r\nX-Injected: 1", "GET; rm -rf ~", "PO ST", "", "GET\n"}) {
+    HttpRequest r = get("/echo");
+    r.method = bad;
+    auto resp = c.send(r);
+    INFO("method: " << bad);
+    CHECK_FALSE(resp.ok);
+    CHECK(resp.error.find("invalid HTTP method") != std::string::npos);
+  }
+  CHECK(is_http_token("PROPFIND"));
+  CHECK(is_http_token("M-SEARCH"));
+  HttpRequest custom = get("/echo");
+  custom.method = "PURGE";  // custom tokens still work
+  auto ok = c.send(custom);
+  REQUIRE(ok.ok);
+  CHECK(ok.body.find("\"method\":\"PURGE\"") != std::string::npos);
+}
+
 TEST_CASE("only http and https are reachable, directly or by redirect", "[http][security]") {
   HttpClient c;
   // win.ini exists on every Windows install; its content must never come back as a body.

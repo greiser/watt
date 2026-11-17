@@ -200,6 +200,17 @@ inline double phase_total(const HttpResponse& r) {
          t.send_ms + t.ttfb_ms + t.download_ms + r.redirect_ms + r.process_ms;
 }
 
+// RFC 9110 token (what an HTTP method must be): 1+ of ALPHA / DIGIT / !#$%&'*+-.^_`|~
+inline bool is_http_token(std::string_view s) {
+  if (s.empty()) return false;
+  for (const char ch : s) {
+    const auto c = static_cast<unsigned char>(ch);
+    const bool alnum = (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
+    if (!alnum && std::string_view("!#$%&'*+-.^_`|~").find(ch) == std::string_view::npos) return false;
+  }
+  return true;
+}
+
 // Optional streaming hook: called on the worker thread for each received body chunk.
 using BodyChunkFn = std::function<void(const char* data, size_t len)>;
 

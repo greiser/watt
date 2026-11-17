@@ -795,6 +795,14 @@ HttpResponse HttpClient::send(const HttpRequest& req, const BodyChunkFn& on_chun
     resp.timing.total_ms = resp.prepare_ms = ms_between(t0, Clock::now());
     return resp;
   }
+  // The method goes into the request line verbatim (CURLOPT_CUSTOMREQUEST): it must be an
+  // RFC 9110 token, or a saved request could smuggle CR/LF, spaces or a second request line.
+  if (!is_http_token(req.method)) {
+    resp.error = "invalid HTTP method \"" + req.method +
+                 "\": use letters, digits or !#$%&'*+-.^_`|~ only (no spaces or line breaks)";
+    resp.timing.total_ms = resp.prepare_ms = ms_between(t0, Clock::now());
+    return resp;
+  }
 
   CURL* h = im.easy;
   im.errbuf[0] = '\0';
