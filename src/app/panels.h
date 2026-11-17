@@ -21,6 +21,7 @@
 #include "core/grpc_client.h"
 #include "core/http_client.h"
 #include "core/model.h"
+#include "core/script.h"
 
 class wxWindow;
 
@@ -98,6 +99,11 @@ GrpcEditorPanel* make_grpc_editor(wxWindow* parent, EditorHost* host);
 // What was actually sent, for the response's Timeline / request view.
 struct SentHttp {
   HttpRequest request;  // after {{var}} expansion and form building
+  // Results of the request's scripts (null when it has none or scripts are not trusted):
+  // logs, tests (name/pass/message), variables set, error with line:col, elapsed_us.
+  std::shared_ptr<const ScriptRun> pre_script;
+  std::shared_ptr<const ScriptRun> post_script;
+  bool scripts_skipped_untrusted = false;  // the request has scripts but the user did not trust them
 };
 
 class ResponsePanel {
@@ -146,6 +152,9 @@ class SidebarHost {
   virtual void file_moved(const std::filesystem::path& from, const std::filesystem::path& to) = 0;
   // The active environment changed (Workspace::active_env already set and saved by the sidebar).
   virtual void environment_changed() = 0;
+  // "Run folder": opens the collection runner (runner_view.h) for every request under folder
+  // (empty = the whole workspace; a .req.json file runs alone), or raises the one already open.
+  virtual void run_folder(const std::filesystem::path& folder) { (void)folder; }
 };
 
 class SidebarPanel {

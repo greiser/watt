@@ -75,6 +75,9 @@ bool needs_workspace(const SavedRequest& r) {
   if (!r.form.empty() || !r.body_file.empty() || !r.body_data.empty() || !r.header_files.empty() ||
       !r.cookie_files.empty() || r.basic_auth.enabled || !r.disabled_headers.empty())
     return true;
+  // Digest/NTLM/Negotiate/SigV4/OAuth2 are applied (and the Windows-logon check enforced) only
+  // in http_to_send; scripts may change the request or set the variables it uses.
+  if (r.auth.type != HttpAuth::Type::None || !r.pre_script.empty() || !r.post_script.empty()) return true;
   auto has_var = [](const std::string& s) { return s.find("{{") != std::string::npos; };
   if (has_var(r.http.url) || has_var(r.http.body)) return true;
   for (const auto& [k, v] : r.http.headers)
@@ -958,6 +961,37 @@ void RequestTab::send_http(Clock::time_point click) {
         return;
       }
     }
+    // NTLM / Negotiate with no user name signs in as the current Windows user: a cloned
+    // workspace could aim that at a hostile host, so each host needs the user's consent.
+    for (const auto& host : ws->blocked_sso_hosts(req_)) {
+      const auto ans = wxMessageBox(
+          wxString::Format("This request signs in to\n\n%s\n\nwith your Windows account (%s, no user name "
+                           "given). Only allow this for servers you trust. Allow it for this workspace?",
+                           wxString::FromUTF8(host),
+                           req_.auth.type == HttpAuth::Type::Ntlm ? "NTLM" : "Negotiate"),
+          "watt", wxYES_NO | wxNO_DEFAULT | wxICON_WARNING, this);
+      std::string err;
+      if (ans != wxYES || !ws->allow_sso_host(host, &err)) {
+        response()->show_error(err.empty() ? "Windows sign-in not allowed for " + host : err);
+        return;
+      }
+    }
+  }
+  // Scripts are code from the workspace (possibly a cloned repo): ask once per workspace.
+  bool run_scripts = false, scripts_skipped = false;
+  if (ws && (!req_.pre_script.empty() || !req_.post_script.empty())) {
+    run_scripts = ws->scripts_trusted();
+    if (!run_scripts) {
+      const auto ans = wxMessageBox(
+          wxString::Format("Requests in this workspace contain scripts:\n\n%s\n\nScripts run in a sandbox "
+                           "(no file or process access; network only through watt's own checks), but they "
+                           "can read and change your requests and variables. Run scripts in this workspace?",
+                           ws->root().wstring()),
+          "watt", wxYES_NO | wxNO_DEFAULT | wxICON_QUESTION, this);
+      std::string err;
+      run_scripts = ans == wxYES && ws->trust_scripts(true, &err);
+      scripts_skipped = !run_scripts;  // sent without its scripts; the response says so
+    }
   }
   const uint64_t gen = ++gen_;
   in_flight_ = true;
@@ -966,19 +1000,33 @@ void RequestTab::send_http(Clock::time_point click) {
   auto saved = std::make_shared<const SavedRequest>(req_);
   auto wsc = ws ? std::make_shared<Workspace>(*ws) : nullptr;
   auto w = worker_;
-  w->push([w, gen, click, saved, wsc] {
+  w->push([w, gen, click, saved, wsc, run_scripts, scripts_skipped] {
     if (w->is_cancelled(gen)) return;
     auto sent = std::make_shared<SentHttp>();
-    if (wsc && needs_workspace(*saved)) {
+    sent->scripts_skipped_untrusted = scripts_skipped;
+    // Pre-request script: edits a copy of the request; its variable writes apply to this
+    // worker's workspace copy (so this send sees them) and later to the real one (UI thread).
+    auto toSend = std::make_shared<SavedRequest>(*saved);
+    std::shared_ptr<ScriptRun> pre, post;
+    if (run_scripts && !toSend->pre_script.empty()) {
+      pre = std::make_shared<ScriptRun>(run_pre_script(*wsc, *toSend));
+      if (!pre->ok) {
+        const std::string err = "Pre-request script failed: " + pre->error;
+        w->post([gen, err](RequestTab& t) { t.on_error(gen, err); });
+        return;
+      }
+      apply_script_vars(*wsc, *pre, false);
+    }
+    if (wsc && needs_workspace(*toSend)) {
       std::string err;
-      auto r = wsc->http_to_send(*saved, &err);
+      auto r = wsc->http_to_send(*toSend, &err);
       if (!r) {
         w->post([gen, err](RequestTab& t) { t.on_error(gen, err); });
         return;
       }
       sent->request = std::move(*r);
     } else {
-      sent->request = saved->http;
+      sent->request = toSend->http;
     }
     HttpClient& client = w->http_client();
     if (w->is_cancelled(gen)) return;
@@ -1000,9 +1048,23 @@ void RequestTab::send_http(Clock::time_point click) {
     auto resp = std::make_shared<HttpResponse>(client.send(sent->request, on_chunk));
     resp->timing.queue_ms += ui_queue;
     resp->timing.total_ms += ui_queue;
+    if (run_scripts && !toSend->post_script.empty() && resp->ok) {
+      ResponseData rd(*resp);
+      post = std::make_shared<ScriptRun>(run_post_script(*wsc, *toSend, rd));
+    }
+    sent->pre_script = pre;
+    sent->post_script = post;
     std::shared_ptr<const HttpResponse> cresp = resp;
     std::shared_ptr<const SentHttp> csent = sent;
-    w->post([gen, cresp, csent](RequestTab& t) { t.on_http_done(gen, cresp, csent); });
+    w->post([gen, cresp, csent, pre, post](RequestTab& t) {
+      // Script variable writes land in the real workspace on the UI thread (persisted for
+      // environment/globals, in memory for runtime vars), even if the tab moved on.
+      if (Workspace* real = t.ctx_.workspace ? t.ctx_.workspace() : nullptr) {
+        if (pre) apply_script_vars(*real, *pre, true);
+        if (post && post->ok) apply_script_vars(*real, *post, true);
+      }
+      t.on_http_done(gen, cresp, csent);
+    });
 
     if (wsc && !(resp->error == "cancelled")) {
       HistoryEntry e;
