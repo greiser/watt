@@ -1228,7 +1228,8 @@ std::vector<AssertResult> evaluate_asserts(const SavedRequest& r, const Response
       const auto t0 = Clock::now();
       bool takes_value = false;
       const Op op = op_from(a.op, &takes_value);
-      ar.expected = (ws && a.value.find("{{") != std::string::npos) ? ws->expand(a.value) : a.value;
+      // r's folder / collection vars count too (Workspace::expand(s, r)).
+      ar.expected = (ws && a.value.find("{{") != std::string::npos) ? ws->expand(a.value, r) : a.value;
       if (!path->error.empty()) {
         ar.message = "invalid target: " + path->error;
       } else if (op == Op::Unknown) {

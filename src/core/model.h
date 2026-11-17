@@ -3,6 +3,9 @@
 //   <ws>/watt.json                   workspace settings (globals)
 //   <ws>/environments/<name>.json      one file per environment (no merge conflicts between them)
 //   <ws>/<folder>/.../<name>.req.json  one saved request per file
+//   <ws>/folder.json                   collection settings (headers, auth, vars, scripts, asserts
+//                                      inherited by every request; see FolderSettings)
+//   <ws>/<folder>/.../folder.json      folder settings, same format, inherited by the requests below
 //   <ws>/.env                          KEY=value lines for {{process.env.KEY}} (keep out of git)
 //   <ws>/.watt/                      personal, gitignored, owner-only (Windows: protected DACL for
 //                                      the current user and SYSTEM; POSIX: 0700, files 0600):
@@ -13,9 +16,12 @@
 // files a workspace may upload from outside its root, see Workspace::blocked_files(), and
 // <config>/allowed_env.json, OS environment variables it may expand, see blocked_env_vars().
 // <config> = %APPDATA%\watt (POSIX: $XDG_CONFIG_HOME/watt or ~/.config/watt, 0700 / 0600).
-// Variables: {{name}} substituted from the active environment, then workspace globals, then
-// dynamic variables ({{$guid}}, {{process.env.X}} from .env, or from the OS environment only for
-// names the user allowed for this workspace, ...).
+// Variables: {{name}} substituted, first match wins, from (Bruno's order):
+//   runtime vars > folder vars (nearest folder first) > active environment > collection vars
+//   (<ws>/folder.json) > workspace globals > dynamic variables ({{$guid}}, {{process.env.X}} from
+//   .env, or from the OS environment only for names the user allowed for this workspace, ...).
+// Folder vars apply only where a request is known (expanded(r), http_to_send(r), expand(s, r),
+// scripts); expand(s) alone uses runtime, environment, collection and globals.
 #include <cstdint>
 #include <filesystem>
 #include <functional>
@@ -36,6 +42,7 @@ namespace watt {
 namespace detail {
 struct HistoryHandles;
 struct TreeIndex;
+struct FolderCache;
 }
 
 enum class RequestKind { Http, Grpc };
@@ -86,8 +93,12 @@ struct OAuth2Config {
 
 // Authentication schemes beyond Basic (which stays in SavedRequest::basic_auth). When type is not
 // None it replaces basic_auth. Strings may hold {{vars}} (see OAuth2Config).
+// Type::Inherit: use the auth of the nearest parent folder (folder.json) or the collection
+// (<ws>/folder.json) whose auth is not Inherit; None (or Basic) at a level ends the walk there.
+// A request saved without an auth scheme keeps None (no inheritance); Workspace::new_request()
+// starts new requests with Inherit, as Postman, Insomnia and Bruno do.
 struct HttpAuth {
-  enum class Type { None, Digest, Ntlm, Negotiate, AwsSigV4, OAuth2 };
+  enum class Type { None, Digest, Ntlm, Negotiate, AwsSigV4, OAuth2, Inherit };
   Type type = Type::None;
   // Digest / NTLM / Negotiate. NTLM and Negotiate with an empty user use the current Windows logon.
   std::string user;
@@ -101,7 +112,7 @@ struct HttpAuth {
   OAuth2Config oauth2;
   bool operator==(const HttpAuth&) const = default;
 };
-const char* auth_type_name(HttpAuth::Type t);  // "none", "digest", "ntlm", "negotiate", "awsv4", "oauth2"
+const char* auth_type_name(HttpAuth::Type t);  // "none", "digest", "ntlm", "negotiate", "awsv4", "oauth2", "inherit"
 HttpAuth::Type auth_type_from(const std::string& s);
 
 // One curl -d family argument kept as written because it reads a file (-d @f, --data-binary @f,
@@ -178,6 +189,91 @@ struct SavedRequest {
   // sandbox; see core/script.h. They run only once the user trusted this workspace's scripts
   // (Workspace::scripts_trusted()). Saved last, only when not empty.
   std::string pre_script, post_script;
+  // Set on the copy returned by Workspace::resolved() / expanded(): folder and collection
+  // settings are merged in, the first inherited_headers entries of http.headers (HTTP) or
+  // inherited_metadata entries of grpc_opts.metadata (gRPC) are inherited ones, and auth /
+  // basic_auth are the resolved ones (never Inherit). Never saved; resolving again is a no-op.
+  bool settings_merged = false;
+  size_t inherited_headers = 0;
+  size_t inherited_metadata = 0;
+};
+
+// One row of a folder's / the collection's headers or variables (Bruno's folder.bru headers /
+// vars, Postman's collection variables). Disabled rows are kept but not sent / not defined.
+struct SettingsRow {
+  std::string name;
+  std::string value;  // may hold {{vars}}
+  std::string description;
+  bool enabled = true;
+  bool operator==(const SettingsRow&) const = default;
+};
+
+// Settings of a folder (<folder>/folder.json) or of the whole collection (<ws>/folder.json),
+// inherited by every request below it (Bruno's folder.bru / collection.bru, Postman's
+// collection and folder Authorization / Pre-request Script / Tests / Variables).
+//   headers   sent with every request below (gRPC: as metadata); a request header (or a nearer
+//             folder's) with the same name, case-insensitive, replaces it
+//   auth      used by requests whose auth is Inherit: auth.type Inherit (the default) passes on to
+//             the parent; None with basic_auth.enabled is Basic auth; None otherwise is "no auth"
+//             (HTTP only: gRPC requests do not use auth)
+//   vars      {{name}} values, see the precedence at the top of this file
+//   scripts   pre: collection, then folders outermost first, then the request; post: request,
+//             then folders nearest first, then the collection (core/script.h)
+//   asserts   checked in addition to the request's own
+// The file is written only while something is set (save_folder_settings() removes it when the
+// settings are empty), so workspaces that do not use it never get one.
+struct FolderSettings {
+  std::vector<SettingsRow> headers;
+  HttpAuth auth{HttpAuth::Type::Inherit};
+  BasicAuth basic_auth;
+  std::vector<SettingsRow> vars;
+  std::vector<Assertion> asserts;
+  std::string pre_script, post_script;
+  bool empty() const { return *this == FolderSettings{}; }
+  bool operator==(const FolderSettings&) const = default;
+};
+
+// Where an effective setting comes from (Workspace::effective_settings()).
+struct SettingsOrigin {
+  enum class Level { Collection, Folder, Request };
+  Level level = Level::Request;
+  std::filesystem::path folder;  // the folder (the workspace root for Collection); empty for Request
+  std::string label;             // "Collection", the folder path relative to the root ("api/users"), "Request"
+  bool operator==(const SettingsOrigin&) const = default;
+};
+
+// What a request gets from its folders and the collection, with the origin of each item, for
+// the editor ("inherited from folder api/users") and for the send path.
+struct EffectiveSettings {
+  struct Row {
+    SettingsRow row;
+    SettingsOrigin from;
+    bool overridden = false;  // replaced by a nearer level (same name): not sent / not used
+  };
+  struct Script {
+    std::string code;
+    SettingsOrigin from;
+  };
+  struct Check {
+    Assertion assertion;
+    SettingsOrigin from;
+  };
+  // Headers in send order: collection, folders outermost first, then the request's own (gRPC:
+  // its metadata). Disabled rows are listed (row.enabled = false) and never sent.
+  std::vector<Row> headers;
+  // Variables, highest precedence first: runtime vars (level Request), folders nearest first,
+  // the collection. (Environment and globals come between / after; see the top of this file.)
+  std::vector<Row> vars;
+  // The resolved auth (type never Inherit) and the level it was taken from.
+  HttpAuth auth;
+  BasicAuth basic_auth;
+  SettingsOrigin auth_from;
+  std::vector<Script> pre_scripts;   // run order
+  std::vector<Script> post_scripts;  // run order
+  std::vector<Check> asserts;        // the request's own, then collection, then folders outermost first
+  // folder.json files that could not be used (unreadable, invalid JSON, outside the workspace):
+  // "<path>: <why>". http_to_send() refuses to send while there is one.
+  std::vector<std::string> errors;
 };
 
 struct Environment {
@@ -235,6 +331,36 @@ class Workspace {
   CollectionNode tree(double badge_budget_ms = 25) const;
 
   bool save_request(SavedRequest& r, std::string* err = nullptr);  // assigns file if empty
+  // A new request as the UI should create it: new id, auth Inherit (uses the folder's /
+  // collection's auth, like Postman / Insomnia / Bruno), otherwise SavedRequest's defaults. With
+  // `folder` (a directory inside the workspace), file = <folder>/<free name>.req.json, so
+  // save_request() puts it there (and its folder settings apply before it is saved).
+  SavedRequest new_request(RequestKind kind = RequestKind::Http, const std::string& name = "New Request",
+                           const std::filesystem::path& folder = {}) const;
+
+  // Folder / collection settings (see FolderSettings). `folder` is a directory inside the
+  // workspace (relative paths against the root), or the root itself for the collection. Load:
+  // empty settings when there is no folder.json; nullopt (and *err) when the folder is outside
+  // the workspace or the file is not valid JSON. Save: writes <folder>/folder.json (pretty,
+  // diff-friendly, unchanged content leaves the file untouched), or removes it when `s` is empty.
+  // Files are cached: changes made outside watt (git pull, an editor) are seen after open() or
+  // tree(), and otherwise at most 100 ms later.
+  std::optional<FolderSettings> folder_settings(const std::filesystem::path& folder, std::string* err = nullptr) const;
+  bool save_folder_settings(const std::filesystem::path& folder, const FolderSettings& s, std::string* err = nullptr) const;
+  FolderSettings collection_settings() const;  // <ws>/folder.json ({} if none or invalid)
+  bool save_collection_settings(const FolderSettings& s, std::string* err = nullptr) const {
+    return save_folder_settings(root_, s, err);
+  }
+  // The settings r inherits (from the folders of r.file up to the root; only the collection for
+  // an unsaved request), merged with r's own, each with its origin.
+  EffectiveSettings effective_settings(const SavedRequest& r) const;
+  // Whether any non-empty folder.json applies to r (cheap: one cached stat per level). A send
+  // path that skips http_to_send() for plain requests must not skip it when this is true.
+  bool has_inherited_settings(const SavedRequest& r) const;
+  // r with its folders' and the collection's headers (gRPC: metadata), auth (when Inherit) and
+  // asserts merged in, not expanded. expanded(), http_to_send(), blocked_*() and schema_plan()
+  // resolve on their own; use this for evaluate_asserts() (inherited asserts) and for display.
+  SavedRequest resolved(const SavedRequest& r) const;
   std::optional<SavedRequest> load_request(const std::filesystem::path& file, std::string* err = nullptr) const;
   bool remove(const std::filesystem::path& p);
   bool rename(const std::filesystem::path& from, const std::string& new_name);
@@ -255,9 +381,13 @@ class Workspace {
   // (history was trimmed): list again.
   std::optional<SavedRequest> history_request(const HistoryEntry& e) const;
 
-  // {{var}} substitution using runtime_vars, then the active env, then globals. Unknown vars are
-  // left as-is.
+  // {{var}} substitution using runtime_vars, then the active env, then the collection vars, then
+  // globals. Unknown vars are left as-is. The second form adds r's folder vars (above the
+  // environment, nearest folder first).
   std::string expand(const std::string& s) const;
+  std::string expand(const std::string& s, const SavedRequest& r) const;
+  // resolved(r) with every field expanded (folder vars included). Inherited headers / metadata
+  // whose expanded name or value holds CR, LF or NUL are dropped.
   SavedRequest expanded(const SavedRequest& r) const;
   // What to hand to HttpClient::send(): expanded(r).http, plus the multipart body built from
   // r.form, body_file or body_data, and the headers / cookies of header_files / cookie_files
@@ -270,6 +400,9 @@ class Workspace {
   // the client credentials / password grants (a blocking token request: call this off the UI
   // thread). An authorization code grant is never started here (it opens a browser): without a
   // cached or refreshable token the send fails with *err saying to authorize first (oauth2.h).
+  // Folder / collection settings are merged first (resolved()): inherited headers, auth, vars.
+  // A header (own or inherited) whose name or value holds CR, LF or NUL after expansion, or a
+  // folder.json that cannot be read (EffectiveSettings::errors), fails the send.
   std::optional<HttpRequest> http_to_send(const SavedRequest& r, std::string* err = nullptr) const;
 
   // Files a request uploads (form file parts, body_file, body_data, header_files, cookie_files)
@@ -358,9 +491,14 @@ class Workspace {
   static void set_user_config_dir(const std::filesystem::path& dir);
 
  private:
+  struct FolderChain;
+  FolderChain folder_chain(const SavedRequest& r) const;
+  SavedRequest resolve_with(const SavedRequest& r, const FolderChain& c) const;
+  SavedRequest expanded_with(const SavedRequest& r, const FolderChain& c) const;
+  std::string expand_in(const std::string& s, const FolderChain* c) const;
   void note_saved(const std::filesystem::path& file, const SavedRequest& r) const;
   bool write_allowlist(const std::vector<std::filesystem::path>& files, std::string* err) const;
-  std::vector<std::string> env_refs_left(const SavedRequest& expanded_request) const;
+  std::vector<std::string> env_refs_left(const SavedRequest& expanded_request, const FolderChain* c) const;
   bool apply_http_auth(const SavedRequest& r, SavedRequest& expanded_request, std::string* err) const;
 
   // Sealed secret values as read or last written: "env\0var" -> {plain, stored}. A value that
@@ -376,6 +514,9 @@ class Workspace {
   // history segment files, opened once per process and root (see model_history_file.h)
   mutable std::shared_ptr<detail::HistoryHandles> hist_;
   detail::HistoryHandles& history_handles() const;
+  // folder.json cache (validated by one stat per file), shared by every Workspace of the root.
+  mutable std::shared_ptr<detail::FolderCache> folder_cache_;
+  detail::FolderCache& folder_cache() const;
 };
 
 // Header value convention (matches libcurl, which the HTTP engine hands headers to):

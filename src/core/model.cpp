@@ -45,8 +45,13 @@
 //   body_file (curl -T / -d @file) or form parts there is no body at all.
 //   Multi-line arrays put the comma first (", [k, v]"), so appending or removing the last
 //   header, form part or body line is a one-line diff too.
+//   A request whose auth is Inherit has "auth_scheme": {"type": "inherit"}; without auth_scheme
+//   it is None (files written before Inherit existed keep their meaning).
 // watt.json: { version, globals: {sorted} } plus any unknown top-level keys written by newer
 //   versions, which are preserved on save.
+// <folder>/folder.json and <ws>/folder.json (the collection): FolderSettings, see folder_value()
+//   below: { version, headers?, auth?, vars?, asserts?, pre_script?, post_script? }, written
+//   only while something is set. The tree lists only *.req.json, so it is never a request.
 // environments/<name>.json: { name, seq, vars: {sorted}, secrets: [names] }; secret values are
 //   in .watt/secrets.json { env: { var: value } } (on Windows value = "dpapi1:" + base64 of a
 //   DPAPI blob, current user; older plaintext values are read and sealed on the next save; see
@@ -86,6 +91,8 @@ namespace {
 
 constexpr const char* kSettingsFile = "watt.json";
 constexpr const char* kReqExt = ".req.json";
+constexpr const char* kFolderFile = "folder.json";  // folder / collection settings (not a request)
+constexpr uint64_t kFolderFileMax = 4u << 20;        // a larger folder.json is refused
 constexpr const char* kEnvDir = "environments";  // at the root: environment files, not requests
 // History is kept in segments of 1000 entries (or 8 MiB of records, whichever comes first)
 // and capped by entry count: the newest segments that hold 10000 entries are kept (10000 to
@@ -468,6 +475,7 @@ Value auth_scheme_value(const HttpAuth& x, Alloc& a) {
   };
   switch (x.type) {
     case HttpAuth::Type::None: break;
+    case HttpAuth::Type::Inherit: break;
     case HttpAuth::Type::Digest:
     case HttpAuth::Type::Ntlm:
     case HttpAuth::Type::Negotiate:
@@ -544,6 +552,148 @@ void auth_scheme_from(const Value& o, HttpAuth& x) {
   }
 }
 
+// [target, "op value"] (+ false when disabled), one line per row.
+Value asserts_value(const std::vector<Assertion>& v, Alloc& a) {
+  Value arr(rapidjson::kArrayType);
+  for (const auto& as : v) {
+    Value e(rapidjson::kArrayType);
+    e.PushBack(jstr(as.target, a), a).PushBack(jstr(assert_op_value(as), a), a);
+    if (!as.enabled) e.PushBack(false, a);
+    arr.PushBack(e, a);
+  }
+  return arr;
+}
+
+// [target, "op value"(, false)]; [target, op, value(, false)] is read too.
+std::vector<Assertion> asserts_from(const Value& o) {
+  std::vector<Assertion> out;
+  if (const Value* as = get_arr(o, "asserts"))
+    for (const auto& e : as->GetArray()) {
+      if (!e.IsArray() || e.Size() < 2 || !e[0].IsString() || !e[1].IsString()) continue;
+      Assertion x;
+      x.target.assign(e[0].GetString(), e[0].GetStringLength());
+      const std::string second(e[1].GetString(), e[1].GetStringLength());
+      if (e.Size() >= 3 && e[2].IsString()) {
+        x.op = second;
+        x.value.assign(e[2].GetString(), e[2].GetStringLength());
+      } else {
+        set_assert_op_value(x, second);
+      }
+      const Value& last = e[e.Size() - 1];
+      x.enabled = !(e.Size() >= 3 && last.IsBool() && !last.GetBool());
+      out.push_back(std::move(x));
+    }
+  return out;
+}
+
+// folder.json rows (headers, vars): [name, value] or [name, value, false] (disabled) on one
+// line; a row with a description is an object {name, value, enabled?, description}.
+Value rows_value(const std::vector<SettingsRow>& rows, Alloc& a) {
+  Value arr(rapidjson::kArrayType);
+  for (const auto& x : rows) {
+    if (x.description.empty()) {
+      Value e(rapidjson::kArrayType);
+      e.PushBack(jstr(x.name, a), a).PushBack(jstr(x.value, a), a);
+      if (!x.enabled) e.PushBack(false, a);
+      arr.PushBack(e, a);
+    } else {
+      Value e(rapidjson::kObjectType);
+      e.AddMember("name", jstr(x.name, a), a);
+      e.AddMember("value", jstr(x.value, a), a);
+      if (!x.enabled) e.AddMember("enabled", false, a);
+      e.AddMember("description", jstr(x.description, a), a);
+      arr.PushBack(e, a);
+    }
+  }
+  return arr;
+}
+
+std::vector<SettingsRow> rows_from(const Value& o, const char* key) {
+  std::vector<SettingsRow> out;
+  const Value* arr = get_arr(o, key);
+  if (!arr) return out;
+  for (const auto& e : arr->GetArray()) {
+    SettingsRow x;
+    if (e.IsArray()) {
+      if (e.Size() < 1 || !e[0].IsString()) continue;
+      x.name.assign(e[0].GetString(), e[0].GetStringLength());
+      if (e.Size() >= 2 && e[1].IsString()) x.value.assign(e[1].GetString(), e[1].GetStringLength());
+      for (SizeType i = 2; i < e.Size(); ++i) {
+        if (e[i].IsBool()) x.enabled = e[i].GetBool();
+        else if (e[i].IsString()) x.description.assign(e[i].GetString(), e[i].GetStringLength());
+      }
+    } else if (e.IsObject()) {
+      x.name = get_str(e, "name");
+      x.value = get_str(e, "value");
+      x.description = get_str(e, "description");
+      x.enabled = get_bool(e, "enabled", true);
+    } else {
+      continue;
+    }
+    if (x.name.empty()) continue;
+    out.push_back(std::move(x));
+  }
+  return out;
+}
+
+// folder.json:
+//   { "version": 1,
+//     "headers": [[name, value] | [name, value, false] | {name, value, enabled?, description}, ...],
+//     "auth": {type: "none"} | {type: "basic", enabled?, user, password} | {type: digest | ntlm |
+//             negotiate | awsv4 | oauth2, ...as a request's "auth_scheme"}   (absent: inherit)
+//     "vars": [rows as headers],
+//     "asserts": [as in a request],
+//     "pre_script": ..., "post_script": ... (as in a request) }
+// Every key but "version" only when set.
+Value folder_value(const FolderSettings& s, Alloc& a) {
+  Value o(rapidjson::kObjectType);
+  o.AddMember("version", 1, a);
+  if (!s.headers.empty()) o.AddMember("headers", rows_value(s.headers, a), a);
+  if (s.auth.type == HttpAuth::Type::None) {
+    const BasicAuth& ba = s.basic_auth;
+    Value auth(rapidjson::kObjectType);
+    if (ba.enabled || !ba.user.empty() || !ba.password.empty()) {
+      auth.AddMember("type", "basic", a);
+      if (!ba.enabled) auth.AddMember("enabled", false, a);
+      auth.AddMember("user", jstr(ba.user, a), a);
+      auth.AddMember("password", jstr(ba.password, a), a);
+    } else {
+      auth.AddMember("type", "none", a);
+    }
+    o.AddMember("auth", auth, a);
+  } else if (s.auth.type != HttpAuth::Type::Inherit) {
+    o.AddMember("auth", auth_scheme_value(s.auth, a), a);
+  }
+  if (!s.vars.empty()) o.AddMember("vars", rows_value(s.vars, a), a);
+  if (!s.asserts.empty()) o.AddMember("asserts", asserts_value(s.asserts, a), a);
+  if (!s.pre_script.empty()) o.AddMember("pre_script", body_value(s.pre_script, a, true), a);
+  if (!s.post_script.empty()) o.AddMember("post_script", body_value(s.post_script, a, true), a);
+  return o;
+}
+
+void folder_from_value(const Value& o, FolderSettings& s) {
+  s = FolderSettings{};
+  s.headers = rows_from(o, "headers");
+  if (const Value* auth = get_obj(o, "auth")) {
+    const std::string t = lower_ascii(get_str(*auth, "type", "inherit"));
+    if (t == "basic") {
+      s.auth = HttpAuth{};
+      s.basic_auth.enabled = get_bool(*auth, "enabled", true);
+      s.basic_auth.user = get_str(*auth, "user");
+      s.basic_auth.password = get_str(*auth, "password");
+    } else if (t == "none" || t == "noauth") {
+      s.auth = HttpAuth{};
+    } else if (t != "inherit") {
+      auth_scheme_from(*auth, s.auth);
+      // An unknown scheme name reads as None: fail closed (no credentials), never as Inherit.
+    }
+  }
+  s.vars = rows_from(o, "vars");
+  s.asserts = asserts_from(o);
+  s.pre_script = body_from(o, "pre_script");
+  s.post_script = body_from(o, "post_script");
+}
+
 Value request_value(const SavedRequest& r, Alloc& a, bool lines, size_t body_cap) {
   Value o(rapidjson::kObjectType);
   o.AddMember("version", 1, a);
@@ -586,16 +736,7 @@ Value request_value(const SavedRequest& r, Alloc& a, bool lines, size_t body_cap
     o.AddMember("grpc", grpc, a);
   // Last, and only when present, so files without them keep their bytes. One line per row, as
   // in .bru files: an assertion is [target, "op value"] (+ false when disabled).
-  if (!r.asserts.empty()) {
-    Value arr(rapidjson::kArrayType);
-    for (const auto& as : r.asserts) {
-      Value e(rapidjson::kArrayType);
-      e.PushBack(jstr(as.target, a), a).PushBack(jstr(assert_op_value(as), a), a);
-      if (!as.enabled) e.PushBack(false, a);
-      arr.PushBack(e, a);
-    }
-    o.AddMember("asserts", arr, a);
-  }
+  if (!r.asserts.empty()) o.AddMember("asserts", asserts_value(r.asserts, a), a);
   if (!r.captures.empty()) {
     Value arr(rapidjson::kArrayType);
     for (const auto& c : r.captures) {
@@ -670,23 +811,7 @@ void request_from_value(const Value& o, SavedRequest& r) {
     r.proto_files = strings_from(*g, "proto_files");
     r.import_dirs = strings_from(*g, "import_dirs");
   }
-  // [target, "op value"(, false)]; [target, op, value(, false)] is read too.
-  if (const Value* as = get_arr(o, "asserts"))
-    for (const auto& e : as->GetArray()) {
-      if (!e.IsArray() || e.Size() < 2 || !e[0].IsString() || !e[1].IsString()) continue;
-      Assertion x;
-      x.target.assign(e[0].GetString(), e[0].GetStringLength());
-      const std::string second(e[1].GetString(), e[1].GetStringLength());
-      if (e.Size() >= 3 && e[2].IsString()) {
-        x.op = second;
-        x.value.assign(e[2].GetString(), e[2].GetStringLength());
-      } else {
-        set_assert_op_value(x, second);
-      }
-      const Value& last = e[e.Size() - 1];
-      x.enabled = !(e.Size() >= 3 && last.IsBool() && !last.GetBool());
-      r.asserts.push_back(std::move(x));
-    }
+  r.asserts = asserts_from(o);
   if (const Value* cs = get_arr(o, "captures"))
     for (const auto& e : cs->GetArray()) {
       if (!e.IsObject()) continue;
@@ -886,6 +1011,11 @@ std::map<std::string, std::string> parse_dotenv(const std::string& text) {
 
 // ==================================================================== Workspace
 
+namespace detail {
+void expire_folder_cache(FolderCache& fc);  // with the folder settings, below
+}
+using detail::expire_folder_cache;
+
 std::optional<Workspace> Workspace::open(const fs::path& root, std::string* err) {
   std::error_code ec;
   const fs::path abs = fs::absolute(root, ec).lexically_normal();
@@ -964,6 +1094,7 @@ std::optional<Workspace> Workspace::open(const fs::path& root, std::string* err)
         }
   std::string dot;
   if (detail::read_file(abs / ".env", dot)) ws.dotenv = parse_dotenv(dot);
+  expire_folder_cache(ws.folder_cache());  // a (re)opened workspace sees folder.json as it is on disk now
   return ws;
 }
 
@@ -1173,6 +1304,7 @@ detail::TreeIndex& Workspace::tree_index() const {
 CollectionNode Workspace::tree(double badge_budget_ms) const {
   using clock = std::chrono::steady_clock;
   const auto t0 = clock::now();
+  expire_folder_cache(folder_cache());  // a refresh also re-checks folder.json files (git pull, an editor)
   CollectionNode node;
   node.name = to_utf8(root_.filename());
   if (node.name.empty()) node.name = to_utf8(root_);
@@ -1469,6 +1601,391 @@ std::optional<SavedRequest> Workspace::load_request(const fs::path& file, std::s
     r.name = n;
   }
   return r;
+}
+
+// ------------------------------------------------------------------ folder / collection settings
+
+namespace detail {
+
+struct LoadedFolder {
+  FolderSettings s;
+  std::map<std::string, std::string> vars;  // the enabled vars (the first row of a name wins)
+  std::string error;                        // why the file cannot be used ("" = it can)
+};
+
+// folder.json files by path: parsed once, re-read when the file's mtime or size changed. A
+// send asks for the same few files many times (blocked_*(), http_to_send(), scripts, asserts),
+// and each stat costs 5-30 us on Windows (antivirus filters), so a file's stat result (also
+// "there is none") is trusted for kRecheck before the next stat. save_folder_settings() drops
+// its entry, open() and tree() expire them all: edits made outside watt (git pull, an editor)
+// are seen on the next refresh, or kRecheck later at most.
+struct FolderCache {
+  static constexpr std::chrono::milliseconds kRecheck{100};
+  struct Entry {
+    std::chrono::steady_clock::time_point checked_at{};
+    bool fresh = false;  // checked_at is valid (cleared by expire())
+    bool exists = false;
+    int64_t mtime = 0;
+    uint64_t size = 0;
+    std::shared_ptr<const LoadedFolder> data;  // nullptr: no file
+  };
+  std::mutex mu;
+  std::map<fs::path, Entry> entries;
+  void expire() {
+    std::lock_guard<std::mutex> lock(mu);
+    for (auto& [k, e] : entries) e.fresh = false;
+  }
+};
+
+void expire_folder_cache(FolderCache& fc) { fc.expire(); }
+
+}  // namespace detail
+
+struct Workspace::FolderChain {
+  struct Level {
+    SettingsOrigin origin;
+    std::shared_ptr<const detail::LoadedFolder> data;
+  };
+  std::vector<Level> levels;  // outermost (the collection) first; only valid, non-empty files
+  std::vector<std::string> errors;
+  const Level* collection() const {
+    return !levels.empty() && levels[0].origin.level == SettingsOrigin::Level::Collection ? &levels[0] : nullptr;
+  }
+};
+
+namespace {
+
+SettingsOrigin collection_origin(const fs::path& root) {
+  return SettingsOrigin{SettingsOrigin::Level::Collection, root, "Collection"};
+}
+
+// The folder.json of `dir` (nullptr when there is none). folder.json comes from the workspace,
+// maybe a cloned repository: it must be a plain file (no link) inside the workspace once
+// resolved, at most kFolderFileMax bytes and valid JSON; otherwise the result carries `error`.
+std::shared_ptr<const detail::LoadedFolder> load_folder_file(detail::FolderCache& fc, const fs::path& root,
+                                                             const fs::path& dir) {
+  if (root.empty()) return nullptr;  // no workspace (a default-constructed one): never the cwd
+  const fs::path file = dir / kFolderFile;
+  using clock = std::chrono::steady_clock;
+  const auto now = clock::now();
+  {
+    std::lock_guard<std::mutex> lock(fc.mu);
+    auto it = fc.entries.find(file);
+    if (it != fc.entries.end() && it->second.fresh && now - it->second.checked_at < detail::FolderCache::kRecheck)
+      return it->second.data;
+  }
+  auto remember = [&](bool exists, int64_t mtime, uint64_t size, std::shared_ptr<const detail::LoadedFolder> d) {
+    std::lock_guard<std::mutex> lock(fc.mu);
+    fc.entries.insert_or_assign(file, detail::FolderCache::Entry{now, true, exists, mtime, size, d});
+    return d;
+  };
+  detail::PathStat st;
+  if (!detail::stat_path(file, st)) return remember(false, 0, 0, nullptr);
+  auto fail = [&](const std::string& why) {
+    auto d = std::make_shared<detail::LoadedFolder>();
+    d->error = to_utf8(file) + ": " + why;
+    return std::shared_ptr<const detail::LoadedFolder>(std::move(d));
+  };
+  const uint64_t size = st.size;
+  const int64_t mtime = st.mtime;
+  if (st.is_link) return remember(true, mtime, size, fail("is a link: folder settings must be a plain file inside the workspace"));
+  if (st.is_dir) return remember(true, mtime, size, fail("is not a file"));
+  {
+    std::lock_guard<std::mutex> lock(fc.mu);
+    auto it = fc.entries.find(file);
+    if (it != fc.entries.end() && it->second.exists && it->second.data && it->second.mtime == mtime &&
+        it->second.size == size) {
+      it->second.checked_at = now;
+      it->second.fresh = true;
+      return it->second.data;
+    }
+  }
+  std::shared_ptr<const detail::LoadedFolder> out;
+  std::string text, why;
+  if (!request_path_inside(root, file, &why)) {
+    out = fail("is not inside the workspace");
+  } else if (size > kFolderFileMax) {
+    out = fail("is larger than " + std::to_string(kFolderFileMax >> 20) + " MiB");
+  } else if (!detail::read_file(file, text)) {
+    out = fail("cannot be read");
+  } else {
+    rapidjson::Document d;
+    d.Parse(text.data(), text.size());
+    if (d.HasParseError() || !d.IsObject()) {
+      auto e = std::make_shared<detail::LoadedFolder>();
+      e->error = d.HasParseError() ? parse_error_text(d, file) : to_utf8(file) + ": not a JSON object";
+      out = std::move(e);
+    } else {
+      auto l = std::make_shared<detail::LoadedFolder>();
+      folder_from_value(d, l->s);
+      for (const auto& v : l->s.vars)
+        if (v.enabled) l->vars.emplace(v.name, v.value);
+      out = std::move(l);
+    }
+  }
+  return remember(true, mtime, size, std::move(out));
+}
+
+bool has_ctl_break(const std::string& s) {
+  return std::any_of(s.begin(), s.end(), [](char c) { return c == '\r' || c == '\n' || c == '\0'; });
+}
+
+}  // namespace
+
+detail::FolderCache& Workspace::folder_cache() const {
+  if (!folder_cache_) folder_cache_ = shared_for_root<detail::FolderCache>(root_);
+  return *folder_cache_;
+}
+
+Workspace::FolderChain Workspace::folder_chain(const SavedRequest& r) const {
+  FolderChain c;
+  std::vector<fs::path> dirs{root_};
+  if (!r.file.empty()) {
+    const fs::path f =
+        (r.file.is_relative() && !is_ambiguous_rooted_path(r.file) ? root_ / r.file : r.file).lexically_normal();
+    // Judged on the text (no UNC path is touched); each folder.json found is checked resolved.
+    if (!is_remote_or_device_path(f) && is_inside(root_, f)) {
+      fs::path d = root_;
+      for (const auto& part : f.parent_path().lexically_relative(root_)) {
+        if (part.empty() || part == "." || dirs.size() > 32) continue;
+        d /= part;
+        dirs.push_back(d);
+      }
+    }
+  }
+  detail::FolderCache& fc = folder_cache();
+  for (size_t i = 0; i < dirs.size(); ++i) {
+    auto d = load_folder_file(fc, root_, dirs[i]);
+    if (!d) continue;
+    if (!d->error.empty()) {
+      c.errors.push_back(d->error);
+      continue;
+    }
+    if (d->s.empty()) continue;
+    FolderChain::Level l;
+    l.data = std::move(d);
+    l.origin = i == 0 ? collection_origin(root_)
+                      : SettingsOrigin{SettingsOrigin::Level::Folder, dirs[i], generic_utf8(dirs[i].lexically_relative(root_))};
+    c.levels.push_back(std::move(l));
+  }
+  return c;
+}
+
+SavedRequest Workspace::resolve_with(const SavedRequest& r, const FolderChain& c) const {
+  if (r.settings_merged) return r;
+  SavedRequest x = r;
+  x.settings_merged = true;
+  // Auth: Inherit walks up to the nearest level that decides (anything but Inherit).
+  if (x.auth.type == HttpAuth::Type::Inherit) {
+    x.auth = HttpAuth{};
+    x.basic_auth = BasicAuth{};
+    for (size_t i = c.levels.size(); i-- > 0;) {
+      const FolderSettings& s = c.levels[i].data->s;
+      if (s.auth.type == HttpAuth::Type::Inherit) continue;
+      x.auth = s.auth;
+      x.basic_auth = s.auth.type == HttpAuth::Type::None ? s.basic_auth : BasicAuth{};
+      break;
+    }
+  }
+  if (c.levels.empty()) return x;
+  // Headers (gRPC: metadata): collection, folders outermost first, then the request's own. A
+  // name set (enabled) at a nearer level replaces the inherited one; disabled rows are not sent.
+  const bool grpc = r.kind == RequestKind::Grpc;
+  std::vector<Header>& own = grpc ? x.grpc_opts.metadata : x.http.headers;
+  std::set<std::string> taken;
+  for (size_t k = 0; k < own.size(); ++k)
+    if (grpc || !x.disabled_headers.count(k)) taken.insert(lower_ascii(own[k].first));
+  std::vector<std::vector<Header>> per_level(c.levels.size());
+  for (size_t i = c.levels.size(); i-- > 0;) {
+    std::vector<std::string> here;
+    for (const auto& row : c.levels[i].data->s.headers) {
+      if (!row.enabled || row.name.empty()) continue;
+      std::string l = lower_ascii(row.name);
+      if (taken.count(l)) continue;
+      per_level[i].emplace_back(row.name, row.value);
+      here.push_back(std::move(l));
+    }
+    taken.insert(here.begin(), here.end());
+  }
+  std::vector<Header> merged;
+  for (auto& l : per_level)
+    for (auto& h : l) merged.push_back(std::move(h));
+  const size_t n = merged.size();
+  if (n) {
+    merged.insert(merged.end(), std::make_move_iterator(own.begin()), std::make_move_iterator(own.end()));
+    own = std::move(merged);
+    if (grpc) {
+      x.inherited_metadata = n;
+    } else {
+      x.inherited_headers = n;
+      std::set<size_t> shifted;
+      for (size_t k : x.disabled_headers) shifted.insert(k + n);
+      x.disabled_headers = std::move(shifted);
+    }
+  }
+  // Asserts: the request's own first (their indexes stay), then the inherited ones.
+  for (const auto& l : c.levels)
+    x.asserts.insert(x.asserts.end(), l.data->s.asserts.begin(), l.data->s.asserts.end());
+  return x;
+}
+
+std::optional<FolderSettings> Workspace::folder_settings(const fs::path& folder, std::string* err) const {
+  const fs::path file =
+      ((folder.is_relative() && !is_ambiguous_rooted_path(folder) ? root_ / folder : folder) / kFolderFile).lexically_normal();
+  if (!request_path_inside(root_, file, err)) return std::nullopt;
+  auto d = load_folder_file(folder_cache(), root_, file.parent_path());
+  if (!d) return FolderSettings{};
+  if (!d->error.empty()) {
+    if (err) *err = d->error;
+    return std::nullopt;
+  }
+  return d->s;
+}
+
+FolderSettings Workspace::collection_settings() const {
+  auto s = folder_settings(root_);
+  return s ? std::move(*s) : FolderSettings{};
+}
+
+bool Workspace::save_folder_settings(const fs::path& folder, const FolderSettings& s, std::string* err) const {
+  const fs::path file =
+      ((folder.is_relative() && !is_ambiguous_rooted_path(folder) ? root_ / folder : folder) / kFolderFile).lexically_normal();
+  if (!request_path_inside(root_, file, err)) return false;
+  std::error_code ec;
+  if (fs::is_symlink(file, ec)) {
+    if (err) *err = to_utf8(file) + " is a link: not written";
+    return false;
+  }
+  rapidjson::Document d;
+  const Value v = folder_value(s, d.GetAllocator());
+  bool ok = true;
+  if (v.MemberCount() <= 1) {  // nothing set: no file (a workspace that does not use it never has one)
+    if (fs::exists(file, ec)) {
+      fs::remove(file, ec);
+      if (ec) {
+        if (err) *err = "cannot remove " + to_utf8(file) + ": " + ec.message();
+        ok = false;
+      }
+    }
+  } else {
+    ok = write_if_changed(file, detail::json_pretty(v), err);
+  }
+  detail::FolderCache& fc = folder_cache();
+  std::lock_guard<std::mutex> lock(fc.mu);
+  fc.entries.erase(file);  // read again next time (a rewrite within the same mtime tick and size)
+  return ok;
+}
+
+SavedRequest Workspace::new_request(RequestKind kind, const std::string& name, const fs::path& folder) const {
+  SavedRequest r;
+  r.id = new_uuid();
+  r.name = name.empty() ? "New Request" : name;
+  r.kind = kind;
+  r.auth.type = HttpAuth::Type::Inherit;
+  if (!folder.empty()) {
+    const fs::path dir = (folder.is_relative() && !is_ambiguous_rooted_path(folder) ? root_ / folder : folder).lexically_normal();
+    const std::string base = sanitize_name(r.name);
+    std::error_code ec;
+    for (int i = 1; i < 10000; ++i) {
+      const fs::path cand = (dir / from_utf8((i == 1 ? base : base + " " + std::to_string(i)) + kReqExt)).lexically_normal();
+      if (!request_path_inside(root_, cand, nullptr)) break;
+      if (!fs::exists(cand, ec)) {
+        r.file = cand;
+        break;
+      }
+    }
+  }
+  return r;
+}
+
+bool Workspace::has_inherited_settings(const SavedRequest& r) const {
+  const FolderChain c = folder_chain(r);
+  return !c.levels.empty() || !c.errors.empty();
+}
+
+SavedRequest Workspace::resolved(const SavedRequest& r) const { return resolve_with(r, folder_chain(r)); }
+
+EffectiveSettings Workspace::effective_settings(const SavedRequest& r) const {
+  const FolderChain c = folder_chain(r);
+  EffectiveSettings e;
+  e.errors = c.errors;
+  const SettingsOrigin req{SettingsOrigin::Level::Request, {}, "Request"};
+  const bool grpc = r.kind == RequestKind::Grpc;
+  // Headers in send order; overridden = an enabled row of the same name at a nearer level.
+  for (const auto& l : c.levels)
+    for (const auto& row : l.data->s.headers) e.headers.push_back({row, l.origin, false});
+  const auto& own = grpc ? r.grpc_opts.metadata : r.http.headers;
+  for (size_t k = 0; k < own.size(); ++k)
+    e.headers.push_back({SettingsRow{own[k].first, own[k].second, {}, grpc || !r.disabled_headers.count(k)}, req, false});
+  {
+    // By level, nearest first: rows of one level never override each other.
+    std::set<std::string> taken;
+    size_t end = e.headers.size();
+    while (end > 0) {
+      size_t begin = end - 1;
+      while (begin > 0 && e.headers[begin - 1].from == e.headers[end - 1].from) --begin;
+      std::vector<std::string> here;
+      for (size_t k = begin; k < end; ++k) {
+        auto& h = e.headers[k];
+        if (!h.row.enabled) continue;
+        const std::string l = lower_ascii(h.row.name);
+        h.overridden = h.from.level != SettingsOrigin::Level::Request && taken.count(l) > 0;
+        if (!h.overridden) here.push_back(l);
+      }
+      taken.insert(here.begin(), here.end());
+      end = begin;
+    }
+  }
+  // Variables, highest precedence first: runtime, folders nearest first, (environment), collection.
+  const Environment* env = nullptr;
+  for (const auto& en : envs_)
+    if (!active_env.empty() && en.name == active_env) env = &en;
+  std::set<std::string> defined;
+  for (const auto& [k, v] : runtime_vars) {
+    e.vars.push_back({SettingsRow{k, v, {}, true}, SettingsOrigin{SettingsOrigin::Level::Request, {}, "Runtime"}, false});
+    defined.insert(k);
+  }
+  for (size_t i = c.levels.size(); i-- > 0;) {
+    const auto& l = c.levels[i];
+    if (l.origin.level == SettingsOrigin::Level::Collection && env)
+      for (const auto& [k, v] : env->vars) defined.insert(k);
+    std::vector<std::string> here;
+    for (const auto& row : l.data->s.vars) {
+      const bool over = row.enabled && defined.count(row.name) > 0;
+      e.vars.push_back({row, l.origin, over});
+      if (row.enabled) here.push_back(row.name);
+    }
+    defined.insert(here.begin(), here.end());
+  }
+  // Auth.
+  e.auth = r.auth;
+  e.basic_auth = r.basic_auth;
+  e.auth_from = req;
+  if (r.auth.type == HttpAuth::Type::Inherit) {
+    e.auth = HttpAuth{};
+    e.basic_auth = BasicAuth{};
+    e.auth_from = collection_origin(root_);
+    for (size_t i = c.levels.size(); i-- > 0;) {
+      const FolderSettings& s = c.levels[i].data->s;
+      if (s.auth.type == HttpAuth::Type::Inherit) continue;
+      e.auth = s.auth;
+      e.basic_auth = s.auth.type == HttpAuth::Type::None ? s.basic_auth : BasicAuth{};
+      e.auth_from = c.levels[i].origin;
+      break;
+    }
+  }
+  // Scripts: pre outermost first, post nearest first.
+  for (const auto& l : c.levels)
+    if (!l.data->s.pre_script.empty()) e.pre_scripts.push_back({l.data->s.pre_script, l.origin});
+  if (!r.pre_script.empty()) e.pre_scripts.push_back({r.pre_script, req});
+  if (!r.post_script.empty()) e.post_scripts.push_back({r.post_script, req});
+  for (size_t i = c.levels.size(); i-- > 0;)
+    if (!c.levels[i].data->s.post_script.empty()) e.post_scripts.push_back({c.levels[i].data->s.post_script, c.levels[i].origin});
+  // Asserts: the request's own, then the inherited ones (as resolved()).
+  for (const auto& a : r.asserts) e.asserts.push_back({a, req});
+  for (const auto& l : c.levels)
+    for (const auto& a : l.data->s.asserts) e.asserts.push_back({a, l.origin});
+  return e;
 }
 
 bool Workspace::remove(const fs::path& p) {
@@ -2133,9 +2650,22 @@ fs::path resolved_path(const fs::path& p);
 
 }  // namespace
 
-std::string Workspace::expand(const std::string& s) const {
+std::string Workspace::expand(const std::string& s) const { return expand_in(s, nullptr); }
+
+std::string Workspace::expand(const std::string& s, const SavedRequest& r) const {
+  if (s.find("{{") == std::string::npos) return s;
+  const FolderChain c = folder_chain(r);
+  return expand_in(s, &c);
+}
+
+// c: the folder chain of the request being expanded (folder and collection vars); nullptr: no
+// request (collection vars read from <ws>/folder.json when a name gets that far).
+std::string Workspace::expand_in(const std::string& s, const FolderChain* c) const {
   if (s.find("{{") == std::string::npos) return s;
   std::optional<std::vector<std::string>> env_allowed;  // read when an OS variable is met
+  bool coll_looked = false;
+  const std::map<std::string, std::string>* coll = nullptr;
+  std::shared_ptr<const detail::LoadedFolder> coll_data;
   const Environment* env = nullptr;
   if (!active_env.empty())
     for (const auto& e : envs_)
@@ -2151,9 +2681,35 @@ std::string Workspace::expand(const std::string& s) const {
         return true;
       }
     }
+    if (c)  // folder vars, nearest folder first
+      for (size_t i = c->levels.size(); i-- > 0;) {
+        const auto& l = c->levels[i];
+        if (l.origin.level != SettingsOrigin::Level::Folder) continue;
+        auto it = l.data->vars.find(name);
+        if (it != l.data->vars.end()) {
+          value = it->second;
+          return true;
+        }
+      }
     if (env) {
       auto it = env->vars.find(name);
       if (it != env->vars.end()) {
+        value = it->second;
+        return true;
+      }
+    }
+    if (!coll_looked) {
+      coll_looked = true;
+      if (c) {
+        if (const auto* l = c->collection()) coll = &l->data->vars;
+      } else {
+        coll_data = load_folder_file(folder_cache(), root_, root_);
+        if (coll_data && coll_data->error.empty()) coll = &coll_data->vars;
+      }
+    }
+    if (coll) {
+      auto it = coll->find(name);
+      if (it != coll->end()) {
         value = it->second;
         return true;
       }
@@ -2229,27 +2785,30 @@ std::string Workspace::expand(const std::string& s) const {
   return run(s, run);
 }
 
-SavedRequest Workspace::expanded(const SavedRequest& r) const {
-  SavedRequest x = r;
-  x.http.url = expand(r.http.url);
+SavedRequest Workspace::expanded(const SavedRequest& r) const { return expanded_with(r, folder_chain(r)); }
+
+SavedRequest Workspace::expanded_with(const SavedRequest& r, const FolderChain& c) const {
+  SavedRequest x = resolve_with(r, c);
+  auto expand = [&](const std::string& s) { return expand_in(s, &c); };
+  x.http.url = expand(x.http.url);
   for (auto& [k, v] : x.http.headers) {
     k = expand(k);
     v = expand(v);
   }
-  x.http.body = expand(r.http.body);
-  x.grpc_target.address = expand(r.grpc_target.address);
-  x.grpc_target.authority = expand(r.grpc_target.authority);
-  x.grpc_method = expand(r.grpc_method);
-  x.grpc_body = expand(r.grpc_body);
+  x.http.body = expand(x.http.body);
+  x.grpc_target.address = expand(x.grpc_target.address);
+  x.grpc_target.authority = expand(x.grpc_target.authority);
+  x.grpc_method = expand(x.grpc_method);
+  x.grpc_body = expand(x.grpc_body);
   for (auto& [k, v] : x.grpc_opts.metadata) {
     k = expand(k);
     v = expand(v);
   }
   for (auto& p : x.proto_files) p = expand(p);
   for (auto& p : x.import_dirs) p = expand(p);
-  x.basic_auth.user = expand(r.basic_auth.user);
-  x.basic_auth.password = expand(r.basic_auth.password);
-  if (r.auth.type != HttpAuth::Type::None) {
+  x.basic_auth.user = expand(x.basic_auth.user);
+  x.basic_auth.password = expand(x.basic_auth.password);
+  if (x.auth.type != HttpAuth::Type::None) {
     HttpAuth& au = x.auth;
     for (std::string* f : {&au.user, &au.password, &au.aws_access_key, &au.aws_secret_key, &au.aws_session_token,
                            &au.aws_region, &au.aws_service, &au.oauth2.token_url, &au.oauth2.auth_url,
@@ -2263,6 +2822,37 @@ SavedRequest Workspace::expanded(const SavedRequest& r) const {
     p.value = expand(p.value);
     p.filename = expand(p.filename);
     p.type = expand(p.type);
+  }
+  // An inherited header / metadata entry cannot smuggle a line break (a second header, a
+  // request split) into the request, whatever its {{vars}} expand to: dropped.
+  if (x.inherited_headers) {
+    std::vector<Header> keep;
+    std::set<size_t> off;
+    size_t inh = 0;
+    for (size_t k = 0; k < x.http.headers.size(); ++k) {
+      auto& h = x.http.headers[k];
+      const bool inherited = k < x.inherited_headers;
+      if (inherited && (has_ctl_break(h.first) || has_ctl_break(h.second))) continue;
+      if (x.disabled_headers.count(k)) off.insert(keep.size());
+      inh += inherited;
+      keep.push_back(std::move(h));
+    }
+    x.http.headers = std::move(keep);
+    x.disabled_headers = std::move(off);
+    x.inherited_headers = inh;
+  }
+  if (x.inherited_metadata) {
+    std::vector<Header> keep;
+    size_t inh = 0;
+    for (size_t k = 0; k < x.grpc_opts.metadata.size(); ++k) {
+      auto& h = x.grpc_opts.metadata[k];
+      const bool inherited = k < x.inherited_metadata;
+      if (inherited && (has_ctl_break(h.first) || has_ctl_break(h.second))) continue;
+      inh += inherited;
+      keep.push_back(std::move(h));
+    }
+    x.grpc_opts.metadata = std::move(keep);
+    x.inherited_metadata = inh;
   }
   return x;
 }
@@ -2507,7 +3097,9 @@ void Workspace::set_user_config_dir(const fs::path& dir) {
 }
 
 std::vector<fs::path> Workspace::blocked_files(const SavedRequest& r) const {
-  const SavedRequest x = expanded(r);
+  const FolderChain c = folder_chain(r);
+  const SavedRequest x = expanded_with(r, c);
+  auto expand = [&](const std::string& s) { return expand_in(s, &c); };
   const UploadPolicy policy(root_);
   std::vector<fs::path> out;
   auto check = [&](const fs::path& fp) {
@@ -2544,7 +3136,7 @@ std::vector<fs::path> Workspace::blocked_files(const SavedRequest& r) const {
 //                 import dirs: it must have no root and no "..".
 //   "\foo" and "C:foo" are refused: they name a different place for every process.
 Workspace::SchemaPlan Workspace::schema_plan(const SavedRequest& r) const {
-  const SavedRequest x = expanded(r);
+  const SavedRequest x = expanded(r);  // folder vars included
   const UploadPolicy policy(root_);
   SchemaPlan plan;
   auto block = [&](const fs::path& fp) {
@@ -2608,9 +3200,13 @@ bool Workspace::write_allowlist(const std::vector<fs::path>& files, std::string*
   return write_root_list(kAllowedFilesFile, root_, items, "upload allowlist", err);
 }
 
-std::vector<std::string> Workspace::blocked_env_vars(const SavedRequest& r) const { return env_refs_left(expanded(r)); }
+std::vector<std::string> Workspace::blocked_env_vars(const SavedRequest& r) const {
+  const FolderChain c = folder_chain(r);
+  return env_refs_left(expanded_with(r, c), &c);
+}
 
-std::vector<std::string> Workspace::env_refs_left(const SavedRequest& x) const {
+std::vector<std::string> Workspace::env_refs_left(const SavedRequest& x, const FolderChain* c) const {
+  auto expand = [&](const std::string& s) { return expand_in(s, c); };
   std::vector<std::string> refs;
   auto scan = [&](const std::string& s) { collect_env_refs(s, refs); };
   scan(x.http.url);
@@ -2701,9 +3297,16 @@ bool Workspace::disallow_file(const fs::path& file, std::string* err) const {
 }
 
 std::optional<HttpRequest> Workspace::http_to_send(const SavedRequest& r, std::string* err) const {
+  // A folder.json on the way that cannot be read: its headers / auth would be missing.
+  const FolderChain chain = folder_chain(r);
+  if (!chain.errors.empty()) {
+    if (err) *err = "folder settings: " + chain.errors.front() + ": request not sent.";
+    return std::nullopt;
+  }
+  auto expand = [&](const std::string& s) { return expand_in(s, &chain); };
   // An OS environment variable this workspace may not read: not sent (the UI asks first).
-  SavedRequest x = expanded(r);
-  if (const auto env = env_refs_left(x); !env.empty()) {
+  SavedRequest x = expanded_with(r, chain);
+  if (const auto env = env_refs_left(x, &chain); !env.empty()) {
     if (err)
       *err = "the request uses the environment variable " + env.front() +
              " ({{process.env." + env.front() + "}}), which this workspace may not read: request not sent. The user "
@@ -2796,6 +3399,13 @@ std::optional<HttpRequest> Workspace::http_to_send(const SavedRequest& r, std::s
       if (!merged) x.http.headers.emplace_back("Cookie", jar_cookies);
     }
   }
+  // No header may carry a line break (header injection / request splitting), own or inherited.
+  for (const auto& [k, v] : x.http.headers)
+    if (has_ctl_break(k) || has_ctl_break(v)) {
+      if (err) *err = "the header '" + k.substr(0, k.find_first_of(std::string_view("\r\n\0", 3))) +
+                      "' contains a line break: request not sent.";
+      return std::nullopt;
+    }
   if (x.auth.type != HttpAuth::Type::None) {
     if (!apply_http_auth(r, x, err)) return std::nullopt;
   } else if (x.basic_auth.enabled) {
@@ -2822,6 +3432,7 @@ bool Workspace::apply_http_auth(const SavedRequest& r, SavedRequest& x, std::str
   };
   switch (au.type) {
     case HttpAuth::Type::None: return true;
+    case HttpAuth::Type::Inherit: return true;  // resolved before: never reaches here
     case HttpAuth::Type::Digest:
     case HttpAuth::Type::Ntlm:
     case HttpAuth::Type::Negotiate:
@@ -2901,6 +3512,7 @@ const char* auth_type_name(HttpAuth::Type t) {
     case HttpAuth::Type::Negotiate: return "negotiate";
     case HttpAuth::Type::AwsSigV4: return "awsv4";
     case HttpAuth::Type::OAuth2: return "oauth2";
+    case HttpAuth::Type::Inherit: return "inherit";
   }
   return "none";
 }
@@ -2912,6 +3524,7 @@ HttpAuth::Type auth_type_from(const std::string& s) {
   if (l == "negotiate" || l == "kerberos" || l == "spnego") return HttpAuth::Type::Negotiate;
   if (l == "awsv4" || l == "aws_sigv4" || l == "awssigv4" || l == "aws") return HttpAuth::Type::AwsSigV4;
   if (l == "oauth2" || l == "oauth2.0" || l == "oauth") return HttpAuth::Type::OAuth2;
+  if (l == "inherit") return HttpAuth::Type::Inherit;
   return HttpAuth::Type::None;
 }
 
@@ -2954,10 +3567,14 @@ std::string Workspace::url_origin(const std::string& url) {
 
 std::vector<std::string> Workspace::blocked_sso_hosts(const SavedRequest& r) const {
   if (r.kind != RequestKind::Http) return {};
-  if (r.auth.type != HttpAuth::Type::Ntlm && r.auth.type != HttpAuth::Type::Negotiate) return {};
-  if (!expand(r.auth.user).empty()) return {};
-  const std::string url = expand(r.http.url);
-  const std::string origin = url_origin(url);
+  // The auth may be inherited from a folder or the collection.
+  if (r.auth.type != HttpAuth::Type::Ntlm && r.auth.type != HttpAuth::Type::Negotiate &&
+      r.auth.type != HttpAuth::Type::Inherit)
+    return {};
+  const SavedRequest x = expanded(r);
+  if (x.auth.type != HttpAuth::Type::Ntlm && x.auth.type != HttpAuth::Type::Negotiate) return {};
+  if (!x.auth.user.empty()) return {};
+  const std::string origin = url_origin(x.http.url);
   // Not an http(s) URL (yet): nothing to ask; http_to_send() refuses it anyway.
   if (origin.empty() || is_sso_host_allowed(origin)) return {};
   return {origin};

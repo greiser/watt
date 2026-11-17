@@ -125,6 +125,30 @@ bool read_file(const fs::path& p, std::string& out) {
   return static_cast<bool>(f) || f.eof();
 }
 
+bool stat_path(const fs::path& p, PathStat& st) {
+  st = PathStat{};
+#ifdef _WIN32
+  // Attributes, size and time in one call that opens nothing (no antivirus scan, no handle).
+  WIN32_FILE_ATTRIBUTE_DATA a;
+  if (!GetFileAttributesExW(p.c_str(), GetFileExInfoStandard, &a)) return false;
+  st.exists = true;
+  st.is_link = (a.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+  st.is_dir = (a.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+  st.size = (static_cast<uint64_t>(a.nFileSizeHigh) << 32) | a.nFileSizeLow;
+  st.mtime = static_cast<int64_t>((static_cast<uint64_t>(a.ftLastWriteTime.dwHighDateTime) << 32) |
+                                  a.ftLastWriteTime.dwLowDateTime);
+#else
+  struct stat s;
+  if (lstat(p.c_str(), &s) != 0) return false;
+  st.exists = true;
+  st.is_link = S_ISLNK(s.st_mode);
+  st.is_dir = S_ISDIR(s.st_mode);
+  st.size = static_cast<uint64_t>(s.st_size);
+  st.mtime = static_cast<int64_t>(s.st_mtim.tv_sec) * 1000000000 + s.st_mtim.tv_nsec;
+#endif
+  return true;
+}
+
 void ensure_dir(const fs::path& dir) {
   std::error_code ec;
   if (dir.empty() || fs::is_directory(dir, ec)) return;

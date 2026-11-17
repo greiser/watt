@@ -29,6 +29,16 @@ std::string json_compact(const rapidjson::Value& v);
 std::string json_pretty(const rapidjson::Value& v);
 
 bool read_file(const fs::path& p, std::string& out);
+// One cheap stat that does not follow links and opens nothing (Windows: GetFileAttributesExW;
+// is_link = any reparse point). False (exists = false) when there is nothing at p.
+struct PathStat {
+  bool exists = false;
+  bool is_link = false;
+  bool is_dir = false;
+  uint64_t size = 0;
+  int64_t mtime = 0;  // platform ticks, only for "did it change" comparisons
+};
+bool stat_path(const fs::path& p, PathStat& st);
 // create_directories, but cheap when dir exists (MSVC's create_directories tries to create
 // every component: ~0.6 ms even when all exist).
 void ensure_dir(const fs::path& dir);

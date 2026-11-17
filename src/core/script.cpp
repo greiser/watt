@@ -69,6 +69,11 @@ struct Host {
   bool cancelled = false;
   size_t log_bytes = 0;
   const Environment* env = nullptr;
+  // Read-only folder vars (nearest folder wins) and collection vars of the request: seen by
+  // reads of every scope at once (pm.variables, interpolate), between runtime and environment /
+  // between environment and globals, as in Workspace::expand().
+  const std::map<std::string, std::string>* folder_vars = nullptr;
+  const std::map<std::string, std::string>* collection_vars = nullptr;
   // What the script set in this run, per scope (0 runtime, 1 environment, 2 globals); nullopt = removed.
   std::map<std::string, std::optional<std::string>> ov[3];
   ResponseData* rd = nullptr;
@@ -97,11 +102,19 @@ struct Host {
     if (auto it = ov[s].find(n); it != ov[s].end()) return it->second;
     return base(s, n);
   }
+  static std::optional<std::string> in(const std::map<std::string, std::string>* m, const std::string& n) {
+    if (!m) return std::nullopt;
+    auto it = m->find(n);
+    if (it == m->end()) return std::nullopt;
+    return it->second;
+  }
   std::optional<std::string> get(int s, const std::string& n) const {
     if (s < 3) return effective(s, n);
-    for (int i = 0; i < 3; ++i)
-      if (auto v = effective(i, n)) return v;
-    return std::nullopt;
+    if (auto v = effective(0, n)) return v;
+    if (auto v = in(folder_vars, n)) return v;
+    if (auto v = effective(1, n)) return v;
+    if (auto v = in(collection_vars, n)) return v;
+    return effective(2, n);
   }
 };
 
@@ -381,7 +394,11 @@ HOST_FN(h_all) {
   };
   if (s == 3) {
     merge(2);
+    if (h.collection_vars)
+      for (const auto& [k, v] : *h.collection_vars) m[k] = v;
     merge(1);
+    if (h.folder_vars)
+      for (const auto& [k, v] : *h.folder_vars) m[k] = v;
     merge(0);
   } else {
     merge(s);
@@ -943,12 +960,31 @@ struct Runtime {
   }
 };
 
+// What a chain of scripts (collection, folders, request) shares: the folder / collection vars,
+// and what the scripts before this one set (seen by this one's reads).
+struct ChainCtx {
+  std::map<std::string, std::string> folder_vars, collection_vars;
+  const std::vector<ScriptVar>* earlier = nullptr;
+  std::string file;  // the script's name in errors and stacks ("": pre-request.js / post-response.js)
+};
+
 ScriptRun run_script(const Workspace& ws, bool pre, const std::string& code, const SavedRequest& req,
-                     SavedRequest* out_req, ResponseData* rd, const ScriptOptions& opts) {
+                     SavedRequest* out_req, ResponseData* rd, const ScriptOptions& opts,
+                     const ChainCtx* chain = nullptr) {
   const auto t0 = Clock::now();
   ScriptRun run;
   run.ran = true;
   Host h;
+  if (chain) {
+    h.folder_vars = &chain->folder_vars;
+    h.collection_vars = &chain->collection_vars;
+    if (chain->earlier)
+      for (const ScriptVar& v : *chain->earlier) {
+        if (!v.ok) continue;
+        const int s = v.scope == ScriptVar::Scope::Environment ? 1 : v.scope == ScriptVar::Scope::Globals ? 2 : 0;
+        h.ov[s][v.name] = v.removed ? std::nullopt : std::optional<std::string>(v.value);
+      }
+  }
   h.ws = &ws;
   h.run = &run;
   h.opts = &opts;
@@ -963,7 +999,7 @@ ScriptRun run_script(const Workspace& ws, bool pre, const std::string& code, con
   const ScriptLimits& lim = opts.limits;
   // Setup gets its own allowance (the first run compiles the prelude); the script's starts below.
   h.deadline = t0 + std::chrono::milliseconds(std::max<long>(lim.cpu_ms, 1000) * 2);
-  const std::string file = pre ? "pre-request.js" : "post-response.js";
+  const std::string file = chain && !chain->file.empty() ? chain->file : pre ? "pre-request.js" : "post-response.js";
   {
     Runtime R;
     R.rt = JS_NewRuntime();
@@ -1089,19 +1125,85 @@ ScriptRun untrusted_run() {
   return run;
 }
 
+// The script file name of a level, as errors and stack traces show it.
+std::string chain_file(const EffectiveSettings::Script& s, bool pre) {
+  const char* base = pre ? "pre-request.js" : "post-response.js";
+  switch (s.from.level) {
+    case SettingsOrigin::Level::Request: return base;
+    case SettingsOrigin::Level::Collection: return std::string("collection/") + base;
+    case SettingsOrigin::Level::Folder: break;
+  }
+  return s.from.label + "/" + base;
+}
+
+// Runs the scripts of every level in order (core/model.h, FolderSettings): each one sees what
+// the ones before it set and (pre-request) the request as they left it. One ScriptRun for them
+// all: logs, tests and variables in order, times summed; the first error stops the chain.
+ScriptRun run_chain(const Workspace& ws, bool pre, const SavedRequest& req, SavedRequest* out_req, ResponseData* rd,
+                    const ScriptOptions& opts) {
+  // No folder.json on the way: only the request's own script (and nothing at all without one:
+  // no trust file read, no QuickJS).
+  if (!ws.has_inherited_settings(req)) {
+    const std::string& own = pre ? req.pre_script : req.post_script;
+    if (own.empty()) return {};
+    if (!ws.scripts_trusted()) return untrusted_run();
+    if (pre) {
+      const SavedRequest original = req;
+      return run_script(ws, true, original.pre_script, original, out_req, nullptr, opts);
+    }
+    return run_script(ws, false, own, req, nullptr, rd, opts);
+  }
+  const EffectiveSettings eff = ws.effective_settings(req);
+  const auto& scripts = pre ? eff.pre_scripts : eff.post_scripts;
+  if (scripts.empty()) return {};
+  // Inherited scripts are workspace code like the request's own: the same trust decision.
+  if (!ws.scripts_trusted()) return untrusted_run();
+  ChainCtx ctx;
+  for (const auto& v : eff.vars) {
+    if (!v.row.enabled) continue;
+    if (v.from.level == SettingsOrigin::Level::Folder) ctx.folder_vars.emplace(v.row.name, v.row.value);
+    else if (v.from.level == SettingsOrigin::Level::Collection) ctx.collection_vars.emplace(v.row.name, v.row.value);
+  }
+  ScriptRun total;
+  ctx.earlier = &total.vars_set;
+  for (const auto& sc : scripts) {
+    ctx.file = chain_file(sc, pre);
+    ScriptRun one;
+    if (pre) {
+      const SavedRequest current = *out_req;
+      one = run_script(ws, true, sc.code, current, out_req, nullptr, opts, &ctx);
+    } else {
+      one = run_script(ws, false, sc.code, req, nullptr, rd, opts, &ctx);
+    }
+    total.ran = total.ran || one.ran;
+    total.request_changed = total.request_changed || one.request_changed;
+    total.logs_truncated = total.logs_truncated || one.logs_truncated;
+    total.requests_sent += one.requests_sent;
+    total.elapsed_us += one.elapsed_us;
+    total.setup_us += one.setup_us;
+    total.wait_us += one.wait_us;
+    for (auto& l : one.logs) total.logs.push_back(std::move(l));
+    for (auto& t : one.tests) total.tests.push_back(std::move(t));
+    for (auto& v : one.vars_set) total.vars_set.push_back(std::move(v));
+    if (!one.ok) {
+      total.ok = false;
+      total.line = one.line;
+      total.column = one.column;
+      total.error = sc.from.level == SettingsOrigin::Level::Request ? one.error : ctx.file + ": " + one.error;
+      break;
+    }
+  }
+  return total;
+}
+
 }  // namespace
 
 ScriptRun run_pre_script(const Workspace& ws, SavedRequest& req, const ScriptOptions& opts) {
-  if (req.pre_script.empty()) return {};
-  if (!ws.scripts_trusted()) return untrusted_run();
-  const SavedRequest original = req;
-  return run_script(ws, true, original.pre_script, original, &req, nullptr, opts);
+  return run_chain(ws, true, req, &req, nullptr, opts);
 }
 
 ScriptRun run_post_script(const Workspace& ws, const SavedRequest& req, ResponseData& res, const ScriptOptions& opts) {
-  if (req.post_script.empty()) return {};
-  if (!ws.scripts_trusted()) return untrusted_run();
-  return run_script(ws, false, req.post_script, req, nullptr, &res, opts);
+  return run_chain(ws, false, req, nullptr, &res, opts);
 }
 
 bool apply_script_vars(Workspace& ws, ScriptRun& run, bool persist, std::string* err) {
