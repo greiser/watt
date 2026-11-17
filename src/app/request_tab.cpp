@@ -353,6 +353,12 @@ void RequestTab::focus_url() { editor()->focus_url(); }
 
 void RequestTab::file_moved(const std::filesystem::path& to) {
   req_.file = to;
+  // A rename in the sidebar also renames the request inside its file. Adopt that name, or the
+  // next Ctrl+S would write the old one back and silently undo the rename. Only the name: any
+  // unsaved edits in this tab are kept.
+  if (!to.empty())
+    if (const Workspace* ws = workspace())
+      if (auto r = ws->load_request(to)) req_.name = r->name;
   if (on_title_changed) on_title_changed(this);
 }
 
