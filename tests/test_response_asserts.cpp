@@ -766,6 +766,34 @@ TEST_CASE("event streams are parsed per the WHATWG rules", "[response_sse]") {
   CHECK(one_line_preview(std::string(300, 'x'), 10).size() == 13);  // 10 + the ellipsis
 }
 
+TEST_CASE("a stream without line ends or blank lines cannot take all memory", "[response_sse]") {
+  using namespace watt::app::rv;
+  SseParser p;
+  std::vector<SseEvent> out;
+  const std::string chunk(1u << 20, 'x');
+  p.feed("data: ", 6, 1.0, out);
+  for (int i = 0; i < 24; ++i) p.feed(chunk.data(), chunk.size(), 2.0, out);  // 24 MB, one line
+  CHECK(p.pending_bytes() <= SseParser::kMaxField + 64);
+  p.feed("\n\n", 2, 3.0, out);
+  REQUIRE(out.size() == 1);
+  CHECK(out[0].truncated);
+  CHECK(out[0].data.size() <= SseParser::kMaxField);
+  // Many data lines and no blank line: the joined data stops growing too.
+  out.clear();
+  const std::string line = "data: " + std::string((1u << 20) - 7, 'y') + "\n";
+  for (int i = 0; i < 24; ++i) p.feed(line.data(), line.size(), 4.0, out);
+  p.feed("\n", 1, 5.0, out);
+  REQUIRE(out.size() == 1);
+  CHECK(out[0].truncated);
+  CHECK(out[0].data.size() <= SseParser::kMaxField);
+  // A normal event after it is whole again.
+  out.clear();
+  p.feed("data: ok\n\n", 10, 6.0, out);
+  REQUIRE(out.size() == 1);
+  CHECK_FALSE(out[0].truncated);
+  CHECK(out[0].data == "ok");
+}
+
 TEST_CASE("the body tap batches events and keeps the start of a cut download", "[response_sse]") {
   using namespace watt::app::rv;
   int posts = 0;

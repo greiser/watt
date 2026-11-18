@@ -364,6 +364,11 @@ class HttpEditor : public wxPanel, public HttpEditorPanel, public wxEventFilter 
                        std::function<void()> send_anyway) override;
   void focus_url() override;
   void vars_changed() override {
+    // Folder / collection variables, headers and auth too: the workspace may have just opened
+    // (tabs restored at start-up load before it), or a folder.json was saved.
+    refresh_inherited();
+    crumb_sig_.clear();  // the breadcrumb's folders need the workspace
+    update_crumb();
     update_preview();
     // Another environment: a {{token}} defined before may be undefined now (and back).
     if (url_) highlight_vars(url_, 0, url_->GetLength());
@@ -697,6 +702,7 @@ class HttpEditor : public wxPanel, public HttpEditorPanel, public wxEventFilter 
   // on a worker after each load and folder save), shown on the Auth tab and under Auto headers.
   InheritView inh_;
   uint64_t inh_gen_ = 0;
+  uint64_t inh_done_gen_ = 0;  // inh_ is current when it equals inh_gen_
   wxStaticText* inh_title_ = nullptr;
   wxStaticText* inh_detail_ = nullptr;
   wxStaticText* inh_errors_ = nullptr;
@@ -3288,7 +3294,9 @@ void HttpEditor::store(SavedRequest& r) const {
   }
   if (sending_) r.http.url = with_path(r.http.url);
   const Workspace* send_ws = sending_ ? host_->workspace() : nullptr;
-  if (send_ws && r.http.url.find("{{") != std::string::npos) {
+  // While inh_ is being re-read (a folder.json just changed), its folder variables may be stale:
+  // the core expands the URL from the files itself then.
+  if (send_ws && inh_done_gen_ == inh_gen_ && r.http.url.find("{{") != std::string::npos) {
     // The shell expands {{vars}} without knowing where they stand; when that would send a
     // different URL (a value with a space or '&' in the query), hand it the URL as sent.
     if (std::string u = sent_url(); u != send_ws->expand(r.http.url)) r.http.url = std::move(u);
@@ -4313,6 +4321,11 @@ void HttpEditor::refresh_inherited() {
     ed->CallAfter([ed, v = std::move(v), gen]() mutable {
       if (gen != ed->inh_gen_) return;
       ed->inh_ = std::move(v);
+      ed->inh_done_gen_ = gen;
+      // Folder variables just became known (a restored tab, a saved folder.json): repaint them.
+      if (ed->url_) ed->highlight_vars(ed->url_, 0, ed->url_->GetLength());
+      for (auto& f : ed->var_fields_)
+        if (wxStyledTextCtrl* s = f.get()) ed->highlight_vars(s, 0, s->GetLength());
       ed->show_inherited();
       if (ed->net_panel_) {
         ed->net_panel_->set_inherited(wxString::FromUTF8(ed->inh_.network));

@@ -418,6 +418,49 @@ TEST_CASE("auth: Inherit walks up; None stops it; saved requests keep their mean
   CHECK(header_values(*h, "Authorization") == std::vector<std::string>{"Bearer t"});
 }
 
+TEST_CASE("auth: Basic beats an Authorization header inherited from further out", "[folders][auth]") {
+  Chain c;
+  FolderSettings coll;
+  coll.headers = {row("Authorization", "Bearer coll-token")};
+  REQUIRE(c.ws.save_collection_settings(coll));
+
+  // The request's own Basic auth (curl -u): sent as Basic, the collection's Bearer is not.
+  SavedRequest own = c.req;
+  own.auth.type = HttpAuth::Type::None;
+  own.basic_auth = BasicAuth{true, "ada", "s3cret"};
+  auto h = c.ws.http_to_send(own);
+  REQUIRE(h);
+  CHECK(header_values(*h, "Authorization") == std::vector<std::string>{"Basic YWRhOnMzY3JldA=="});
+  EffectiveSettings e = c.ws.effective_settings(own);
+  bool coll_overridden = false;
+  for (const auto& eh : e.headers)
+    if (eh.row.name == "Authorization" && eh.from.level == SettingsOrigin::Level::Collection) coll_overridden = eh.overridden;
+  CHECK(coll_overridden);
+
+  // Basic from folder api beats the collection's header too.
+  FolderSettings a;
+  a.auth.type = HttpAuth::Type::None;
+  a.basic_auth = BasicAuth{true, "ann", "secret"};
+  REQUIRE(c.ws.save_folder_settings(c.a, a));
+  h = c.ws.http_to_send(c.req);
+  REQUIRE(h);
+  CHECK(header_values(*h, "Authorization") == std::vector<std::string>{"Basic YW5uOnNlY3JldA=="});
+
+  // But a nearer folder's (api/users) Authorization header beats api's Basic.
+  FolderSettings b;
+  b.headers = {row("Authorization", "Bearer users-token")};
+  REQUIRE(c.ws.save_folder_settings(c.b, b));
+  h = c.ws.http_to_send(c.req);
+  REQUIRE(h);
+  CHECK(header_values(*h, "Authorization") == std::vector<std::string>{"Bearer users-token"});
+
+  // The request's own Authorization header still beats its own Basic (curl -u -H).
+  own.http.headers = {{"Authorization", "Bearer mine"}};
+  h = c.ws.http_to_send(own);
+  REQUIRE(h);
+  CHECK(header_values(*h, "Authorization") == std::vector<std::string>{"Bearer mine"});
+}
+
 TEST_CASE("variables: runtime > request folder (nearest first) > environment > collection > globals", "[folders][vars]") {
   Chain c;
   c.ws.globals = {{"v", "global"}, {"g_only", "g"}, {"coll_vs_global", "global"}};

@@ -1967,6 +1967,9 @@ SavedRequest Workspace::resolve_with(const SavedRequest& r, const FolderChain& c
     x.cert_from_key = passphrase_key(nr.cert_from, r.id);
   }
   // Auth: Inherit walks up to the nearest level that decides (anything but Inherit).
+  // The level whose Basic auth applies (c.levels.size(): the request's own): an Authorization
+  // header inherited from a level further out never replaces it (only a nearer one does).
+  size_t basic_at = c.levels.size();
   if (x.auth.type == HttpAuth::Type::Inherit) {
     x.auth = HttpAuth{};
     x.basic_auth = BasicAuth{};
@@ -1975,10 +1978,12 @@ SavedRequest Workspace::resolve_with(const SavedRequest& r, const FolderChain& c
       if (s.auth.type == HttpAuth::Type::Inherit) continue;
       x.auth = s.auth;
       x.basic_auth = s.auth.type == HttpAuth::Type::None ? s.basic_auth : BasicAuth{};
+      basic_at = i;
       break;
     }
   }
   if (c.levels.empty()) return x;
+  const bool basic_wins = r.kind == RequestKind::Http && x.auth.type == HttpAuth::Type::None && x.basic_auth.enabled;
   // Headers (gRPC: metadata): collection, folders outermost first, then the request's own. A
   // name set (enabled) at a nearer level replaces the inherited one; disabled rows are not sent.
   const bool grpc = r.kind == RequestKind::Grpc;
@@ -1988,6 +1993,7 @@ SavedRequest Workspace::resolve_with(const SavedRequest& r, const FolderChain& c
     if (grpc || !x.disabled_headers.count(k)) taken.insert(lower_ascii(own[k].first));
   std::vector<std::vector<Header>> per_level(c.levels.size());
   for (size_t i = c.levels.size(); i-- > 0;) {
+    if (basic_wins && i < basic_at) taken.insert("authorization");
     std::vector<std::string> here;
     for (const auto& row : c.levels[i].data->s.headers) {
       if (!row.enabled || row.name.empty()) continue;
@@ -2152,18 +2158,29 @@ EffectiveSettings Workspace::effective_settings(const SavedRequest& r) const {
   e.auth = r.auth;
   e.basic_auth = r.basic_auth;
   e.auth_from = req;
+  size_t basic_at = c.levels.size();  // as resolve_with(): the level whose Basic auth applies
   if (r.auth.type == HttpAuth::Type::Inherit) {
     e.auth = HttpAuth{};
     e.basic_auth = BasicAuth{};
     e.auth_from = collection_origin(root_);
+    basic_at = 0;
     for (size_t i = c.levels.size(); i-- > 0;) {
       const FolderSettings& s = c.levels[i].data->s;
       if (s.auth.type == HttpAuth::Type::Inherit) continue;
       e.auth = s.auth;
       e.basic_auth = s.auth.type == HttpAuth::Type::None ? s.basic_auth : BasicAuth{};
       e.auth_from = c.levels[i].origin;
+      basic_at = i;
       break;
     }
+  }
+  // Basic auth beats an Authorization header inherited from a level further out (resolve_with()).
+  if (!grpc && e.auth.type == HttpAuth::Type::None && e.basic_auth.enabled) {
+    size_t k = 0;
+    for (size_t i = 0; i < c.levels.size(); ++i)
+      for (size_t j = 0; j < c.levels[i].data->s.headers.size(); ++j, ++k)
+        if (i < basic_at && e.headers[k].row.enabled && lower_ascii(e.headers[k].row.name) == "authorization")
+          e.headers[k].overridden = true;
   }
   // Scripts: pre outermost first, post nearest first.
   for (const auto& l : c.levels)
@@ -3561,6 +3578,7 @@ namespace {
 
 // <user_config_dir()>/allowed_network.json: {"version": 1, "workspaces": {"<resolved root>": [keys]}}.
 constexpr const char* kAllowedNetworkFile = "allowed_network.json";
+constexpr const char* kKeepAuthKey = "keep-auth";
 
 std::string level_name(const SettingsOrigin& o) {
   switch (o.level) {
@@ -3671,7 +3689,10 @@ std::vector<Workspace::NetworkItem> Workspace::blocked_network_settings(const Sa
   const FolderChain c = folder_chain(r);
   const SavedRequest x = expanded_with(r, c);
   const NetworkSettings& n = x.network;
-  if (n.ca_file.empty() && n.cert_file.empty() && n.proxy != NetworkSettings::Proxy::Url) return out;
+  HttpRequest opts = x.http;
+  apply_network_options(n, opts);  // as http_to_send(): a level that sets it decides, else the request's own
+  const bool keep_auth = opts.keep_auth_on_redirect;
+  if (n.ca_file.empty() && n.cert_file.empty() && n.proxy != NetworkSettings::Proxy::Url && !keep_auth) return out;
   const EffectiveSettings e = effective_settings(r);
   const auto allowed = read_root_list(kAllowedNetworkFile, root_);
   auto listed = [&](const std::string& k) { return std::find(allowed.begin(), allowed.end(), k) != allowed.end(); };
@@ -3691,6 +3712,14 @@ std::vector<Workspace::NetworkItem> Workspace::blocked_network_settings(const Sa
       it.text = "the proxy " + origin + (creds ? " (the URL carries proxy credentials)" : "");
       out.push_back(std::move(it));
     }
+  }
+  if (keep_auth && !listed(kKeepAuthKey)) {
+    NetworkItem it;
+    it.kind = NetworkItem::Kind::KeepAuth;
+    it.key = kKeepAuthKey;
+    it.level = level_name(e.keep_auth_from);
+    it.text = "sending Authorization and credentials on to other hosts when a server redirects";
+    out.push_back(std::move(it));
   }
   if (!n.ca_file.empty()) {
     NetworkItem it;
@@ -3934,6 +3963,14 @@ std::optional<HttpRequest> Workspace::http_to_send(const SavedRequest& r, std::s
     x.http.proxy_url.clear();
     // Redirect / URL / TLS options: a level that sets one decides, else the request's own field.
     apply_network_options(n, x.http);
+    // Authorization / credentials replayed to another host on a redirect: a workspace file may ask
+    // for it, but only the user decides (an open redirect would hand the token to anyone).
+    if (x.http.keep_auth_on_redirect && !listed(kKeepAuthKey)) {
+      if (err)
+        *err = "the workspace wants Authorization and credentials sent on to other hosts when a server redirects "
+               "(keep_auth_on_redirect)" + std::string(how);
+      return std::nullopt;
+    }
     if (has_ctl_break(n.proxy_url) || has_ctl_break(x.http.no_proxy)) {
       if (err) *err = "the proxy setting contains a line break: request not sent.";
       return std::nullopt;

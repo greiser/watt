@@ -1,5 +1,6 @@
 #include "app/response_sse.h"
 
+#include <algorithm>
 #include <cctype>
 
 namespace watt::app::rv {
@@ -33,7 +34,12 @@ void SseParser::feed(const char* p, size_t n, double at_ms, std::vector<SseEvent
     // Copy the run of bytes up to the next line end in one go.
     size_t e = i;
     while (e < n && p[e] != '\n' && p[e] != '\r') ++e;
-    line_.append(p + i, e - i);
+    if (const size_t room = kMaxField - std::min(kMaxField, line_.size()); e - i > room) {
+      line_.append(p + i, room);
+      cur_.truncated = true;
+    } else {
+      line_.append(p + i, e - i);
+    }
     if (e == n) break;
     cr_ = p[e] == '\r';
     cur_bytes_ += line_.size() + 1;
@@ -67,8 +73,12 @@ void SseParser::line(std::string_view l, double at_ms, std::vector<SseEvent>& ou
     if (!value.empty() && value[0] == ' ') value.remove_prefix(1);
   }
   if (name == "data") {
-    cur_.data.append(value);
-    cur_.data += '\n';
+    if (cur_.data.size() + value.size() + 1 > kMaxField) {
+      cur_.truncated = true;
+    } else {
+      cur_.data.append(value);
+      cur_.data += '\n';
+    }
     has_data_ = true;
   } else if (name == "event") {
     cur_.type.assign(value);
@@ -195,7 +205,12 @@ void SseTap::parse(const char* p, size_t n) {
     if (pending_.empty()) pending_.swap(scratch_);
     else
       for (SseEvent& e : scratch_) pending_.push_back(std::move(e));
-    raw_.append(p, n);
+    if (pending_.size() > kMaxPendingEvents) {
+      const size_t drop = pending_.size() - kMaxPendingEvents;
+      pending_.erase(pending_.begin(), pending_.begin() + static_cast<std::ptrdiff_t>(drop));
+      dropped_.fetch_add(drop, std::memory_order_relaxed);
+    }
+    if (raw_.size() < kMaxPendingRaw) raw_.append(p, std::min(n, kMaxPendingRaw - raw_.size()));
     comments_ = parser_.comments();
     if (!posted_) post = posted_ = true;
   }

@@ -132,6 +132,45 @@ TEST_CASE("network trust: a planted workspace proxy is blocked until the user al
   }
 }
 
+TEST_CASE("network trust: keep_auth_on_redirect from a workspace file needs the user's consent", "[network][consent]") {
+  TestConfigDir cfg;
+  TempWs t;
+  FolderSettings coll;
+  coll.network.keep_auth = true;  // would replay Authorization to any host a redirect names
+  REQUIRE(t.ws.save_collection_settings(coll));
+  const SavedRequest r = request(t);
+
+  auto items = t.ws.blocked_network_settings(r);
+  REQUIRE(items.size() == 1);
+  CHECK(items[0].kind == Item::Kind::KeepAuth);
+  CHECK(items[0].level == "collection");
+  std::string err;
+  CHECK_FALSE(t.ws.http_to_send(r, &err));
+  CHECK_THAT(err, ContainsSubstring("keep_auth_on_redirect"));
+
+  // A planted approval inside the workspace is ignored.
+  write(t.root / ".watt" / "allowed_network.json",
+        R"({"version":1,"workspaces":{")" + t.root.generic_string() + R"(":["keep-auth"]}})");
+  CHECK_FALSE(t.ws.http_to_send(r, &err));
+
+  REQUIRE(t.ws.allow_network_item(items[0]));
+  CHECK(t.ws.blocked_network_settings(r).empty());
+  auto h = t.ws.http_to_send(r, &err);
+  REQUIRE(h);
+  CHECK(h->keep_auth_on_redirect);
+
+  // The request file's own field is gated the same way.
+  REQUIRE(t.ws.disallow_network_item(items[0]));
+  REQUIRE(t.ws.save_collection_settings(FolderSettings{}));
+  SavedRequest own = request(t);
+  own.http.keep_auth_on_redirect = true;
+  CHECK(t.ws.blocked_network_settings(own).size() == 1);
+  CHECK_FALSE(t.ws.http_to_send(own, &err));
+  // Off (the default) needs nothing.
+  CHECK(t.ws.blocked_network_settings(request(t)).empty());
+  CHECK(t.ws.http_to_send(request(t), &err));
+}
+
 TEST_CASE("network trust: CA approval is bound to the file's content", "[network][consent]") {
   TestConfigDir cfg;
   TempWs t;

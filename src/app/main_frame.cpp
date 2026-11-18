@@ -668,6 +668,32 @@ bool MainFrame::when_workspace(std::function<void()> fn) {
 namespace {
 std::filesystem::path session_file(const Workspace& ws) { return ws.root() / ".watt" / "session.json"; }
 std::filesystem::path session_dir(const Workspace& ws) { return ws.root() / ".watt" / "session"; }
+
+// A tab's file as session.json stores it: relative to the root (the workspace can move or be
+// cloned elsewhere), generic separators.
+std::string session_path(const Workspace& ws, const std::filesystem::path& f) {
+  if (f.empty()) return {};
+  const std::filesystem::path rel = f.lexically_normal().lexically_relative(ws.root().lexically_normal());
+  if (rel.empty() || *rel.begin() == "..") return detail::to_utf8(f);  // not below the root: load_request refuses it
+  return detail::to_utf8(rel.generic_wstring());
+}
+
+// And back: a relative path without ".." below the root, or (older sessions) an absolute path
+// below it. Anything else is ignored.
+std::filesystem::path session_file_path(const Workspace& ws, const std::string& s) {
+  namespace fs = std::filesystem;
+  if (s.empty()) return {};
+  const fs::path p = detail::from_utf8(s);
+  const fs::path root = ws.root().lexically_normal();
+  if (p.is_absolute()) {
+    const fs::path rel = p.lexically_normal().lexically_relative(root);
+    return rel.empty() || *rel.begin() == ".." ? fs::path() : p.lexically_normal();
+  }
+  if (p.has_root_name() || p.has_root_directory()) return {};
+  for (const auto& part : p)
+    if (part == "..") return {};
+  return (root / p).lexically_normal();
+}
 }  // namespace
 
 // What save_session writes, taken on the UI thread (cheap: only tabs with unsaved changes copy
@@ -736,7 +762,7 @@ bool write_session(const MainFrame::SessionSnapshot& s) {
       continue;
     }
     w.Key("file");
-    w.String(detail::to_utf8(t.file).c_str());
+    w.String(session_path(ws, t.file).c_str());
     if (t.draft) {
       SavedRequest d = *t.draft;
       const std::string draft = "tab" + std::to_string(n) + ".req.json";
@@ -905,7 +931,7 @@ std::shared_ptr<MainFrame::Session> read_session(const Workspace& ws) {
       if (ok && (p.empty() || fs::exists(p, ec))) out->runners.push_back(p);
       continue;
     }
-    const fs::path file = detail::from_utf8(str("file"));
+    const fs::path file = session_file_path(ws, str("file"));
     const std::string draft = str("draft");
     SessionTab t;
     std::optional<SavedRequest> r;

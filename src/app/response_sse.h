@@ -23,10 +23,14 @@ struct SseEvent {
   std::string data;      // "data:" lines joined with '\n'
   long retry = -1;       // "retry:" reconnection time in ms (-1 = none)
   size_t bytes = 0;      // bytes of the event block in the stream (its lines and the blank line)
+  bool truncated = false;  // a line or the data went past SseParser::kMaxField: the rest was dropped
 };
 
 class SseParser {
  public:
+  // A line, or an event's joined data, never grows past this (a stream that never sends a line
+  // end or a blank line must not take all memory): the excess is dropped and the event marked.
+  static constexpr size_t kMaxField = 16u << 20;
   // Parses the next bytes of the stream; dispatched events are appended to out with at_ms.
   void feed(const char* p, size_t n, double at_ms, std::vector<SseEvent>& out);
   uint64_t comments() const { return comments_; }
@@ -94,6 +98,11 @@ class SseTap : public HttpBodyTap {
   // a request cancelled while it downloads: what arrived is shown, not thrown away.
   std::string partial() const;
   static constexpr size_t kPartialMax = 2u << 20;
+  // Between two drains (the UI drains once per frame; these only matter if it stalls): the
+  // newest events are kept (older ones counted in dropped()), the raw bytes are cut off.
+  static constexpr size_t kMaxPendingEvents = 100000;
+  static constexpr size_t kMaxPendingRaw = 64u << 20;
+  uint64_t dropped() const { return dropped_.load(std::memory_order_relaxed); }
 
  private:
   void parse(const char* p, size_t n);
@@ -107,6 +116,7 @@ class SseTap : public HttpBodyTap {
   std::atomic<uint64_t> bytes_{0};
   std::atomic<int64_t> first_us_{-1};
   std::atomic<bool> partial_full_{false};
+  std::atomic<uint64_t> dropped_{0};
   // Worker only.
   std::string sniff_;
   SseParser parser_;

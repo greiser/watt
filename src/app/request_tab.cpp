@@ -155,6 +155,13 @@ bool confirm_network_item(const Workspace::NetworkItem& it, wxWindow* parent) {
                            "this workspace?",
                            where, wxString::FromUTF8(it.proxy_origin),
                            it.proxy_credentials ? "\n    (the proxy URL carries credentials)" : "");
+  } else if (it.kind == K::KeepAuth) {
+    msg = wxString::Format("The workspace settings (%s) send the Authorization header, Basic / Digest credentials "
+                           "and cookies on to ANY host a server redirects to (keep_auth_on_redirect).\n\n"
+                           "A redirect from a server you trust to one you do not would hand it your token or "
+                           "password. Only allow this if every server this workspace talks to is yours. Allow it "
+                           "for this workspace?",
+                           where);
   } else if (it.kind == K::Ca) {
     wxString who;
     for (const auto& s : it.subjects) who += "    " + wxString::FromUTF8(s) + "\n";

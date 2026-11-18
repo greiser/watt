@@ -575,13 +575,15 @@ class Workspace {
   //   Ca          key "ca sha256:<hex> <resolved path>": bound to the file's content, so changing
   //               the file revokes the approval
   //   ClientCert  key "cert <resolved cert path>[ key <resolved key path>]"
+  //   KeepAuth    key "keep-auth": "keep_auth_on_redirect" (CURLOPT_UNRESTRICTED_AUTH), which
+  //               replays Authorization / credentials to whatever host a redirect names
   // CA / certificate / key files are read under the upload policy (inside the workspace or
   // allow_file()d; UNC / device paths judged from their text, never touched before approval).
   // An item whose file is not readable yet has file_blocked set and no fingerprint: approving it
   // only allows the file (allow_file), and the next blocked_network_settings() call reads it and
   // asks about its content. http_to_send() refuses to send while any item is blocked, naming it.
   struct NetworkItem {
-    enum class Kind { Proxy, Ca, ClientCert };
+    enum class Kind { Proxy, Ca, ClientCert, KeepAuth };
     Kind kind = Kind::Proxy;
     std::string key;    // allowlist entry (above)
     std::string text;   // what is trusted, for the prompt: "the proxy http://10.0.0.5:8080 (with credentials)"
