@@ -113,6 +113,19 @@ struct GrpcResponse {
   // ("ipv4:127.0.0.1:50051", "ipv4:a:443,b:443" for several addresses, "dns:///host:443" when
   // gRPC resolves itself). Empty when no channel was leased (gRPC-Web, local failures).
   std::string peer;
+  // A user-paced stream (the app's Manual mode: each message goes out when the user clicks).
+  // Offsets from the call start, as GrpcMessageEvent::at_ms; -1 = did not happen. timing.total_ms
+  // (stream open -> trailers) is then mostly the user's pace, so res.responseTime evaluates
+  // tail_ms: the client's last action (End, else its last message, else the call start) -> the
+  // trailers. The engine never sets this; the caller that paced the stream does.
+  struct Pacing {
+    bool on = false;
+    int sent = 0;                // messages the client sent
+    double first_send_ms = -1;
+    double last_send_ms = -1;
+    double end_ms = -1;          // half-close (End)
+    double tail_ms = -1;
+  } pacing;
 };
 
 // Message format for requests and responses. Text is protobuf text format (grpcurl -format text):

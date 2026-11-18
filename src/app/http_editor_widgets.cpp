@@ -611,8 +611,23 @@ PickPopup::PickPopup(wxWindow* owner, std::vector<PickItem> items, const wxStrin
   Bind(wxEVT_PAINT, [this](wxPaintEvent&) { paint(); });
   Bind(wxEVT_MOTION, [this](wxMouseEvent& e) {
     const int r = row_at(e.GetPosition().y);
-    if (r >= 0 && rows_[static_cast<size_t>(r)].item >= 0 && r != sel_) {
+    const bool item = r >= 0 && rows_[static_cast<size_t>(r)].item >= 0;
+    if (no_preselect) {  // hover only: a key choice stays the user's own
+      const int h = item ? r : -1;
+      if (h != hover_) {
+        hover_ = h;
+        Refresh();
+      }
+      return;
+    }
+    if (item && r != sel_) {
       sel_ = r;
+      Refresh();
+    }
+  });
+  Bind(wxEVT_LEAVE_WINDOW, [this](wxMouseEvent&) {
+    if (hover_ >= 0) {
+      hover_ = -1;
       Refresh();
     }
   });
@@ -670,9 +685,10 @@ void PickPopup::rebuild() {
       }
   }
   sel_ = -1;
+  hover_ = -1;
   for (size_t r = 0; r < rows_.size(); ++r) {
     if (rows_[r].item < 0) continue;
-    if (sel_ < 0) sel_ = static_cast<int>(r);  // the best match
+    if (sel_ < 0 && !no_preselect) sel_ = static_cast<int>(r);  // the best match
     if (f.empty() && items_[static_cast<size_t>(rows_[r].item)].value == current_) {
       sel_ = static_cast<int>(r);
       break;
@@ -779,7 +795,10 @@ bool PickPopup::key(int code) {
     case WXK_PAGEDOWN: case WXK_NUMPAD_PAGEDOWN: move(visible_rows()); return true;
     case WXK_HOME: case WXK_NUMPAD_HOME: move(-1000); return true;
     case WXK_END: case WXK_NUMPAD_END: move(1000); return true;
-    case WXK_RETURN: case WXK_NUMPAD_ENTER: case WXK_TAB: pick_selected(); return true;
+    case WXK_RETURN: case WXK_NUMPAD_ENTER: case WXK_TAB:
+      picked_with = code == WXK_NUMPAD_ENTER ? WXK_RETURN : code;
+      pick_selected();
+      return true;
     case WXK_ESCAPE: close(); return true;
     case WXK_BACK:
       if (!filter_.empty()) set_filter(filter_.Left(filter_.length() - 1));
@@ -877,6 +896,10 @@ void PickPopup::paint() {
     if (sel) {
       dc.SetPen(*wxTRANSPARENT_PEN);
       dc.SetBrush(wxBrush(t.accent));
+      dc.DrawRoundedRectangle(FromDIP(4), y + FromDIP(1), sz.x - FromDIP(8), rh - FromDIP(2), FromDIP(3));
+    } else if (r == hover_) {
+      dc.SetPen(*wxTRANSPARENT_PEN);
+      dc.SetBrush(wxBrush(t.dark ? wxColour(0x37, 0x37, 0x3A) : wxColour(0xE8, 0xEC, 0xF2)));
       dc.DrawRoundedRectangle(FromDIP(4), y + FromDIP(1), sz.x - FromDIP(8), rh - FromDIP(2), FromDIP(3));
     }
     const int ind = filter_.empty() && !row.group.empty() ? FromDIP(8) : 0;

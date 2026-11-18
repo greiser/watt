@@ -303,6 +303,7 @@ int run_cli(const std::vector<std::string>& args, const GrpcFactory& grpc, std::
     if (r->sent) {
       const std::string st = r->kind == RequestKind::Http ? std::to_string(r->status) : r->status_text;
       line += pad_right(st, std::max(status_w, st.size() + 1)) + ms(r->timing.total_ms);
+      if (r->script_ms > 0) line += "  (+" + ms(r->script_ms) + " scripts)";
     }
     else
       line += r->error;
@@ -355,7 +356,14 @@ int run_cli(const std::vector<std::string>& args, const GrpcFactory& grpc, std::
     } else {
       avg += "; every connection reused";
     }
+    // watt's setup before the first I/O (Newman's "prepare"): not in the response times.
+    if (full.avg_prep_ms > 0) avg += "; setup " + ms(full.avg_prep_ms) + " (not in the times)";
     avg += '\n';
+    // Scripts and token requests run outside the response time (as in Newman): their own line.
+    if (full.scripted)
+      avg += "scripts (not in response time): " + std::to_string(full.scripted) + " request" +
+             (full.scripted == 1 ? "" : "s") + ", avg " + ms(full.avg_script_ms) + ", max " + ms(full.max_script_ms) +
+             ", total " + ms(full.script_sum_ms) + "\n";
   }
   // Newman's failure table: every failed step once more (not with --quiet: the causes say it),
   // in iteration order (parallel workers finish out of order).
@@ -401,6 +409,12 @@ int run_cli(const std::vector<std::string>& args, const GrpcFactory& grpc, std::
           its = "  (" + its + "; " + std::to_string(g.iterations) + " of " + std::to_string(meta.iterations) + " iterations)";
         }
         *out += pad_right("  " + std::to_string(g.count) + "x", 9) + pad_cols(where, 28) + " " + g.message + its + "\n";
+        if (g.unresolved) {
+          std::string names;
+          for (const auto& u : g.unresolved_names) names += (names.empty() ? "{{" : ", {{") + u + "}}";
+          *out += std::string(9 + 28 + 1, ' ') + "! " + names + " unresolved in " + std::to_string(g.unresolved) + " of " +
+                  std::to_string(g.count) + "\n";
+        }
       }
     }
   }

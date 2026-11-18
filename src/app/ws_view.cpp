@@ -10,10 +10,14 @@
 #include <wx/textctrl.h>
 #include <wx/vlbox.h>
 
+#include <rapidjson/document.h>
+#include <rapidjson/error/en.h>
+
 #include <algorithm>
 #include <cctype>
 #include <set>
 
+#include "app/autocomp_guard.h"
 #include "app/http_editor_kv.h"
 #include "app/http_editor_util.h"
 #include "app/http_editor_widgets.h"
@@ -100,11 +104,12 @@ void json_colours(wxStyledTextCtrl* s) {
 
 std::string ms_text(double v) { return fmt::ms(v); }
 
-// "+1.23 ms", "+2.41 s", "+3m 05s": the offset column of the message log.
+// "+1.234 ms", "+2.4105 s", "+3m 05s": the offset column of the message log (since Connect was
+// clicked). 0.1 ms under a minute, so an echo's send and receive rows show its round trip.
 std::string offset_text(double ms) {
   char b[48];
-  if (ms < 1000) std::snprintf(b, sizeof b, "+%.2f ms", ms);
-  else if (ms < 60000) std::snprintf(b, sizeof b, "+%.3f s", ms / 1000);
+  if (ms < 1000) std::snprintf(b, sizeof b, "+%.3f ms", ms);
+  else if (ms < 60000) std::snprintf(b, sizeof b, "+%.4f s", ms / 1000);
   else std::snprintf(b, sizeof b, "+%dm %02ds", static_cast<int>(ms / 60000), static_cast<int>(ms / 1000) % 60);
   return b;
 }
@@ -303,7 +308,42 @@ class WsEditor : public wxPanel, public WsEditorPanel {
     send_->Enable(s == State::Open);
     send_->SetToolTip(s == State::Open ? "Send this message (Ctrl+Enter)" : "Connect first (Ctrl+Enter connects)");
     hint_->SetLabel(s == State::Open ? "Ctrl+Enter sends" : "Ctrl+Enter connects");
+    hint_->SetForegroundColour(http_editor::Theme::get().dim);
+    hint_->UnsetToolTip();
+    warned_text_.clear();
+    hint_->GetParent()->Layout();
     Layout();
+  }
+
+  // JSON mode: a message that is not valid JSON ({{variables}} count as values) is held once with
+  // the parse error in the composer's hint; sending it again unchanged sends it as written.
+  bool confirm_message() override {
+    if (mode_->selection() != 0) return true;
+    const std::string text = body_->GetText().utf8_string();
+    std::string probe;
+    probe.reserve(text.size());
+    for (size_t i = 0; i < text.size();) {
+      if (text.compare(i, 2, "{{") == 0)
+        if (const size_t e = text.find("}}", i + 2); e != std::string::npos) {
+          probe += '0';
+          i = e + 2;
+          continue;
+        }
+      probe += text[i++];
+    }
+    rapidjson::Document d;
+    d.Parse(probe.data(), probe.size());
+    if (!d.HasParseError() || text == warned_text_) {
+      if (!warned_text_.empty()) set_state(state_);  // the hint back to normal
+      return true;
+    }
+    warned_text_ = text;
+    hint_->SetLabel(wxString::FromUTF8("Not valid JSON at " + std::to_string(d.GetErrorOffset()) + ": Send again sends it as is"));
+    hint_->SetToolTip(wxString::FromUTF8(std::string(rapidjson::GetParseError_En(d.GetParseError())) + " (offset " +
+                                         std::to_string(d.GetErrorOffset()) + ")"));
+    hint_->SetForegroundColour(http_editor::Theme::get().var_bad);
+    hint_->GetParent()->Layout();  // the message page's bar: room for the longer hint
+    return false;
   }
 
   void focus_url() override {
@@ -406,6 +446,8 @@ class WsEditor : public wxPanel, public WsEditorPanel {
     s->Bind(wxEVT_STC_DWELLSTART, [this](wxStyledTextEvent& e) { var_tip(e.GetPosition()); });
     s->Bind(wxEVT_STC_DWELLEND, [this](wxStyledTextEvent&) { url_->CallTipCancel(); });
   }
+
+  std::string warned_text_;  // the message held by confirm_message()
 
   void build_message_page() {
     const auto& t = http_editor::Theme::get();
@@ -653,6 +695,7 @@ class WsEditor : public wxPanel, public WsEditorPanel {
     for (const auto& n : names) list += wxString::FromUTF8(n) + "\n";
     list.RemoveLast();
     url_->AutoCompShow(typed, list);
+    guard_autocomp(url_);
   }
 
   void var_tip(int pos) {
@@ -936,7 +979,7 @@ class LogList : public wxVListBox {
     // Offset and size columns.
     dc.SetTextForeground(t.dim);
     const wxString off = wxString::FromUTF8(offset_text(r->at_ms));
-    const int off_w = dc.GetTextExtent("+00.000 s").x + FromDIP(8);
+    const int off_w = dc.GetTextExtent("+000.000 ms").x + FromDIP(8);
     dc.DrawText(off, x, cy);
     x += off_w;
     const bool msg = r->kind == LogRow::In || r->kind == LogRow::Out;
@@ -955,7 +998,7 @@ class LogList : public wxVListBox {
     } else {
       dc.SetTextForeground(r->kind == LogRow::Bad ? t.err : r->kind == LogRow::Good ? t.fg : t.dim);
     }
-    const wxString pv = wxControl::Ellipsize(wxString::FromUTF8(r->preview), dc, wxELLIPSIZE_END, avail);
+    const wxString pv = wxControl::Ellipsize(wxString::FromUTF8(r->preview), dc, wxELLIPSIZE_END, avail, wxELLIPSIZE_FLAGS_EXPAND_TABS);
     const int py = rect.y + (rect.height - dc.GetCharHeight()) / 2;
     dc.DrawText(pv, x, py);
   }
@@ -1066,6 +1109,7 @@ class WsView : public wxPanel, public WsResponsePanel {
 
   void show_sending(RequestKind) override {
     connect_t0_ = Clock::now();
+    open_off_ms_ = 0;
     status_->set_busy("Connecting\xE2\x80\xA6", connect_t0_);
     wf_->set_waiting(connect_t0_);
     add_info(LogRow::Info, "Connecting\xE2\x80\xA6");
@@ -1154,7 +1198,8 @@ class WsView : public wxPanel, public WsResponsePanel {
       last_badge_ = "101 Switching Protocols";
       segs.insert(segs.begin(), rv::StatusSeg{"\xE2\x97\x8F Connected", "The connection is open", rv::Tone::Ok, true});
       status_->set(last_badge_, rv::Tone::Ok, segs);
-      if (!restored_) add_info(LogRow::Good, "Connected to " + hs->url + "  (101 Switching Protocols, " + ms_text(total) + ")");
+      open_off_ms_ = total;  // message offsets count from the Connect click, like this row's
+      if (!restored_) add_info(LogRow::Good, "Connected to " + hs->url + "  (101 Switching Protocols, " + ms_text(total) + ")", total);
     } else {
       open_ = false;
       last_badge_ = hs->status ? std::to_string(hs->status) + (hs->status_text.empty() ? "" : " " + hs->status_text) : "Failed";
@@ -1176,7 +1221,7 @@ class WsView : public wxPanel, public WsResponsePanel {
       LogRow r;
       r.kind = m.out ? LogRow::Out : LogRow::In;
       r.binary = m.binary;
-      r.at_ms = m.at_ms;
+      r.at_ms = open_off_ms_ + m.at_ms;
       r.size = m.data.size();
       r.preview = preview_of(m.data, m.binary);
       (m.out ? out_ : in_)++;
@@ -1195,7 +1240,7 @@ class WsView : public wxPanel, public WsResponsePanel {
     if (!c.reason.empty()) what += ": " + c.reason;
     what += c.by_client ? "  (closed by watt)" : c.code == 1006 ? "" : "  (closed by the server)";
     if (!c.error.empty() && c.error != "cancelled") what += "  \xC2\xB7 " + c.error;
-    add_info(c.code == 1000 || c.code == 1001 || c.code == 1005 ? LogRow::Info : LogRow::Bad, what, c.at_ms);
+    add_info(c.code == 1000 || c.code == 1001 || c.code == 1005 ? LogRow::Info : LogRow::Bad, what, open_off_ms_ + c.at_ms);
     std::vector<rv::StatusSeg> segs = last_segs_;
     std::string tag = "Closed " + std::to_string(c.code) + (*name ? std::string(" ") + name : std::string());
     if (!c.reason.empty()) tag += " \xC2\xB7 " + c.reason;
@@ -1229,8 +1274,9 @@ class WsView : public wxPanel, public WsResponsePanel {
       p.has_value = has;
       m.phases.push_back(std::move(p));
     };
-    add("Queue", queue_ms, "Click -> the tab's worker built the upgrade request (http_to_send: inherited headers, auth, {{vars}}, OAuth token).", setup);
+    // Prepare before Queue, as in the HTTP waterfall.
     add("Prepare", hs.prepare_ms, "watt's connection setup: URL parse, libcurl options.", setup);
+    add("Queue", queue_ms, "Click -> the tab's worker built the upgrade request (http_to_send: inherited headers, auth, {{vars}}, OAuth token).", setup);
     add("DNS", hs.dns_ms, "Name resolution.", dns);
     add("Connect", hs.connect_ms, "TCP handshake (through the proxy tunnel when there is one).", con);
     add("TLS", hs.tls_ms, "TLS handshake (wss://). n/a for ws://.", tls, hs.tls);
@@ -1271,7 +1317,8 @@ class WsView : public wxPanel, public WsResponsePanel {
   void add_info(LogRow::Kind k, const std::string& text, double at = -1) {
     LogRow r;
     r.kind = k;
-    r.at_ms = at >= 0 ? at : (open_ ? 0 : 0);
+    // Without a time of its own: now, since the Connect click (0 before any connect).
+    r.at_ms = at >= 0 ? at : connect_t0_ == Clock::time_point{} ? 0 : ms_between(connect_t0_, Clock::now());
     r.preview = text;
     r.data = std::make_shared<const std::string>(text);
     const size_t from = list_->rows.size();
@@ -1389,6 +1436,7 @@ class WsView : public wxPanel, public WsResponsePanel {
   bool restored_ = false;
   std::shared_ptr<const WsHandshake> hs_;
   Clock::time_point connect_t0_{};
+  double open_off_ms_ = 0;  // Connect click -> open: added to the engine's since-open offsets
   size_t in_ = 0, out_ = 0;
   uint64_t bytes_in_ = 0, bytes_out_ = 0;
   std::string last_badge_;

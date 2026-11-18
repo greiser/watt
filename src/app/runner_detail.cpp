@@ -4,6 +4,7 @@
 #include <wx/dcbuffer.h>
 #include <wx/scrolwin.h>
 #include <wx/sizer.h>
+#include <wx/stattext.h>
 #include <wx/stc/stc.h>
 
 #include <algorithm>
@@ -145,7 +146,7 @@ class HeadView : public wxWindow {
     if (!s_) {
       dc.SetFont(base);
       dc.SetTextForeground(th.dim);
-      dc.DrawText(wxControl::Ellipsize(U(hint_), dc, wxELLIPSIZE_END, std::max(cs.x - 2 * pad, 40)), pad, y + FromDIP(2));
+      dc.DrawText(wxControl::Ellipsize(U(hint_), dc, wxELLIPSIZE_END, std::max(cs.x - 2 * pad, 40), wxELLIPSIZE_FLAGS_EXPAND_TABS), pad, y + FromDIP(2));
       return;
     }
     const StepResult& r = *s_;
@@ -158,7 +159,7 @@ class HeadView : public wxWindow {
     };
     auto ell = [&](const std::string& s, int width, const wxFont& f) {
       dc.SetFont(f);
-      return wxControl::Ellipsize(U(s), dc, wxELLIPSIZE_END, std::max(width, FromDIP(40)));
+      return wxControl::Ellipsize(U(s), dc, wxELLIPSIZE_END, std::max(width, FromDIP(40)), wxELLIPSIZE_FLAGS_EXPAND_TABS);
     };
     const wxSize a = text(wxString::Format("#%zu  ", r.seq + 1), pad, bold, th.dim);
     const std::string m = r.kind == RequestKind::Http ? r.method : "gRPC";
@@ -389,7 +390,7 @@ class Canvas : public wxScrolledCanvas {
     };
     auto ell = [&](const std::string& s, int width, const wxFont& f) {
       dc.SetFont(f);
-      return wxControl::Ellipsize(U(s), dc, wxELLIPSIZE_END, std::max(width, FromDIP(40)));
+      return wxControl::Ellipsize(U(s), dc, wxELLIPSIZE_END, std::max(width, FromDIP(40)), wxELLIPSIZE_FLAGS_EXPAND_TABS);
     };
     auto empty = [&](const std::string& s) {
       text(U(s), pad, base, th.dim);
@@ -397,7 +398,14 @@ class Canvas : public wxScrolledCanvas {
     };
     if (tab_ == kTiming) {
       if (!r.sent) return empty(r.skipped ? "Not run." : "Not sent: no timing.");
-      const std::string head = "Total " + fmt_ms(r.timing.total_ms) + "   \xC2\xB7   " + fmt_bytes(r.size) + " body, " +
+      // The response time (the Time column, the percentiles, Newman's figure), then the
+      // scripts' time apart from it.
+      const std::string scripts =
+          r.script_ms > 0 ? "   \xC2\xB7   scripts " + fmt_ms(r.script_ms) + " (" + fmt_ms(r.total_incl_scripts_ms()) + " incl. scripts)"
+                          : std::string();
+      // The setup before the first I/O (Prepare, Queue) is watt's, not the server's: apart.
+      const std::string setup = r.prep_ms > 0 ? "   \xC2\xB7   setup " + fmt_ms(r.prep_ms) + " (not in it)" : std::string();
+      const std::string head = "Response time " + fmt_ms(r.timing.total_ms) + setup + scripts +"   \xC2\xB7   " + fmt_bytes(r.size) + " body, " +
                                fmt_bytes(r.bytes_received) + " received   \xC2\xB7   " +
                                (r.timing.connection_reused ? "reused connection" : "new connection") +
                                "   \xC2\xB7   started " + fmt_ms(r.started_ms) + " into the run";
@@ -405,7 +413,7 @@ class Canvas : public wxScrolledCanvas {
       y += FromDIP(24);
       const int label_w = FromDIP(110), val_w = FromDIP(80);
       const int bar_x = pad + label_w, bar_w = std::max(FromDIP(60), right - val_w - bar_x - FromDIP(10));
-      const double total = std::max(r.timing.total_ms, 1e-6);
+      const double total = std::max(r.total_incl_scripts_ms() + r.prep_ms, 1e-6);
       double at = 0;
       const wxColour cols[] = {th.dim, th.info, th.redirect, th.warn, th.accent, th.ok};
       int ci = 0;
@@ -414,13 +422,15 @@ class Canvas : public wxScrolledCanvas {
           at += std::max(p.ms, 0.0);
           continue;
         }
-        text(p.name, pad, small, th.fg);
+        // Script and setup phases are dim: they are not part of the response time.
+        const bool script = runner::is_script_phase(p) || runner::is_setup_phase(p);
+        text(p.name, pad, small, script ? th.dim : th.fg);
         dc.SetPen(*wxTRANSPARENT_PEN);
         dc.SetBrush(wxBrush(th.grid));
         dc.DrawRectangle(bar_x, y + FromDIP(4), bar_w, FromDIP(10));
         const int x0 = bar_x + static_cast<int>(at / total * bar_w);
         const int w = std::max(FromDIP(2), static_cast<int>(p.ms / total * bar_w));
-        dc.SetBrush(wxBrush(cols[ci++ % 6]));
+        dc.SetBrush(wxBrush(script ? mix(th.bg, th.dim, 0.75) : cols[ci++ % 6]));
         dc.DrawRectangle(std::min(x0, bar_x + bar_w - w), y + FromDIP(4), w, FromDIP(10));
         const wxString v = U(fmt_ms(p.ms));
         dc.SetFont(small);
@@ -585,6 +595,52 @@ class DetailPane::Impl {
     return text;
   }
 
+  // A run restored from History has no bodies: said in the UI font, with Run again next to it
+  // (the body view's message is monospace text, for responses).
+  wxPanel* history_note() {
+    if (!note) {
+      const auto& th = rv::Theme::get();
+      note = new wxPanel(body_host);
+      note->SetBackgroundColour(th.bg);
+      auto* v = new wxBoxSizer(wxVERTICAL);
+      auto* t = new wxStaticText(note, wxID_ANY, "");
+      t->SetForegroundColour(th.fg);
+      t->SetFont(t->GetFont().Bold());
+      t->SetLabel("Response bodies are not kept between sessions");
+      v->Add(t, 0, wxLEFT | wxRIGHT | wxTOP, note->FromDIP(16));
+      note_text = new wxStaticText(note, wxID_ANY,
+                                   "History keeps this run's results, times and checks. Run again to see the responses, or "
+                                   "Open request to send this one from an editor.");
+      note_text->SetForegroundColour(th.dim);
+      v->AddSpacer(note->FromDIP(6));
+      v->Add(note_text, 0, wxEXPAND | wxLEFT | wxRIGHT, note->FromDIP(16));
+      auto* again = new rv::ChipBar(note, [this](int) {
+        if (pane->on_run_again) pane->on_run_again();
+      });
+      again->add(1, "Run again", "Run the requests again (Ctrl+Enter)", -1, false);
+      again->set_on(1, true);
+      again->SetMinSize(note->FromDIP(wxSize(120, 32)));
+      v->AddSpacer(note->FromDIP(8));
+      v->Add(again, 0, 0);  // the chip's own padding lines its text up with the lines above
+      note->SetSizer(v);
+      note->Bind(wxEVT_SIZE, [this](wxSizeEvent& e) {
+        e.Skip();
+        const int w = note->GetClientSize().x - note->FromDIP(32);
+        if (w > note->FromDIP(80) && w != note_wrap) {
+          note_wrap = w;
+          note_text->SetLabel("History keeps this run's results, times and checks. Run again to see the responses, or "
+                              "Open request to send this one from an editor.");
+          note_text->Wrap(w);
+          note->Layout();
+        }
+      });
+      body_sizer->Add(note, 1, wxEXPAND);
+      note->Hide();
+      hook();
+    }
+    return note;
+  }
+
   rv::BodyView* body_view() {
     if (!body) {
       body = new rv::BodyView(body_host);
@@ -627,6 +683,7 @@ class DetailPane::Impl {
       if (text) text->Hide();
       canvas->Hide();
       if (body) body->Hide();
+      if (note) note->Hide();
       tabs->Hide();
       chips->Hide();
       pane->Layout();
@@ -673,8 +730,17 @@ class DetailPane::Impl {
     if (text) text->Hide();
     canvas->Hide();
     if (body) body->Hide();
+    if (note) note->Hide();
     if (i == kResponse) {
       rv::BodyView* b = body_view();
+      if (built != gen && defer_big && !user && r.sent && (r.body_file || r.body_preview.size() > kDeferBody)) {
+        built = -2;  // not built: the next select() (or set_defer_big(false)) builds it
+        b->show_message(fmt_bytes(r.body_file ? r.body_file->size() : r.size) +
+                        " response: shown when you select this result, click Response, or the run ends.");
+        b->Show();
+        body_host->Layout();
+        return;
+      }
       if (built != gen) {
         built = gen;
         if (r.body_file) load_full(s);
@@ -687,12 +753,19 @@ class DetailPane::Impl {
                              r.grpc_details);
         } else if (r.body_preview.empty() && r.body_file) {
           b->show_message("Loading the " + fmt_bytes(r.body_file->size()) + " response...");
+        } else if (r.body_preview.empty() && r.from_history && r.size && r.sent && r.transport_ok && !r.skipped &&
+                   !r.stopped()) {
+          note_gen = gen;
+          b->show_message("");
         } else if (r.body_preview.empty()) {
           b->show_message(r.skipped ? "Not run: the run ended before this request."
                           : !r.sent ? (r.error.empty() ? std::string("Not sent.") : r.error)
                           : r.kind == RequestKind::Http && !r.transport_ok && !r.stopped()
                               ? "No response: " + (r.error.empty() ? std::string("transport error") : r.error)
                           : r.stopped() ? std::string("Stopped before the response arrived.")
+                          : r.from_history && r.size
+                              ? std::string("A run from an earlier session: History keeps its results, times and checks, not response bodies. "
+                                            "Open request opens it in an editor to send again.")
                           : r.size ? "The body of this step was not kept: a long run keeps the bodies of failed steps and of the first " +
                                          std::to_string(runner::kKeepPreviews) + " passing ones, within a memory budget."
                                    : std::string("Empty body."));
@@ -716,7 +789,8 @@ class DetailPane::Impl {
           b->set_filter("");
         }
       }
-      b->Show();
+      if (note_gen == gen) history_note()->Show();
+      else b->Show();
     } else if (i == kHeaders || i == kRequest || i == kConsole) {
       Styled st;
       if (i == kConsole) {
@@ -813,7 +887,8 @@ class DetailPane::Impl {
     if (sel == kHeaders || sel == kRequest || sel == kConsole) return text ? text->GetText().ToStdString(wxConvUTF8) : std::string();
     std::string o;
     if (sel == kTiming) {
-      o = "Total " + fmt_ms(r.timing.total_ms) + "\n";
+      o = "Response time " + fmt_ms(r.timing.total_ms) + "\n";
+      if (r.script_ms > 0) o += "Scripts " + fmt_ms(r.script_ms) + "\nIncl. scripts " + fmt_ms(r.total_incl_scripts_ms()) + "\n";
       for (const auto& p : r.phases) o += std::string(p.name) + "\t" + fmt_ms(p.ms) + "\n";
     } else if (sel == kTests) {
       for (const auto& a : r.asserts)
@@ -845,9 +920,17 @@ class DetailPane::Impl {
   TextPane* text = nullptr;
   Canvas* canvas = nullptr;
   rv::BodyView* body = nullptr;
+  wxPanel* note = nullptr;  // history_note()
+  wxStaticText* note_text = nullptr;
+  int note_wrap = 0;
   int sel = kResponse;
-  int gen = 0, built = -1;
+  int gen = 0, built = -1, note_gen = -1;
   bool filter_open = false;  // a body was shown last (its filter bar may be open)
+  // While the selection follows a run's newest result: a big body (spilled, or a preview over
+  // kDeferBody) is not read or laid out until the user asks (the Response tab, a click) or the
+  // run ends; 4 builds a second of a 9 MB body would keep the UI thread busy.
+  bool defer_big = false;
+  static constexpr size_t kDeferBody = 256u << 10;
   std::set<wxWindow*> hooked;
   std::shared_ptr<int> alive = std::make_shared<int>(0);  // workers' CallAfter checks it
 };
@@ -859,6 +942,15 @@ DetailPane::~DetailPane() = default;
 void DetailPane::show(StepPtr s, const std::string& hint) {
   s_ = std::move(s);
   if (impl_) impl_->show(s_, hint);
+}
+
+void DetailPane::set_defer_big(bool on, bool rebuild) {
+  if (!impl_ || impl_->defer_big == on) return;
+  impl_->defer_big = on;
+  if (!on && rebuild && impl_->built == -2 && s_ && impl_->sel == kResponse) {
+    impl_->built = -1;
+    impl_->select(kResponse, false);
+  }
 }
 
 void DetailPane::set_can_open(bool on) {

@@ -34,6 +34,24 @@ size_t json_locate(std::string_view text, const std::vector<PathStep>& path, siz
 // "$.items[3].name" for a path (for tooltips).
 std::string path_string(const std::vector<PathStep>& path);
 
+// The assert / capture target of a path: "res.body.items[3].name" (root "res.body"). Keys that
+// are not plain identifiers use the bracket form (res.body["a.b"]).
+std::string target_string(const std::vector<PathStep>& path, const std::string& root = "res.body");
+
+// What is at byte offset `off` of a JSON text (the Body view's right-click): the path to it, and
+// where its value is (the value of a member when `off` is on its key). A spot between values
+// (whitespace, a comma) gives the innermost object or array around it. False when the text is
+// not JSON up to there or the path is deeper than an assert target may be (64 steps).
+struct JsonHit {
+  std::vector<PathStep> path;
+  size_t at = std::string_view::npos;  // the value's first byte
+  size_t len = 0;                      // its length (0 for an object or array)
+  bool scalar = false;                 // a string, number, true / false / null
+};
+bool json_value_at(std::string_view text, size_t off, JsonHit& hit);
+// A scalar's text as a user copies it: a string decoded (no quotes), anything else as written.
+std::string json_scalar_text(std::string_view literal);
+
 // Why `path` is not in the JSON `text`, in words: which part exists and what is there instead
 // ("res.body is an array, not an object: index it first, e.g. res.body[0].items"). Empty when the
 // path is there or the text is not JSON. root names the text ("res.body").

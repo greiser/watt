@@ -35,3 +35,10 @@ class StallProbe {
 };
 
 }  // namespace watt::app::sidebar
+
+namespace watt::app::sidebar {
+// WATT_CRASHLOG=<file> (self tests and critics): an unhandled exception writes its code, the
+// faulting address and a symbolized stack of the crashing thread to <file> before the process
+// dies (dbghelp, loaded only then). No effect when the variable is unset.
+void install_crash_log();
+}  // namespace watt::app::sidebar

@@ -194,10 +194,12 @@ class SseList : public wxWindow {
       const int y = hh + static_cast<int>(i - top_) * rh + (rh - ch) / 2;
       const wxString cells[5] = {wxString::Format("%zu", ei + 1), U(at_text(ev.at_ms)),
                                  U(ev.type.empty() ? std::string("message") : ev.type), U(ev.id),
-                                 U(fmt::human_bytes(ev.data.size()))};
+                                 U(fmt::human_bytes(ev.data.size()) + (ev.truncated ? " cut" : ""))};
       int x = 0;
       for (int c = 0; c < 5; ++c) {
-        dc.SetTextForeground(c == 0 || (c == 2 && ev.type.empty()) || c == 3 ? th.dim : c == 2 ? th.accent : th.fg);
+        dc.SetTextForeground(c == 4 && ev.truncated ? th.err
+                             : c == 0 || (c == 2 && ev.type.empty()) || c == 3 ? th.dim
+                             : c == 2 ? th.accent : th.fg);
         dc.SetClippingRegion(x, hh, w[c] - FromDIP(2), std::max(0, cs.y - hh));
         if (right[c]) dc.DrawText(cells[c], x + w[c] - pad - dc.GetTextExtent(cells[c]).x, y);
         else dc.DrawText(cells[c], x + pad, y);
@@ -379,6 +381,7 @@ void SsePage::apply_filter() {
       if (matches(events_[i], filter_)) view_.push_back(i);
   find_->SetForegroundColour(!filter_.empty() && view_.empty() ? Theme::get().err : Theme::get().fg);
   find_->Refresh();
+  show_note();
   user_picked_ = false;
   detail_row_ = -2;
   list_->reset();
@@ -397,13 +400,15 @@ void SsePage::reset() {
   events_.clear();
   previews_.clear();
   dropped_ = 0;
+  truncated_ = 0;
+  tap_dropped_ = 0;
   user_picked_ = false;
   detail_row_ = -2;
   detail_size_ = 0;
   caption_text_.clear();
   view_.clear();
   if (!bar_) return;
-  bar_->set_note({});
+  show_note();
   list_->reset();
   show_detail(-1);
 }
@@ -418,18 +423,36 @@ void SsePage::append(std::vector<SseEvent>&& evs) {
   previews_.reserve(previews_.size() + take);
   for (size_t i = 0; i < take; ++i) {
     previews_.push_back(one_line_preview(evs[i].data, 200));
+    truncated_ += evs[i].truncated ? 1 : 0;
     if (!filter_.empty() && matches(evs[i], filter_)) view_.push_back(events_.size());
     events_.push_back(std::move(evs[i]));
   }
   if (!list_) return;
+  if (!filter_.empty()) show_note();
   list_->sync(follow && !user_picked_);
   if (!user_picked_) show_detail(rows() - 1);
 }
 
 void SsePage::set_caption(const std::string& text, Tone tone) {
   caption_text_ = text;
+  if (truncated_)
+    caption_text_ += " \xC2\xB7 " + std::to_string(truncated_) + (truncated_ == 1 ? " event" : " events") + " cut at " +
+                     fmt::human_bytes(SseParser::kMaxField);
+  if (const uint64_t n = dropped_ + tap_dropped_; n)
+    caption_text_ += " \xC2\xB7 " + std::to_string(n) + " not listed (" +
+                     (tap_dropped_ ? "the list fell behind the stream" : "list limit " + std::to_string(kMaxRows)) + ")";
+  if ((truncated_ || dropped_ || tap_dropped_) && tone != Tone::Err) tone = Tone::Warn;
   caption_tone_ = tone;
-  if (bar_) bar_->set_note(text, tone);
+  show_note();
+}
+
+void SsePage::show_note() {
+  if (!bar_) return;
+  if (filter_.empty()) return bar_->set_note(caption_text_, caption_tone_);
+  // First: the bar drops whole parts from the end when the note does not fit.
+  std::string t = std::to_string(view_.size()) + " of " + std::to_string(events_.size()) + " match";
+  if (!caption_text_.empty()) t += " \xC2\xB7 " + caption_text_;
+  bar_->set_note(t, view_.empty() ? Tone::Err : caption_tone_);
 }
 
 void SsePage::show_detail(long row) {
@@ -459,6 +482,7 @@ void SsePage::show_detail(long row) {
     head += " (gap " + fmt::ms(ev.at_ms - events_[ei - 1].at_ms) + ")";
   if (ev.retry >= 0) head += " \xC2\xB7 retry " + std::to_string(ev.retry) + " ms";
   head += " \xC2\xB7 " + fmt::human_bytes(ev.data.size());
+  if (ev.truncated) head += " \xC2\xB7 cut: a line or the data went past " + fmt::human_bytes(SseParser::kMaxField) + ", the rest was dropped";
   std::string_view data = ev.data;
   std::string pretty;
   bool json = false;

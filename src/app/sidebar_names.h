@@ -8,6 +8,7 @@
 // Threading: apply_cached() and refresh() run on worker threads; the cache is locked inside.
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -64,5 +65,16 @@ class NameCache {
 
 // Reads "name" and the URL / gRPC method from the start of a request file.
 bool read_request_meta(const std::filesystem::path& file, ReqMeta* out);
+
+// True when `now` holds a request, name, url or id that `shown` does not.
+bool meta_differs(const MetaMap& shown, const MetaMap& now);
+
+// One sidebar folder scan (worker thread): the fast pass with cached names, a full pass when
+// some badges were not read within the budget, then the files are checked and a last pass is
+// delivered when anything differs from what this scan delivered before. The comparison is with
+// this scan's own deliveries, not only with the cache: an overlapping scan may fill the cache
+// in between (bulk import plus file watcher) while its own delivery is dropped as stale.
+using ScanDeliver = std::function<void(CollectionNode node, MetaMap meta, bool final)>;
+void scan_tree(const Workspace& ws, NameCache* names, const ScanDeliver& deliver);
 
 }  // namespace watt::app::sidebar

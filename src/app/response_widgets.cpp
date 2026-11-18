@@ -6,6 +6,9 @@
 #include <wx/control.h>
 #include <wx/settings.h>
 #include <wx/tooltip.h>
+#ifdef __WXMSW__
+#include <wx/msw/wrapcctl.h>
+#endif
 
 #include <algorithm>
 #include <cmath>
@@ -198,6 +201,7 @@ void StatusStrip::set_busy(const std::string& label, Clock::time_point since) {
   busy_label_ = label;
   busy_badge_.clear();
   since_ = since;
+  busy_ms_ = -1;
   badge_.clear();
   segs_.clear();
   hit_.clear();
@@ -239,7 +243,7 @@ void StatusStrip::on_paint() {
     x += draw_text(dc, U(busy_label_), x, cr) + FromDIP(10);
     dc.SetFont(big);
     dc.SetTextForeground(th.fg);
-    draw_text(dc, U(fmt::ms(ms_between(since_, Clock::now()))), x, cr);
+    draw_text(dc, U(fmt::ms(busy_ms_ >= 0 ? busy_ms_ : ms_between(since_, Clock::now()))), x, cr);
     return;
   }
   if (!badge_.empty()) {
@@ -288,7 +292,7 @@ void StatusStrip::on_paint() {
     if (widest >= 0) {
       const size_t k = static_cast<size_t>(widest);
       dc.SetFont(segs_[k].bold ? bold : base);
-      text[k] = wxControl::Ellipsize(text[k], dc, wxELLIPSIZE_END, std::max(FromDIP(24), w[k] - over));
+      text[k] = wxControl::Ellipsize(text[k], dc, wxELLIPSIZE_END, std::max(FromDIP(24), w[k] - over), wxELLIPSIZE_FLAGS_EXPAND_TABS);
       w[k] = dc.GetTextExtent(text[k]).x;
     }
   }
@@ -405,7 +409,7 @@ void Waterfall::live_tick(double live_ms, double total_ms, const std::string& he
   if (!cur_.valid || cur_.live_row < 0 || cur_.live_row >= static_cast<int>(cur_.phases.size())) return;
   cur_.phases[static_cast<size_t>(cur_.live_row)].ms = std::max(0.0, live_ms);
   cur_.total = total_ms;
-  cur_.network = std::max(0.0, cur_.total - cur_.server_wait - cur_.client);
+  cur_.network = std::max(0.0, cur_.total - cur_.server_wait - cur_.client - std::max(0.0, cur_.paced));
   cur_.live_head = head;
   Refresh(false);
 }
@@ -417,8 +421,16 @@ void Waterfall::set_waiting(Clock::time_point since) {
   live_first_ms_ = -1;
   live_bytes_ = 0;
   live_msgs_ = 0;
+  paced_sent_ = -1;
+  paced_ended_ = false;
   if (!wait_timer_.IsRunning()) wait_timer_.Start(66);
   Refresh(false);
+}
+
+void Waterfall::set_paced(int sent, bool ended) {
+  paced_sent_ = std::max(0, sent);
+  paced_ended_ = ended;
+  if (waiting_) Refresh(false);
 }
 
 void Waterfall::set_cancelled(double after_ms) {
@@ -456,6 +468,7 @@ void Waterfall::paint_waiting(wxDC& dc) {
   dc.SetFont(GetFont());
   dc.SetTextForeground(cancelled_ ? th.warn : th.accent);
   const bool grpc = reserve_rows_ == 8;
+  const bool paced = grpc && paced_sent_ >= 0;
   // Cancelled after body data arrived: what was seen until the cancel stays drawn (frozen).
   const bool got = live_first_ms_ >= 0;
   const bool partial = cancelled_ && got;
@@ -473,11 +486,18 @@ void Waterfall::paint_waiting(wxDC& dc) {
                  : fmt::human_bytes(live_bytes_) + " received");
   } else if (cancelled_) {
     head = "cancelled after " + fmt::ms(cancel_ms_) + " \xC2\xB7 no response, so no phase breakdown";
+  } else if (paced && !got) {
+    // A Manual stream: open at the user's pace. Nothing is awaited before the client sends.
+    head = paced_sent_ == 0 ? (paced_ended_ ? "ended by you, nothing sent \xC2\xB7 waiting for the trailers \xC2\xB7 "
+                                            : "stream open, idle \xC2\xB7 nothing sent yet \xC2\xB7 ")
+                            : "waiting for the reply \xC2\xB7 " + std::to_string(paced_sent_) + " sent \xC2\xB7 ";
+    head += el_text(el);
   } else if (!got) {
     head = "waiting for the response \xC2\xB7 " + el_text(el);
   } else if (grpc) {
-    head = "streaming \xC2\xB7 " + std::to_string(live_msgs_) + (live_msgs_ == 1 ? " message \xC2\xB7 " : " messages \xC2\xB7 ") +
-           el_text(el);
+    head = "streaming \xC2\xB7 " + std::to_string(live_msgs_) + (live_msgs_ == 1 ? " message \xC2\xB7 " : " messages \xC2\xB7 ");
+    if (paced) head += std::to_string(paced_sent_) + " sent" + (paced_ended_ ? ", ended" : "") + " \xC2\xB7 ";
+    head += el_text(el);
   } else {
     head = "receiving \xC2\xB7 " + fmt::human_bytes(live_bytes_) + " \xC2\xB7 " + el_text(el);
   }
@@ -565,7 +585,7 @@ void Waterfall::paint_waiting(wxDC& dc) {
       dc.SetBrush(wxBrush(mix(th.bg, th.accent, 0.35)));
       dc.DrawRectangle(wxRect(sx, block.y + 1, ex - sx, block.height - 2));
     }
-  } else {
+  } else if (!paced) {  // a Manual stream's first reply is paced by the user: no TTFB line
     dc.SetPen(wxPen(mix(th.bg, wait_c, 0.7), 1, wxPENSTYLE_SHORT_DASH));
     dc.DrawLine(x1, top, x1, bottom);
     const int wy = header_h() + (down - 1) * rh + rh / 2;
@@ -581,11 +601,15 @@ void Waterfall::paint_waiting(wxDC& dc) {
     const std::string what = grpc ? "connect, send, server wait" : "DNS, connect, TLS, send, server wait";
     // HTTP: what is seen live is body data (the progress reports), not the first response byte:
     // the headers came before it, and the exact TTFB (Wait) arrives with the response's split.
-    const std::string t = got ? (grpc ? "\xE2\x9C\x93 first message at +" + fmt::ms(live_first_ms_) + " (" + what +
+    const std::string t = got && paced ? "first reply at +" + fmt::ms(live_first_ms_) +
+                                             " from the stream opening (user-paced: the split comes with the trailers)"
+                          : got ? (grpc ? "\xE2\x9C\x93 first message at +" + fmt::ms(live_first_ms_) + " (" + what +
                                             " done; split with the response)"
                                       : "\xE2\x9C\x93 body data by +" + fmt::ms(live_first_ms_) +
                                             " (headers earlier; exact Wait (TTFB) with the response)")
-                              : what + ": in progress";
+                              : paced ? (paced_sent_ == 0 ? std::string("open, idle: user-paced, nothing is awaited until you send #1")
+                                                          : "sent " + std::to_string(paced_sent_) + ", waiting for the server")
+                                      : what + ": in progress";
     const wxString wt = wxString::FromUTF8(t);
     const wxSize e = dc.GetTextExtent(wt);
     int tx = block.x + FromDIP(8);
@@ -597,7 +621,7 @@ void Waterfall::paint_waiting(wxDC& dc) {
       if (tx + e.x > bar_x + bar_w) tx = std::max(bar_x + FromDIP(4), x1 - FromDIP(8) - e.x);
     }
     dc.DrawText(wt, std::max(bar_x + FromDIP(4), tx), ty);
-    if (got && grpc) {  // HTTP: the Wait row's value is the exact TTFB, known with the response
+    if (got && grpc && !paced) {  // HTTP: the Wait row's value is the exact TTFB, known with the response
       const wxString v = wxString::FromUTF8("+" + fmt::ms(live_first_ms_));
       dc.SetTextForeground(th.dim);
       dc.DrawText(v, value_r - dc.GetTextExtent(v).x, header_h() + (down - 1) * rh + (rh - dc.GetCharHeight()) / 2);
@@ -607,6 +631,7 @@ void Waterfall::paint_waiting(wxDC& dc) {
   dc.SetFont(GetFont().Smaller());
   dc.DrawText(wxString::FromUTF8(partial ? "cancelled by you while it downloaded: the engine reports the exact "
                                            "per-phase split only with a complete response"
+                                 : paced ? "user-paced: the split (open idle, your sends, End -> trailers) comes with the trailers"
                                  : got ? (grpc ? "per-phase split with the trailers, when the stream ends"
                                             : "per-phase split when the download completes")
                                      : "the engine times each phase and reports the split with the response"),
@@ -855,7 +880,9 @@ void Waterfall::on_paint() {
       }
       all += "Total " + fmt::ms(cur_.total) + "  \xC2\xB7  " + cur_.server_label + " " +
              (cur_.server_na ? std::string("n/a") : fmt::ms(cur_.server_wait)) +
-             ", network " + fmt::ms(cur_.network) + ", client " + fmt::ms(cur_.client);
+             ", network " + fmt::ms(cur_.network) + ", client " + fmt::ms(cur_.client) +
+             (cur_.auth >= 0 ? ", auth " + fmt::ms(cur_.auth) : std::string()) +
+             (cur_.paced >= 0 ? ", user-paced " + fmt::ms(cur_.paced) : std::string());
       if (ax.broken) {
         all += std::string("\n") + kBrokenAxisTip;
         dc.SetPen(wxPen(th.bg, FromDIP(2)));
@@ -1050,6 +1077,9 @@ void Waterfall::on_paint() {
     w += dc.GetTextExtent(part_text(cur_.server_label, cur_.server_wait, brief)).x + sw + FromDIP(5) + g;
     w += dc.GetTextExtent(part_text("network", cur_.network, brief)).x + sw + FromDIP(5) + g;
     w += dc.GetTextExtent(part_text("client", cur_.client, brief)).x + sw + FromDIP(5);
+    if (cur_.auth >= 0) w += g + dc.GetTextExtent(part_text("auth", cur_.auth, brief)).x + sw + FromDIP(5);
+    if (cur_.paced >= 0)
+      w += g + dc.GetTextExtent(part_text(brief ? "paced" : "user-paced", cur_.paced, brief)).x + sw + FromDIP(5);
     return w;
   };
   bool brief = false;
@@ -1075,6 +1105,9 @@ void Waterfall::on_paint() {
   part(cur_.server_label, cur_.server_wait, cur_.server_tip, th.dark ? wxColour(80, 200, 120) : wxColour(30, 160, 80));
   part("network", cur_.network, cur_.network_tip, th.dark ? wxColour(70, 130, 240) : wxColour(40, 100, 220));
   part("client", cur_.client, cur_.client_tip, th.dark ? wxColour(130, 130, 140) : wxColour(150, 150, 160));
+  if (cur_.auth >= 0) part("auth", cur_.auth, cur_.auth_tip, wxColour(200, 150, 60));  // the Auth / token row's colour
+  if (cur_.paced >= 0)
+    part(brief ? "paced" : "user-paced", cur_.paced, cur_.paced_tip, th.dark ? wxColour(190, 150, 70) : wxColour(190, 130, 30));
   if (has_prev_) {
     dc.SetFont(bold);
     delta_text(cur_.total - prev_.total, fr, std::max(cur_.total, prev_.total));
@@ -1102,12 +1135,23 @@ TabStrip::TabStrip(wxWindow* parent, std::function<void(int)> on_select)
   SetBackgroundColour(Theme::get().bg);
   Bind(wxEVT_PAINT, [this](wxPaintEvent&) { on_paint(); });
   Bind(wxEVT_LEFT_DOWN, [this](wxMouseEvent& e) {
-    for (size_t i = 0; i < tabs_.size(); ++i)
-      if (tabs_[i].shown && tabs_[i].rect.Contains(e.GetPosition())) {
-        select(static_cast<int>(i));
-        if (on_select_) on_select_(static_cast<int>(i));
-        return;
+    // Hit by column, with the gaps between tabs split between their neighbours: a label that
+    // grows while a stream runs ("Events 99" -> "Events 100") never leaves a dead spot under
+    // the mouse.
+    const int x = e.GetPosition().x;
+    int best = -1, best_d = FromDIP(12) + 1;
+    for (size_t i = 0; i < tabs_.size(); ++i) {
+      if (!tabs_[i].shown || tabs_[i].rect.IsEmpty()) continue;
+      const wxRect& r = tabs_[i].rect;
+      const int d = x < r.GetLeft() ? r.GetLeft() - x : x > r.GetRight() ? x - r.GetRight() : 0;
+      if (d < best_d) {
+        best_d = d;
+        best = static_cast<int>(i);
       }
+    }
+    if (best < 0) return;
+    select(best);
+    if (on_select_) on_select_(best);
   });
   Bind(wxEVT_SIZE, [this](wxSizeEvent& e) { Refresh(false); e.Skip(); });
   SetCursor(wxCursor(wxCURSOR_HAND));
@@ -1255,6 +1299,10 @@ ChipBar::ChipBar(wxWindow* parent, std::function<void(int)> on_click)
       }
   });
   Bind(wxEVT_SIZE, [this](wxSizeEvent& e) { Refresh(false); e.Skip(); });
+  Bind(wxEVT_DPI_CHANGED, [this](wxDPIChangedEvent& e) {
+    for (Chip& c : chips_) c.ext = wxSize();
+    e.Skip();
+  });
 }
 
 void ChipBar::more_menu() {
@@ -1310,6 +1358,7 @@ void ChipBar::set_visible(int id, bool vis) {
 void ChipBar::set_label(int id, const std::string& label) {
   if (Chip* c = find(id); c && c->label != label) {
     c->label = label;
+    c->ext = wxSize();
     Refresh(false);
   }
 }
@@ -1334,6 +1383,11 @@ void ChipBar::on_paint() {
   const wxFont base = GetFont();
   dc.SetFont(base);
   const int ch = cr.height - FromDIP(8);
+  // Label extents are measured once per label (a resize repaints the bar on every size event).
+  auto ext = [&dc](Chip& c) -> wxSize {
+    if (c.ext.x <= 0) c.ext = dc.GetTextExtent(U(c.label));
+    return c.ext;
+  };
   // Fitting: full padding, then tighter chips, then right chips (from the last) folded into a
   // "more" chip, until the left chips, the note's first part (the size) and the right chips fit
   // side by side; chips never overlap.
@@ -1344,21 +1398,23 @@ void ChipBar::on_paint() {
     dc.SetFont(base.Smaller());
     wxString first = U(note_);
     if (const size_t cut = first.find(note_sep); cut != wxString::npos) first.Truncate(cut);
-    note_min = dc.GetTextExtent(first).x + FromDIP(32);
+    // A fixed-width slot at most: a long transient note ("assertion added: ...") is elided (the
+    // full text is the tooltip) and never folds the right chips (Filter / Find / Copy / Save).
+    note_min = std::min(dc.GetTextExtent(first).x, FromDIP(56)) + FromDIP(32);
     dc.SetFont(base);
   }
   auto need = [&](int pad, size_t keep) {
     int w = FromDIP(16), last = -2;
     size_t seen = 0;
-    for (const Chip& c : chips_) {
+    for (Chip& c : chips_) {
       if (!c.visible) continue;
       if (c.right) {
         if (seen++ >= keep) continue;
-        w += dc.GetTextExtent(U(c.label)).x + 2 * pad + FromDIP(2);
+        w += ext(c).x + 2 * pad + FromDIP(2);
         continue;
       }
       if (last != -2 && (c.group != last || c.group < 0)) w += FromDIP(6);
-      w += dc.GetTextExtent(U(c.label)).x + 2 * pad;
+      w += ext(c).x + 2 * pad;
       last = c.group;
     }
     if (seen > keep) w += dc.GetTextExtent(more_label).x + 2 * pad + FromDIP(2);
@@ -1379,7 +1435,7 @@ void ChipBar::on_paint() {
     }
   }
   auto layout = [&](Chip& c, int x) {
-    const wxSize e = dc.GetTextExtent(U(c.label));
+    const wxSize e = ext(c);
     c.rect = wxRect(x, (cr.height - ch) / 2, e.x + 2 * padx, ch);
     return c.rect.width;
   };
@@ -1404,7 +1460,7 @@ void ChipBar::on_paint() {
   for (size_t i = chips_.size(); i-- > 0;) {
     Chip& c = chips_[i];
     if (!c.right || !c.visible || c.folded) continue;
-    const wxSize e = dc.GetTextExtent(U(c.label));
+    const wxSize e = ext(c);
     rx -= e.x + 2 * padx;
     c.rect = wxRect(rx, (cr.height - ch) / 2, e.x + 2 * padx, ch);
     rx -= FromDIP(2);
@@ -1431,7 +1487,7 @@ void ChipBar::on_paint() {
     }
     dc.SetTextForeground(!c.enabled ? th.faint : (c.on ? th.fg : th.dim));
     if (hover && !c.on) dc.SetTextForeground(th.fg);
-    const wxSize e = dc.GetTextExtent(U(c.label));
+    const wxSize e = ext(c);
     dc.DrawText(U(c.label), c.rect.x + (c.rect.width - e.x) / 2, c.rect.y + (c.rect.height - e.y) / 2);
   }
   if (!note_.empty()) {
@@ -1453,7 +1509,7 @@ void ChipBar::on_paint() {
         note_cut_ = true;
       }
       if (dc.GetTextExtent(n).x > avail) {
-        n = wxControl::Ellipsize(n, dc, wxELLIPSIZE_END, avail);
+        n = wxControl::Ellipsize(n, dc, wxELLIPSIZE_END, avail, wxELLIPSIZE_FLAGS_EXPAND_TABS);
         note_cut_ = true;
       }
       const wxSize e = dc.GetTextExtent(n);
@@ -1462,5 +1518,84 @@ void ChipBar::on_paint() {
     }
   }
 }
+
+// ------------------------------------------------------------------ FastList
+
+#ifdef __WXMSW__
+bool FastList::MSWOnNotify(int id, WXLPARAM lp, WXLPARAM* result) {
+  const auto* hdr = reinterpret_cast<const NMHDR*>(lp);
+  if (hdr->hwndFrom == GetHwnd() && hdr->code == NM_CUSTOMDRAW && InReportView() && Theme::get().dark) {
+    auto* cd = reinterpret_cast<NMLVCUSTOMDRAW*>(lp);
+    if (cd->nmcd.dwDrawStage == CDDS_PREPAINT) {
+      *result = CDRF_NOTIFYITEMDRAW;
+      return true;
+    }
+    if (cd->nmcd.dwDrawStage == CDDS_ITEMPREPAINT) {
+      const long item = static_cast<long>(cd->nmcd.dwItemSpec);
+      if (item >= 0 && item < GetItemCount()) {
+        paint_row(cd->nmcd.hdc, item);
+        *result = CDRF_SKIPDEFAULT;
+        return true;
+      }
+    }
+  }
+  return wxListCtrl::MSWOnNotify(id, lp, result);
+}
+
+void FastList::paint_row(WXHDC dc, long item) {
+  HDC hdc = static_cast<HDC>(dc);
+  HWND hwnd = GetHwnd();
+  RECT rc;
+  if (!ListView_GetItemRect(hwnd, static_cast<int>(item), &rc, LVIR_BOUNDS)) return;
+  const UINT state = ListView_GetItemState(hwnd, static_cast<int>(item), LVIS_SELECTED | LVIS_FOCUSED);
+  const bool sel = (state & LVIS_SELECTED) != 0;
+  auto rgb = [](const wxColour& c) { return RGB(c.Red(), c.Green(), c.Blue()); };
+  auto fill = [&](const RECT& r, COLORREF c) {
+    HBRUSH b = ::CreateSolidBrush(c);
+    ::FillRect(hdc, &r, b);
+    ::DeleteObject(b);
+  };
+  fill(rc, sel ? rgb(wxSystemSettings::GetColour(wxSYS_COLOUR_HIGHLIGHT)) : rgb(GetBackgroundColour()));
+  const COLORREF sel_fg = rgb(wxSystemSettings::GetColour(wxSYS_COLOUR_HIGHLIGHTTEXT));
+  const COLORREF plain_fg = rgb(GetTextColour());
+  // The control's own font, as it selected it into the DC (GetFont() may be a temporary default
+  // whose HFONT dies with it).
+  const HFONT base = static_cast<HFONT>(::GetCurrentObject(hdc, OBJ_FONT));
+  const HGDIOBJ old_font = base;
+  const int old_mode = ::SetBkMode(hdc, TRANSPARENT);
+  const COLORREF old_fg = ::GetTextColor(hdc);
+  const int cols = GetColumnCount();
+  RECT next{};
+  for (int c = 0; c < cols; ++c) {
+    RECT r;
+    if (!ListView_GetSubItemRect(hwnd, static_cast<int>(item), c, LVIR_BOUNDS, &r)) continue;
+    // Sub-item 0's rectangle is the whole row: it ends where column 1 starts.
+    if (c == 0 && cols > 1 && ListView_GetSubItemRect(hwnd, static_cast<int>(item), 1, LVIR_BOUNDS, &next))
+      r.right = next.left;
+    if (r.right <= r.left) continue;
+    const wxItemAttr* a = DoGetItemColumnAttr(item, c);
+    if (!sel && a && a->HasBackgroundColour()) fill(r, rgb(a->GetBackgroundColour()));
+    ::SetTextColor(hdc, sel ? sel_fg : a && a->HasTextColour() ? rgb(a->GetTextColour()) : plain_fg);
+    ::SelectObject(hdc, a && a->HasFont() ? static_cast<HFONT>(a->GetFont().GetHFONT()) : base);
+    const wxString text = GetItemText(item, c);
+    if (text.empty()) continue;
+    UINT fmt = DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX | DT_VCENTER;
+    LVCOLUMN col{};
+    col.mask = LVCF_FMT;
+    if (ListView_GetColumn(hwnd, c, &col)) {
+      if ((col.fmt & LVCFMT_JUSTIFYMASK) == LVCFMT_RIGHT) fmt |= DT_RIGHT;
+      else if ((col.fmt & LVCFMT_JUSTIFYMASK) == LVCFMT_CENTER) fmt |= DT_CENTER;
+    }
+    // (The same inset as the control's own text, unscaled, as wx draws it.)
+    r.left += 6;
+    r.right -= 4;
+    if (r.right > r.left) ::DrawTextW(hdc, text.wc_str(), static_cast<int>(text.length()), &r, fmt);
+  }
+  if ((state & LVIS_FOCUSED) && ::GetFocus() == hwnd) ::DrawFocusRect(hdc, &rc);
+  ::SetTextColor(hdc, old_fg);
+  ::SetBkMode(hdc, old_mode);
+  ::SelectObject(hdc, old_font);
+}
+#endif
 
 }  // namespace watt::app::rv

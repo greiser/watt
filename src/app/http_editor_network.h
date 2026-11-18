@@ -18,6 +18,9 @@
 class wxStaticText;
 class wxTextCtrl;
 
+class wxFlexGridSizer;
+class wxBoxSizer;
+
 namespace watt::app::http_editor {
 
 class ChoiceButton;
@@ -26,7 +29,11 @@ class CheckButton;
 class NetworkPanel : public wxPanel {
  public:
   // top: the collection (nothing above it to inherit from: "Inherit" reads as the default).
-  NetworkPanel(wxWindow* parent, const std::filesystem::path& root, bool top);
+  // staged: only the first section now, the rest in build_step() calls (idle steps of ~10 ms
+  // each instead of one ~40 ms step); set() / get() and the rest need complete().
+  NetworkPanel(wxWindow* parent, const std::filesystem::path& root, bool top, bool staged = false);
+  bool build_step();  // builds the next section; true once the panel is complete
+  bool complete() const { return stage_ >= 3; }
   void set(const NetworkSettings& n, const std::string& passphrase);
   NetworkSettings get() const;
   std::string passphrase() const;
@@ -43,6 +50,13 @@ class NetworkPanel : public wxPanel {
  private:
   void sync();
   void label_inherit();
+  void build_certs();     // stage 1: client certificate
+  void build_ca_proxy();  // stage 2: server certificate, proxy, the bindings
+  wxStaticText* add_label(wxFlexGridSizer* grid, const char* text);
+  void add_file_row(wxFlexGridSizer* grid, wxTextCtrl* f, const wxString& title, const wxString& wildcard);
+  int stage_ = 0;
+  int label_w_ = 0;
+  wxBoxSizer* sizer_ = nullptr;
   wxTextCtrl* field(const char* hint, bool secret = false);
   void browse(wxTextCtrl* f, const wxString& title, const wxString& wildcard);
 

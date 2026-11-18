@@ -66,8 +66,14 @@ class TestsView : public wxPanel {
   // Cheap: the controls are created by ensure_built() (the first time the tab is shown); until
   // then every setter only records its state.
   explicit TestsView(wxWindow* parent);
+  // Builds whatever is not built yet (all slices, then lays the page out).
   void ensure_built();
   bool built() const { return list_ != nullptr; }
+  // Builds the next slice of the page (chip bars; assertion list; script group; captures; folder
+  // checks; layout at the page size), each a few ms, so the owner can build it ahead of its first
+  // show while the UI is idle. True once the page is complete (later calls do nothing).
+  bool build_step();
+  bool complete() const { return stage_ >= kStages; }
 
   // The user changed the list (add / edit / delete / toggle): the owner saves it into the
   // request and re-runs the checks.
@@ -113,12 +119,20 @@ class TestsView : public wxPanel {
   bool rechecked() const { return rechecked_; }
   int passed() const { return passed_; }
   int failed() const { return failed_; }
+  // The check (own or inherited) that already tests target/op/value, if any, and its result for
+  // the shown response (NotRun / Off for a disabled one). A string value matches with or without
+  // its JSON quotes. nullptr: no such check. *inherited_from: "" for an own check.
+  const TestRow* find_check(const std::string& target, const std::string& op, const std::string& value,
+                            std::string* inherited_from = nullptr) const;
   int script_passed() const { return script_pass_; }
   int script_failed() const { return script_fail_; }  // failed tests and script errors
   bool script_skipped() const { return script_.skipped_untrusted; }
 
  private:
   friend class TestList;
+  static constexpr int kStages = 6;
+  int stage_ = 0;  // build slices done (see build_step)
+  void build_core();
   void on_chip(int id);
   void begin_edit(int row);  // -1: a new assertion
   void commit_edit();

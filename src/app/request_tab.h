@@ -40,9 +40,16 @@ struct LastResponse {
   std::shared_ptr<const HttpResponse> http;
   std::shared_ptr<const SentHttp> sent;
   std::shared_ptr<const GrpcResponse> grpc;
+  // A WebSocket tab: the message log (sent and received, the newest kLogMessages, each capped).
+  std::shared_ptr<const std::vector<WsMessage>> ws_log;
+  static constexpr size_t kLogMessages = 500;
+  static constexpr size_t kLogMessageBytes = 64u << 10;
   // Set when it comes from a history entry (UTC ISO time it was received): shown as "last run
   // at ...", not as a tab restored from an earlier session. Not stored.
   std::string when_iso;
+  // HTTP: the headers the request inherited from folders / the collection, as {{templates}}
+  // (stored with the session instead of their expanded values; restored into sent).
+  std::vector<std::pair<std::string, std::string>> inherited_headers;
   explicit operator bool() const { return http || grpc; }
 };
 // "" when r holds nothing or is too large to keep.
@@ -109,7 +116,18 @@ class RequestTab : public wxPanel, public EditorHost {
   // waits for the ~70 ms build).
   void build_response_view() { response(); }
   bool realized() const { return split_ != nullptr; }
+  // A hidden background tab gives back its windows: its editor and response view are ~300 USER
+  // handles, and Windows allows 10,000 per process (past that every window creation fails and wx
+  // crashes on a null window). Its request (editor state stored first) and last response stay; it
+  // is built again when shown (realize()). An unrealized tab is only marked, so the frame's
+  // prebuild leaves it alone. False (nothing freed) for a shown, dirty or busy tab.
+  bool hibernate();
+  bool hibernated() const { return hibernated_; }
   bool has_response_view() const { return resp_ != nullptr; }
+  // A hidden spare tab: sizes and lays it out at the notebook's page size now (an idle slice), so
+  // adding it as a page later is no first layout of all its controls inside the click.
+  void prelayout(const wxSize& sz);
+  bool laid_out_at(const wxSize& sz) const { return split_ && !layout_pending_ && GetSize() == sz; }
   RequestKind request_kind() const { return req_.kind; }
   // A restored draft: show the unsaved-changes mark.
   void mark_dirty();
@@ -119,6 +137,11 @@ class RequestTab : public wxPanel, public EditorHost {
   // The last response shown (for the session), and one restored from it (shown as soon as the
   // response view exists; replaced by the next send).
   const LastResponse& last_response() const { return last_; }
+  // last_response() for the session: a WebSocket tab's with its message log as it is now.
+  LastResponse session_response();
+  // A gRPC tab's Manual stream checkbox, kept in the session (restore before or after realize()).
+  bool grpc_manual() const;
+  void restore_grpc_manual(bool on);
   void restore_response(LastResponse r);
   // A tab restored from the session: its gRPC editor does not start the gRPC engine, reflect or
   // preconnect when it is built (that is ~250 ms of CPU and 20 threads right as the window first
@@ -134,6 +157,10 @@ class RequestTab : public wxPanel, public EditorHost {
   std::shared_ptr<const GrpcSchema> session_schema() const;
   void wake_grpc();
   bool grpc_parked() const { return grpc_parked_; }
+  // A closed tab (hidden and parked by the frame): stops what is in flight and frees one heavy
+  // part per call (the editor's big documents, then the response view), so no single UI step
+  // tears down megabytes. False: nothing heavy is left, delete the tab.
+  bool teardown_step();
   // Where the first save of an unsaved request goes (empty: Workspace::save_request's default).
   void set_save_folder(const std::filesystem::path& folder) { save_folder_ = folder; }
   const std::filesystem::path& save_folder() const { return save_folder_; }
@@ -156,6 +183,7 @@ class RequestTab : public wxPanel, public EditorHost {
   void accept_unresolved(const std::vector<std::string>& names) override {
     unresolved_ok_.insert(names.begin(), names.end());
   }
+  void not_sent(const std::string& why) override;
   // req with file = inherit_file(): what the workspace's inheritance (folder.json) is computed on.
   SavedRequest for_inheritance(const SavedRequest& req) const;
   void load_schema(const SavedRequest& r) override;
@@ -226,6 +254,8 @@ class RequestTab : public wxPanel, public EditorHost {
   bool loading_ = false;   // suppress changed() while load()ing an editor
   bool user_sash_ = false;  // the user dragged the sash: stop keeping it at 50%
   bool layout_pending_ = false;  // resized while hidden: Layout() when shown again
+  bool hibernated_ = false;      // see hibernate()
+  bool size_bound_ = false;      // realize()'s size / show handlers (bound once, also across hibernate())
   std::filesystem::path save_folder_;
   std::string save_name_;
 
@@ -245,6 +275,12 @@ class RequestTab : public wxPanel, public EditorHost {
   bool pending_send_ = false;          // send() waiting for the workspace (when_workspace)
 
   LastResponse last_;
+  // A WebSocket tab's message log for the session (see LastResponse::ws_log): appended per batch,
+  // copied into last_.ws_log only when the session is written.
+  std::shared_ptr<std::vector<WsMessage>> ws_log_;
+  bool ws_log_changed_ = false;
+  bool manual_pending_ = false;  // see restore_grpc_manual()
+  void ws_log_add(const std::vector<WsMessage>& batch);
   bool last_pending_ = false;                    // last_ restored, not shown yet
   std::string shown_method_;                     // gRPC: the method last_ was received for
   bool grpc_parked_ = false;                     // see park_grpc()

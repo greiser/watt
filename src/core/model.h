@@ -126,6 +126,9 @@ struct HttpAuth {
 };
 const char* auth_type_name(HttpAuth::Type t);  // "none", "digest", "ntlm", "negotiate", "awsv4", "oauth2", "inherit"
 HttpAuth::Type auth_type_from(const std::string& s);
+// True when the scheme sends its own Authorization header (OAuth 2.0 in the header, Digest, NTLM,
+// Negotiate, SigV4): an Authorization header inherited from a level further out is then not sent.
+bool auth_sets_authorization(const HttpAuth& a);
 
 // One curl -d family argument kept as written because it reads a file (-d @f, --data-binary @f,
 // --json @f, --data-urlencode name@f): nothing is read when a command is imported, the file is
@@ -678,6 +681,9 @@ struct CurlImport {
   HttpRequest http;               // with form parts, http.body is empty
   std::vector<FormPart> form;
   BasicAuth basic_auth;           // -u user:password (not also in http.headers)
+  // --digest / --ntlm / --negotiate / --aws-sigv4 with -u: that scheme with the -u credentials
+  // (basic_auth is then disabled); Type::None otherwise.
+  HttpAuth auth;
   // -T file, or a single --data-binary @file: the file as given (http.body is empty); a
   // SavedRequest keeps the reference (SavedRequest::body_file) and reads the file at send time.
   std::string body_file;

@@ -4,6 +4,7 @@
 #include <wx/choice.h>
 #include <wx/clipbrd.h>
 #include <wx/combobox.h>
+#include <wx/dcclient.h>
 #include <wx/listctrl.h>
 #include <wx/menu.h>
 #include <wx/sizer.h>
@@ -12,6 +13,9 @@
 #include <wx/wupdlock.h>
 
 #include <algorithm>
+#include <array>
+#include <chrono>
+#include <cstdio>
 #include <cmath>
 #include <cstdlib>
 
@@ -23,6 +27,16 @@ namespace watt::app::rv {
 namespace {
 
 wxString U(std::string_view s) { return wxString::FromUTF8(s.data(), s.size()); }
+
+// WATT_RV_TRACE=<file> (as in response_view.cpp): "tests.build.<slice> ms" lines for the page's
+// build slices, so its first show can be measured in the running app.
+FILE* trace_file() {
+  static FILE* f = []() -> FILE* {
+    const wchar_t* p = _wgetenv(L"WATT_RV_TRACE");
+    return p && *p ? _wfopen(p, L"a") : nullptr;
+  }();
+  return f;
+}
 
 enum Chip { kAdd = 1, kEdit, kToggle, kDelete, kHintStatus = 20, kHintTime, kHintType, kHintJson };
 
@@ -70,10 +84,10 @@ std::string op_label(const std::string& op) {
 
 // ------------------------------------------------------------------ list
 
-class TestList : public wxListCtrl {
+class TestList : public FastList {
  public:
   explicit TestList(TestsView* owner)
-      : wxListCtrl(owner, wxID_ANY, wxDefaultPosition, wxDefaultSize,
+      : FastList(owner, wxID_ANY, wxDefaultPosition, wxDefaultSize,
                    wxLC_REPORT | wxLC_VIRTUAL | wxLC_SINGLE_SEL | wxBORDER_NONE),
         v_(owner) {
     AppendColumn("Result", wxLIST_FORMAT_LEFT, FromDIP(70));
@@ -94,8 +108,16 @@ class TestList : public wxListCtrl {
   }
   void refresh_rows() {
     SetItemCount(static_cast<long>(v_->asserts_.size()));
+    ++gen_;
     Refresh();
     schedule_fit();  // the columns follow what the rows hold
+  }
+  // The column widths for the current rows and width, now (computed once per change of either).
+  void fit_now() { fit(); }
+  // The rows' texts changed without a change of rows (the Result column while checking).
+  void texts_changed() {
+    ++gen_;
+    Refresh();
   }
 
  private:
@@ -108,11 +130,15 @@ class TestList : public wxListCtrl {
     });
   }
   // Result fixed. Target, Check and Actual get what their text needs (measured over the first
-  // rows), as long as the Note keeps at least a quarter of the width; when they need more, the
-  // room is shared in proportion to the need. The Note (why a check failed) gets the rest.
+  // rows), as long as the Note keeps a sixth of the width (when any row has a note); when they
+  // need more, the room is shared fairly (water-filling). The Note gets the rest.
   void fit() {
     const int r = FromDIP(64);
     const int w = std::max(FromDIP(300), GetClientSize().x - r - 2);
+    // Same rows, same width: the widths computed last time still hold (no text measuring again).
+    if (w == fit_w_ && gen_ == fit_gen_) return;
+    fit_w_ = w;
+    fit_gen_ = gen_;
     const int pad = FromDIP(16);
     static const char* const kHead[] = {"", "Target", "Check", "Actual"};
     int need[4] = {0, 0, 0, 0};
@@ -120,19 +146,40 @@ class TestList : public wxListCtrl {
     const long n = std::min<long>(GetItemCount(), 200);
     for (long i = 0; i < n; ++i)
       for (int c = 1; c <= 3; ++c) {
-        const wxString t = OnGetItemText(i, c);
+        // The Target as written, not as elided to the current width.
+        const wxString t = c == 1 ? U(v_->asserts_[static_cast<size_t>(i)].target) : OnGetItemText(i, c);
         if (t.empty()) continue;
         // Long values are cut anyway: no need to measure more than ~120 characters.
         need[c] = std::max(need[c], GetTextExtent(t.length() > 120 ? t.Left(120) : t).x + pad);
       }
     const int lo = w * 10 / 100;  // never narrower than this
     for (int c = 1; c <= 3; ++c) need[c] = std::max(need[c], lo);
-    const int avail = w - w * 25 / 100;
-    const int sum = need[1] + need[2] + need[3];
+    // The Note keeps a quarter of the width only when some row has one (a failure's reason).
+    bool any_note = false;
+    for (long i = 0; i < n && !any_note; ++i) any_note = !OnGetItemText(i, 4).empty();
+    const int avail = w - (any_note ? w * 18 / 100 : w * 6 / 100);
+    // Water-filling: a column that needs less than an equal share gets all it needs, the rest
+    // share what is left equally (a long Actual no longer squeezes a short Target to its floor).
     int cols[4] = {r, need[1], need[2], need[3]};
-    if (sum > avail)
-      for (int c = 1; c <= 3; ++c) cols[c] = std::max(lo, static_cast<int>(static_cast<long long>(need[c]) * avail / sum));
-    const int note = std::max(w * 20 / 100, w - cols[1] - cols[2] - cols[3]);
+    {
+      bool done[4] = {true, false, false, false};
+      int left = avail, open = 3;
+      for (bool changed = true; changed && open > 0;) {
+        changed = false;
+        const int share = left / open;
+        for (int c = 1; c <= 3; ++c)
+          if (!done[c] && need[c] <= share) {
+            cols[c] = need[c];
+            left -= need[c];
+            done[c] = true;
+            --open;
+            changed = true;
+          }
+      }
+      for (int c = 1; c <= 3; ++c)
+        if (!done[c]) cols[c] = std::max(lo, left / std::max(open, 1));
+    }
+    const int note = std::max(any_note ? w * 14 / 100 : w * 6 / 100, w - cols[1] - cols[2] - cols[3]);
     const int widths[] = {cols[0], cols[1], cols[2], cols[3], note};
     // Frozen: every SetColumnWidth repaints the list at once otherwise (~50 ms each).
     Freeze();
@@ -143,7 +190,24 @@ class TestList : public wxListCtrl {
   const TestRow* row(long i) const {
     return static_cast<size_t>(i) < v_->rows_.size() ? &v_->rows_[static_cast<size_t>(i)] : nullptr;
   }
+  // The list asks for every cell's text several times per paint (and fit() measures them): the
+  // texts are made once per change of rows or of the Target column's width, with one DC for the
+  // elided targets, and served from here.
   wxString OnGetItemText(long item, long col) const override {
+    if (item < 0 || static_cast<size_t>(item) >= v_->asserts_.size() || col < 0 || col > 4) return {};
+    const int room = GetColumnWidth(1) - FromDIP(14);
+    if (cache_gen_ != gen_ || cache_room_ != room || cache_.size() != v_->asserts_.size()) {
+      cache_gen_ = gen_;
+      cache_room_ = room;
+      cache_.assign(v_->asserts_.size(), {});
+      wxClientDC dc(const_cast<TestList*>(this));
+      dc.SetFont(GetFont());
+      for (size_t i = 0; i < cache_.size(); ++i)
+        for (long c = 0; c < 5; ++c) cache_[i][static_cast<size_t>(c)] = make_text(static_cast<long>(i), c, dc, room);
+    }
+    return cache_[static_cast<size_t>(item)][static_cast<size_t>(col)];
+  }
+  wxString make_text(long item, long col, wxDC& dc, int room) const {
     const Assertion& a = v_->asserts_[static_cast<size_t>(item)];
     const TestRow* r = row(item);
     switch (col) {
@@ -157,7 +221,12 @@ class TestList : public wxListCtrl {
           default: return v_->running_ ? wxString::FromUTF8("\xE2\x80\xA6") : wxString::FromUTF8("\xE2\x80\x94");
         }
       }
-      case 1: return U(a.target);
+      case 1: {
+        // A long target keeps its end, the part that tells rows apart: "...items[2].owner.email".
+        const wxString t = U(a.target);
+        if (room <= 0 || dc.GetTextExtent(t).x <= room) return t;
+        return wxControl::Ellipsize(t, dc, wxELLIPSIZE_START, room, wxELLIPSIZE_FLAGS_EXPAND_TABS);
+      }
       case 2: {
         std::string s = op_label(a.op);
         const std::string& exp = r && !r->expected.empty() ? r->expected : a.value;
@@ -177,8 +246,8 @@ class TestList : public wxListCtrl {
       }
       default:
         if (!r) return {};
-        if (r->message.empty() && (r->state == TestRow::Pass || r->state == TestRow::Fail) && r->eval_us > 0)
-          return U("eval " + fmt::ms(r->eval_us / 1000.0));
+        // (Per-check evaluation time is not repeated here: the summary has the total, and the
+        // column's room goes to Target and Actual.)
         // "expected res.body[3].name to equal nope, got item 3": the target is the row's own
         // Target column, so the note starts after it ("to equal nope, got item 3") and fits.
         if (const std::string head = "expected " + a.target + " ";
@@ -202,6 +271,11 @@ class TestList : public wxListCtrl {
   TestsView* v_;
   mutable wxItemAttr pass_, fail_, off_;
   bool fit_pending_ = false;
+  mutable std::vector<std::array<wxString, 5>> cache_;
+  mutable unsigned cache_gen_ = ~0u;
+  mutable int cache_room_ = -1;
+  unsigned gen_ = 0, fit_gen_ = ~0u;  // rows changed / rows the widths were computed for
+  int fit_w_ = -1;                     // width they were computed for
 };
 
 // ------------------------------------------------------------------ view
@@ -209,10 +283,20 @@ class TestList : public wxListCtrl {
 TestsView::TestsView(wxWindow* parent) : wxPanel(parent, wxID_ANY) { SetBackgroundColour(Theme::get().bg); }
 
 void TestsView::ensure_built() {
-  if (list_) return;
-  const Theme& th = Theme::get();
+  if (complete()) return;
   wxWindowUpdateLocker lock(this);
-  bar_ = new ChipBar(this, [this](int id) { on_chip(id); });
+  while (!build_step()) {
+  }
+}
+
+bool TestsView::build_step() {
+  if (complete()) return true;
+  const auto t0 = std::chrono::steady_clock::now();
+  const int s = stage_++;  // (the apply_* below check stage_: the slice running counts as done)
+  static const char* const kName[kStages] = {"chips", "list", "script", "captures", "inherited", "layout"};
+  switch (s) {
+    case 0: {
+      bar_ = new ChipBar(this, [this](int id) { on_chip(id); });
   bar_->add(kAdd, "+ Add", "Add a check (Insert). Checks are saved with the request and run on every response.", -1,
             true);
   bar_->add(kEdit, "Edit", "Change the selected check (F2 or double-click)", -1, true);
@@ -226,7 +310,43 @@ void TestsView::ensure_built() {
   hints_->add(kHintType, "+ Content-Type", "Add: the Content-Type contains this response's type");
   hints_->add(kHintJson, "+ body is JSON", "Add: res.body isJson");
   hints_->Hide();
+      break;
+    }
+    case 1: build_core(); break;
+    case 2:
+      if (script_.any_script || script_.skipped_untrusted || !script_.rows.empty()) apply_script();
+      break;
+    case 3:
+      if (!cap_rows_.empty()) apply_captures();
+      break;
+    case 4:
+      if (!inh_.empty()) apply_inherited();
+      break;
+    default: {
+      // At the page's size (a hidden page of the book may never have been sized), with the
+      // columns fitted now: the first show only paints.
+      if (wxWindow* p = GetParent()) {
+        const wxSize ps = p->GetClientSize();
+        if (ps.x > 0 && ps.y > 0 && GetSize() != ps) SetSize(ps);
+      }
+      update_summary();
+      Layout();
+      list_->fit_now();
+      if (script_list_) fit_script_columns();
+      break;
+    }
+  }
+  if (FILE* f = trace_file()) {
+    std::fprintf(f, "tests.build.%s %.2f\n", kName[s],
+                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+    std::fflush(f);
+  }
+  return complete();
+}
 
+// The assertion list, the empty-state text and the captures title, with their handlers.
+void TestsView::build_core() {
+  const Theme& th = Theme::get();
   list_ = new TestList(this);
   empty_ = new wxStaticText(this, wxID_ANY, "");
   empty_->SetForegroundColour(th.dim);
@@ -330,10 +450,6 @@ void TestsView::ensure_built() {
   list_->refresh_rows();
   update_summary();
   update_chips();
-  if (!cap_rows_.empty()) apply_captures();
-  if (script_.any_script || script_.skipped_untrusted || !script_.rows.empty()) apply_script();
-  if (!inh_.empty()) apply_inherited();
-  Layout();
 }
 
 // The add / edit form: created the first time a check is added or edited.
@@ -403,10 +519,10 @@ void TestsView::build_editor() {
 
 // The capture table: created with the first capture to show.
 void TestsView::apply_captures() {
-  if (!list_) return;
+  if (stage_ < 4) return;  // (built by its slice)
   const Theme& th = Theme::get();
   if (!caps_) {
-    caps_ = new wxListCtrl(this, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxLC_REPORT | wxLC_SINGLE_SEL | wxBORDER_NONE);
+    caps_ = new FastList(this, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxLC_REPORT | wxLC_SINGLE_SEL | wxBORDER_NONE);
     caps_->AppendColumn("Result", wxLIST_FORMAT_LEFT, FromDIP(64));
     caps_->AppendColumn("Variable", wxLIST_FORMAT_LEFT, FromDIP(120));
     caps_->AppendColumn("Scope", wxLIST_FORMAT_LEFT, FromDIP(80));
@@ -495,7 +611,7 @@ void TestsView::apply_captures() {
 // The Script group: created with the first script result to show, between the assertions and
 // the captures.
 void TestsView::apply_script() {
-  if (!list_) return;
+  if (stage_ < 3) return;  // (built by its slice)
   const Theme& th = Theme::get();
   const ScriptResults& sr = script_;
   const bool show = sr.any_script || sr.skipped_untrusted || !sr.rows.empty();
@@ -505,7 +621,7 @@ void TestsView::apply_script() {
     script_title_->SetFont(script_title_->GetFont().Bold());
     script_title_->SetToolTip("Results of the request's scripts: test() / pm.test() calls and uncaught errors "
                               "(Scripts tab of the request). Their console output is in the Log tab.");
-    script_list_ = new wxListCtrl(this, wxID_ANY, wxDefaultPosition, wxDefaultSize,
+    script_list_ = new FastList(this, wxID_ANY, wxDefaultPosition, wxDefaultSize,
                                   wxLC_REPORT | wxLC_SINGLE_SEL | wxBORDER_NONE);
     script_list_->AppendColumn("Result", wxLIST_FORMAT_LEFT, FromDIP(64));
     script_list_->AppendColumn("Test", wxLIST_FORMAT_LEFT, FromDIP(240));
@@ -671,7 +787,7 @@ void TestsView::wrap_script_err() {
 // The inherited group: the folders' / collection's checks, read-only, with their origin. Created
 // with the first inherited check, right under the request's own list.
 void TestsView::apply_inherited() {
-  if (!list_) return;
+  if (stage_ < 5) return;  // (built by its slice)
   const Theme& th = Theme::get();
   const bool show = !inh_.empty();
   if (!show && !inh_list_) return;
@@ -695,7 +811,7 @@ void TestsView::apply_inherited() {
         if (on_edit_folder) on_edit_folder(f);
       });
     });
-    inh_list_ = new wxListCtrl(this, wxID_ANY, wxDefaultPosition, wxDefaultSize,
+    inh_list_ = new FastList(this, wxID_ANY, wxDefaultPosition, wxDefaultSize,
                                wxLC_REPORT | wxLC_SINGLE_SEL | wxBORDER_NONE);
     inh_list_->AppendColumn("Result", wxLIST_FORMAT_LEFT, FromDIP(64));
     inh_list_->AppendColumn("Check", wxLIST_FORMAT_LEFT, FromDIP(260));
@@ -772,6 +888,12 @@ void TestsView::apply_inherited() {
     if (r && (r->state == TestRow::Pass || r->state == TestRow::Fail)) {
       act = r->state == TestRow::Fail && !r->message.empty() ? r->message
                                                               : (r->actual.empty() ? std::string("(undefined)") : r->actual);
+      // Times read as times, as in the own checks: "0.66669999" -> "0.667 ms".
+      if (act == r->actual && (c.a.target.rfind("res.responseTime", 0) == 0 || c.a.target.rfind("res.timing.", 0) == 0)) {
+        char* end = nullptr;
+        const double v = std::strtod(act.c_str(), &end);
+        if (end && *end == 0 && !act.empty()) act = fmt::ms(v);
+      }
       if (act.size() > 300) act = act.substr(0, 300) + "\xE2\x80\xA6";
       for (char& ch : act)
         if (ch == '\n' || ch == '\r' || ch == '\t') ch = ' ';
@@ -879,7 +1001,7 @@ void TestsView::set_running() {
   count_results();
   if (!list_) return;
   update_summary();
-  list_->Refresh();
+  list_->texts_changed();
 }
 
 void TestsView::set_no_response(std::string reason) {
@@ -898,6 +1020,27 @@ void TestsView::set_no_response(std::string reason) {
   update_summary();
 }
 
+const TestRow* TestsView::find_check(const std::string& target, const std::string& op, const std::string& value,
+                                     std::string* inherited_from) const {
+  auto unq = [](std::string_view v) {
+    if (v.size() >= 2 && v.front() == '"' && v.back() == '"') v = v.substr(1, v.size() - 2);
+    return v;
+  };
+  auto same = [&](const Assertion& a) { return a.target == target && a.op == op && unq(a.value) == unq(value); };
+  static const TestRow kNotRun{};
+  for (size_t i = 0; i < asserts_.size(); ++i)
+    if (same(asserts_[i])) {
+      if (inherited_from) inherited_from->clear();
+      return i < rows_.size() ? &rows_[i] : &kNotRun;
+    }
+  for (size_t i = 0; i < inh_.size(); ++i)
+    if (same(inh_[i].a)) {
+      if (inherited_from) *inherited_from = inh_[i].from;
+      return i < inh_rows_.size() ? &inh_rows_[i] : &kNotRun;
+    }
+  return nullptr;
+}
+
 void TestsView::set_results(std::vector<TestRow> rows, double total_ms, double parse_ms) {
   running_ = false;
   have_response_ = true;
@@ -906,6 +1049,8 @@ void TestsView::set_results(std::vector<TestRow> rows, double total_ms, double p
   total_ms_ = total_ms;
   parse_ms_ = parse_ms;
   count_results();
+  // The inherited rows were filled while running_ still read "checking": redraw their Result.
+  if (!inh_.empty()) apply_inherited();
   if (!list_) return;
   list_->refresh_rows();
   update_summary();

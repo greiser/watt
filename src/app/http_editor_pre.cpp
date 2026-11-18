@@ -479,20 +479,43 @@ class Parser {
     if (depth > kMaxPreDepth) return fail("nested too deeply");
     out.clear();
     if (!term(out, depth)) return false;
+    bool num = num_;  // as in JavaScript: number + number adds, anything else concatenates
     std::string t;
     for (;;) {
       skip();
-      if (i_ >= s_.size() || s_[i_] != '+') return true;
+      if (i_ >= s_.size() || s_[i_] != '+') {
+        num_ = num;
+        return true;
+      }
       ++i_;
       if (!term(t, depth)) return false;
+      if (num && num_ && computing()) {
+        double a = 0, b = 0;
+        if (to_num(out, a) && to_num(t, b)) {
+          out = fmt_num(a + b);
+          continue;
+        }
+      }
+      num = false;
       if (out.size() + t.size() > kMaxPreValueBytes) return fail("value too large");
       out += t;
     }
+  }
+  static bool to_num(const std::string& s, double& v) {
+    const char* e = s.data() + s.size();
+    const auto r = std::from_chars(s.data(), e, v);
+    return r.ec == std::errc() && r.ptr == e;
+  }
+  static std::string fmt_num(double v) {
+    char buf[64];
+    const auto r = std::to_chars(buf, buf + sizeof buf, v);
+    return r.ec == std::errc() ? std::string(buf, r.ptr) : std::string("NaN");
   }
 
   bool term(std::string& out, int depth) {
     skip();
     out.clear();
+    num_ = false;
     if (i_ >= s_.size()) return fail("a value is missing at the end");
     const char c = s_[i_];
     if (c == '\'' || c == '"') return string_lit(out, c);
@@ -503,6 +526,7 @@ class Parser {
         ++i_;
       if (i_ == b + (c == '-' ? 1u : 0u)) return fail("expected a number");
       out.assign(s_.substr(b, i_ - b));
+      num_ = true;  // kept as written ("007") unless it is added to another number
       return true;
     }
     if (c == '{' && i_ + 1 < s_.size() && s_[i_ + 1] == '{') {
@@ -560,6 +584,9 @@ class Parser {
       }
     }
     const int n = static_cast<int>(args.size());
+    // A number in JavaScript too (Date.now(), str.length): "+" adds it to another number.
+    const std::string_view fname(f->name);
+    num_ = fname == "now" || fname == "unix" || fname == "randomInt" || fname == "length";
     if (n < f->min_args || n > f->max_args) {
       i_ = at;
       const std::string want = f->min_args == f->max_args ? std::to_string(f->min_args)
@@ -643,6 +670,7 @@ class Parser {
   Ctx& c_;
   size_t i_ = 0;
   std::string err_;
+  bool num_ = false;  // the last term / expression is a number (literal, sum, now(), length() ...)
 };
 
 bool valid_var_name(std::string_view v) {
@@ -652,13 +680,41 @@ bool valid_var_name(std::string_view v) {
   return true;
 }
 
+// Plain text with {{vars}} (Bruno's and Postman's way of writing a variable's value, e.g.
+// {{userId}}-x): no quotes, parentheses or '+', so it cannot be a mistyped expression. When such
+// a value does not parse as an expression it is taken as that text, its {{vars}} expanded.
+bool template_text(std::string_view s) {
+  return !trim_view(s).empty() && s.find_first_of("()'\"+") == std::string_view::npos;
+}
+
+// Only a value that stops parsing at a character no expression has there ({{a}}-x, v1/{{id}}) is
+// text; an unknown req. field, a too long value or a bad call stays an error.
+bool syntax_fails(std::string_view s) {
+  Ctx c;
+  Parser p(s, c);
+  std::string out;
+  return !p.run(out) && p.error().find("unexpected '") != std::string::npos;
+}
+
+// The parser's message plus what to write instead, so the fix is in the error itself.
+std::string with_hint(std::string_view expr, std::string err) {
+  const size_t dot = expr.find('.');
+  if (err.find("unknown function") != std::string::npos && dot != std::string_view::npos)
+    return err + ": JavaScript methods do not run here; write lower(req.method), upper(x), trim(x), length(x), "
+                 "substr(x, 0, 4), replace(x, 'a', 'b'), or use the pre-request script below";
+  if (err.find("unknown function") != std::string::npos) return err + " (the '?' above lists the functions)";
+  if (err.find("not defined") != std::string::npos || err.find("unknown '") != std::string::npos) return err;
+  return err + ". Write plain text like {{userId}}-x, or an expression like 'id-' + lower(req.method)";
+}
+
 }  // namespace
 
 std::string check_pre_expr(std::string_view expr) {
   Ctx c;
   Parser p(expr, c);
   std::string out;
-  return p.run(out) ? std::string() : p.error();
+  if (p.run(out) || (template_text(expr) && syntax_fails(expr))) return {};
+  return with_hint(expr, p.error());
 }
 
 std::vector<PreVarResult> evaluate_pre_vars(const std::vector<PreVar>& rows, const SavedRequest& r, Workspace& ws) {
@@ -683,8 +739,13 @@ std::vector<PreVarResult> evaluate_pre_vars(const std::vector<PreVar>& rows, con
       c.ws = &ws;
       Parser p(pv.expr, c);
       std::string v;
-      if (!p.run(v)) {
-        res.message = p.error();
+      bool parsed = p.run(v);
+      if (!parsed && template_text(pv.expr) && syntax_fails(pv.expr)) {
+        v = ws.expand(std::string(trim_view(pv.expr)));  // plain text, e.g. {{userId}}-x
+        parsed = true;
+      }
+      if (!parsed) {
+        res.message = with_hint(pv.expr, p.error());
       } else if (v.find("{{") != std::string::npos) {
         res.message = "the value holds \"{{\" (it would be expanded again when sent): not set";
       } else {

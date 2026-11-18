@@ -4,7 +4,8 @@
 // "name = expression" is evaluated in order, off the UI thread, right before the request is
 // sent; its value is then a {{name}} like any other (and visible to the rows after it). No wx.
 //
-// Expressions: terms joined with '+' (string concatenation).
+// Expressions: terms joined with '+', as in JavaScript: number + number adds ("p-" + (1+1) is
+// "p-2", now() + 60000 a time), anything with a string concatenates ({{vars}} are strings).
 //   'text' "text"       string literal (\n \t \r \\ \' \" escapes); {{vars}} inside are expanded
 //   123  -1.5           number (kept as written)
 //   {{name}}            a variable (runtime, environment, globals, dynamic {{$timestamp}} ...)

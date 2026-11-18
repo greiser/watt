@@ -268,23 +268,42 @@ int folder_settings(wxWindow* parent, FolderSettings& s) {
 
 namespace watt::app::sidebar {
 
-void pick_file_async(wxWindow* owner, const std::wstring& title,
-                     const std::vector<std::pair<std::wstring, std::wstring>>& filters, bool folders,
+namespace {
+
+// IFileOpenDialog / IFileSaveDialog on a thread of their own (see pick_file_async).
+void run_file_dialog(wxWindow* owner, std::wstring title, std::vector<std::pair<std::wstring, std::wstring>> filters,
+                     bool folders, bool save, std::filesystem::path start, std::wstring name,
                      std::function<void(const std::filesystem::path&)> done) {
   const HWND hwnd = owner ? static_cast<HWND>(owner->GetHWND()) : nullptr;
-  std::thread([hwnd, title, filters, folders, done = std::move(done)]() mutable {
+  std::thread([hwnd, title = std::move(title), filters = std::move(filters), folders, save, start = std::move(start),
+               name = std::move(name), done = std::move(done)]() mutable {
     std::filesystem::path chosen;
     const HRESULT init = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
-    IFileOpenDialog* dlg = nullptr;
-    if (SUCCEEDED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dlg)))) {
+    IFileDialog* dlg = nullptr;
+    const HRESULT made = save ? CoCreateInstance(CLSID_FileSaveDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(
+                                                     reinterpret_cast<IFileSaveDialog**>(&dlg)))
+                              : CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(
+                                                     reinterpret_cast<IFileOpenDialog**>(&dlg)));
+    if (SUCCEEDED(made) && dlg) {
       FILEOPENDIALOGOPTIONS opts = 0;
       dlg->GetOptions(&opts);
-      opts |= FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST | (folders ? FOS_PICKFOLDERS : FOS_FILEMUSTEXIST);
+      opts |= FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST;
+      if (save) opts |= FOS_OVERWRITEPROMPT;
+      else opts |= folders ? FOS_PICKFOLDERS : FOS_FILEMUSTEXIST;
       dlg->SetOptions(opts);
       dlg->SetTitle(title.c_str());
       std::vector<COMDLG_FILTERSPEC> spec;
       for (const auto& [label, pattern] : filters) spec.push_back({label.c_str(), pattern.c_str()});
       if (!folders && !spec.empty()) dlg->SetFileTypes(static_cast<UINT>(spec.size()), spec.data());
+      if (save) dlg->SetDefaultExtension(L"json");
+      if (!name.empty()) dlg->SetFileName(name.c_str());
+      if (!start.empty()) {
+        IShellItem* at = nullptr;
+        if (SUCCEEDED(SHCreateItemFromParsingName(start.c_str(), nullptr, IID_PPV_ARGS(&at))) && at) {
+          dlg->SetFolder(at);
+          at->Release();
+        }
+      }
       if (SUCCEEDED(dlg->Show(hwnd))) {
         IShellItem* item = nullptr;
         if (SUCCEEDED(dlg->GetResult(&item))) {
@@ -302,6 +321,20 @@ void pick_file_async(wxWindow* owner, const std::wstring& title,
     if (wxAppConsole* app = wxTheApp)
       app->CallAfter([done = std::move(done), chosen = std::move(chosen)] { done(chosen); });
   }).detach();
+}
+
+}  // namespace
+
+void pick_file_async(wxWindow* owner, const std::wstring& title,
+                     const std::vector<std::pair<std::wstring, std::wstring>>& filters, bool folders,
+                     std::function<void(const std::filesystem::path&)> done, const std::filesystem::path& start) {
+  run_file_dialog(owner, title, filters, folders, false, start, {}, std::move(done));
+}
+
+void save_file_async(wxWindow* owner, const std::wstring& title,
+                     const std::vector<std::pair<std::wstring, std::wstring>>& filters, const std::wstring& name,
+                     std::function<void(const std::filesystem::path&)> done, const std::filesystem::path& start) {
+  run_file_dialog(owner, title, filters, false, true, start, name, std::move(done));
 }
 
 }  // namespace watt::app::sidebar

@@ -894,3 +894,56 @@ TEST_CASE("the Visualize page follows the app theme", "[response_visualize]") {
   CHECK(dark.find("<style>") < dark.find("<table>"));
   CHECK(visualize_page("x").find("color-scheme:light") != std::string::npos);
 }
+
+TEST_CASE("the JSON value under a click", "[response_asserts]") {
+  const std::string doc =
+      "{\n  \"items\": [\n    {\n      \"id\": 1,\n      \"name\": \"a \\\"b\\\"\"\n    },\n    {\n      \"id\": 2,\n"
+      "      \"tags\": [\"x\", \"y\"],\n      \"a.b\": null\n    }\n  ],\n  \"ok\": true\n}\n";
+  JsonHit h;
+  auto at = [&](const std::string& needle, size_t nth = 0) {
+    size_t p = doc.find(needle);
+    while (nth-- && p != std::string::npos) p = doc.find(needle, p + 1);
+    REQUIRE(p != std::string::npos);
+    return p;
+  };
+  // On a number value.
+  REQUIRE(json_value_at(doc, at("1,") , h));
+  CHECK(target_string(h.path) == "res.body.items[0].id");
+  CHECK(h.scalar);
+  CHECK(doc.substr(h.at, h.len) == "1");
+  // On a key: its value.
+  REQUIRE(json_value_at(doc, at("\"name\"") + 2, h));
+  CHECK(target_string(h.path) == "res.body.items[0].name");
+  CHECK(json_scalar_text(doc.substr(h.at, h.len)) == "a \"b\"");
+  // Inside an array of strings, the second element.
+  REQUIRE(json_value_at(doc, at("\"y\"") + 1, h));
+  CHECK(target_string(h.path) == "res.body.items[1].tags[1]");
+  CHECK(json_scalar_text(doc.substr(h.at, h.len)) == "y");
+  // A key that needs the bracket form.
+  REQUIRE(json_value_at(doc, at("null"), h));
+  CHECK(target_string(h.path) == "res.body.items[1][\"a.b\"]");
+  CHECK(json_scalar_text(doc.substr(h.at, h.len)) == "null");
+  // A key whose value is an array: the array (not a scalar).
+  REQUIRE(json_value_at(doc, at("\"tags\""), h));
+  CHECK(target_string(h.path) == "res.body.items[1].tags");
+  CHECK_FALSE(h.scalar);
+  // Whitespace inside the second object: that object.
+  REQUIRE(json_value_at(doc, at("      \"id\": 2") + 1, h));
+  CHECK(target_string(h.path) == "res.body.items[1]");
+  // The root's closing brace: the root.
+  REQUIRE(json_value_at(doc, doc.rfind('}'), h));
+  CHECK(target_string(h.path) == "res.body");
+  REQUIRE(json_value_at(doc, at("true"), h));
+  CHECK(target_string(h.path) == "res.body.ok");
+  // Not JSON, past the end.
+  CHECK_FALSE(json_value_at("hello world", 3, h));
+  CHECK_FALSE(json_value_at(doc, doc.size() + 5, h));
+  // Raw (compact) JSON works the same.
+  REQUIRE(json_value_at(R"([{"a":[10,20]}])", 10, h));
+  CHECK(target_string(h.path) == "res.body[0].a[1]");
+  // Too deep for an assert target.
+  std::string deep(70, '[');
+  deep += "1";
+  deep += std::string(70, ']');
+  CHECK_FALSE(json_value_at(deep, 70, h));
+}

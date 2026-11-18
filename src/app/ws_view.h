@@ -28,6 +28,9 @@ class WsEditorPanel : public RequestEditorPanel {
   // closed (Connect).
   enum class State { Closed, Connecting, Open };
   virtual void set_state(State s) = 0;
+  // Before a message is sent: false holds it (JSON mode with text that does not parse; the
+  // editor says why, and the same text sent again goes out as written).
+  virtual bool confirm_message() { return true; }
 };
 
 class WsResponsePanel : public ResponsePanel {

@@ -7,6 +7,7 @@
 #include <wx/time.h>
 
 #include <algorithm>
+#include <unordered_map>
 #include <ctime>
 #include <set>
 
@@ -526,37 +527,49 @@ void HistoryList::refilter() {
     shown.push_back(static_cast<int>(i));
     days.push_back(day_text(all_[i].when_iso));
   }
-  // Consecutive repeats: same day, kind, summary, status and request name.
-  auto same = [&](size_t a, size_t b) {
+  // Repeats of one request within a day fold into one row at its newest send, also when other
+  // sends fall in between (two Health checks 5 min apart group like four List users in a row):
+  // same day, kind, target, status and request (its id, else its name).
+  auto key_of = [&](size_t a) {
     const HistoryEntry& x = all_[static_cast<size_t>(shown[a])];
-    const HistoryEntry& y = all_[static_cast<size_t>(shown[b])];
-    if (days[a] != days[b] || x.kind != y.kind || x.status != y.status || group_key(x) != group_key(y)) return false;
-    return label(static_cast<size_t>(shown[a])).name == label(static_cast<size_t>(shown[b])).name;
+    std::string k = std::to_string(static_cast<int>(x.kind)) + '\x1f' + std::to_string(x.status) + '\x1f' + group_key(x);
+    const std::string id = identity ? identity(x) : std::string();
+    k += id.empty() ? "\x1fn" + label(static_cast<size_t>(shown[a])).name : "\x1fi" + id;
+    return k;
+  };
+  std::vector<std::vector<int>> groups;  // the day's groups, in the order of their newest send
+  std::unordered_map<std::string, size_t> group_at;
+  auto flush = [&] {
+    for (auto& g : groups) {
+      if (g.size() == 1) {
+        rows_.push_back(Row{g[0], {}, {}, false});
+      } else {
+        Row r{g[0], {}, {}, false};
+        r.run = g;
+        const HistoryEntry& oldest = all_[static_cast<size_t>(g.back())];
+        const bool open =
+            std::find(unfolded_.begin(), unfolded_.end(), oldest.when_iso + "\x01" + oldest.summary) != unfolded_.end();
+        rows_.push_back(std::move(r));
+        if (open)
+          for (int m : g) rows_.push_back(Row{m, {}, {}, true});
+      }
+      shown_count_ += g.size();
+    }
+    groups.clear();
+    group_at.clear();
   };
   std::string day;
-  for (size_t k = 0; k < shown.size();) {
-    size_t j = k + 1;
-    while (j < shown.size() && same(k, j)) ++j;
+  for (size_t k = 0; k < shown.size(); ++k) {
     if (rows_.empty() || days[k] != day) {
+      flush();
       day = days[k];
       rows_.push_back(Row{-1, day, {}, false});
     }
-    if (j - k == 1) {
-      rows_.push_back(Row{shown[k], {}, {}, false});
-    } else {
-      Row r{shown[k], {}, {}, false};
-      r.run.assign(shown.begin() + static_cast<std::ptrdiff_t>(k), shown.begin() + static_cast<std::ptrdiff_t>(j));
-      const HistoryEntry& oldest = all_[static_cast<size_t>(r.run.back())];
-      const bool open =
-          std::find(unfolded_.begin(), unfolded_.end(), oldest.when_iso + "\x01" + oldest.summary) != unfolded_.end();
-      const std::vector<int> members = r.run;
-      rows_.push_back(std::move(r));
-      if (open)
-        for (int m : members) rows_.push_back(Row{m, {}, {}, true});
-    }
-    shown_count_ += j - k;
-    k = j;
+    auto [it, fresh] = group_at.try_emplace(key_of(k), groups.size());
+    if (fresh) groups.emplace_back();
+    groups[it->second].push_back(shown[k]);
   }
+  flush();
   hover_ = -1;
   click_opened_ = -1;
   chip_x_.assign(rows_.size(), {0, 0});
@@ -713,22 +726,32 @@ void HistoryList::OnDrawItem(wxDC& dc, const wxRect& rect, size_t n) const {
     if (avail <= FromDIP(12)) return;
     dc.SetTextForeground(path_col);
     const wxString ps =
-        wxControl::Ellipsize(wxString::FromUTF8(path.size() > 1 || host.empty() ? path : t), dc, wxELLIPSIZE_END, avail);
+        wxControl::Ellipsize(wxString::FromUTF8(path.size() > 1 || host.empty() ? path : t), dc, wxELLIPSIZE_END, avail, wxELLIPSIZE_FLAGS_EXPAND_TABS);
     dc.DrawText(ps, x, y);
     const int used = dc.GetTextExtent(ps).x + FromDIP(6);
     if (path.size() > 1 && !host.empty() && avail - used > FromDIP(28)) {
       dc.SetTextForeground(dim_colour());
-      dc.DrawText(wxControl::Ellipsize(wxString::FromUTF8(host), dc, wxELLIPSIZE_END, avail - used), x + used, y);
+      dc.DrawText(wxControl::Ellipsize(wxString::FromUTF8(host), dc, wxELLIPSIZE_END, avail - used, wxELLIPSIZE_FLAGS_EXPAND_TABS), x + used, y);
     }
   };
-  draw_target(tx, y2, tailx - FromDIP(8) - tx, mix(window_colour(), text_colour(), 0.72));
+  // An unnamed HTTP entry has its path on line 1 already: line 2 names only the host.
+  const bool path_on_top = l.name.empty() && h.kind == RequestKind::Http && path.size() > 1 && !host.empty();
+  if (path_on_top) {
+    const int avail = tailx - FromDIP(8) - tx;
+    if (avail > FromDIP(12)) {
+      dc.SetTextForeground(mix(window_colour(), text_colour(), 0.72));
+      dc.DrawText(wxControl::Ellipsize(wxString::FromUTF8(host), dc, wxELLIPSIZE_END, avail, wxELLIPSIZE_FLAGS_EXPAND_TABS), tx, y2);
+    }
+  } else {
+    draw_target(tx, y2, tailx - FromDIP(8) - tx, mix(window_colour(), text_colour(), 0.72));
+  }
 
   dc.SetFont(base);
   const int avail1 = stx - FromDIP(8) - tx;
   if (avail1 > FromDIP(12)) {
     if (!l.name.empty()) {
       dc.SetTextForeground(text_colour());
-      dc.DrawText(wxControl::Ellipsize(wxString::FromUTF8(l.name), dc, wxELLIPSIZE_END, avail1), tx, y1);
+      dc.DrawText(wxControl::Ellipsize(wxString::FromUTF8(l.name), dc, wxELLIPSIZE_END, avail1, wxELLIPSIZE_FLAGS_EXPAND_TABS), tx, y1);
     } else {
       // No saved request: the method / gRPC method name on top.
       std::string top = t;
@@ -740,7 +763,7 @@ void HistoryList::OnDrawItem(wxDC& dc, const wxRect& rect, size_t n) const {
         top = path.size() > 1 ? path : t;
       }
       dc.SetTextForeground(mix(window_colour(), text_colour(), 0.88));
-      dc.DrawText(wxControl::Ellipsize(wxString::FromUTF8(top), dc, wxELLIPSIZE_END, avail1), tx, y1);
+      dc.DrawText(wxControl::Ellipsize(wxString::FromUTF8(top), dc, wxELLIPSIZE_END, avail1, wxELLIPSIZE_FLAGS_EXPAND_TABS), tx, y1);
     }
   }
 }

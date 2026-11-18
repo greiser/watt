@@ -676,7 +676,10 @@ Val resolve(const Path& p, ResponseData::Impl& d, std::string* why) {
       break;
     case Root::StatusText: v = str_val(h ? h->status_text : g->status_name); break;
     case Root::StatusMessage: v = str_val(h ? h->error : g->status_message); break;
-    case Root::ResponseTime: v = num_val(t.total_ms); break;
+    case Root::ResponseTime:
+      // A user-paced stream: open -> trailers is the user's pace, not a latency.
+      v = num_val(g && g->pacing.on && g->pacing.tail_ms >= 0 ? g->pacing.tail_ms : t.total_ms);
+      break;
     case Root::Timing: {
       const std::string& ph = p.segs[0].key;
       from = 1;

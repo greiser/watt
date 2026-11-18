@@ -51,6 +51,9 @@ class HistoryList : public wxVListBox {
   // Fills the label of an entry: *name = the saved request it was sent from ("" if none),
   // *target = what to show without a name (e.g. the URL with {{vars}} resolved).
   std::function<void(const HistoryEntry&, std::string* name, std::string* target)> describe;
+  // The id of the saved request an entry was sent from ("" unknown). Repeats of one request
+  // group by it (a rename or move in between does not split them); without ids, by name.
+  std::function<std::string(const HistoryEntry&)> identity;
   // gRPC call kind of an entry (GrpcCallKind as int, < 0 unknown), for its badge arrow.
   std::function<int(const HistoryEntry&)> grpc_kind;
   // Context menu / Del: remove entries (a folded run removes all of its entries), clear the

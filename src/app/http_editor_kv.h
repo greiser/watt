@@ -114,6 +114,14 @@ class KvGrid : public wxGrid {
   void ensure_blank_row();
   void layout_columns();
   void changed();
+  // Undo / redo of committed edits (Ctrl+Z / Ctrl+Y or Ctrl+Shift+Z while no cell is being
+  // edited; inside a cell the text control's own undo applies): a snapshot of the rows before
+  // each commit, a cell edit, a delete, a toggle, a picked operator, a paste. set_rows() (a load,
+  // the URL rewriting Params) starts a new history.
+  std::vector<std::vector<KvRow>> undo_, redo_;
+  std::vector<KvRow> undo_base_;
+  bool undo_step(bool redo);
+  void record_undo();
   void update_tooltip(int row, int col);
   // Keyboard path: Key -> Value -> next row's Key (Tab also stops at Type in multipart), with
   // the editor opened; Shift goes back. The checkbox and delete columns are not on it.
@@ -139,7 +147,7 @@ class KvGrid : public wxGrid {
   bool suggest_key(int key, bool shift);  // a key while the list is open: true when it used it
   // false: nothing to change (the key does its own thing). *whole: the choice replaced the whole
   // cell (a header name / value), not a {{variable}} inside it.
-  bool accept_suggest(wxTextCtrl* tc, bool* whole = nullptr);
+  bool accept_suggest(wxTextCtrl* tc, bool* whole = nullptr, wxString* picked = nullptr);
   void insert_suggest(wxTextCtrl* tc, const wxString& value);
   void close_suggest();
   // The open cell editor survives a switch to another app (Postman / Bruno inputs keep their
@@ -195,6 +203,8 @@ class KvPanel : public wxPanel {
   void refresh_text();
   std::string bulk_text() const;
   void dim_disabled_lines();
+  void show_bulk_hint();  // the example lines under an empty bulk box
+  bool bulk_hint_ = false;
   KvGrid* grid_ = nullptr;
   wxStyledTextCtrl* text_ = nullptr;
   bool setting_text_ = false;

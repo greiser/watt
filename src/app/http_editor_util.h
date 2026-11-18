@@ -98,6 +98,16 @@ std::string clean_header_name(std::string_view s);
 std::string header_name_problem(std::string_view name);
 // Header value as sent: CR, LF and other control characters (except tab) removed.
 std::string clean_header_value(std::string_view s);
+// The Auto headers list: for each (name, value) row, why it is not sent ("" = sent):
+//   "(replaced by your header)"   an enabled row of the Headers table (`own`) has its name;
+//   "(replaced by the Auth tab)"  an inherited row (value ends "   (from <level>)") named like
+//                                 the header the Auth tab sends (`auth_name`: Basic / Bearer ->
+//                                 Authorization, API key -> its name; "" = none), as core's
+//                                 resolve_with() drops it.
+// Rows whose value ends with `from_auth` are the Auth tab's own.
+std::vector<std::string> auto_header_losers(const std::vector<std::pair<std::string, std::string>>& rows,
+                                            const std::vector<std::string>& own, std::string_view auth_name,
+                                            std::string_view from_auth);
 // Enabled items joined with '&'.
 std::string join_query(const std::vector<KvItem>& items);
 // url with its query replaced by the enabled items (no '?' when there are none).
@@ -129,6 +139,10 @@ struct JsonIssue {
   std::string message;
 };
 std::optional<JsonIssue> check_json(std::string_view s);
+
+// First unbalanced { } ( ) [ ] or unterminated string of a GraphQL document ("..." and """block"""
+// strings and # comments skipped), or nullopt. Not a full parser: what Bruno / Insomnia flag first.
+std::optional<JsonIssue> check_graphql(std::string_view s);
 
 // Re-indents JSON (2 spaces) token by token without parsing values.
 std::string reindent_json(std::string_view in);
@@ -228,6 +242,44 @@ struct TypingModel {
   void type(std::string_view keys) {
     for (char c : keys) type(c);
   }
+};
+
+// Whole-cell completion in the key / value tables (KvGrid). Header names, most used first within
+// a prefix ("Cont" offers Content-Type first).
+const std::vector<std::string>& header_name_choices();
+// A header's value suggestions, keyed by its name: Content-Type / Accept get media types,
+// Accept-Encoding codings, Authorization schemes, Connection keep-alive / close, Expect
+// 100-continue. None for an unknown or X-* header, so a typed "1" stays "1".
+const std::vector<std::string>& header_value_choices(std::string_view header_name);
+// The choices that extend `typed` (a case-insensitive prefix, longer than it), in list order;
+// none for an empty `typed`.
+std::vector<std::string> completions_for(const std::vector<std::string>& choices, std::string_view typed);
+// A choice that is the start of a value ("Bearer "): picking it keeps the cell open for the rest.
+inline bool choice_continues(std::string_view choice) { return !choice.empty() && choice.back() == ' '; }
+
+// The Headers table's keyboard rules, without wx (for tests and for reasoning; KvGrid applies the
+// same ones). The completion list never highlights an entry by itself: Down / Up choose one.
+// Tab / Enter put the chosen entry in (nothing chosen: the text stays as typed), commit the cell
+// and move on: Tab Name -> Value -> Description -> next Name, Enter Name -> Value -> next Name.
+// A chosen entry that continues ("Bearer ") goes in and the cell stays open.
+struct HeaderGridModel {
+  struct Row {
+    std::string name, value, desc;
+  };
+  std::vector<Row> rows{Row{}};  // the last row is the blank one
+  int row = 0, col = 0;          // col 0 name, 1 value, 2 description
+  std::string text;              // the open editor's text
+  std::vector<std::string> list; // the completion list (empty: closed)
+  int sel = -1;                  // the chosen entry, -1: none
+  void type(std::string_view keys);  // printable characters; '\t' Tab, '\n' Enter, '\v' Down, '\f' Up
+  // The committed rows, the blank last one left out.
+  std::vector<std::pair<std::string, std::string>> headers() const;
+
+ private:
+  void key(char k);
+  void commit();
+  void open(int r, int c);
+  void refresh_list();
 };
 
 // Row descriptions (the Description column of Params and Headers): notes saved with the request

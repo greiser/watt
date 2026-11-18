@@ -1,6 +1,7 @@
 #include "app/http_editor_codegen.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cstdio>
 #include <string_view>
 #include <utility>
@@ -591,6 +592,22 @@ const char* code_lang_name(CodeLang lang) {
     case CodeLang::PowerShell: return "PowerShell (Invoke-RestMethod)";
   }
   return "";
+}
+
+void drop_shadowed_basic(SavedRequest& r) {
+  if (!r.basic_auth.enabled) return;
+  auto is_auth = [](const std::string& k) {
+    static constexpr std::string_view a = "authorization";
+    if (k.size() != a.size()) return false;
+    for (size_t i = 0; i < k.size(); ++i)
+      if (static_cast<char>(std::tolower(static_cast<unsigned char>(k[i]))) != a[i]) return false;
+    return true;
+  };
+  for (size_t i = 0; i < r.http.headers.size(); ++i)
+    if (!r.disabled_headers.count(i) && is_auth(r.http.headers[i].first)) {
+      r.basic_auth = BasicAuth{};
+      return;
+    }
 }
 
 std::string to_code(const SavedRequest& r, CodeLang lang) {

@@ -23,28 +23,9 @@ namespace watt::app::http_editor {
 
 namespace {
 
-// Most used first within a prefix ("Cont" offers Content-Type first, "Acc" Accept): the
-// completion list keeps this order.
-const char* const kHeaderNames[] = {
-    "Accept", "Accept-Encoding", "Accept-Language", "Accept-Charset", "Authorization", "Cache-Control",
-    "Connection", "Content-Type", "Content-Length", "Content-Encoding", "Content-Disposition",
-    "Content-Language", "Cookie", "DNT", "Date", "Expect", "Forwarded", "From", "Host", "If-Match",
-    "If-Modified-Since", "If-None-Match", "If-Range", "If-Unmodified-Since", "Idempotency-Key",
-    "Keep-Alive", "Max-Forwards", "Origin", "Pragma", "Prefer", "Proxy-Authorization", "Range", "Referer",
-    "TE", "Traceparent", "Tracestate", "Upgrade", "User-Agent", "Via", "X-API-Key", "X-Correlation-ID",
-    "X-CSRF-Token", "X-Forwarded-For", "X-Forwarded-Host", "X-Forwarded-Proto", "X-HTTP-Method-Override",
-    "X-Request-ID", "X-Requested-With"};
-
-const char* const kHeaderValues[] = {
-    "application/json", "application/json; charset=utf-8", "application/xml", "application/x-www-form-urlencoded",
-    "application/octet-stream", "application/grpc-web+proto", "multipart/form-data", "text/plain", "text/html",
-    "text/csv", "*/*", "gzip, deflate, br", "gzip", "identity", "no-cache", "no-store", "max-age=0",
-    "keep-alive", "close", "Bearer ", "Basic ", "en-US,en;q=0.9", "XMLHttpRequest", "100-continue",
-    "return=representation", "return=minimal"};
-
 const char* const kAssertTargets[] = {
-    "res.status", "res.statusText", "res.responseTime", "res.size", "res.headersSize", "res.url", "res.body",
-    "res.body.", "res.body[0]", "res.body.length", "res.headers.", "res.headers.content-type",
+    "res.status", "res.statusText", "res.responseTime", "res.size", "res.headers.", "res.headers.content-type",
+    "res.headersSize", "res.url", "res.body", "res.body.", "res.body[0]", "res.body.length",
     "res.timing.total", "res.timing.ttfb", "res.timing.dns", "res.timing.connect", "res.timing.tls",
     "res.timing.download"};
 
@@ -68,7 +49,7 @@ bool assert_op_unary(std::string_view op) { return istarts_with(op, "is"); }
 
 std::string canonical_header_name(std::string_view name) {
   std::string n = clean_header_name(name);
-  for (const char* known : kHeaderNames)
+  for (const auto& known : header_name_choices())
     if (iequals(n, known)) return known;
   return n;
 }
@@ -78,6 +59,12 @@ namespace {
 wxArrayString to_array(const char* const* b, const char* const* e) {
   wxArrayString a;
   for (auto* p = b; p != e; ++p) a.Add(*p);
+  return a;
+}
+
+wxArrayString to_array(const std::vector<std::string>& v) {
+  wxArrayString a;
+  for (const auto& x : v) a.Add(wxString::FromUTF8(x));
   return a;
 }
 
@@ -240,6 +227,25 @@ class KvRenderer : public wxGridCellStringRenderer {
       return;
     }
     if (path && col == g_->col_key()) s = ":" + s;
+    if (file_row && col == g_->col_value() && s.find("{{") == std::string::npos) {
+      // A chip with the file name (a long path cut at the end hid it), then its folder, dimmed.
+      const size_t cut = s.find_last_of("/\\");
+      const wxString name = wxString::FromUTF8(cut == std::string::npos ? s : s.substr(cut + 1));
+      const wxString dir = cut == std::string::npos ? wxString() : wxString::FromUTF8(s.substr(0, cut + 1));
+      const wxSize ns = dc.GetTextExtent(name);
+      const int cp = grid.FromDIP(6);
+      dc.SetPen(wxPen(t.border, 1));
+      dc.SetBrush(wxBrush(t.hover));
+      dc.DrawRoundedRectangle(x - 2, ty - 2, ns.x + 2 * cp, ch + 4, grid.FromDIP(4));
+      dc.SetTextForeground(enabled ? t.fg : t.dim);
+      dc.DrawText(name, x - 2 + cp, ty);
+      x += ns.x + 2 * cp + grid.FromDIP(6);
+      if (!dir.empty() && x < rect.GetRight()) {
+        dc.SetTextForeground(t.dim);
+        dc.DrawText(dir, x, ty);
+      }
+      return;
+    }
     std::string problem = g_->check ? g_->check(col, g_->cell(row, col)) : std::string();
     if (problem.empty() && kind != KvGrid::Kind::Capture) problem = brace_problem(g_->cell(row, col));
     const wxColour fg = !problem.empty() ? t.var_bad : enabled && !(path && col == g_->col_key()) ? t.fg : t.dim;
@@ -359,11 +365,11 @@ KvGrid::KvGrid(wxWindow* parent, Kind kind)
     a->SetEditor(new CompletingEditor());
     SetColAttr(col_key(), a);
   }
-  key_choices_ = kind == Kind::Headers  ? to_array(std::begin(kHeaderNames), std::end(kHeaderNames))
+  key_choices_ = kind == Kind::Headers  ? to_array(header_name_choices())
                  : kind == Kind::Assert ? to_array(std::begin(kAssertTargets), std::end(kAssertTargets))
                                         : wxArrayString();
-  value_choices_ = kind == Kind::Headers   ? to_array(std::begin(kHeaderValues), std::end(kHeaderValues))
-                   : kind == Kind::Capture ? to_array(std::begin(kAssertTargets), std::end(kAssertTargets))
+  // A header's values follow its name (suggestions()): none here.
+  value_choices_ = kind == Kind::Capture   ? to_array(std::begin(kAssertTargets), std::end(kAssertTargets))
                    : kind == Kind::PreVar  ? to_array(std::begin(kPreFunctions), std::end(kPreFunctions))
                                            : wxArrayString();
   {
@@ -544,9 +550,24 @@ KvGrid::KvGrid(wxWindow* parent, Kind kind)
           });
         });
       }
-      tc->Bind(wxEVT_CHAR_HOOK, [this](wxKeyEvent& ke) {
+      tc->Bind(wxEVT_CHAR_HOOK, [this, tc](wxKeyEvent& ke) {
         const int k = ke.GetKeyCode();
         if (suggest_ && !ke.ControlDown() && !ke.AltDown() && suggest_key(k, ke.ShiftDown())) return;
+        // Ctrl+Z / Ctrl+Y in a cell where nothing was typed yet (Enter moved here after a commit):
+        // the table's undo, as if the edit had not been opened. With typed text the text
+        // control's own undo applies.
+        const int mods = ke.GetModifiers();
+        const bool undo = mods == wxMOD_CONTROL && k == 'Z';
+        const bool redo = (mods == wxMOD_CONTROL && k == 'Y') || (mods == (wxMOD_CONTROL | wxMOD_SHIFT) && k == 'Z');
+        if (undo || redo) {
+          const int r = GetGridCursorRow(), c = GetGridCursorCol();
+          if (r >= 0 && c >= 0 && r < GetNumberRows() && tc->GetValue() == GetCellValue(r, c) &&
+              !(redo ? redo_ : undo_).empty()) {
+            DisableCellEditControl();
+            undo_step(redo);
+            return;
+          }
+        }
         if (k == WXK_ESCAPE && !ke.HasAnyModifiers()) {
           commit_edit();  // no list to close: the edit ends, keeping what was typed
           return;
@@ -648,6 +669,7 @@ KvGrid::KvGrid(wxWindow* parent, Kind kind)
       echo = false;
     }
     ensure_blank_row();
+    record_undo();  // the cell's commit (the edit control may still count as enabled here)
     echo_ = echo;
     changed();
     echo_ = false;
@@ -743,7 +765,50 @@ void KvGrid::layout_columns() {
   EndBatch();
 }
 
+namespace {
+bool same_rows(const std::vector<KvRow>& a, const std::vector<KvRow>& b) {
+  return std::equal(a.begin(), a.end(), b.begin(), b.end(), [](const KvRow& x, const KvRow& y) {
+    return x.key == y.key && x.value == y.value && x.enabled == y.enabled && x.file == y.file && x.bare == y.bare &&
+           x.desc == y.desc && x.type == y.type;
+  });
+}
+}  // namespace
+
+bool KvGrid::undo_step(bool redo) {
+  auto& from = redo ? redo_ : undo_;
+  auto& to = redo ? undo_ : redo_;
+  if (from.empty()) return false;
+  std::vector<KvRow> rows_now = rows();
+  std::vector<KvRow> back = std::move(from.back());
+  from.pop_back();
+  to.push_back(std::move(rows_now));
+  auto keep_undo = std::move(undo_);
+  auto keep_redo = std::move(redo_);
+  const int r = GetGridCursorRow(), c = GetGridCursorCol();
+  set_rows(back);  // resets the history: put it back
+  undo_ = std::move(keep_undo);
+  redo_ = std::move(keep_redo);
+  undo_base_ = std::move(back);
+  if (r >= 0 && r < GetNumberRows() && c >= 0) SetGridCursor(r, c);
+  ForceRefresh();
+  report_orphans();
+  if (on_change) on_change();
+  return true;
+}
+
+void KvGrid::record_undo() {
+  if (updating_) return;
+  std::vector<KvRow> now = rows();
+  if (same_rows(now, undo_base_)) return;
+  undo_.push_back(std::move(undo_base_));
+  if (undo_.size() > 100) undo_.erase(undo_.begin());
+  redo_.clear();
+  undo_base_ = std::move(now);
+}
+
 void KvGrid::changed() {
+  // A committed change (not a keystroke inside a cell): the rows before it can be restored.
+  if (!IsCellEditControlEnabled()) record_undo();
   ForceRefresh();
   report_orphans();
   if (on_change) on_change();
@@ -805,6 +870,9 @@ void KvGrid::set_rows(const std::vector<KvRow>& rows) {
   }
   EndBatch();
   updating_ = false;
+  undo_.clear();
+  redo_.clear();
+  undo_base_ = this->rows();
   tip_row_ = tip_col_ = -2;
   if (GetNumberRows() > 0 && GetGridCursorCol() != col_key() && GetGridCursorCol() != col_value() &&
       GetGridCursorCol() != col_type() && GetGridCursorCol() != col_desc())
@@ -931,7 +999,13 @@ void KvPanel::set_bulk(bool on) {
     // A themed Scintilla editor (a native multi-line box is light, with light scroll bars, in
     // the dark theme), framed like the table.
     const Theme& t = Theme::get();
-    text_ = new wxStyledTextCtrl(book_, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxBORDER_NONE);
+    // In a 1 px frame of the border colour, so it reads as a box to type in.
+    auto* frame = new wxPanel(book_);
+    frame->SetBackgroundColour(t.border);
+    text_ = new wxStyledTextCtrl(frame, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxBORDER_NONE);
+    auto* fs = new wxBoxSizer(wxVERTICAL);
+    fs->Add(text_, 1, wxEXPAND | wxALL, 1);
+    frame->SetSizer(fs);
     wxFont f(wxFontInfo(GetFont().GetPointSize()).Family(wxFONTFAMILY_TELETYPE).FaceName("Cascadia Mono"));
     if (!f.IsOk() || f.GetFaceName() != "Cascadia Mono")
       f = wxFont(wxFontInfo(GetFont().GetPointSize()).Family(wxFONTFAMILY_TELETYPE).FaceName("Consolas"));
@@ -956,14 +1030,23 @@ void KvPanel::set_bulk(bool on) {
     text_->SetToolTip(grid_->kind() == KvGrid::Kind::Headers
                           ? "One header per line, \"Name: value\"; a line starting with // is kept but not sent"
                           : "One row per line, \"key: value\"; a line starting with // is kept but not sent");
-    book_->AddPage(text_, "bulk");
+    // Placeholder: an annotation under the empty first line, in the dim colour.
+    text_->StyleSetForeground(2, t.dim);
+    text_->StyleSetBackground(2, t.field);
+    text_->StyleSetFont(2, f);
+    text_->AnnotationSetVisible(wxSTC_ANNOTATION_STANDARD);
+    book_->AddPage(frame, "bulk");
     text_->Bind(wxEVT_STC_CHANGE, [this](wxStyledTextEvent& e) {
       e.Skip();
       if (!setting_text_) text_changed();
       dim_disabled_lines();
+      show_bulk_hint();
     });
   }
-  if (on) refresh_text();
+  if (on) {
+    refresh_text();
+    show_bulk_hint();
+  }
   book_->ChangeSelection(on ? 1 : 0);
   toggle_->SetLabel(on ? "Key-Value Edit" : "Bulk Edit");
   Layout();
@@ -985,6 +1068,34 @@ void KvPanel::refresh_text() {
   text_->EmptyUndoBuffer();
   setting_text_ = false;
   dim_disabled_lines();
+}
+
+void KvPanel::show_bulk_hint() {
+  if (!text_) return;
+  const bool empty = text_->GetLength() == 0;
+  if (empty == bulk_hint_) return;
+  bulk_hint_ = empty;
+  // The annotation is no edit, though Scintilla may report it as a change.
+  struct Guard {
+    bool& b;
+    bool was;
+    ~Guard() { b = was; }
+  } guard{setting_text_, setting_text_};
+  setting_text_ = true;
+  if (!empty) {
+    text_->AnnotationClearAll();
+    return;
+  }
+  const bool headers = grid_->kind() == KvGrid::Kind::Headers;
+  text_->AnnotationSetText(0, headers ? "One per line:  Name: value\n"
+                                        "Content-Type: application/json\n"
+                                        "Authorization: Bearer {{token}}\n"
+                                        "// X-Debug: 1      (a // line is kept, not sent)"
+                                      : "One per line:  key: value\n"
+                                        "page: 1\n"
+                                        "q: {{search}}\n"
+                                        "// sort: asc      (a // line is kept, not sent)");
+  text_->AnnotationSetStyle(0, 2);
 }
 
 std::string KvPanel::bulk_text() const {
@@ -1060,6 +1171,15 @@ void KvGrid::on_key(wxKeyEvent& e) {
        (e.GetModifiers() == wxMOD_SHIFT && (code == WXK_INSERT || code == WXK_NUMPAD_INSERT))) &&
       paste_into_cell())
     return;
+  if (!editing && !e.AltDown() && code == 'Z' &&
+      (e.GetModifiers() == wxMOD_CONTROL || e.GetModifiers() == (wxMOD_CONTROL | wxMOD_SHIFT))) {
+    undo_step(e.ShiftDown());
+    return;
+  }
+  if (!editing && e.GetModifiers() == wxMOD_CONTROL && code == 'Y') {
+    undo_step(true);
+    return;
+  }
   if (e.ControlDown() && !(code == WXK_BACK && !editing)) {
     e.Skip();  // Ctrl+Enter sends, Ctrl+C copies, ...
     return;
@@ -1310,19 +1430,23 @@ KvGrid::Suggest KvGrid::suggestions(int col, const wxString& text, long caret) c
     out.var = true;
     return out;
   }
-  static const wxArrayString none;
-  const wxArrayString& fixed = col == col_key() ? key_choices_ : col == col_value() ? value_choices_ : none;
-  if (fixed.empty() || before.empty() || caret != static_cast<long>(text.length())) return out;
-  const wxString lp = before.Lower();
-  bool exact = false;
-  for (const auto& c : fixed) {
-    const wxString lc = c.Lower();
-    if (lc == lp) exact = true;
-    else if (lc.StartsWith(lp)) out.items.push_back({c, "", ""});
+  if (before.empty() || caret != static_cast<long>(text.length())) return out;
+  // A header's values are keyed by its name (Content-Type: media types, Expect: 100-continue);
+  // an unknown or X-* header gets none, so a typed "1" is never offered "100-continue".
+  if (kind_ == Kind::Headers && col == col_value()) {
+    const int row = GetGridCursorRow();
+    if (row < 0 || row >= GetNumberRows()) return out;
+    const std::string name = GetCellValue(row, col_key()).utf8_string();
+    for (const auto& c : completions_for(header_value_choices(name), before.utf8_string()))
+      out.items.push_back({wxString::FromUTF8(c), "", ""});
+  } else {
+    static const wxArrayString none;
+    const wxArrayString& fixed = col == col_key() ? key_choices_ : col == col_value() ? value_choices_ : none;
+    const wxString lp = before.Lower();
+    for (const auto& c : fixed)  // strictly longer: what is typed is already there
+      if (c.length() > lp.length() && c.Lower().StartsWith(lp)) out.items.push_back({c, "", ""});
   }
   if (out.items.empty()) return out;
-  // What was typed is itself a choice ("gzip"): first, so Enter keeps it.
-  if (exact) out.items.insert(out.items.begin(), PickItem{before, "", ""});
   out.from = 0;
   out.to = static_cast<long>(text.length());
   return out;
@@ -1344,6 +1468,9 @@ void KvGrid::update_suggest(wxTextCtrl* tc) {
     };
   }
   suggest_tc_ = tc;
+  // A whole-cell list highlights nothing until Up / Down: Enter / Tab keep what was typed
+  // ("X-Api-Version: 1" stays 1). A {{variable}} list takes its best match.
+  p->no_preselect = !s.var;
   // A click picks (the popup never takes the focus, so the edit is still open).
   p->on_pick = [this, tc](const wxString& v) { insert_suggest(tc, v); };
   // Showing / resizing it can move the focus (and so close it, which clears suggest_): the
@@ -1367,15 +1494,16 @@ bool KvGrid::suggest_key(int k, bool shift) {
       return true;
     case WXK_TAB: case WXK_RETURN: case WXK_NUMPAD_ENTER: {
       bool whole = false;
-      if (!shift && accept_suggest(suggest_tc_, &whole)) {
-        // A whole-cell choice (a header name, a known value): the cell is done, so the key also
-        // moves on as it would without the list (Tab: "Auth" Tab -> Authorization, caret in the
-        // value). A {{variable}} inside a text, or Enter, keeps the caret there.
-        if (whole && k == WXK_TAB) nav_move(true, false);
+      wxString picked;
+      if (!shift && accept_suggest(suggest_tc_, &whole, &picked)) {
+        // A whole-cell entry the user chose with Up / Down: in, and the key commits the cell and
+        // moves on as it would without the list (Enter: the next row's name after a value). One
+        // that continues ("Bearer ") keeps the caret for the rest, as a {{variable}} does.
+        if (whole && !choice_continues(picked.utf8_string())) nav_move(true, k != WXK_TAB);
         return true;
       }
       close_suggest();
-      return false;
+      return false;  // nothing chosen: the cell keeps what was typed and the key moves on
     }
     case WXK_LEFT: case WXK_RIGHT: case WXK_NUMPAD_LEFT: case WXK_NUMPAD_RIGHT:
     case WXK_HOME: case WXK_END: case WXK_NUMPAD_HOME: case WXK_NUMPAD_END:
@@ -1385,10 +1513,11 @@ bool KvGrid::suggest_key(int k, bool shift) {
   }
 }
 
-bool KvGrid::accept_suggest(wxTextCtrl* tc, bool* whole) {
+bool KvGrid::accept_suggest(wxTextCtrl* tc, bool* whole, wxString* picked) {
   if (!tc) return false;
   if (!suggest_) return false;
   const wxString v = suggest_->selected_value();
+  if (picked) *picked = v;
   if (v.empty()) return false;
   const Suggest s = suggestions(GetGridCursorCol(), tc->GetValue(), tc->GetInsertionPoint());
   const wxString text = tc->GetValue();
@@ -1461,8 +1590,9 @@ void KvGrid::open_picker(int row, wxChar first) {
     pick_ = nullptr;
     pick_row_ = -1;
   };
-  p->on_pick = [this, row](const wxString& v) {
+  p->on_pick = [this, row, p](const wxString& v) {
     if (row >= GetNumberRows()) return;
+    const bool tab = p->picked_with == WXK_TAB;
     const wxString old = GetCellValue(row, col_type());
     SetCellValue(row, col_type(), v);
     if (kind_ == Kind::Multipart && v != old) SetCellValue(row, col_value(), "");
@@ -1472,10 +1602,12 @@ void KvGrid::open_picker(int row, wxChar first) {
     SetFocus();
     if (kind_ == Kind::Multipart && v == "File") {
       CallAfter([this, row] { choose_file(row); });
-    } else if (kind_ == Kind::Assert && !assert_op_unary(v.utf8_string())) {
-      go(row, col_value(), true);  // the expected value comes next
     } else {
-      go(row, col_type(), false);
+      // Tab picks and moves on to the expected value, as Tab in Target does ("lt, Tab, 9" types 9
+      // into Expected). Enter picks and stays (moving on as well made "cont, Enter, Tab" land in
+      // Description).
+      if (tab && col_value() > col_type()) go(row, col_value(), true);
+      else go(row, col_type(), false);
     }
   };
   wxRect r = CellToRect(row, col_type());

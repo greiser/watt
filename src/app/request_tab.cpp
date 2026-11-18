@@ -272,10 +272,18 @@ std::vector<std::string> unresolved_in(const HttpRequest& q) {
   return out;
 }
 
+// An unsaved tab's title: the path without the host and the query ("{{base}}/echo?u={{user}}"
+// -> "/echo"), as Postman and Bruno keep tab titles short; the host when there is no path.
 std::string url_tail(const std::string& url) {
   auto p = url.find("://");
   std::string s = p == std::string::npos ? url : url.substr(p + 3);
-  if (s.size() > 40) s = "..." + s.substr(s.size() - 37);
+  if (const auto q = s.find_first_of("?#"); q != std::string::npos && q > 0) s.erase(q);
+  if (const auto sl = s.find('/'); sl != std::string::npos && sl > 0 && sl + 1 < s.size()) s.erase(0, sl);
+  if (s.size() > 32) {
+    size_t from = s.size() - 29;
+    while (from < s.size() && (static_cast<unsigned char>(s[from]) & 0xC0) == 0x80) ++from;  // whole UTF-8 characters
+    s = "..." + s.substr(from);
+  }
   return s;
 }
 
@@ -324,6 +332,15 @@ void put_pairs(JWriter& w, const char* k, const Pairs& pairs) {
     w.EndArray();
   }
   w.EndArray();
+}
+
+bool has_header_named(const std::vector<Header>& hs, const std::string& name) {
+  return std::any_of(hs.begin(), hs.end(), [&](const Header& x) {
+    return x.first.size() == name.size() &&
+           std::equal(x.first.begin(), x.first.end(), name.begin(), [](char a, char b) {
+             return std::tolower(static_cast<unsigned char>(a)) == std::tolower(static_cast<unsigned char>(b));
+           });
+  });
 }
 
 std::string str(const rapidjson::Value& o, const char* k) {
@@ -401,6 +418,24 @@ std::string last_response_to_json(const LastResponse& r) {
       put(w, "sent_method", r.sent->request.method);
       put(w, "sent_url", r.sent->request.url);
     }
+    if (!r.inherited_headers.empty()) put_pairs(w, "inherited_headers", r.inherited_headers);
+    if (r.ws_log && !r.ws_log->empty()) {
+      w.Key("ws_messages");
+      w.StartArray();
+      for (const WsMessage& m : *r.ws_log) {
+        w.StartObject();
+        w.Key("out");
+        w.Bool(m.out);
+        if (m.binary) {
+          w.Key("binary");
+          w.Bool(true);
+        }
+        put(w, "at_ms", m.at_ms);
+        put(w, "data", m.data);
+        w.EndObject();
+      }
+      w.EndArray();
+    }
   } else if (const GrpcResponse* g = r.grpc.get()) {
     size_t bytes = 0;
     for (const auto& m : g->messages) bytes += m.json.size();
@@ -428,6 +463,16 @@ std::string last_response_to_json(const LastResponse& r) {
     put(w, "reflect_ms", g->reflect_ms);
     put(w, "peer", g->peer);
     put_timing(w, g->timing);
+    if (g->pacing.on) {
+      w.Key("pacing");
+      w.StartObject();
+      put(w, "sent", static_cast<double>(g->pacing.sent));
+      put(w, "first_send", g->pacing.first_send_ms);
+      put(w, "last_send", g->pacing.last_send_ms);
+      put(w, "end", g->pacing.end_ms);
+      put(w, "tail", g->pacing.tail_ms);
+      w.EndObject();
+    }
   } else {
     return {};
   }
@@ -474,8 +519,28 @@ LastResponse last_response_from_json(const std::string& json, const SavedRequest
       sent->request.method = str(d, "sent_method");
       sent->request.url = str(d, "sent_url");
     }
+    get_pairs(d, "inherited_headers", [&](const std::string& n, const std::string& v) {
+      if (has_header_named(sent->request.headers, n)) return;
+      sent->request.headers.emplace_back(n, v);
+      out.inherited_headers.emplace_back(n, v);
+    });
     out.http = std::move(h);
     out.sent = std::move(sent);
+    if (req.kind == RequestKind::WebSocket && d.HasMember("ws_messages") && d["ws_messages"].IsArray()) {
+      auto log = std::make_shared<std::vector<WsMessage>>();
+      for (const auto& m : d["ws_messages"].GetArray()) {
+        if (!m.IsObject()) continue;
+        if (log->size() >= LastResponse::kLogMessages) break;
+        WsMessage e;
+        e.out = flag(m, "out");
+        e.binary = flag(m, "binary");
+        e.at_ms = num(m, "at_ms");
+        e.data = str(m, "data");
+        if (e.data.size() > LastResponse::kLogMessageBytes) e.data.resize(LastResponse::kLogMessageBytes);
+        log->push_back(std::move(e));
+      }
+      if (!log->empty()) out.ws_log = std::move(log);
+    }
   } else if (kind == "grpc" && req.kind == RequestKind::Grpc) {
     auto g = std::make_shared<GrpcResponse>();
     g->ok = flag(d, "ok");
@@ -497,6 +562,16 @@ LastResponse last_response_from_json(const std::string& json, const SavedRequest
     g->reflect_ms = num(d, "reflect_ms");
     g->peer = str(d, "peer");
     g->timing = get_timing(d);
+    if (d.HasMember("pacing") && d["pacing"].IsObject()) {
+      const auto& p = d["pacing"];
+      auto off = [&](const char* k) { return p.HasMember(k) && p[k].IsNumber() ? p[k].GetDouble() : -1.0; };
+      g->pacing.on = true;
+      g->pacing.sent = static_cast<int>(std::clamp(num(p, "sent"), 0.0, 1e9));
+      g->pacing.first_send_ms = off("first_send");
+      g->pacing.last_send_ms = off("last_send");
+      g->pacing.end_ms = off("end");
+      g->pacing.tail_ms = off("tail");
+    }
     out.grpc = std::move(g);
   }
   if (out) out.when_iso = str(d, "when");
@@ -642,6 +717,10 @@ struct TabWorker : std::enable_shared_from_this<TabWorker> {
   std::mutex call_m;
   std::shared_ptr<GrpcCall> call;
   std::shared_ptr<WsClient> ws;  // the WebSocket connection of this tab (under call_m)
+  // A Manual (interactive) stream, under call_m: when its first and last messages went out and
+  // when End half-closed it. The time between is the user's pace, not the call's.
+  Clock::time_point first_send{}, last_send{}, end_sent{};
+  int sends = 0;
   std::atomic<uint64_t> cancelled_gen{0};
 
   std::mutex msg_m;
@@ -803,6 +882,7 @@ void RequestTab::wake_grpc() {
 
 void RequestTab::realize() {
   if (split_) return;
+  hibernated_ = false;
   wxWindowUpdateLocker lock(this);
   split_ = new wxSplitterWindow(this, wxID_ANY, wxDefaultPosition, wxDefaultSize,
                                 wxSP_LIVE_UPDATE | wxSP_NOBORDER | wxSP_THIN_SASH);
@@ -845,6 +925,9 @@ void RequestTab::realize() {
   // wxAuiNotebook sizes every page when the window is resized, the hidden ones too: laying out
   // each tab's editor and response view made one resize step O(tabs) (67-105 ms with 12-25
   // tabs). A hidden tab only notes it; it lays itself out when it is shown again.
+  // Bound once: a tab realized again after hibernate() keeps these.
+  if (!size_bound_) {
+  size_bound_ = true;
   Bind(wxEVT_SIZE, [this](wxSizeEvent& e) {
     if (!IsShown()) {
       layout_pending_ = true;
@@ -860,8 +943,49 @@ void RequestTab::realize() {
     Layout();
     if (!user_sash_) center_sash();
   });
+  }
   center_sash();  // realized after the page was laid out (a restored tab)
   Bind(wxEVT_IDLE, &RequestTab::on_idle, this);
+}
+
+bool RequestTab::hibernate() {
+  if (!split_) {
+    hibernated_ = true;
+    return false;
+  }
+  if (IsShown() || dirty_ || in_flight_ || pending_send_ || ws_open_ || req_.kind == RequestKind::Grpc) return false;
+  store();  // what the editor shows (a reload of the file could differ from it)
+  if (RequestEditorPanel* ed = editor())
+    while (ed->teardown_step()) {  // big documents freed on a worker, timers stopped
+    }
+  resp_timer_.Stop();
+  Unbind(wxEVT_IDLE, &RequestTab::on_idle, this);  // false when response() unbound it already
+  if (last_) last_pending_ = true;  // shown again once the response view is built again
+  wxWindow* const old = split_;
+  split_ = nullptr;
+  http_ = nullptr;
+  grpc_ = nullptr;
+  ws_ = nullptr;
+  resp_ = nullptr;
+  resp_ph_ = nullptr;
+  resp_ws_ = false;
+  focus_keep_ = nullptr;
+  held_status_ = nullptr;
+  SetSizer(nullptr);  // deletes the sizer that held old
+  old->Destroy();
+  hibernated_ = true;
+  return true;
+}
+
+void RequestTab::prelayout(const wxSize& sz) {
+  if (!split_ || sz.x <= 0 || sz.y <= 0) return;
+  if (GetSize() != sz) SetSize(sz);  // hidden: the size handler only notes layout_pending_
+  layout_pending_ = false;
+  if (user_sash_)
+    Layout();
+  else
+    center_sash();  // Layout() + the 50% sash
+  if (resp_) resp_->window()->Layout();
 }
 
 void RequestTab::center_sash() {
@@ -959,6 +1083,25 @@ void RequestTab::on_resp_focus(wxChildFocusEvent& e) {
 
 RequestTab::~RequestTab() { worker_->shutdown(); }
 
+bool RequestTab::teardown_step() {
+  if (in_flight_) worker_->cancel(gen_);
+  in_flight_ = false;
+  pending_send_ = false;
+  ++gen_;  // a late result is dropped
+  resp_timer_.Stop();
+  if (RequestEditorPanel* ed = editor(); ed && ed->teardown_step()) return true;
+  if (resp_ && split_) {  // the response view (its documents) in a step of its own
+    wxWindow* w = resp_->window();
+    resp_ = nullptr;
+    resp_ph_ = new wxPanel(split_);  // response() is never called again, but keep the invariant
+    resp_ph_->Hide();
+    split_->ReplaceWindow(w, resp_ph_);
+    w->Destroy();
+    return true;
+  }
+  return false;
+}
+
 RequestEditorPanel* RequestTab::editor() const {
   if (req_.kind == RequestKind::WebSocket) return ws_;
   return req_.kind == RequestKind::Http ? static_cast<RequestEditorPanel*>(http_)
@@ -999,6 +1142,7 @@ RequestEditorPanel* RequestTab::ensure_editor(RequestKind kind) {
       // A parked tab (restored from the session) waits for the user instead (wake_grpc).
       if (ctx_.grpc && !grpc_parked_) std::thread([g = ctx_.grpc] { g(); }).detach();
       grpc_ = make_grpc_editor(split_, this);
+      if (manual_pending_) grpc_->set_manual(true);  // a restored session's Manual stream
     }
     ed = grpc_;
   }
@@ -1048,10 +1192,13 @@ std::wstring RequestTab::title() const {
   std::string prefix = req_.kind == RequestKind::Http        ? req_.http.method
                        : req_.kind == RequestKind::WebSocket ? std::string("WS")
                                                              : std::string("gRPC");
-  // A name that already starts with the kind ("WS echo", "GET users") is not prefixed twice.
+  // A name that already starts with the kind ("WS echo", "Get order") is not prefixed twice: its
+  // first word becomes the method as every other tab shows it ("GET order"), so the strip does
+  // not mix labels with and without a method.
   const bool named_with_kind = t.size() > prefix.size() && t[prefix.size()] == ' ' &&
                                wxString::FromUTF8(t.substr(0, prefix.size())).IsSameAs(wxString::FromUTF8(prefix), false);
-  return wxString::FromUTF8(named_with_kind ? t : prefix + " " + t).ToStdWstring() + (dirty_ ? L" \u25CF" : L"");
+  return wxString::FromUTF8(prefix + (named_with_kind ? t.substr(prefix.size()) : " " + t)).ToStdWstring() +
+         (dirty_ ? L" \u25CF" : L"");
 }
 
 void RequestTab::make_permanent() {
@@ -1155,6 +1302,7 @@ void RequestTab::focus_url() {
 void RequestTab::restore_response(LastResponse r) {
   if (!r || in_flight_ || pending_send_) return;
   last_ = std::move(r);
+  if (last_.ws_log) ws_log_ = std::make_shared<std::vector<WsMessage>>(*last_.ws_log);
   shown_method_ = last_.grpc ? req_.grpc_method : std::string();
   last_pending_ = true;
   if (resp_) {
@@ -1168,6 +1316,42 @@ void RequestTab::show_last() {
   if (last_.http) resp_->show_http(last_.http, last_.sent);
   else if (last_.grpc) resp_->show_grpc(last_.grpc);
   resp_->set_history_when({});
+  // A WebSocket tab's restored message log, under its "last session" handshake.
+  if (last_.http && last_.ws_log && resp_ws_)
+    if (WsResponsePanel* v = ws_view()) v->ws_messages(std::vector<WsMessage>(*last_.ws_log));
+}
+
+bool RequestTab::grpc_manual() const {
+  if (req_.kind != RequestKind::Grpc) return false;
+  return grpc_ ? grpc_->manual_wanted() : manual_pending_;
+}
+
+void RequestTab::restore_grpc_manual(bool on) {
+  manual_pending_ = on;
+  if (grpc_) grpc_->set_manual(on);
+}
+
+LastResponse RequestTab::session_response() {
+  if (req_.kind == RequestKind::WebSocket && last_.http && ws_log_ && ws_log_changed_) {
+    last_.ws_log = std::make_shared<const std::vector<WsMessage>>(*ws_log_);
+    ws_log_changed_ = false;
+  }
+  return last_;
+}
+
+void RequestTab::ws_log_add(const std::vector<WsMessage>& batch) {
+  if (!ws_log_) ws_log_ = std::make_shared<std::vector<WsMessage>>();
+  for (const WsMessage& m : batch) {
+    WsMessage c;
+    c.out = m.out;
+    c.binary = m.binary;
+    c.at_ms = m.at_ms;
+    c.data = m.data.size() > LastResponse::kLogMessageBytes ? m.data.substr(0, LastResponse::kLogMessageBytes) : m.data;
+    ws_log_->push_back(std::move(c));
+  }
+  if (ws_log_->size() > LastResponse::kLogMessages)
+    ws_log_->erase(ws_log_->begin(), ws_log_->begin() + static_cast<std::ptrdiff_t>(ws_log_->size() - LastResponse::kLogMessages));
+  ws_log_changed_ = true;
 }
 
 std::shared_ptr<const GrpcSchema> RequestTab::session_schema() const {
@@ -1208,7 +1392,16 @@ void RequestTab::file_moved(const std::filesystem::path& to) {
   // unsaved edits in this tab are kept.
   if (!to.empty())
     if (const Workspace* ws = workspace())
-      if (auto r = ws->load_request(to)) req_.name = r->name;
+      if (auto r = ws->load_request(to)) {
+        req_.name = r->name;
+        // The editor shows the name too (the HTTP breadcrumb): tell it, or reload a clean one.
+        RequestEditorPanel* ed = realized() ? editor() : nullptr;
+        if (ed && !ed->adopt_name(req_.name) && !dirty_ && req_.kind == RequestKind::Http) {
+          loading_ = true;
+          ed->load(req_);
+          loading_ = false;
+        }
+      }
   if (on_title_changed) on_title_changed(this);
 }
 
@@ -1407,6 +1600,7 @@ void RequestTab::on_ws_handshake(uint64_t gen, std::shared_ptr<const WsHandshake
   s->request = *sent;
   last_ = LastResponse{ws_handshake_response(*hs, queue_ms), s, nullptr};
   last_.when_iso = now_iso();
+  ws_log_changed_ = ws_log_ != nullptr;  // the log of earlier connections stays with the new handshake
   last_pending_ = false;
   if (hs->ok) {
     ws_open_ = true;
@@ -1419,6 +1613,8 @@ void RequestTab::on_ws_handshake(uint64_t gen, std::shared_ptr<const WsHandshake
 
 void RequestTab::on_ws_batch(uint64_t gen, std::shared_ptr<std::vector<WsMessage>> batch) {
   if (gen != gen_ || !ws_open_) return;
+  ws_log_add(*batch);
+  if (on_response) on_response(this);  // the session keeps the log
   if (WsResponsePanel* v = ws_view()) v->ws_messages(std::move(*batch));
 }
 
@@ -1436,6 +1632,7 @@ void RequestTab::ws_send_message() {
     c = worker_->ws;
   }
   WsResponsePanel* v = ws_view();
+  if (ws_ && c && !ws_->confirm_message()) return;
   std::string text = req_.http.body;
   if (const Workspace* ws = workspace(); ws && text.find("{{") != std::string::npos)
     text = ws->expand(text, for_inheritance(req_));  // {{vars}} in a message, as Postman and Insomnia do
@@ -1520,6 +1717,10 @@ void RequestTab::on_send_bounced(uint64_t gen) {
   // declined or a "Not sent" banner leaves Send a Send button, never a Cancel that cancels nothing.
   editor()->set_in_flight(false);
   send_http(sent_at_, /*checked=*/true);  // the click time stays unless a prompt is answered
+}
+
+void RequestTab::not_sent(const std::string& why) {
+  if (!in_flight_) response()->show_error(why + " See the banner above the request.");
 }
 
 void RequestTab::before_prompt(const std::string& what) {
@@ -1786,12 +1987,20 @@ void RequestTab::send_http_job(Clock::time_point click, std::shared_ptr<SavedReq
         c->timing.total_ms += ui_queue;
         tap->head(std::move(c));
       };
+    if (tap) {
+      auto copy = std::make_shared<SentHttp>(*sent);
+      copy->pre_script = pre;
+      tap->sent(std::move(copy));
+    }
     auto resp = std::make_shared<HttpResponse>(client.send(sent->request, on_chunk, on_head));
     w->give_back(origin);
     resp->timing.queue_ms += ui_queue;
     resp->timing.total_ms += ui_queue;
     if (run_scripts && has_post && resp->ok) {
       ResponseData rd(*resp);
+      // Captures first (into this worker's workspace copy, not saved): the post-response script
+      // reads this response's captured values, not the previous run's.
+      apply_captures(*toSend, rd, *wsc, false);
       post = std::make_shared<ScriptRun>(run_post_script(*wsc, *toSend, rd));
     }
     sent->pre_script = pre;
@@ -1863,12 +2072,13 @@ void RequestTab::send_grpc(Clock::time_point click) {
     {
       std::lock_guard lk(w->call_m);
       w->call = call;
+      w->first_send = w->last_send = w->end_sent = Clock::time_point{};
+      w->sends = 0;
       if (w->is_cancelled(gen)) call->cancel();
     }
     if (!call->done()) {
-      if (interactive) {
-        if (!trim(r.grpc_body).empty()) call->send(r.grpc_body);
-      } else {
+      // Manual: nothing goes out until the user clicks Send (RequestTab::stream_send).
+      if (!interactive) {
         for (const auto& m : split_messages(r.grpc_body)) {
           std::string err;
           if (!call->send(m, &err)) {
@@ -1881,9 +2091,31 @@ void RequestTab::send_grpc(Clock::time_point click) {
       }
     }
     auto resp = std::make_shared<GrpcResponse>(call->wait());
+    Clock::time_point first_send, last_send, end_sent;
+    int sends = 0;
     {
       std::lock_guard lk(w->call_m);
       w->call.reset();
+      first_send = w->first_send;
+      last_send = w->last_send;
+      end_sent = w->end_sent;
+      sends = w->sends;
+    }
+    // A Manual stream: one clock from the stream opening (as the message offsets), with the
+    // user's pace recorded beside it: what Timing and res.responseTime make of it is in
+    // GrpcResponse::pacing.
+    if (interactive) {
+      auto& pc = resp->pacing;
+      const double engine_total = resp->timing.total_ms;
+      auto at = [&](Clock::time_point t) {
+        return t == Clock::time_point{} ? -1.0 : std::clamp(ms_between(start, t), 0.0, engine_total);
+      };
+      pc.on = true;
+      pc.sent = sends;
+      pc.first_send_ms = at(first_send);
+      pc.last_send_ms = at(last_send);
+      pc.end_ms = at(end_sent);
+      pc.tail_ms = std::max(0.0, engine_total - std::max({0.0, pc.last_send_ms, pc.end_ms}));
     }
     resp->timing.queue_ms += ui_queue;
     resp->timing.total_ms += ui_queue;
@@ -1910,6 +2142,7 @@ void RequestTab::send_grpc(Clock::time_point click) {
   });
   editor()->set_in_flight(true);
   response()->show_sending(RequestKind::Grpc);
+  if (interactive) response()->show_paced(0, false);
 }
 
 void RequestTab::cancel() {
@@ -1940,6 +2173,12 @@ void RequestTab::on_http_done(uint64_t gen, std::shared_ptr<const HttpResponse> 
   if (gen != gen_ || !in_flight_) return;
   finish(gen);
   last_ = LastResponse{r, sent, nullptr};
+  // The headers it inherited from folders / the collection, as templates (never expanded: no
+  // secret is stored): the session restores them into the sent request (X-Team: core).
+  if (const Workspace* ws = workspace(); ws && sent && ws->has_inherited_settings(for_inheritance(req_))) {
+    for (const auto& h : ws->resolved(for_inheritance(req_)).http.headers)
+      if (!has_header_named(req_.http.headers, h.first)) last_.inherited_headers.push_back(h);
+  }
   last_.when_iso = now_iso();
   last_pending_ = false;
   response()->show_http(std::move(r), std::move(sent));
@@ -2133,16 +2372,38 @@ bool RequestTab::stream_send(const std::string& json, std::string* error) {
     if (error) *error = "No stream is open.";
     return false;
   }
-  return call->send(json, error);
+  if (!call->send(json, error)) return false;
+  int sent = 0;
+  bool ended = false;
+  {
+    std::lock_guard lk(worker_->call_m);
+    if (worker_->call == call) {
+      const auto now = Clock::now();
+      if (worker_->first_send == Clock::time_point{}) worker_->first_send = now;
+      worker_->last_send = now;
+      sent = ++worker_->sends;
+      ended = worker_->end_sent != Clock::time_point{};
+    }
+  }
+  if (sent > 0) response()->show_paced(sent, ended);
+  return true;
 }
 
 void RequestTab::stream_close() {
   std::shared_ptr<GrpcCall> call;
+  int sent = 0;
+  bool first_end = false;
   {
     std::lock_guard lk(worker_->call_m);
     call = worker_->call;
+    if (call && worker_->end_sent == Clock::time_point{}) {
+      worker_->end_sent = Clock::now();
+      first_end = true;
+    }
+    sent = worker_->sends;
   }
   if (call) call->close_send();
+  if (first_end) response()->show_paced(sent, true);
 }
 
 }  // namespace watt::app

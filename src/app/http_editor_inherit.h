@@ -43,6 +43,12 @@ struct InheritView {
     bool auth = false;  // the header carries the inherited auth (Bearer / API key)
   };
   std::vector<Header> headers;         // inherited, enabled, not replaced by a nearer folder
+  struct Check {
+    Assertion assertion;
+    std::string from;                  // "Collection", "api/users"
+    std::filesystem::path folder;      // that level's folder (the collection: the workspace root)
+  };
+  std::vector<Check> asserts;          // the folders' / collection's enabled assertions, run on every response
   std::vector<std::string> errors;     // folder.json files that could not be used
   // Folder / collection variables, nearest level first (name, value as written), enabled only.
   std::vector<std::pair<std::string, std::string>> vars;

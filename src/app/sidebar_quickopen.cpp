@@ -109,8 +109,32 @@ class ResultList : public wxVListBox {
     const int y = rect.y + (rect.height - lh) / 2;
     if (it.badge || it.kind == RequestKind::Grpc) draw_badge(dc, this, it.kind, it.method, rect.x + pad, rect.y, rect.height);
     int x = rect.x + pad + FromDIP(44);
-    const int right = rect.GetRight() - pad;
+    int right = rect.GetRight() - pad;
     wxFont normal = GetFont();
+    // The URL at the right (requests that differ only by URL), up to 40% of the row, ellipsized
+    // at its start: the path end is what tells them apart.
+    if (!it.url.empty()) {
+      wxFont small = normal;
+      small.SetFractionalPointSize(normal.GetFractionalPointSize() * 0.92);
+      dc.SetFont(small);
+      wxString u = wxString::FromUTF8(it.url);
+      const int max_w = (right - x) * 2 / 5;
+      if (dc.GetTextExtent(u).x > max_w) {
+        const wxString ell = wxString::FromUTF8("\xE2\x80\xA6");
+        size_t lo = 1, hi = u.length();  // the fewest leading chars to drop (binary search)
+        while (lo < hi) {
+          const size_t mid = (lo + hi) / 2;
+          if (dc.GetTextExtent(ell + u.Mid(mid)).x > max_w) lo = mid + 1;
+          else hi = mid;
+        }
+        u = ell + u.Mid(lo);
+      }
+      const int uw = dc.GetTextExtent(u).x;
+      dc.SetTextForeground(dim_colour());
+      dc.DrawText(u, right - uw, rect.y + (rect.height - dc.GetCharHeight()) / 2);
+      right -= uw + FromDIP(16);
+    }
+    dc.SetFont(normal);
     wxFont bold = normal.Bold();
     const wxColour hl = is_dark() ? wxColour(0x6C, 0xB6, 0xFF) : wxColour(0x0B, 0x5C, 0xB8);
     const size_t ns = it.folder.empty() ? 0 : it.folder.size() + 1;

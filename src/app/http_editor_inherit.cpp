@@ -138,6 +138,9 @@ InheritView make_inherit_view(const EffectiveSettings& eff) {
     InheritView::Header h{name, r.row.value, r.from.label, false};
     v.headers.push_back(std::move(h));
   }
+  for (const auto& c : eff.asserts)
+    if (c.from.level != SettingsOrigin::Level::Request && c.assertion.enabled && !c.assertion.target.empty())
+      v.asserts.push_back({c.assertion, c.from.label, c.from.folder});
   for (const auto& r : eff.vars)
     if (r.from.level != SettingsOrigin::Level::Request && r.row.enabled && !r.overridden && !r.row.name.empty())
       v.vars.emplace_back(r.row.name, r.row.value);

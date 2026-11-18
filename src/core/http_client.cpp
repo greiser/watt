@@ -60,6 +60,8 @@
 #include <thread>
 #include <string_view>
 
+#include "core/loopback_connect.h"
+
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "winmm.lib")
 #pragma comment(lib, "secur32.lib")
@@ -948,6 +950,7 @@ struct TransferCtx {
   const char* hop_version = "";  // protocol of the latest status line ("HTTP/1.1", "HTTP/2")
   std::array<SocketOpen, 8> opens;  // sockets curl opened during this send(), in order
   size_t n_opens = 0;
+  curl_socket_t preconnected = CURL_SOCKET_BAD;  // on_opensocket connected it (loopback)
   // Connection details (HttpResponse::conn), read at a status line on a connection this client
   // has not seen yet and kept across sends; a reused connection costs one CONN_ID lookup.
   ConnCache conns;
@@ -956,6 +959,9 @@ struct TransferCtx {
   const HeadFn* on_head = nullptr;
   bool head_sent = false;
   bool client_cert = false;
+  // The final head said text/event-stream: send() lifts the total timeout (a stream is open
+  // until one side closes it, as in Postman / Insomnia) and keeps an idle timeout instead.
+  bool event_stream = false;
   Clock::time_point t0{}, t_io{};
 
   void begin(HttpResponse* r, const BodyChunkFn* chunk, const HttpRequest& req) {
@@ -963,6 +969,7 @@ struct TransferCtx {
     on_chunk = chunk;
     has_chunk = chunk && *chunk;
     head_sent = false;
+    event_stream = false;
     keep_body = req.keep_body;
     follow = req.follow_redirects;
     hop_open = false;
@@ -1036,6 +1043,10 @@ size_t on_header(char* buf, size_t size, size_t nitems, void* userdata) {
   if (t.empty()) {
     // End of a header block. If curl is about to follow this one, remember where the hop
     // stands: everything after this belongs to the next hop.
+    if (ctx->hop_status >= 200 && ctx->hop_status < 300 && !ctx->event_stream) {
+      const std::string_view ct = r.headers.get("content-type");
+      ctx->event_stream = ct.size() >= 17 && iequals(ct.substr(0, 17), "text/event-stream");
+    }
     if (ctx->follow && ctx->have_location && is_redirect_code(ctx->hop_status)) {
       RawHop& h = ctx->hops.emplace_back();
       h.at_end = Marks::read(ctx->easy);
@@ -1127,24 +1138,55 @@ curl_socket_t on_opensocket(void* userdata, curlsocktype purpose, curl_sockaddr*
   curl_socket_t s = socket(address->family, address->socktype, address->protocol);
   if (s == CURL_SOCKET_BAD) return s;
   const auto* sa = reinterpret_cast<const sockaddr*>(&address->addr);
-  if (purpose == CURLSOCKTYPE_IPCXN && address->socktype == SOCK_STREAM && is_loopback(sa)) {
-    // A refused loopback port answers with RST immediately; without SYN retransmissions the
-    // connect fails at once and curl moves on to the next address (::1 -> 127.0.0.1).
+  const bool loop_tcp =
+      purpose == CURLSOCKTYPE_IPCXN && address->socktype == SOCK_STREAM && is_loopback(sa);
+  // A refused loopback port answers with RST immediately; without SYN retransmissions the
+  // connect fails at once and curl moves on to the next address (::1 -> 127.0.0.1).
+  auto no_syn_retries = [](curl_socket_t fd) {
     TCP_INITIAL_RTO_PARAMETERS rto{};
     rto.Rtt = TCP_INITIAL_RTO_UNSPECIFIED_RTT;
     rto.MaxSynRetransmissions = TCP_INITIAL_RTO_NO_SYN_RETRANSMISSIONS;
     DWORD bytes = 0;
-    WSAIoctl(s, SIO_TCP_INITIAL_RTO, &rto, sizeof(rto), nullptr, 0, &bytes, nullptr, nullptr);
-  }
+    WSAIoctl(fd, SIO_TCP_INITIAL_RTO, &rto, sizeof(rto), nullptr, 0, &bytes, nullptr, nullptr);
+  };
+  if (loop_tcp) no_syn_retries(s);
   if (ctx->n_opens < ctx->opens.size()) {
     SocketOpen& o = ctx->opens[ctx->n_opens++];
     o.at = at;
     std::memset(&o.addr, 0, sizeof(o.addr));
     std::memcpy(&o.addr, sa,
                 std::min<size_t>(sizeof(o.addr), static_cast<size_t>(address->addrlen)));
-    o.ready = Clock::now();
+    o.ready = Clock::now();  // the handshake below counts as Connect, not socket set-up
+  }
+  // Loopback: connect here and let on_sockopt report it connected, so curl skips its own
+  // connect check (see core/loopback_connect.h: ~10 ms on every other fresh connection).
+  ctx->preconnected = CURL_SOCKET_BAD;
+  if (loop_tcp) {
+    switch (detail::loopback_preconnect(s, sa, static_cast<int>(address->addrlen))) {
+      case detail::PreConnect::Connected:
+        ctx->preconnected = s;
+        break;
+      case detail::PreConnect::Refused:
+        // curl moves on to the next address, or fails with its usual "Failed to connect".
+        closesocket(s);
+        WSASetLastError(WSAECONNREFUSED);
+        return CURL_SOCKET_BAD;
+      case detail::PreConnect::Unknown:
+        // Slow: curl connects a fresh socket itself and reports the outcome as usual.
+        closesocket(s);
+        s = socket(address->family, address->socktype, address->protocol);
+        if (s != CURL_SOCKET_BAD) no_syn_retries(s);
+        break;
+    }
   }
   return s;
+}
+
+int on_sockopt(void* userdata, curl_socket_t s, curlsocktype purpose) {
+  const auto* ctx = static_cast<const TransferCtx*>(userdata);
+  return purpose == CURLSOCKTYPE_IPCXN && s != CURL_SOCKET_BAD && s == ctx->preconnected
+             ? CURL_SOCKOPT_ALREADY_CONNECTED
+             : CURL_SOCKOPT_OK;
 }
 
 bool same_ip(const sockaddr_storage& ss, const std::string& ip) {
@@ -1381,6 +1423,8 @@ struct HttpClient::Impl {
     curl_easy_setopt(h, CURLOPT_ACCEPT_ENCODING, "");  // all decoders curl was built with
     curl_easy_setopt(h, CURLOPT_OPENSOCKETFUNCTION, &on_opensocket);
     curl_easy_setopt(h, CURLOPT_OPENSOCKETDATA, &ctx);
+    curl_easy_setopt(h, CURLOPT_SOCKOPTFUNCTION, &on_sockopt);
+    curl_easy_setopt(h, CURLOPT_SOCKOPTDATA, &ctx);
     curl_easy_setopt(h, CURLOPT_HEADERFUNCTION, &on_header);
     curl_easy_setopt(h, CURLOPT_HEADERDATA, &ctx);
     curl_easy_setopt(h, CURLOPT_PREREQFUNCTION, &on_prereq);
@@ -1828,6 +1872,7 @@ HttpResponse HttpClient::send(const HttpRequest& req, const BodyChunkFn& on_chun
   const bool spin = req.busy_poll_ms > 0;
   const auto spin_until = t_io + std::chrono::milliseconds(spin ? req.busy_poll_ms : 0);
   bool connected = false;
+  bool timeout_lifted = false;
   if (!added) {
     multi_error = curl_multi_strerror(mc);
   } else {
@@ -1843,6 +1888,15 @@ HttpResponse HttpClient::send(const HttpRequest& req, const BodyChunkFn& on_chun
       if (im.cancel_flag.load(std::memory_order_relaxed)) {
         cancelled = true;
         break;
+      }
+      if (ctx.event_stream && !timeout_lifted && req.timeout_ms > 0) {
+        // An event stream: no total timeout once its head arrived; it fails only when nothing
+        // at all arrives for max(timeout, 5 min) (keep-alive comments count).
+        timeout_lifted = true;
+        curl_easy_setopt(h, CURLOPT_TIMEOUT_MS, 0L);
+        curl_easy_setopt(h, CURLOPT_LOW_SPEED_LIMIT, 1L);
+        curl_easy_setopt(h, CURLOPT_LOW_SPEED_TIME, std::max(300L, req.timeout_ms / 1000));
+        im.last.timeout = -1;  // apply() sets it again for the next request
       }
       // Busy-poll: let curl look at its sockets again shortly instead of sleeping in the
       // kernel; a few pause instructions keep the loop from hammering the socket calls.
@@ -1868,6 +1922,10 @@ HttpResponse HttpClient::send(const HttpRequest& req, const BodyChunkFn& on_chun
       if (msg->msg == CURLMSG_DONE && msg->easy_handle == h) result = msg->data.result;
     }
     curl_multi_remove_handle(im.multi, h);  // curl's marks stay readable after removal
+    if (timeout_lifted) {
+      curl_easy_setopt(h, CURLOPT_LOW_SPEED_LIMIT, 0L);
+      curl_easy_setopt(h, CURLOPT_LOW_SPEED_TIME, 0L);
+    }
   }
   if (im.cancel_flag.load(std::memory_order_relaxed) &&
       (result == CURLE_ABORTED_BY_CALLBACK || result == CURLE_WRITE_ERROR))

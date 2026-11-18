@@ -196,7 +196,7 @@ void NameCache::save_locked() {
   std::ostringstream o;
   for (const auto& [p, e] : entries_)
     o << escape(to_u8(p.lexically_relative(root_))) << '\t' << e.mtime << '\t' << e.size << '\t'
-      << escape(e.meta.name) << '\t' << escape(e.meta.url) << '\n';
+      << escape(e.meta.name) << '\t' << escape(e.meta.url) << '\t' << escape(e.meta.id) << '\n';
   const fs::path tmp = dir / "sidebar-names.tsv.tmp";
   {
     std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
@@ -289,6 +289,45 @@ void NameCache::note(const fs::path& file, const std::string& name, const std::s
   std::lock_guard<std::mutex> lock(mu_);
   load_locked();
   entries_[file.lexically_normal()] = std::move(e);
+}
+
+bool meta_differs(const MetaMap& shown, const MetaMap& now) {
+  if (shown.size() != now.size()) return true;
+  for (const auto& [path, m] : now) {
+    auto it = shown.find(path);
+    if (it == shown.end() || it->second.name != m.name || it->second.url != m.url || it->second.id != m.id)
+      return true;
+  }
+  return false;
+}
+
+namespace {
+bool badge_missing(const CollectionNode& n) {
+  if (!n.is_folder) return !n.badge;
+  for (const auto& c : n.children)
+    if (badge_missing(c)) return true;
+  return false;
+}
+}  // namespace
+
+void scan_tree(const Workspace& ws, NameCache* names, const ScanDeliver& deliver) {
+  CollectionNode first = ws.tree(25);
+  const bool missing = badge_missing(first);
+  MetaMap meta = names ? names->apply_cached(first) : MetaMap{};
+  CollectionNode latest = missing ? CollectionNode{} : first;
+  MetaMap shown = meta;
+  deliver(std::move(first), std::move(meta), !missing);
+  if (missing) {
+    latest = ws.tree(-1);
+    CollectionNode full = latest;
+    MetaMap m2 = names ? names->apply_cached(full) : MetaMap{};
+    shown = m2;
+    deliver(std::move(full), std::move(m2), true);
+  }
+  if (!names) return;
+  bool changed = false;
+  MetaMap m3 = names->refresh(latest, &changed);
+  if (changed || meta_differs(shown, m3)) deliver(std::move(latest), std::move(m3), true);
 }
 
 }  // namespace watt::app::sidebar

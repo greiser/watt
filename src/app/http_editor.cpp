@@ -14,6 +14,9 @@
 // highlighting looks at the visible part of the body only; Beautify runs on a worker thread.
 #include <wx/scrolwin.h>
 #include <wx/accel.h>
+#include <wx/aui/auibook.h>
+#include <wx/display.h>
+#include <wx/popupwin.h>
 #include <wx/eventfilter.h>
 #include <wx/toplevel.h>
 #include <wx/app.h>
@@ -61,11 +64,13 @@
 #include <set>
 #include <thread>
 
+#include "app/autocomp_guard.h"
 #include "app/http_editor_codegen.h"
 #include "app/http_editor_cookies.h"
 #include "app/sidebar_cookies.h"
 #include "app/http_editor_find.h"
 #include "app/http_editor_folder.h"
+#include "app/http_editor_gql.h"
 #include "app/http_editor_inherit.h"
 #include "app/http_editor_network.h"
 #include "app/http_editor_jshelp.h"
@@ -144,6 +149,8 @@ constexpr int kIndOkBox = 8, kIndOkText = 9, kIndBadBox = 10, kIndBadText = 11;
 constexpr int kIndAutoClose = 12, kIndJsonError = 13;
 // The script syntax problem (pre / post script editors) and its annotation under the line.
 constexpr int kIndJsLint = 14;
+// GraphQL: unknown fields / arguments / variables (query) and keys (variables JSON).
+constexpr int kIndGql = 15;
 constexpr int kStyleJsLint = 41;
 // Style for the URL placeholder (an end-of-line annotation on the empty line).
 constexpr int kStylePlaceholder = 40;
@@ -203,6 +210,70 @@ wxFont mono_font(int pt) {
   if (!f.IsOk() || f.GetFaceName() != "Cascadia Mono") f = wxFont(wxFontInfo(pt).Family(wxFONTFAMILY_TELETYPE).FaceName("Consolas"));
   return f;
 }
+
+// A '?' reference: a dark panel with the title and the wrapped text, at most `width` px wide.
+// Closes on Esc, on a click elsewhere and when the app is deactivated (wxPopupTransientWindow).
+class HelpPopup : public wxPopupTransientWindow {
+ public:
+  HelpPopup(wxWindow* parent, const wxString& title, const wxString& text, int width)
+      : wxPopupTransientWindow(parent, wxBORDER_SIMPLE) {
+    const Theme& t = Theme::get();
+    SetBackgroundColour(t.border);
+    panel_ = new wxPanel(this, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxWANTS_CHARS);
+    panel_->SetBackgroundColour(t.field);
+    auto* s = new wxBoxSizer(wxVERTICAL);
+    const int pad = FromDIP(10);
+    auto* head = new wxStaticText(panel_, wxID_ANY, title);
+    head->SetForegroundColour(t.fg);
+    head->SetFont(head->GetFont().Bold());
+    s->Add(head, 0, wxLEFT | wxRIGHT | wxTOP, pad);
+    auto* body = new wxStaticText(panel_, wxID_ANY, text);
+    body->SetForegroundColour(t.fg);
+    body->Wrap(width - 2 * pad);
+    s->Add(body, 0, wxLEFT | wxRIGHT | wxTOP, pad);
+    auto* foot = new wxStaticText(panel_, wxID_ANY, "Esc or a click elsewhere closes this");
+    foot->SetForegroundColour(t.dim);
+    s->Add(foot, 0, wxALL, pad);
+    panel_->SetSizer(s);
+    auto* outer = new wxBoxSizer(wxVERTICAL);
+    outer->Add(panel_, 1, wxEXPAND | wxALL, 1);
+    SetSizerAndFit(outer);
+    auto esc = [this](wxKeyEvent& e) {
+      if (e.GetKeyCode() == WXK_ESCAPE) DismissAndNotify();
+      else e.Skip();
+    };
+    panel_->Bind(wxEVT_CHAR_HOOK, esc);
+    panel_->Bind(wxEVT_KEY_DOWN, esc);
+    // The popup does not take the keyboard: Esc reaches the window under it, whose top-level
+    // window sees it first (wxEVT_CHAR_HOOK). Unbound when this popup goes (sink tracking).
+    if (wxWindow* top = wxGetTopLevelParent(parent)) top->Bind(wxEVT_CHAR_HOOK, &HelpPopup::on_hook, this);
+  }
+  void on_hook(wxKeyEvent& e) {
+    if (e.GetKeyCode() == WXK_ESCAPE && IsShown()) {
+      DismissAndNotify();
+      return;
+    }
+    e.Skip();
+  }
+  wxWindow* focus() const { return panel_; }
+  // wxPopupWindow is created always-on-top (WS_EX_TOPMOST): it would float over other apps.
+  // Owned by the main window, it stays above that one without it.
+  void Popup(wxWindow* focus = nullptr) override {
+    wxPopupTransientWindow::Popup(focus);
+#ifdef __WXMSW__
+    ::SetWindowPos(static_cast<HWND>(GetHWND()), HWND_NOTOPMOST, 0, 0, 0, 0,
+                   SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+#endif
+  }
+
+ protected:
+  void OnDismiss() override {
+    CallAfter([this] { Destroy(); });
+  }
+
+ private:
+  wxPanel* panel_ = nullptr;
+};
 
 // Lifetime token for worker threads that post back to the editor.
 struct Alive {
@@ -354,6 +425,7 @@ class HttpEditor : public wxPanel, public HttpEditorPanel, public wxEventFilter 
   // accelerator, which would send without do_send(): no {{var}} check, no encoding of variable
   // values. The visible editor takes that command and sends through do_send().
   int FilterEvent(wxEvent& e) override;
+  bool teardown_step() override;
 
   wxWindow* window() override { return this; }
   void load(const SavedRequest& r) override;
@@ -375,6 +447,8 @@ class HttpEditor : public wxPanel, public HttpEditorPanel, public wxEventFilter 
     for (auto& f : var_fields_)
       if (wxStyledTextCtrl* s = f.get()) highlight_vars(s, 0, s->GetLength());
     if (!jar_) refresh_jar();  // the workspace has just opened
+    if (gql_query_) gql_timer_.StartOnce(50);  // another environment: another endpoint / schema
+    recheck_banner();  // "{{base}} is not defined" may be defined in this environment
   }
 
  private:
@@ -400,6 +474,7 @@ class HttpEditor : public wxPanel, public HttpEditorPanel, public wxEventFilter 
   void update_badges();
   void update_auto_headers(bool force = false);
   void set_method(const std::string& m);
+  void note_body_method();
   void show_method_menu();
   std::string url_text() const;
   void set_url_text(const std::string& u);
@@ -473,6 +548,13 @@ class HttpEditor : public wxPanel, public HttpEditorPanel, public wxEventFilter 
   bool prebuild_done_ = false;
   std::string prebuild_times_;
   bool tests_laid_out_ = false;
+  // A tab that is not in the notebook yet (main_frame's hidden spare): its steps run while it
+  // waits there, so Ctrl+T hands out a tab whose Tests / Scripts pages are already built.
+  bool parked() const;
+  // A click on Scripts / Tests before their side is built shows the page with one piece (a table)
+  // and builds the rest one piece per timer tick (each 5-10 ms), never all of it in one step.
+  wxTimer side_timer_;
+  void finish_side_step();
   wxTimer st_timer_;
   double st_swap_ms_ = 0, st_install_ms_ = 0;
   std::string ctor_times_;  // the constructor's steps in ms (self test)
@@ -509,6 +591,9 @@ class HttpEditor : public wxPanel, public HttpEditorPanel, public wxEventFilter 
   std::set<wxStyledTextCtrl*> var_list_bound_;  // editors whose list pick inserts the name only
   bool step_over_closer(wxStyledTextCtrl* s, int key);
   void step_past_var_closer(wxStyledTextCtrl* s);
+  std::string auth_header_name() const;
+  bool close_on_blank_line(int key);  // JSON body: "}" on the blank line above an auto-closed "}"
+  void dedent_closer();               // JSON body: a closer that starts its line takes the block's indent
 
   // send + upload prompt
   void do_send();
@@ -516,6 +601,7 @@ class HttpEditor : public wxPanel, public HttpEditorPanel, public wxEventFilter 
   void show_info(const wxString& title, const wxString& text = {}, const wxString& action = {},
                  std::function<void()> on_action = {});
   void hide_banner();
+  void recheck_banner();
   void wrap_banner();
   void set_banner_texts(const wxString& title, const wxString& text);
 
@@ -618,10 +704,65 @@ class HttpEditor : public wxPanel, public HttpEditorPanel, public wxEventFilter 
   int body_page_[7] = {-1, -1, -1, -1, -1, -1, -1};
   // GraphQL body: the two editors (built with their page) and their text until then.
   wxStyledTextCtrl* gql_query_ = nullptr;
+  wxStaticText* gql_lint_ = nullptr;  // the query's first unbalanced bracket / string
+  void lint_gql();
   wxStyledTextCtrl* gql_vars_ = nullptr;
   std::string gql_q_val_, gql_v_val_, gql_op_;
   std::string gql_query_text() const;
   std::string gql_vars_text() const;
+  // GraphQL schema (http_editor_gql.h): introspection POSTed on a worker through the same
+  // resolve path as a send (inherited headers and auth, OAuth token, {{vars}}, consents: the
+  // worker's http_to_send() is the gate and a blocked fetch comes back here to ask), parsed on
+  // the worker, cached per URL + environment in memory and in <ws>/.watt/graphql/. It drives
+  // the query's completion (fields, arguments, input fields, enum values, $variables) and the
+  // lint (unknown fields / arguments / types / variables underlined; variables JSON keys).
+  wxStaticText* gql_chip_ = nullptr;   // "Schema: 42 types, 3 min ago" / "Fetching..." / error
+  FlatButton* gql_fetch_ = nullptr;    // Fetch schema / Refresh
+  // Explore: every type's fields (arguments, type, description) in a searchable list, grouped by
+  // type with the root types first; picking one inserts it at the query's caret with its
+  // required arguments and a { } for an object.
+  FlatButton* gql_explore_ = nullptr;
+  PickPopup* gql_explore_pop_ = nullptr;
+  void gql_explore();
+  void gql_insert_field(const std::string& type, const std::string& field);
+  wxStaticText* gql_vars_lint_ = nullptr;
+  std::shared_ptr<const GqlSchema> gql_schema_;
+  std::string gql_key_;          // cache key of the URL + environment shown (gql_schema_ is for it)
+  std::string gql_disk_tried_;   // the key whose .watt copy was looked for
+  double gql_time_ = 0;          // when gql_schema_ was fetched (seconds since the epoch)
+  bool gql_busy_ = false;
+  bool gql_consented_ = false;   // the fetch in flight follows an Allow in the banner
+  std::string gql_error_;
+  uint64_t gql_gen_ = 0;
+  std::vector<GqlItem> gql_items_;  // the completion list shown (descriptions for the call tip)
+  GqlCompletion::Kind gql_items_kind_ = GqlCompletion::Kind::None;
+  wxTimer gql_timer_;            // the URL / environment settled: look the schema up again
+  wxTimer gql_age_timer_;        // the chip's "3 min ago"
+  void build_gql_schema_row(wxWindow* parent, wxSizer* sizer);
+  std::string gql_current_key() const;
+  void gql_lookup();             // the schema for the current URL + environment (memory, then disk)
+  void gql_fetch();
+  void gql_fetch_blocked(std::shared_ptr<SavedRequest> req, const std::string& err);
+  void gql_set_schema(std::shared_ptr<const GqlSchema> schema, const std::string& key, double when);
+  void update_gql_chip();
+  void gql_completion(bool explicit_request);
+  PickPopup* gql_pop_ = nullptr;   // the completion list while it is open
+  void gql_close_pop();
+  void gql_pick(const wxString& name);
+  bool gql_key(wxKeyEvent& e);   // auto-close helpers on wxEVT_CHAR
+  void gql_char_added(int key);
+  void lint_gql_vars();
+  // WATT_HTTPED_GQLTEST=<log file> (WATT_HTTPED_GQLURL=<endpoint>): the first editor switches
+  // to GraphQL, fetches the schema, types into the query and logs each step's UI time, the
+  // completion lists and the lint, plus the longest UI-thread stall (WATT_HTTPED_SELFTEST_STAY:
+  // stays open with a completion list showing).
+  wxTimer gqlst_timer_;
+  int gqlst_state_ = 0;
+  std::chrono::steady_clock::time_point gqlst_t0_{};
+  std::string gqlst_log_;
+  std::wstring gqlst_out_;
+  std::shared_ptr<StallProbe> gqlst_probe_;
+  void gql_self_test_tick();
   int ensure_body_page(int kind);
   void sync_body_book();
   std::string binary_val_;     // the File mode path (binary_path_ shows it once built)
@@ -759,6 +900,11 @@ class HttpEditor : public wxPanel, public HttpEditorPanel, public wxEventFilter 
   KvGrid* asserts_ = nullptr;
   KvGrid* captures_ = nullptr;
   wxStaticText* tests_hint_ = nullptr;
+  // The folders' / collection's assertions (inh_.asserts), listed under the table with their
+  // origin as the Headers tab lists inherited headers; a click edits that folder's settings.
+  wxPanel* inh_asserts_box_ = nullptr;
+  std::vector<std::pair<std::string, std::string>> inh_asserts_shown_;
+  void show_inherited_asserts();
   wxPanel* tests_page_ = nullptr;
   KvPanel* assert_panel_ = nullptr;
   KvPanel* capture_panel_ = nullptr;
@@ -789,6 +935,21 @@ class HttpEditor : public wxPanel, public HttpEditorPanel, public wxEventFilter 
   wxPanel* post_pg_ = nullptr;
   void build_pre_side();
   void build_post_side();
+  // Each side in two idle steps (prebuild_step): its tables, then its script editor (an
+  // STC with its help, ~10-20 ms each); a user who opens the side gets both at once.
+  void build_pre_script();
+  void build_post_script();
+  void build_post_captures();  // the Captures table: its own idle step after the assertions
+  bool split_sides_ = false;
+  wxSizer* pre_sizer_ = nullptr;
+  wxSizer* post_sizer_ = nullptr;
+  // Options: the page, then its Certificates & proxy panel in a later idle step.
+  bool defer_net_ = false;
+  wxSizer* opts_sizer_ = nullptr;
+  wxWindow* opts_page_ = nullptr;
+  size_t net_at_ = 0;
+  NetworkPanel* net_staged_ = nullptr;  // being built in idle steps (net_panel_ once complete)
+  void build_net_panel(bool step);
   void add_trust_row(wxWindow* parent, wxSizer* s, int side);
   void setup_tests_grid(KvGrid* g);
   void show_trust();
@@ -906,6 +1067,7 @@ class HttpEditor : public wxPanel, public HttpEditorPanel, public wxEventFilter 
   std::string loaded_urlenc_;     // urlencoded body as loaded (kept byte for byte if not edited)
   std::vector<KvRow> loaded_urlenc_rows_;
   bool loading_ = false;
+  bool torn_ = false;  // teardown_step() began: the tab is closing
   bool syncing_ = false;
   bool in_flight_ = false;
   bool first_load_ = true;
@@ -1041,6 +1203,7 @@ HttpEditor::HttpEditor(wxWindow* parent, EditorHost* host) : wxPanel(parent, wxI
   fold_timer_.Bind(wxEVT_TIMER, [this](wxTimerEvent&) { run_fold_ops(); });
   fill_timer_.Bind(wxEVT_TIMER, [this](wxTimerEvent&) { run_fill(); });
   prebuild_timer_.Bind(wxEVT_TIMER, [](wxTimerEvent&) { wxWakeUpIdle(); });
+  side_timer_.Bind(wxEVT_TIMER, [this](wxTimerEvent&) { finish_side_step(); });
   schedule_prebuild(800);
   Bind(wxEVT_IDLE, &HttpEditor::on_idle, this);
 
@@ -1073,6 +1236,13 @@ HttpEditor::HttpEditor(wxWindow* parent, EditorHost* host) : wxPanel(parent, wxI
     st_timer_.Bind(wxEVT_TIMER, [this](wxTimerEvent&) { self_test_tick(); });
     st_timer_.Start(20);
   }
+  static bool gqlst_ran = false;
+  if (!gqlst_ran && wxGetEnv("WATT_HTTPED_GQLTEST", &st_out) && !st_out.empty()) {
+    gqlst_ran = true;
+    gqlst_out_ = st_out.ToStdWstring();
+    gqlst_timer_.Bind(wxEVT_TIMER, [this](wxTimerEvent&) { gql_self_test_tick(); });
+    gqlst_timer_.Start(20);
+  }
 }
 
 int HttpEditor::FilterEvent(wxEvent& e) {
@@ -1094,6 +1264,39 @@ HttpEditor::~HttpEditor() {
   prev_doc_ = nullptr;
   if (redo_doc_) body_->ReleaseDocument(redo_doc_);
   redo_doc_ = nullptr;
+}
+
+// The tab is closing (hidden, parked outside the notebook, deleted once this returns false): the
+// big documents are let go one per step, each freed on a worker, so neither the close nor the
+// final delete frees a 12 MB, 960k-line document (and its undo copy) on the UI thread.
+bool HttpEditor::teardown_step() {
+  if (!torn_) {
+    torn_ = true;
+    loading_ = true;  // nothing below is an edit
+    for (wxTimer* t : {&prebuild_timer_, &side_timer_, &st_timer_, &fill_timer_, &note_timer_, &jar_timer_, &lint_timer_,
+                       &fold_timer_, &gql_timer_, &gql_age_timer_, &gqlst_timer_, &o_timer_, &pre_timer_})
+      t->Stop();
+    Unbind(wxEVT_IDLE, &HttpEditor::on_idle, this);
+    ++beautify_gen_;  // a paste / format still on its worker is dropped when it comes back
+    ++body_load_gen_;
+    end_fill(false);
+    return true;
+  }
+  for (wxStyledTextCtrl* s : {body_, gql_query_, gql_vars_, pre_js_, post_js_}) {
+    if (!s || s->GetLength() < 64 * 1024) continue;
+    void* doc = s->GetDocPointer();
+    s->AddRefDocument(doc);
+    s->SetDocPointer(nullptr);  // an empty document: the old one keeps the reference taken above
+    release_doc_async(doc);
+    return true;
+  }
+  if (prev_doc_ || redo_doc_) {
+    release_doc_async(std::exchange(prev_doc_, nullptr));
+    release_doc_async(std::exchange(redo_doc_, nullptr));
+    redo_raw_.reset();
+    return true;
+  }
+  return false;
 }
 
 void HttpEditor::build_url_bar(wxSizer* sz) {
@@ -1229,6 +1432,7 @@ void HttpEditor::setup_url_stc() {
       while (i < n && method_str_ != kMethods[i]) ++i;
       i = i == n ? 0 : (i + (k == WXK_DOWN ? 1 : n - 1)) % n;
       set_method(kMethods[i]);
+      note_body_method();
       touched();
     } else if (k == WXK_TAB && !e.ControlDown()) {
       url_->Navigate(e.ShiftDown() ? wxNavigationKeyEvent::IsBackward : wxNavigationKeyEvent::IsForward);
@@ -1384,9 +1588,9 @@ wxWindow* HttpEditor::build_body_page() {
   beautify_ = new FlatButton(p, "Beautify", FlatButton::Style::Subtle);
   beautify_->SetToolTip("Re-indent the JSON body (keeps values and {{variables}} as written)  Ctrl+B");
   beautify_->on_click = [this] { beautify(); };
-  minify_ = new CheckButton(p, "Send minified");
-  minify_->SetToolTip("The body is shown and edited formatted; on: it is sent without the whitespace between "
-                      "tokens (an unedited paste byte for byte as pasted), off: sent as shown");
+  minify_ = new CheckButton(p, "Send compact");
+  minify_->SetToolTip("The body is shown and edited formatted. On: sent on one line, an unedited paste byte for "
+                      "byte as pasted, an edited body without the whitespace between tokens. Off: sent as shown");
   minify_->on_change = [this] {
     if (!loading_) touched();
     // Only what is sent changes: the view stays, repainted whole (no stale line paint over a
@@ -1557,14 +1761,87 @@ int HttpEditor::ensure_body_page(int kind) {
       l->SetForegroundColour(t.dim);
       gs->Add(l, 0, wxTOP | wxBOTTOM, FromDIP(4));
     };
+    build_gql_schema_row(gp, gs);
     label("Query");
     gql_query_ = make_script_editor(gp, "query { user(id: $id) { id name } }");
     gql_query_->SetKeyWords(0, "query mutation subscription fragment on true false null");
     gql_query_->SetKeyWords(1, "");
+    {
+      wxStyledTextCtrl* q = gql_query_;
+      q->IndicatorSetStyle(kIndAutoClose, wxSTC_INDIC_HIDDEN);
+      q->IndicatorSetStyle(kIndGql, wxSTC_INDIC_SQUIGGLE);
+      q->IndicatorSetForeground(kIndGql, t.js_error);
+      q->Bind(wxEVT_CHAR, [this](wxKeyEvent& e) {
+        if (gql_key(e)) return;
+        e.Skip();
+      });
+      // The completion list (a themed PickPopup that never takes the focus) is driven from here.
+      q->Bind(wxEVT_KEY_DOWN, [this](wxKeyEvent& e) {
+        const int k = e.GetKeyCode();
+        if (k == WXK_SPACE && e.GetModifiers() == wxMOD_CONTROL) {
+          gql_completion(true);
+          return;
+        }
+        if (gql_pop_ && e.GetModifiers() == wxMOD_NONE) {
+          switch (k) {
+            case WXK_UP: case WXK_DOWN: case WXK_PAGEUP: case WXK_PAGEDOWN: case WXK_NUMPAD_UP:
+            case WXK_NUMPAD_DOWN: case WXK_RETURN: case WXK_NUMPAD_ENTER: case WXK_TAB: case WXK_ESCAPE:
+              gql_pop_->key(k);  // moves in the list, picks, or closes it
+              return;
+            case WXK_BACK:  // the word shrinks: the list follows once Scintilla deleted the character
+              CallAfter([this] {
+                if (gql_pop_) gql_completion(false);
+              });
+              break;
+            case WXK_LEFT: case WXK_RIGHT: case WXK_HOME: case WXK_END:
+              gql_close_pop();
+              break;
+            default:
+              break;
+          }
+        }
+        e.Skip();
+      });
+      q->Bind(wxEVT_KILL_FOCUS, [this](wxFocusEvent& e) {
+        e.Skip();
+        CallAfter([this] { gql_close_pop(); });
+      });
+      q->Bind(wxEVT_LEFT_DOWN, [this](wxMouseEvent& e) {
+        e.Skip();
+        gql_close_pop();
+      });
+      q->Bind(wxEVT_STC_CHARADDED, [this](wxStyledTextEvent& e) {
+        e.Skip();
+        gql_char_added(e.GetKey());
+      });
+    }
     gs->Add(gql_query_, 3, wxEXPAND);
+    // The lint lines keep their row when empty: a message coming or going never moves the
+    // editors (a click aimed at Variables landed in the query when it did).
+    gql_lint_ = new wxStaticText(gp, wxID_ANY, "", wxDefaultPosition, wxDefaultSize,
+                                 wxST_NO_AUTORESIZE | wxST_ELLIPSIZE_END);
+    gql_lint_->SetForegroundColour(t.var_bad);
+    gql_lint_->SetMinSize(wxSize(-1, GetCharHeight()));
+    gs->Add(gql_lint_, 0, wxEXPAND | wxTOP, FromDIP(2));
+    gql_query_->Bind(wxEVT_STC_CHANGE, [this](wxStyledTextEvent& e) {
+      e.Skip();
+      lint_gql();
+      lint_gql_vars();  // the declarations may have changed
+    });
     label("Variables (JSON, {{variables}} allowed)");
     gql_vars_ = make_script_editor(gp, "{ \"id\": \"{{userId}}\" }");
+    gql_vars_->IndicatorSetStyle(kIndGql, wxSTC_INDIC_SQUIGGLE);
+    gql_vars_->IndicatorSetForeground(kIndGql, t.js_error);
     gs->Add(gql_vars_, 2, wxEXPAND);
+    gql_vars_lint_ = new wxStaticText(gp, wxID_ANY, "", wxDefaultPosition, wxDefaultSize,
+                                      wxST_NO_AUTORESIZE | wxST_ELLIPSIZE_END);
+    gql_vars_lint_->SetForegroundColour(t.var_bad);
+    gql_vars_lint_->SetMinSize(wxSize(-1, GetCharHeight()));
+    gs->Add(gql_vars_lint_, 0, wxEXPAND | wxTOP, FromDIP(2));
+    gql_vars_->Bind(wxEVT_STC_CHANGE, [this](wxStyledTextEvent& e) {
+      e.Skip();
+      lint_gql_vars();
+    });
     auto* note = new wxStaticText(gp, wxID_ANY, "Sent as a JSON POST body {\"query\": ..., \"variables\": ...} "
                                                 "(Content-Type: application/json).");
     note->SetForegroundColour(t.dim);
@@ -1577,6 +1854,9 @@ int HttpEditor::ensure_body_page(int kind) {
     gql_query_->EmptyUndoBuffer();
     gql_vars_->EmptyUndoBuffer();
     loading_ = was;
+    lint_gql();
+    lint_gql_vars();
+    gql_lookup();
     page = gp;
   } else if (kind == 5) {
     auto* cp = new QuietPanel(body_book_);
@@ -1721,6 +2001,10 @@ void HttpEditor::setup_body_stc() {
     ++body_edits_;
     update_line_margin();
     if (loading_) return;
+    // The first edit of a pasted / loaded one-line JSON: it no longer goes out byte for byte.
+    if (raw_body_ && raw_edits_ + 1 == body_edits_ && minify_ && minify_->value())
+      note("Body edited: now sent without the whitespace between tokens (Send compact), not as pasted. "
+           "Undo the edit to send the pasted bytes again.");
     drop_redo_doc();  // an edit after Ctrl+Z: the swapped-out document is no longer a redo
     body_hl_first_ = -1;
     if (body_mode_ == BodyMode::Json) lint_timer_.StartOnce(body_->GetLength() < 256 * 1024 ? 250 : 300);
@@ -1778,6 +2062,7 @@ void HttpEditor::setup_body_stc() {
   s->IndicatorSetForeground(kIndJsonError, t.js_error);
   s->Bind(wxEVT_CHAR, [this](wxKeyEvent& e) {
     if (text_mode(body_mode_) && step_over_closer(body_, e.GetUnicodeKey())) return;
+    if (body_mode_ == BodyMode::Json && close_on_blank_line(e.GetUnicodeKey())) return;
     e.Skip();
   });
   s->Bind(wxEVT_STC_AUTOCOMP_COMPLETED, [this](wxStyledTextEvent& e) {
@@ -1793,6 +2078,10 @@ void HttpEditor::setup_body_stc() {
       return;
     }
     if (body_->AutoCompActive()) var_narrow(body_);
+    if ((key == '}' || key == ']') && body_mode_ == BodyMode::Json) {
+      dedent_closer();
+      return;
+    }
     if (key != '\n') return;
     const int line = body_->GetCurrentLine();
     if (line <= 0) return;
@@ -1917,6 +2206,9 @@ void HttpEditor::ensure_page(size_t i) {
     wxWindowUpdateLocker lock(opts_holder_);
     opts_holder_->GetSizer()->Add(build_options_page(), 1, wxEXPAND);
     push_opts();
+    opts_holder_->Layout();
+  } else if (i == kTabOptions && !net_panel_) {
+    build_net_panel(false);
     opts_holder_->Layout();
   } else if (i == kTabDocs && !docs_) {
     wxWindowUpdateLocker lock(docs_holder_);
@@ -2363,7 +2655,8 @@ void HttpEditor::build_auth_subpage(size_t index) {
       break;
     }
     case 2: {
-      auto [pg, grid] = page("Sent as  Authorization: Basic base64(user:password)  unless the request sets its own Authorization header.");
+      auto [pg, grid] = page("Sent as  Authorization: Basic base64(user:password).  It replaces an Authorization header inherited from a "
+                            "folder or the collection; one in this request's Headers table replaces it.");
       basic_user_ = var_field(pg, grid, "Username", "user", &av_.user);
       {
         auto* lb = new wxStaticText(pg, wxID_ANY, "Password");
@@ -2730,6 +3023,49 @@ wxStyledTextCtrl* HttpEditor::make_var_field(wxWindow* parent, const char* hint,
   return s;
 }
 
+// CA / client certificate / proxy of this request, over its folders' (Certificates & proxy):
+// built with the Options page when the user opens it, or in its own idle step after the page.
+void HttpEditor::build_net_panel(bool step) {
+  if (net_panel_ || !opts_sizer_) return;
+  wxWindowUpdateLocker lock(opts_page_);
+  if (!net_staged_) {
+    const Workspace* ws = host_->workspace();
+    net_staged_ = new NetworkPanel(opts_page_, ws ? ws->root() : std::filesystem::path(), false, step);
+    opts_sizer_->Insert(net_at_, net_staged_, 0, wxEXPAND | wxTOP | wxBOTTOM | wxRIGHT, FromDIP(6));
+    if (step && !net_staged_->complete()) {
+      opts_page_->Layout();
+      return;
+    }
+  }
+  if (step) {
+    if (!net_staged_->build_step()) {
+      opts_page_->Layout();
+      return;
+    }
+  } else {
+    while (!net_staged_->build_step()) {
+    }
+  }
+  net_panel_ = net_staged_;
+  net_panel_->on_change = [this] {
+    if (loading_) return;
+    ov_.net = net_panel_->get();
+    const std::string pass = ov_.net.cert_file.empty() ? std::string() : net_panel_->passphrase();
+    if (pass != ov_.pass) save_passphrase(pass);
+    update_preview();  // "Encode URL" changes the Sent-as line
+    touched();
+  };
+  const bool was = loading_;  // its values (push_opts does the same once the page is built)
+  loading_ = true;
+  net_panel_->set(ov_.net, ov_.pass);
+  net_panel_->set_inherited(wxString::FromUTF8(inh_.network));
+  net_panel_->set_above(inh_.opts);
+  net_panel_->set_follow(ov_.redirects);
+  loading_ = was;
+  opts_page_->Layout();
+  opts_page_->FitInside();
+}
+
 wxWindow* HttpEditor::build_options_page() {
   const Theme& t = Theme::get();
   // Scrolls: with Certificates & proxy the page is taller than a small request pane.
@@ -2789,20 +3125,10 @@ wxWindow* HttpEditor::build_options_page() {
   jar_opt_->on_change = [this] {
     if (!loading_) set_use_jar(jar_opt_->value());
   };
-  {
-    // CA / client certificate / proxy of this request, over its folders' (Certificates & proxy).
-    const Workspace* ws = host_->workspace();
-    net_panel_ = new NetworkPanel(p, ws ? ws->root() : std::filesystem::path(), false);
-    s->Add(net_panel_, 0, wxEXPAND | wxTOP | wxBOTTOM | wxRIGHT, FromDIP(6));
-    net_panel_->on_change = [this] {
-      if (loading_) return;
-      ov_.net = net_panel_->get();
-      const std::string pass = ov_.net.cert_file.empty() ? std::string() : net_panel_->passphrase();
-      if (pass != ov_.pass) save_passphrase(pass);
-      update_preview();  // "Encode URL" changes the Sent-as line
-      touched();
-    };
-  }
+  opts_sizer_ = s;
+  opts_page_ = p;
+  net_at_ = s->GetItemCount();
+  if (!defer_net_) build_net_panel(false);
   auto timeout_changed = [this] {
     if (loading_) return;
     long v = 0;
@@ -3087,6 +3413,9 @@ void HttpEditor::load(const SavedRequest& r) {
     gql_query_->EmptyUndoBuffer();
     gql_vars_->EmptyUndoBuffer();
     loading_ = was;
+    lint_gql();
+    lint_gql_vars();
+    gql_timer_.StartOnce(50);  // another URL: its schema (memory, then the .watt copy)
   }
 
   std::vector<KvRow> mrows;
@@ -3167,16 +3496,20 @@ void HttpEditor::load(const SavedRequest& r) {
     std::vector<KvRow> cr;
     for (const auto& c : r.captures) cr.push_back({c.var, c.target, c.enabled, false, false, {}, capture_scope_name(c.scope)});
     set_assert_rows(r.asserts);
-    captures_->set_rows(cr);
-    post_js_->SetText(wxString::FromUTF8(r.post_script));
-    post_js_->EmptyUndoBuffer();
+    if (captures_) captures_->set_rows(cr);
+    if (post_js_) {
+      post_js_->SetText(wxString::FromUTF8(r.post_script));
+      post_js_->EmptyUndoBuffer();
+    }
   }
   if (pre_) {
     std::vector<KvRow> pr;
     for (const auto& x : pre_vals_) pr.push_back({x.var, x.expr, x.enabled, false, false, {}, x.scope.empty() ? "runtime" : x.scope});
     pre_->set_rows(pr);
-    pre_js_->SetText(wxString::FromUTF8(r.pre_script));
-    pre_js_->EmptyUndoBuffer();
+    if (pre_js_) {
+      pre_js_->SetText(wxString::FromUTF8(r.pre_script));
+      pre_js_->EmptyUndoBuffer();
+    }
   }
   if (tests_page_) {
     update_tests_hint();
@@ -3432,8 +3765,13 @@ void HttpEditor::store(SavedRequest& r) const {
 
 void HttpEditor::set_in_flight(bool f) {
   in_flight_ = f;
+  // A send the shell dispatched (Ctrl+Enter from the sidebar, the Send menu): a "Not sent"
+  // banner whose problems are all gone no longer describes this request.
+  if (f) recheck_banner();
   if (!f && auth_mode_ == AuthMode::OAuth2) update_oauth_status();
   if (!f) jar_timer_.StartOnce(300);  // the response may have set cookies (recorded on a worker)
+  // The trust question may have been answered meanwhile (the send starts / the response came).
+  if (trust_state_ != 1 && has_scripts()) refresh_trust();
   send_->SetLabel(f ? "Cancel" : "Send");
   send_->SetToolTip(f ? "Cancel the request in flight" : "Send (Ctrl+Enter)");
 }
@@ -3447,17 +3785,22 @@ void HttpEditor::focus_url() {
 
 // ------------------------------------------------------------------ behaviour
 
+// The "Not sent" banner goes away once none of the problems it names is left (an edit, another
+// environment, a send that now resolves).
+void HttpEditor::recheck_banner() {
+  if (banner_missing_.empty() || !banner_ || !banner_->IsShown()) return;
+  auto now = unresolved_vars(nullptr);
+  for (const auto& n : empty_path_vars()) now.push_back(":" + n);
+  for (const auto& b : brace_problems()) now.push_back("{}" + b.first);
+  for (const auto& r : header_rows())
+    if (r.enabled && !header_name_problem(r.key).empty()) now.push_back("{}header name " + r.key);
+  if (std::none_of(banner_missing_.begin(), banner_missing_.end(),
+                   [&](const std::string& v) { return std::find(now.begin(), now.end(), v) != now.end(); }))
+    hide_banner();
+}
+
 void HttpEditor::touched() {
-  if (!banner_missing_.empty() && banner_ && banner_->IsShown()) {
-    auto now = unresolved_vars(nullptr);
-    for (const auto& n : empty_path_vars()) now.push_back(":" + n);
-    for (const auto& b : brace_problems()) now.push_back("{}" + b.first);
-    for (const auto& r : header_rows())
-      if (r.enabled && !header_name_problem(r.key).empty()) now.push_back("{}header name " + r.key);
-    if (std::none_of(banner_missing_.begin(), banner_missing_.end(),
-                     [&](const std::string& v) { return std::find(now.begin(), now.end(), v) != now.end(); }))
-      hide_banner();
-  }
+  recheck_banner();
   update_badges();
   if (body_mode_ == BodyMode::Text) sync_text_kind();  // a Content-Type typed on the Headers tab
   if (!KvGrid::echo()) host_->changed();  // a cell's commit of text already reported: not a new edit
@@ -3486,7 +3829,9 @@ void HttpEditor::update_badges() {
     std::set<std::string> own;
     for (const auto& r : header_rows())
       if (r.enabled && !trim(r.key).empty()) own.insert(canonical_header_name(r.key));
-    for (const auto& h : inh_.headers) nh += own.count(canonical_header_name(h.name)) == 0;
+    const std::string by_auth = auth_header_name();  // the Auth tab's header replaces an inherited one
+    for (const auto& h : inh_.headers)
+      nh += own.count(canonical_header_name(h.name)) == 0 && !(!by_auth.empty() && iequals(h.name, by_auth));
   }
   tabs_->set_badge(strip_of(kTabHeaders), nh || ho ? wxString::Format("%zu", nh) : wxString(), ho > 0);
   tabs_->set_badge(strip_of(kTabAuth), auth_mode_ == AuthMode::None || (auth_mode_ == AuthMode::Inherit && (!inh_.known || inh_.type == "No auth"))
@@ -3495,7 +3840,10 @@ void HttpEditor::update_badges() {
   {
     size_t npre = 0, npost = 0;
     if (asserts_) {
-      npost = asserts_->enabled_count() + captures_->enabled_count();
+      npost = asserts_->enabled_count();
+      if (captures_) npost += captures_->enabled_count();
+      else
+        for (const auto& c : capture_vals_) npost += c.enabled && !c.var.empty();
     } else {
       for (const auto& a : assert_vals_) npost += a.enabled && !a.target.empty();
       for (const auto& c : capture_vals_) npost += c.enabled && !c.var.empty();
@@ -3505,7 +3853,8 @@ void HttpEditor::update_badges() {
     } else {
       for (const auto& x : pre_vals_) npre += x.enabled && !x.var.empty();
     }
-    const bool bad = tests_hint_ && tests_hint_->IsShown();
+    const bool bad = tests_hint_ && !tests_hint_->GetLabel().empty();
+    npost += inh_.asserts.size();  // the folders' checks run too (listed under the table)
     npre += pre_js_ ? pre_js_->GetLength() > 0 : !base_.pre_script.empty();
     npost += post_js_ ? post_js_->GetLength() > 0 : !base_.post_script.empty();
     tabs_->set_badge(kStripScripts, npre ? wxString::Format("%zu", npre) : wxString());
@@ -3531,6 +3880,18 @@ void HttpEditor::update_badges() {
   tabs_->set_badge(strip_of(kTabDocs), docs_text_.empty() ? wxString() : wxString::FromUTF8("\xE2\x97\x8F"));
   if (book_->GetSelection() == kTabCookies) update_cookies();
   update_auto_headers();
+}
+
+// The header the Auth tab sends that beats one of the same name inherited from a folder or the
+// collection (core resolve_with: the request's own Basic, Bearer and API key header); "" = none.
+std::string HttpEditor::auth_header_name() const {
+  if (auth_mode_ == AuthMode::Basic || (auth_mode_ == AuthMode::Bearer && !av_.bearer.empty())) return "Authorization";
+  if (auth_mode_ == AuthMode::ApiKey && av_.key_where == 0) return clean_header_name(av_.key_name);
+  // OAuth 2.0 in the header, Digest / NTLM / Negotiate / SigV4: their Authorization replaces an
+  // inherited one (core resolve_with, auth_sets_authorization).
+  if (auth_mode_ == AuthMode::OAuth2) return av_.adv.oauth2.add_to == OAuth2Config::AddTo::Header ? "Authorization" : "";
+  if (scheme_mode(auth_mode_)) return "Authorization";
+  return {};
 }
 
 // What HttpClient / libcurl add on their own (see src/core/http_client.cpp).
@@ -3598,36 +3959,46 @@ void HttpEditor::update_auto_headers(bool force) {
       else rows.emplace_back("Content-Length", "<computed when sent>");
       break;
   }
-  const wxString label = inh_.headers.empty()
-                             ? wxString::Format("Auto headers (%zu)", rows.size())
-                             : wxString::Format("Auto headers (%zu, %zu inherited)", rows.size(), inh_.headers.size());
+  std::vector<std::string> own;  // enabled names of the Headers table
+  for (const auto& r : header_rows())
+    if (r.enabled) own.push_back(r.key);
+  // The header the Auth tab sends beats one of the same name inherited from a folder or the
+  // collection (core resolve_with: the request's own Basic, Bearer and API key header).
+  const std::vector<std::string> lost = auto_header_losers(rows, own, auth_header_name(), kFromAuth);
+  // Counted: what is sent (a replaced row is listed, struck through, but not counted).
+  const size_t sent = static_cast<size_t>(std::count(lost.begin(), lost.end(), std::string()));
+  size_t inh_sent = 0;
+  for (size_t i = 0; i < rows.size(); ++i)
+    inh_sent += lost[i].empty() && rows[i].second.rfind("   (from ") != std::string::npos && rows[i].second.back() == ')';
+  const wxString label = inh_.headers.empty() ? wxString::Format("Auto headers (%zu)", sent)
+                                              : wxString::Format("Auto headers (%zu, %zu inherited)", sent, inh_sent);
   if (label != auto_btn_->GetLabel()) {
     auto_btn_->SetLabel(label);
     auto_btn_->InvalidateBestSize();
     auto_btn_->GetParent()->Layout();
   }
   if (!auto_panel_->IsShown()) return;
-  std::set<std::string> overridden;
-  for (const auto& r : header_rows())
-    if (r.enabled) overridden.insert(canonical_header_name(r.key));
   auto sig = rows;
-  for (auto& [k, v] : sig)
-    if (overridden.count(canonical_header_name(k))) v += '\x01';
+  for (size_t i = 0; i < sig.size(); ++i) sig[i].second += '\x01' + lost[i];
   if (sig == auto_shown_rows_) return;
   auto_shown_rows_ = std::move(sig);
   const Theme& t = Theme::get();
   auto_panel_->Freeze();
   auto_grid_->Clear(true);
-  for (const auto& [k, v] : rows) {
-    const bool over = overridden.count(canonical_header_name(k)) > 0;
+  for (size_t i = 0; i < rows.size(); ++i) {
+    const auto& [k, v] = rows[i];
+    const bool over = !lost[i].empty();
     auto* kl = new wxStaticText(auto_panel_, wxID_ANY, wxString::FromUTF8(k));
-    auto* vl = new wxStaticText(auto_panel_, wxID_ANY, wxString::FromUTF8(over ? v + "   (replaced by your header)" : v));
+    auto* vl = new wxStaticText(auto_panel_, wxID_ANY, wxString::FromUTF8(over ? v + "   " + lost[i] : v));
     kl->SetForegroundColour(over ? t.dim : t.fg);
     vl->SetForegroundColour(t.dim);
     if (over) {
       wxFont f = kl->GetFont();
       f.SetStrikethrough(true);
       kl->SetFont(f);
+      const wxString tip = "Not sent: " + wxString::FromUTF8(lost[i].substr(1, lost[i].size() - 2));
+      kl->SetToolTip(tip);
+      vl->SetToolTip(tip);
     } else if (v.size() >= strlen(kFromAuth) && v.compare(v.size() - strlen(kFromAuth), std::string::npos, kFromAuth) == 0) {
       kl->SetToolTip("Set on the Auth tab");
       vl->SetToolTip("Set on the Auth tab");
@@ -3673,6 +4044,13 @@ void HttpEditor::update_auto_headers(bool force) {
   auto_panel_->GetParent()->Layout();
 }
 
+// A method picked by hand that usually carries no body while the request has one: say so (the
+// body is still sent, as curl -X GET -d would).
+void HttpEditor::note_body_method() {
+  if ((method_str_ == "GET" || method_str_ == "HEAD") && body_mode_ != BodyMode::None && body_mode_ != BodyMode::CurlData)
+    note(wxString::FromUTF8(method_str_ + " with a body: it is sent, but many servers and proxies ignore or refuse it"), true);
+}
+
 void HttpEditor::set_method(const std::string& m) {
   method_str_ = m;
   method_->SetLabel(wxString::FromUTF8(m));
@@ -3711,6 +4089,7 @@ void HttpEditor::show_method_menu() {
     }
     if (m == method_str_) return;
     set_method(m);
+    note_body_method();
     touched();
   };
   const wxRect r = method_->GetScreenRect();
@@ -3783,6 +4162,7 @@ void HttpEditor::update_placeholder(bool empty) {
 
 void HttpEditor::url_changed() {
   const std::string u = url_text();
+  if (gql_query_) gql_timer_.StartOnce(300);  // the endpoint's schema, once the URL settles
   update_placeholder(u.empty());
   highlight_vars(url_, 0, url_->GetLength());
   sync_path_rows();
@@ -4123,6 +4503,7 @@ void HttpEditor::import_curl(const std::string& cmd, CmdBackslashes bs) {
   r.disabled_params.clear();
   r.form = imp->form;
   r.basic_auth = imp->basic_auth;
+  if (imp->auth.type != HttpAuth::Type::None) r.auth = imp->auth;  // --digest -u, --aws-sigv4 -u, ...
   r.body_file = imp->body_file;
   r.body_data = imp->body_data;
   r.header_files = imp->header_files;
@@ -4176,6 +4557,13 @@ void HttpEditor::set_body_mode(BodyMode m, bool user) {
   lint_timer_.StartOnce(50);
   fit_body_tools();
   if (!user) return;
+  // A body picked on a GET / HEAD: POST, as GraphQL does (curl -d does the same). Most servers
+  // and proxies ignore or refuse a GET body; picking GET again keeps it (with a note).
+  if (m != BodyMode::None && m != BodyMode::GraphQL && (method_str_ == "GET" || method_str_ == "HEAD")) {
+    note(wxString::FromUTF8(method_str_ + " -> POST: a " + method_str_ +
+                            " body is ignored or refused by most servers (pick GET to keep it)"));
+    set_method("POST");
+  }
   switch (m) {
     case BodyMode::None: set_content_type(nullptr); break;
     case BodyMode::Json: set_content_type("application/json"); break;
@@ -4184,7 +4572,11 @@ void HttpEditor::set_body_mode(BodyMode m, bool user) {
     case BodyMode::UrlEncoded: set_content_type("application/x-www-form-urlencoded"); break;
     case BodyMode::Multipart: set_content_type(nullptr); break;  // built with its boundary at send time
     case BodyMode::Binary: set_content_type("application/octet-stream"); break;
-    case BodyMode::GraphQL: set_content_type("application/json"); break;
+    case BodyMode::GraphQL:
+      set_content_type("application/json");
+      // The query goes as a JSON POST body (as the note under it says): GET / HEAD carry none.
+      if (method_str_ == "GET" || method_str_ == "HEAD") set_method("POST");
+      break;
     case BodyMode::CurlData: break;
   }
   if (text_mode(m)) body_->SetFocus();
@@ -4332,6 +4724,7 @@ void HttpEditor::refresh_inherited() {
         ed->net_panel_->set_above(ed->inh_.opts);
       }
       ed->update_preview();  // a folder's "Encode URL" changes what is sent
+      ed->show_inherited_asserts();
       ed->update_badges();
       ed->update_auto_headers();
     });
@@ -4651,19 +5044,27 @@ void HttpEditor::lint() {
   const uint64_t edits = body_edits_;
   const bool blocks = body_->GetLineCount() >= 100000;  // where big_fold folds
   void* doc = body_->GetDocPointer();
-  std::thread([alive = alive_, text, gen, minify, edits, blocks, doc] {
+  // Edited back to the pasted tokens (x then Backspace): the pasted bytes go out again.
+  std::shared_ptr<const std::string> raw = minify ? raw_body_ : nullptr;
+  std::thread([alive = alive_, text, gen, minify, edits, blocks, doc, raw] {
     auto issue = check_json(*text);
     std::shared_ptr<const std::string> mini;
     if (minify) mini = std::make_shared<const std::string>(minify_json(*text));
+    const bool same_as_raw = mini && raw && mini->size() <= raw->size() && *mini == minify_json(*raw);
     std::vector<std::pair<int, int>> big;
     if (blocks) big = json_big_blocks(*text, kBigBlockLines);
     std::lock_guard lk(alive->m);
     if (!alive->target) return;
     auto* ed = static_cast<HttpEditor*>(alive->target);
-    ed->CallAfter([ed, gen, issue = std::move(issue), mini, edits, blocks, doc, big = std::move(big)]() mutable {
+    ed->CallAfter([ed, gen, issue = std::move(issue), mini, edits, blocks, doc, big = std::move(big), raw,
+                   same_as_raw]() mutable {
       if (mini && edits == ed->body_edits_) {
         ed->minified_ = mini;
         ed->minified_edits_ = edits;
+        if (same_as_raw && raw == ed->raw_body_ && ed->raw_edits_ != edits) {
+          ed->raw_edits_ = edits;
+          ed->note("Body back to the pasted JSON: sent as pasted.");
+        }
       }
       if (blocks && edits == ed->body_edits_ && doc == ed->body_->GetDocPointer()) {
         ed->big_blocks_ = std::move(big);
@@ -4673,6 +5074,693 @@ void HttpEditor::lint() {
       ed->show_lint(gen, issue);
     });
   }).detach();
+}
+
+void HttpEditor::lint_gql() {
+  if (!gql_query_ || !gql_lint_) return;
+  const int len = gql_query_->GetLength();
+  gql_query_->SetIndicatorCurrent(kIndGql);
+  gql_query_->IndicatorClearRange(0, len);
+  std::optional<JsonIssue> issue;
+  std::vector<GqlIssue> schema_issues;
+  if (len < 256 * 1024) {  // a query is small: checked as typed (~1 ms per 100 KB)
+    const std::string_view doc(gql_query_->GetCharacterPointer(), static_cast<size_t>(len));
+    issue = check_graphql(doc);
+    // Brackets first: an unclosed one makes everything after it ambiguous.
+    if (!issue) schema_issues = gql_validate(doc, gql_schema_.get());
+  }
+  wxString msg;
+  auto where = [&](int at) {
+    const int line = gql_query_->LineFromPosition(at);
+    return wxString::Format("Query line %d col %d: ", line + 1, at - gql_query_->PositionFromLine(line) + 1);
+  };
+  if (issue && static_cast<int>(issue->offset) <= len) {
+    msg = where(static_cast<int>(issue->offset)) + wxString::FromUTF8(issue->message);
+  } else if (!schema_issues.empty()) {
+    for (const auto& i : schema_issues) {
+      const int at = static_cast<int>(i.offset);
+      if (at < len) gql_query_->IndicatorFillRange(at, std::max(1, std::min(static_cast<int>(i.length), len - at)));
+    }
+    msg = where(static_cast<int>(std::min<size_t>(schema_issues[0].offset, static_cast<size_t>(len)))) +
+          wxString::FromUTF8(schema_issues[0].message);
+    if (schema_issues.size() > 1)
+      msg += wxString::Format("  (+%d more, underlined)", static_cast<int>(schema_issues.size() - 1));
+  }
+  if (gql_lint_->GetLabel() != msg) {
+    gql_lint_->SetLabel(msg);
+    gql_lint_->SetToolTip(msg);  // the whole message when it is cut short
+  }
+}
+
+// The variables JSON: its syntax first, then its keys against the operation's declarations.
+void HttpEditor::lint_gql_vars() {
+  if (!gql_vars_ || !gql_vars_lint_ || !gql_query_) return;
+  const int len = gql_vars_->GetLength();
+  gql_vars_->SetIndicatorCurrent(kIndGql);
+  gql_vars_->IndicatorClearRange(0, len);
+  wxString msg;
+  if (len < 256 * 1024 && gql_query_->GetLength() < 256 * 1024) {
+    const std::string vars(gql_vars_->GetCharacterPointer(), static_cast<size_t>(len));
+    const std::string_view doc(gql_query_->GetCharacterPointer(), static_cast<size_t>(gql_query_->GetLength()));
+    auto where = [&](int at) {
+      const int line = gql_vars_->LineFromPosition(at);
+      return wxString::Format("Variables line %d col %d: ", line + 1, at - gql_vars_->PositionFromLine(line) + 1);
+    };
+    if (const auto ji = check_json(vars)) {
+      const int at = static_cast<int>(std::min<size_t>(ji->offset, static_cast<size_t>(len)));
+      if (at < len) gql_vars_->IndicatorFillRange(at, std::max(1, std::min(static_cast<int>(ji->length), len - at)));
+      msg = where(at) + wxString::FromUTF8(ji->message);
+    } else if (const auto v = gql_check_variables(doc, vars, gql_op_); !v.empty()) {
+      for (const auto& i : v)
+        if (i.length > 0 && static_cast<int>(i.offset) < len)
+          gql_vars_->IndicatorFillRange(static_cast<int>(i.offset),
+                                        std::min(static_cast<int>(i.length), len - static_cast<int>(i.offset)));
+      msg = (v[0].length > 0 ? where(static_cast<int>(v[0].offset)) : wxString("Variables: ")) +
+            wxString::FromUTF8(v[0].message);
+      if (v.size() > 1) msg += wxString::Format("  (+%d more)", static_cast<int>(v.size() - 1));
+    }
+  }
+  if (gql_vars_lint_->GetLabel() != msg) {
+    gql_vars_lint_->SetLabel(msg);
+    gql_vars_lint_->SetToolTip(msg);
+  }
+}
+
+// ------------------------------------------------------------------ GraphQL schema
+
+namespace {
+struct GqlCached {
+  std::shared_ptr<const GqlSchema> schema;
+  double when = 0;
+};
+// Fetched schemas by URL + environment, for every tab (UI thread only).
+std::map<std::string, GqlCached>& gql_cache() {
+  static std::map<std::string, GqlCached> c;
+  return c;
+}
+double epoch_now() {
+  return std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count();
+}
+// A schema of thousands of types is ~100k small allocations: the last reference to one is
+// dropped on a worker, never in a UI step.
+void release_schema(std::shared_ptr<const GqlSchema>&& old) {
+  if (old && old.use_count() == 1 && old->types.size() > 64) std::thread([o = std::move(old)] {}).detach();
+  old.reset();
+}
+}  // namespace
+
+void HttpEditor::build_gql_schema_row(wxWindow* parent, wxSizer* sizer) {
+  const Theme& t = Theme::get();
+  auto* row = new wxBoxSizer(wxHORIZONTAL);
+  auto* l = new wxStaticText(parent, wxID_ANY, "Schema");
+  l->SetForegroundColour(t.dim);
+  row->Add(l, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, FromDIP(8));
+  // Fixed size, ellipsized: a long error must not widen the editor (RequestTab::center_sash).
+  gql_chip_ = new wxStaticText(parent, wxID_ANY, "", wxDefaultPosition, wxDefaultSize,
+                               wxST_NO_AUTORESIZE | wxST_ELLIPSIZE_END);
+  gql_chip_->SetMinSize(wxSize(FromDIP(60), GetCharHeight()));
+  row->Add(gql_chip_, 1, wxALIGN_CENTER_VERTICAL);
+  gql_fetch_ = new FlatButton(parent, "Fetch schema", FlatButton::Style::Outline);
+  gql_fetch_->SetToolTip("POST the introspection query to the URL above (its headers, auth and variables apply), "
+                         "on a worker thread. The schema completes fields, arguments and $variables as you type "
+                         "(Ctrl+Space) and underlines unknown ones.");
+  gql_fetch_->on_click = [this] { gql_fetch(); };
+  gql_explore_ = new FlatButton(parent, "Explore", FlatButton::Style::Outline);
+  gql_explore_->SetToolTip("Browse the schema: each type's fields with their arguments, types and descriptions. "
+                           "Type to search, Enter inserts the field at the query's caret.");
+  gql_explore_->on_click = [this] { gql_explore(); };
+  gql_explore_->Bind(wxEVT_KEY_DOWN, [this](wxKeyEvent& e) {
+    if (gql_explore_pop_ && !e.ControlDown() && !e.AltDown()) {
+      const int k = e.GetKeyCode();
+      if (k == WXK_LEFT || k == WXK_RIGHT) {
+        gql_explore_pop_->close();
+      } else if (gql_explore_pop_->key(k)) {
+        return;
+      }
+    }
+    e.Skip();
+  });
+  gql_explore_->Bind(wxEVT_CHAR, [this](wxKeyEvent& e) {
+    const wxChar c = e.GetUnicodeKey();
+    if (gql_explore_pop_ && !e.ControlDown() && !e.AltDown() && c >= 32 && gql_explore_pop_->chr(c)) return;
+    e.Skip();
+  });
+  gql_explore_->Bind(wxEVT_KILL_FOCUS, [this](wxFocusEvent& e) {
+    e.Skip();
+    CallAfter([this] {
+      if (!gql_explore_pop_) return;
+      if (gql_explore_pop_->GetScreenRect().Contains(wxGetMousePosition()) && wxGetMouseState().LeftIsDown()) return;
+      gql_explore_pop_->close();
+    });
+  });
+  gql_explore_->Hide();
+  row->Add(gql_explore_, 0, wxALIGN_CENTER_VERTICAL | wxLEFT, FromDIP(8));
+  row->Add(gql_fetch_, 0, wxALIGN_CENTER_VERTICAL | wxLEFT, FromDIP(8));
+  sizer->Add(row, 0, wxEXPAND | wxTOP | wxBOTTOM, FromDIP(4));
+  gql_timer_.Bind(wxEVT_TIMER, [this](wxTimerEvent&) { gql_lookup(); });
+  gql_age_timer_.Bind(wxEVT_TIMER, [this](wxTimerEvent&) { update_gql_chip(); });
+  update_gql_chip();
+}
+
+void HttpEditor::gql_explore() {
+  if (gql_explore_pop_) {
+    gql_explore_pop_->close();
+    return;
+  }
+  if (!gql_schema_) return;
+  const GqlSchema& sc = *gql_schema_;
+  std::vector<PickItem> items;
+  auto add = [&](const GqlType* t) {
+    if (!t) return;
+    for (const GqlField& f : t->fields) {
+      if (items.size() >= 4000) return;
+      std::string d;
+      if (!f.args.empty()) {
+        d = "(";
+        for (size_t i = 0; i < f.args.size(); ++i) d += (i ? ", " : "") + f.args[i].name + ": " + f.args[i].type;
+        d += ")";
+      }
+      d += ": " + f.type;
+      if (f.deprecated) d += "  deprecated";
+      if (!f.desc.empty()) {
+        std::string first = f.desc.substr(0, f.desc.find('\n'));
+        if (first.size() > 70) first = first.substr(0, 67) + "...";
+        d += "  \xE2\x80\x94 " + first;
+      }
+      // "name \xC2\xB7 Type": typing a field name finds it first, the type tells same-named ones apart.
+      items.push_back({wxString::FromUTF8(f.name + " \xC2\xB7 " + t->name), wxString::FromUTF8(d), wxString::FromUTF8(t->name)});
+    }
+  };
+  for (const std::string* root : {&sc.query, &sc.mutation, &sc.subscription})
+    if (!root->empty()) add(sc.type(*root));
+  for (const auto& [name, t] : sc.types)
+    if ((t.kind == "OBJECT" || t.kind == "INTERFACE") && name.rfind("__", 0) != 0 && name != sc.query &&
+        name != sc.mutation && name != sc.subscription)
+      add(&t);
+  if (items.empty()) {
+    note("The schema has no fields to show");
+    return;
+  }
+  auto* p = new PickPopup(gql_explore_, std::move(items), "");
+  gql_explore_pop_ = p;
+  p->on_close = [this, p] {
+    if (gql_explore_pop_ == p) gql_explore_pop_ = nullptr;
+  };
+  p->on_pick = [this](const wxString& v) {
+    const std::string tf = v.utf8_string();
+    const size_t dot = tf.find(" \xC2\xB7 ");
+    if (dot != std::string::npos) gql_insert_field(tf.substr(dot + 4), tf.substr(0, dot));
+  };
+  gql_explore_->SetFocus();  // it forwards the keys to the list
+  const wxRect b = gql_explore_->GetScreenRect();
+  const int w = FromDIP(520);
+  p->show_below(wxRect(b.GetRight() - w, b.y, w, b.height + FromDIP(2)));
+}
+
+void HttpEditor::gql_insert_field(const std::string& type, const std::string& field) {
+  if (!gql_query_ || !gql_schema_) return;
+  const GqlType* t = gql_schema_->type(type);
+  const GqlField* f = t ? t->field(field) : nullptr;
+  if (!f) return;
+  std::string text = f->name;
+  int caret = -1;
+  std::string args;
+  for (const GqlArg& a : f->args)
+    if (!a.type.empty() && a.type.back() == '!' && a.default_value.empty()) {
+      if (!args.empty()) args += ", ";
+      args += a.name + ": ";
+      if (caret < 0) caret = static_cast<int>(text.size() + 1 + args.size());
+    }
+  if (!args.empty()) text += "(" + args + ")";
+  const GqlType* nt = gql_schema_->type(f->named);
+  if (nt && nt->selectable()) {
+    text += " {  }";
+    if (caret < 0) caret = static_cast<int>(text.size()) - 2;
+  }
+  if (caret < 0) caret = static_cast<int>(text.size());
+  wxStyledTextCtrl* s = gql_query_;
+  const int at = s->GetCurrentPos();
+  s->InsertText(at, wxString::FromUTF8(text));
+  s->GotoPos(at + caret);
+  s->SetFocus();
+  note(wxString::FromUTF8("Inserted " + type + "." + field + ": " + f->type));
+}
+
+std::string HttpEditor::gql_current_key() const {
+  const Workspace* ws = host_->workspace();
+  return gql_cache_key(sent_url(), ws ? ws->active_env : std::string());
+}
+
+void HttpEditor::update_gql_chip() {
+  if (!gql_chip_) return;
+  const Theme& t = Theme::get();
+  wxString text, tip;
+  bool warn = false;
+  if (gql_busy_) {
+    text = wxString::FromUTF8("Fetching the schema\xE2\x80\xA6");
+  } else if (!gql_error_.empty()) {
+    // A failed refresh keeps the copy it had: say both.
+    const std::string kept = gql_schema_ ? "; still using the copy fetched " + gql_age(epoch_now() - gql_time_) : "";
+    text = wxString::FromUTF8("\xE2\x9A\xA0 " + gql_error_ + kept);
+    tip = wxString::FromUTF8(gql_error_ + kept);
+    warn = true;
+  } else if (gql_schema_) {
+    const size_t n = gql_schema_->user_type_count();
+    text = wxString::FromUTF8(std::to_string(n) + (n == 1 ? " type" : " types") + " \xC2\xB7 fetched " +
+                              gql_age(epoch_now() - gql_time_));
+    tip = "Completion (Ctrl+Space) and the checks below use this copy of the schema (kept per URL and "
+          "environment). Refresh fetches it again.";
+  } else {
+    text = "None: fetch it to complete fields and check the query";
+  }
+  gql_chip_->SetForegroundColour(warn ? t.var_bad : gql_schema_ ? t.fg : t.dim);
+  if (gql_chip_->GetLabel() != text) gql_chip_->SetLabel(text);
+  gql_chip_->SetToolTip(tip.empty() ? text : tip);
+  if (gql_explore_ && gql_explore_->IsShown() != (gql_schema_ != nullptr)) {
+    gql_explore_->Show(gql_schema_ != nullptr);
+    gql_explore_->GetParent()->Layout();
+  }
+  if (gql_fetch_) {
+    const wxString b = gql_schema_ ? "Refresh" : "Fetch schema";
+    if (gql_fetch_->GetLabel() != b) {
+      gql_fetch_->SetLabel(b);
+      gql_fetch_->GetParent()->Layout();
+    }
+    gql_fetch_->Enable(!gql_busy_);
+  }
+  if (gql_schema_ && !gql_age_timer_.IsRunning()) gql_age_timer_.Start(30000);
+}
+
+void HttpEditor::gql_set_schema(std::shared_ptr<const GqlSchema> schema, const std::string& key, double when) {
+  GqlCached& slot = gql_cache()[key];
+  std::shared_ptr<const GqlSchema> old = std::move(slot.schema);
+  slot = {schema, when};
+  if (key != gql_key_) {  // the URL / environment changed meanwhile: kept for when it comes back
+    release_schema(std::move(old));
+    return;
+  }
+  std::shared_ptr<const GqlSchema> prev = std::move(gql_schema_);
+  gql_schema_ = std::move(schema);
+  release_schema(std::move(old));
+  release_schema(std::move(prev));
+  gql_time_ = when;
+  gql_error_.clear();
+  update_gql_chip();
+  lint_gql();
+}
+
+void HttpEditor::gql_lookup() {
+  if (!gql_query_) return;
+  const std::string key = gql_current_key();
+  if (key == gql_key_ && gql_schema_) return;
+  if (key != gql_key_) {
+    gql_key_ = key;
+    gql_error_.clear();
+  }
+  if (const auto it = gql_cache().find(key); it != gql_cache().end()) {
+    gql_set_schema(it->second.schema, key, it->second.when);
+    return;
+  }
+  const bool had = gql_schema_ != nullptr;
+  release_schema(std::move(gql_schema_));  // another endpoint's would complete and flag the wrong fields
+  update_gql_chip();
+  if (had) lint_gql();
+  // The copy kept in <ws>/.watt/graphql/ (read and parsed on a worker, once per key).
+  const Workspace* ws = host_->workspace();
+  if (!ws || gql_disk_tried_ == key) return;
+  gql_disk_tried_ = key;
+  const std::filesystem::path file = ws->root() / L".watt" / L"graphql" / gql_cache_file_name(key);
+  std::thread([alive = alive_, file, key] {
+    std::error_code ec;
+    const auto size = std::filesystem::file_size(file, ec);
+    if (ec || size == 0 || size > (64u << 20)) return;
+    const auto mtime = std::filesystem::last_write_time(file, ec);
+    std::string text;
+    {
+      std::ifstream in(file, std::ios::binary);
+      if (!in) return;
+      text.resize(static_cast<size_t>(size));
+      in.read(text.data(), static_cast<std::streamsize>(size));
+      text.resize(static_cast<size_t>(in.gcount()));
+    }
+    std::string err;
+    std::shared_ptr<const GqlSchema> schema = parse_gql_schema(text, &err);
+    if (!schema) return;
+    double when = epoch_now();
+    if (!ec) {
+      const auto sys = std::chrono::clock_cast<std::chrono::system_clock>(mtime);
+      when = std::chrono::duration<double>(sys.time_since_epoch()).count();
+    }
+    std::lock_guard lk(alive->m);
+    if (!alive->target) return;
+    auto* ed = static_cast<HttpEditor*>(alive->target);
+    ed->CallAfter([ed, schema, key, when] {
+      if (gql_cache().count(key)) return;  // fetched meanwhile: that one is newer
+      ed->gql_set_schema(schema, key, when);
+    });
+  }).detach();
+}
+
+void HttpEditor::gql_fetch() {
+  if (gql_busy_) return;
+  if (trim(url_text()).empty()) {
+    gql_error_ = "enter the GraphQL endpoint URL first";
+    update_gql_chip();
+    return;
+  }
+  const Workspace* ws = host_->workspace();
+  // The request as it is, sent as the introspection query: the same headers, auth (OAuth tokens
+  // included), options and {{vars}} as a send, inherited from its folders like a send.
+  auto req = std::make_shared<SavedRequest>(base_);
+  store(*req);
+  req->file = host_->inherit_file();
+  req->kind = RequestKind::Http;
+  req->http.method = "POST";
+  req->form.clear();
+  req->body_file.clear();
+  req->body_data.clear();
+  req->http.body = graphql_body(graphql_introspection_query(), "", "IntrospectionQuery");
+  auto& hs = req->http.headers;
+  hs.erase(std::remove_if(hs.begin(), hs.end(), [](const Header& h) { return iequals(trim(h.first), "Content-Type"); }),
+           hs.end());
+  hs.emplace_back("Content-Type", "application/json");
+  if (std::none_of(hs.begin(), hs.end(), [](const Header& h) { return iequals(trim(h.first), "Accept"); }))
+    hs.emplace_back("Accept", "application/json");
+  gql_key_ = gql_current_key();
+  const std::string key = gql_key_;
+  auto wsc = ws ? std::make_shared<Workspace>(*ws) : nullptr;
+  const uint64_t gen = ++gql_gen_;
+  gql_busy_ = true;
+  gql_error_.clear();
+  update_gql_chip();
+  std::thread([alive = alive_, req, wsc, key, gen] {
+    const auto t0 = std::chrono::steady_clock::now();
+    HttpRequest hr;
+    std::string err;
+    if (wsc) {
+      // The gate for every consent (uploads, OS environment variables, Windows sign-in, network
+      // settings): what it refuses is asked about on the UI thread, then fetched again.
+      auto r = wsc->http_to_send(*req, &err);
+      if (!r) {
+        std::lock_guard lk(alive->m);
+        if (!alive->target) return;
+        auto* ed = static_cast<HttpEditor*>(alive->target);
+        ed->CallAfter([ed, req, err, gen] {
+          if (gen != ed->gql_gen_) return;
+          ed->gql_busy_ = false;
+          ed->gql_fetch_blocked(req, err);
+        });
+        return;
+      }
+      hr = std::move(*r);
+    } else {
+      hr = req->http;
+    }
+    HttpResponse resp;
+    {
+      HttpClient client;
+      resp = client.send(hr);
+    }
+    std::shared_ptr<const GqlSchema> schema;
+    if (!resp.ok) {
+      err = resp.error.empty() ? "the request failed" : resp.error;
+    } else {
+      std::string perr;
+      schema = parse_gql_schema(resp.body, &perr);
+      if (!schema)
+        err = (resp.status >= 300 ? "HTTP " + std::to_string(resp.status) + ": " : std::string()) + perr;
+    }
+    // A copy in <ws>/.watt/graphql/ for the next session (only into an existing .watt: it is
+    // created owner-only by the workspace, never here).
+    if (schema && wsc) {
+      std::error_code ec;
+      const std::filesystem::path dir = wsc->root() / L".watt";
+      if (std::filesystem::is_directory(dir, ec)) {
+        const std::filesystem::path sub = dir / L"graphql";
+        std::filesystem::create_directory(sub, ec);
+        const std::filesystem::path file = sub / gql_cache_file_name(key);
+        const std::filesystem::path tmp = sub / (gql_cache_file_name(key) + ".tmp");
+        {
+          std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+          if (out) out.write(resp.body.data(), static_cast<std::streamsize>(resp.body.size()));
+        }
+        std::filesystem::rename(tmp, file, ec);
+        if (ec) std::filesystem::remove(tmp, ec);
+      }
+    }
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    const double net_ms = resp.timing.total_ms;
+    const size_t bytes = resp.body.size();
+    std::lock_guard lk(alive->m);
+    if (!alive->target) return;
+    auto* ed = static_cast<HttpEditor*>(alive->target);
+    ed->CallAfter([ed, schema, err, key, gen, ms, net_ms, bytes] {
+      if (gen != ed->gql_gen_) return;
+      ed->gql_busy_ = false;
+      ed->gql_consented_ = false;
+      if (!schema) {
+        ed->gql_error_ = err;
+        ed->update_gql_chip();
+        return;
+      }
+      ed->gql_set_schema(schema, key, epoch_now());
+      ed->note(wxString::Format("Schema: %d types (%.1f KB) in %.1f ms, %.1f ms of it on the network (off the UI thread)",
+                                static_cast<int>(schema->user_type_count()), static_cast<double>(bytes) / 1024.0, ms,
+                                net_ms));
+    });
+  }).detach();
+}
+
+// http_to_send() refused the introspection request: the consents a send would ask for, asked in
+// the editor's banner (the safe choice is the default), then the fetch runs again and the worker
+// checks again. Anything else (or a second refusal) is shown as the error.
+void HttpEditor::gql_fetch_blocked(std::shared_ptr<SavedRequest> req, const std::string& err) {
+  const Workspace* ws = host_->workspace();
+  const bool asked = gql_consented_;
+  gql_consented_ = false;
+  std::vector<std::filesystem::path> files;
+  std::vector<std::string> env, sso;
+  std::vector<Workspace::NetworkItem> net;
+  if (ws && !asked) {
+    files = ws->blocked_files(*req);
+    env = ws->blocked_env_vars(*req);
+    sso = ws->blocked_sso_hosts(*req);
+    net = ws->blocked_network_settings(*req);
+  }
+  if (!net.empty()) {
+    gql_error_ = "not fetched: " + net[0].text + " (set in the " + net[0].level +
+                 ") needs your approval; send the request once to review it";
+    update_gql_chip();
+    return;
+  }
+  if (files.empty() && env.empty() && sso.empty()) {
+    gql_error_ = err.empty() ? std::string("not fetched") : err;
+    update_gql_chip();
+    return;
+  }
+  gql_error_ = "not fetched: it needs your approval (the banner above)";
+  update_gql_chip();
+  const Theme& t = Theme::get();
+  ensure_banner();
+  banner_missing_.clear();
+  long_line_banner_ = false;
+  banner_->set_colours(t.warn_bg, t.warn_border);
+  std::string text;
+  for (const auto& f : files) text += "\xE2\x80\xA2 uploads " + path_utf8(f.filename()) + "   " + path_utf8(f) + "\n";
+  for (const auto& e : env) text += "\xE2\x80\xA2 reads the environment variable " + e + " from your system\n";
+  for (const auto& h : sso)
+    text += "\xE2\x80\xA2 signs in to " + h + " with your Windows account (no user name given; only for servers you trust)\n";
+  text += "Nothing has been sent. The choice is remembered for this workspace (in your user settings, never in "
+          "the workspace).";
+  set_banner_texts("Fetching the schema sends this request's data", wxString::FromUTF8(text));
+  banner_action_->SetLabel("Allow and fetch schema");
+  banner_action_->Show();
+  banner_cancel_->SetLabel("Cancel");
+  banner_on_action_ = [this, files, env, sso] {
+    const Workspace* w = host_->workspace();
+    if (!w) return;
+    std::string e;
+    for (const auto& f : files)
+      if (!w->allow_file(f, &e)) return show_info("Could not allow the file", wxString::FromUTF8(e.empty() ? path_utf8(f) : e));
+    for (const auto& v : env)
+      if (!w->allow_env_var(v, &e))
+        return show_info("Could not allow the environment variable", wxString::FromUTF8(e.empty() ? v : e));
+    for (const auto& h : sso)
+      if (!w->allow_sso_host(h, &e)) return show_info("Could not allow Windows sign-in", wxString::FromUTF8(e.empty() ? h : e));
+    hide_banner();
+    gql_consented_ = true;
+    gql_fetch();  // the worker checks again
+  };
+  banner_->Show();
+  Layout();
+  wrap_banner();
+  banner_cancel_->SetFocus();  // the safe choice is the default
+}
+
+// Completion in the query: what gql_complete() offers at the caret, in a themed list under the
+// word (each item with its type and the start of its description, like Postman / Insomnia).
+// Built once per list and refilled as the word grows: a keystroke costs the walk (microseconds)
+// and one repaint.
+void HttpEditor::gql_completion(bool explicit_request) {
+  wxStyledTextCtrl* s = gql_query_;
+  const int len = s->GetLength();
+  if (len > 256 * 1024) return;
+  const int pos = s->GetCurrentPos();
+  const std::string_view doc(s->GetCharacterPointer(), static_cast<size_t>(len));
+  GqlCompletion c = gql_complete(doc, static_cast<size_t>(pos), gql_schema_.get());
+  const std::string typed(doc.substr(c.from, static_cast<size_t>(pos) - c.from));
+  if (c.items.empty() || (c.items.size() == 1 && c.items[0].name == typed && !explicit_request)) {
+    gql_close_pop();
+    if (explicit_request && c.items.empty() && !gql_schema_ && c.kind == GqlCompletion::Kind::None)
+      note("Fetch the schema (above the query) to complete fields and arguments");
+    return;
+  }
+  if (c.items.size() > 300) c.items.resize(300);
+  std::vector<PickItem> items;
+  items.reserve(c.items.size());
+  for (const auto& i : c.items) {
+    std::string d = i.detail;
+    if (!i.desc.empty()) {
+      std::string first = i.desc.substr(0, i.desc.find('\n'));
+      if (first.size() > 56) first = first.substr(0, 53) + "...";
+      d += (d.empty() ? "" : "   ") + first;
+    }
+    items.push_back({wxString::FromUTF8(i.name), wxString::FromUTF8(d), ""});
+  }
+  gql_items_ = std::move(c.items);
+  gql_items_kind_ = c.kind;
+  PickPopup* p = gql_pop_;
+  if (!p) {
+    p = new PickPopup(s, {}, "");
+    p->compact = true;
+    p->SetFont(s->StyleGetFont(wxSTC_STYLE_DEFAULT));
+    gql_pop_ = p;
+    p->on_close = [this, p] {
+      if (gql_pop_ == p) gql_pop_ = nullptr;
+    };
+  }
+  p->on_pick = [this](const wxString& v) { gql_pick(v); };
+  p->set_items(std::move(items), "");
+  if (gql_pop_ != p) return;
+  // Under the word being typed (screen coordinates), at least as wide as 18 characters.
+  const wxPoint at = s->PointFromPosition(static_cast<int>(c.from));
+  const int lh = s->TextHeight(s->LineFromPosition(pos));
+  const wxRect r(s->ClientToScreen(at), wxSize(s->TextWidth(wxSTC_STYLE_DEFAULT, "MMMMMMMMMMMMMMMMMM"), lh));
+  p->show_below(r);
+}
+
+void HttpEditor::gql_close_pop() {
+  if (gql_pop_) gql_pop_->close();  // its on_close clears gql_pop_
+}
+
+// A pick: the word at the caret becomes the name; an argument / input field gets its ": ".
+void HttpEditor::gql_pick(const wxString& name) {
+  wxStyledTextCtrl* s = gql_query_;
+  const int pos = s->GetCurrentPos();
+  int from = pos;
+  while (from > 0) {
+    const int ch = s->GetCharAt(from - 1);
+    if (!((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '_')) break;
+    --from;
+  }
+  int to = pos;  // the rest of the word after the caret is replaced too
+  for (;;) {
+    const int ch = s->GetCharAt(to);
+    if (!((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '_')) break;
+    ++to;
+  }
+  wxString text = name;
+  const bool keyed = gql_items_kind_ == GqlCompletion::Kind::Argument || gql_items_kind_ == GqlCompletion::Kind::InputField;
+  if (keyed) {
+    int p = to;
+    while (s->GetCharAt(p) == ' ') ++p;
+    if (s->GetCharAt(p) != ':') text += ": ";
+  }
+  s->SetTargetRange(from, to);
+  s->ReplaceTarget(text);
+  s->GotoPos(from + static_cast<int>(text.utf8_string().size()));
+}
+
+// '}' ')' ']' '"' typed right before the closer auto-close put there: step over it.
+bool HttpEditor::gql_key(wxKeyEvent& e) {
+  wxStyledTextCtrl* s = gql_query_;
+  const int k = e.GetUnicodeKey();
+  if ((k != '}' && k != ')' && k != ']' && k != '"') || !s->GetSelectionEmpty()) return false;
+  const int pos = s->GetCurrentPos();
+  if (s->GetCharAt(pos) != k || s->IndicatorValueAt(kIndAutoClose, pos) == 0) return false;
+  gql_close_pop();
+  s->SetIndicatorCurrent(kIndAutoClose);
+  s->IndicatorClearRange(pos, 1);
+  s->GotoPos(pos + 1);
+  return true;
+}
+
+void HttpEditor::gql_char_added(int key) {
+  wxStyledTextCtrl* s = gql_query_;
+  const bool word = (key >= 'a' && key <= 'z') || (key >= 'A' && key <= 'Z') || (key >= '0' && key <= '9') || key == '_';
+  if (key == '{' || key == '(' || key == '[' || key == '"') {
+    // Auto-close (as the JSON body does): not inside a string or a comment, and only where the
+    // next character does not continue a token.
+    if (!s->GetSelectionEmpty() || s->GetSelections() != 1) return;
+    const int pos = s->GetCurrentPos();
+    const int ls = s->PositionFromLine(s->LineFromPosition(pos));
+    if (pos - ls > 4096) return;
+    const wxCharBuffer before = s->GetTextRangeRaw(ls, pos - 1);
+    bool in_str = false;
+    for (size_t i = 0; i < before.length(); ++i) {
+      if (before[i] == 0x5C && in_str) ++i;
+      else if (before[i] == '"') in_str = !in_str;
+      else if (before[i] == '#' && !in_str) return;  // a comment
+    }
+    if (in_str) return;
+    if (key == '"' && pos >= 2 && s->GetCharAt(pos - 2) == '"') return;  // """block strings"""
+    const int next = s->GetCharAt(pos);
+    const bool ok_next = next == 0 || next == ' ' || next == 9 || next == 13 || next == 10 || next == ',' ||
+                         next == '}' || next == ')' || next == ']';
+    if (!ok_next) return;
+    const char closer[2] = {key == '{' ? '}' : key == '(' ? ')' : key == '[' ? ']' : '"', 0};
+    s->InsertTextRaw(pos, closer);
+    s->SetIndicatorCurrent(kIndAutoClose);
+    s->IndicatorFillRange(pos, 1);
+    return;
+  }
+  if (key == '\n') {
+    // After the script editor's own indentation: "{|}" Enter puts the closer on its own line and
+    // the caret indented between them (Monaco / Postman).
+    CallAfter([this] {
+      wxStyledTextCtrl* q = gql_query_;
+      if (!q) return;
+      const int line = q->GetCurrentLine();
+      if (line <= 0) return;
+      const int prev_end = q->GetLineEndPosition(line - 1);
+      const int prev_start = q->PositionFromLine(line - 1);
+      int p = prev_end - 1;
+      while (p >= prev_start && (q->GetCharAt(p) == ' ' || q->GetCharAt(p) == '\t' || q->GetCharAt(p) == '\r')) --p;
+      if (p < prev_start) return;
+      const int open = q->GetCharAt(p);
+      if (open != '{' && open != '(' && open != '[') return;
+      const int base = q->GetLineIndentation(line - 1);
+      q->SetLineIndentation(line, base + 2);
+      const int caret = q->GetLineIndentPosition(line);
+      q->GotoPos(caret);
+      const int next = q->GetCharAt(caret);
+      if ((open == '{' && next == '}') || (open == '(' && next == ')') || (open == '[' && next == ']')) {
+        q->InsertText(caret, "\n" + wxString(' ', static_cast<size_t>(base)));
+        q->GotoPos(caret);
+      }
+    });
+    return;
+  }
+  if (!word && key != '$') {
+    gql_close_pop();
+    return;
+  }
+  if (key == '$' || (word && gql_pop_)) {
+    gql_completion(false);
+  } else if (word) {
+    const int pos = s->GetCurrentPos();
+    if (pos - s->WordStartPosition(pos, true) == 1) gql_completion(false);  // the first letter typed
+  }
 }
 
 void HttpEditor::show_lint(uint64_t gen, std::optional<JsonIssue> issue) {
@@ -5014,7 +6102,7 @@ void HttpEditor::swap_body_doc(void* doc, bool reindent, uint64_t gen, uint64_t 
       fit_body_tools();
     }
     note(wxString::Format("One-line JSON body (%s) shown formatted (%.0f ms on a worker); sent and saved as it was "
-                          "(Send minified).",
+                          "(Send compact).",
                           human_size(raw_body_->size()), worker_ms));
   }
   if (reindent) {
@@ -5157,9 +6245,39 @@ void HttpEditor::on_idle(wxIdleEvent& e) {
       prebuild_at_ = {};
       prebuild_step();
     }
-  } else if (!prebuild_done_ && IsShownOnScreen()) {
+  } else if (!prebuild_done_ && (IsShownOnScreen() || parked())) {
     schedule_prebuild(400);  // a tab that was in the background when its steps came due
   }
+}
+
+bool HttpEditor::parked() const {
+  // In the notebook (an open tab, shown or not): built when shown. Outside it (main_frame's
+  // hidden spare): built while it waits, as long as the window itself is up.
+  const wxWindow* top = wxGetTopLevelParent(const_cast<HttpEditor*>(this));
+  if (!top || !top->IsShown()) return false;
+  if (const auto* f = wxDynamicCast(top, wxTopLevelWindow); f && f->IsIconized()) return false;
+  for (const wxWindow* w = GetParent(); w && w != top; w = w->GetParent())
+    if (wxDynamicCast(w, wxAuiNotebook)) return false;
+  return true;
+}
+
+void HttpEditor::finish_side_step() {
+  if (torn_ || !tests_page_ || !script_tabs_) return;
+  const size_t side = script_tabs_->selection();
+  split_sides_ = true;
+  bool more = false;
+  if (side == 0) {
+    if (!pre_) build_pre_side();
+    else if (!pre_js_) build_pre_script();
+    more = !pre_js_;
+  } else {
+    if (!asserts_) build_post_side();
+    else if (!captures_) build_post_captures();
+    else if (!post_js_) build_post_script();
+    more = !post_js_;
+  }
+  split_sides_ = false;
+  if (more) side_timer_.StartOnce(1);
 }
 
 void HttpEditor::schedule_prebuild(int ms) {
@@ -5170,7 +6288,7 @@ void HttpEditor::schedule_prebuild(int ms) {
 void HttpEditor::prebuild_step() {
   LASTINPUTINFO li{sizeof(li), 0};
   const bool typing = ::GetLastInputInfo(&li) && ::GetTickCount() - li.dwTime < 300;
-  if (!IsShownOnScreen()) return;  // on_idle starts again once the tab is shown (no polling)
+  if (!IsShownOnScreen() && !parked()) return;  // on_idle starts again once the tab is shown (no polling)
   if (typing || fill_src_ || !fold_ops_.empty() || wxGetMouseState().LeftIsDown()) {
     schedule_prebuild(250);
     return;
@@ -5188,11 +6306,24 @@ void HttpEditor::prebuild_step() {
     want_side_ = 2;
     what = "tests";
   } else if (!pre_) {
+    split_sides_ = true;
     build_pre_side();
+    split_sides_ = false;
     what = "pre";
+  } else if (!pre_js_) {
+    build_pre_script();
+    what = "pre script";
   } else if (!asserts_) {
+    split_sides_ = true;
     build_post_side();
+    split_sides_ = false;
     what = "post";
+  } else if (!captures_) {
+    build_post_captures();
+    what = "post captures";
+  } else if (!post_js_) {
+    build_post_script();
+    what = "post script";
   } else if (!tests_laid_out_) {
     tests_laid_out_ = true;
     if (book_->GetSelection() != kTabTests) {
@@ -5201,9 +6332,15 @@ void HttpEditor::prebuild_step() {
     }
     what = "tests layout";
   } else if (!timeout_) {
+    defer_net_ = book_->GetSelection() != kTabOptions;
     ensure_page(kTabOptions);
+    defer_net_ = false;
     if (book_->GetSelection() != kTabOptions) lay_out(opts_holder_);
     what = "options";
+  } else if (!net_panel_) {
+    build_net_panel(true);  // three steps: a section each
+    if (book_->GetSelection() != kTabOptions) lay_out(opts_holder_);
+    what = "options net";
   } else {
     prebuild_done_ = true;
     return;
@@ -5452,6 +6589,50 @@ bool HttpEditor::step_over_closer(wxStyledTextCtrl* s, int key) {
   return true;
 }
 
+// '}' / ']' typed on a blank line right above the closer that auto-close put there ("{" Enter,
+// a member, Enter, "}"): the blank line goes and the caret steps over that closer, so the body
+// keeps one closer at its indent (as Postman's Monaco does), not "  }" plus a stray "}".
+bool HttpEditor::close_on_blank_line(int key) {
+  if ((key != '}' && key != ']') || !body_->GetSelectionEmpty() || body_->GetSelections() != 1) return false;
+  const int pos = body_->GetCurrentPos();
+  const int line = body_->LineFromPosition(pos);
+  if (line <= 0 || line + 1 >= body_->GetLineCount()) return false;
+  const int ls = body_->PositionFromLine(line), le = body_->GetLineEndPosition(line);
+  if (le - ls > 256) return false;
+  for (int p = ls; p < le; ++p)
+    if (const int c = body_->GetCharAt(p); c != ' ' && c != '\t') return false;
+  const int q = body_->GetLineIndentPosition(line + 1);  // the next line's first non-blank
+  if (body_->GetCharAt(q) != key || body_->IndicatorValueAt(kIndAutoClose, q) == 0) return false;
+  if (body_->AutoCompActive()) body_->AutoCompCancel();
+  body_->BeginUndoAction();
+  const int from = body_->GetLineEndPosition(line - 1);
+  body_->DeleteRange(from, le - from);  // the blank line, with the line break before it
+  const int closer = q - (le - from);
+  body_->SetIndicatorCurrent(kIndAutoClose);
+  body_->IndicatorClearRange(closer, 1);
+  body_->EndUndoAction();
+  body_->GotoPos(closer + 1);
+  return true;
+}
+
+// '}' / ']' typed as the first thing on its line: the line takes the indent of the line that
+// opened the block (a closer is never left one level too deep).
+void HttpEditor::dedent_closer() {
+  const int pos = body_->GetCurrentPos();  // after the closer
+  const int line = body_->LineFromPosition(pos);
+  if (body_->GetLineIndentPosition(line) != pos - 1) return;
+  int indent = -1;
+  if (body_->GetLength() <= (2 << 20)) {  // the matching brace (a bounded scan on a big body)
+    body_->Colourise(body_->PositionFromLine(line), pos);  // BraceMatch compares styles: style the new closer
+    const int m = body_->BraceMatch(pos - 1);
+    if (m >= 0 && m < pos - 1) indent = body_->GetLineIndentation(body_->LineFromPosition(m));
+  }
+  if (indent < 0) indent = std::max(0, body_->GetLineIndentation(line) - 2);
+  if (indent == body_->GetLineIndentation(line)) return;
+  body_->SetLineIndentation(line, indent);
+  body_->GotoPos(body_->GetLineIndentPosition(line) + 1);
+}
+
 // A variable picked from the list: the caret goes past the "}}" that {{ added, ready for the rest.
 void HttpEditor::step_past_var_closer(wxStyledTextCtrl* s) {
   const int pos = s->GetCurrentPos();
@@ -5576,6 +6757,7 @@ void HttpEditor::show_var_list(wxStyledTextCtrl* s, const std::string& typed) {
   s->AutoCompSetSeparator('\x1e');      // values may hold spaces
   s->AutoCompSetTypeSeparator('\x1f');  // and '?', Scintilla's default image marker
   s->AutoCompShow(static_cast<int>(typed.size()), wxString::FromUTF8(list));
+  guard_autocomp(s);
 }
 
 void HttpEditor::highlight_vars(wxStyledTextCtrl* s, int start, int end) {
@@ -5674,6 +6856,9 @@ bool HttpEditor::show_unresolved(const std::vector<std::string>& missing, bool i
   text += in_url ? "A URL with an undefined variable cannot be sent: define it in the environment, or remove it "
                    "from the URL."
                  : "Define it in the environment, or send it as written.";
+  if (std::find(missing.begin(), missing.end(), "mock") != missing.end())
+    text += " {{mock}} is the address of a running mock server: start it in its Mock tab (or right-click a "
+            "folder > Start mock server).";
   // The usual case after a restart: a token a login request captured into a runtime variable.
   text += " Runtime variables (captures, scripts) last until watt closes: send the request that sets it first.";
   const Theme& t = Theme::get();
@@ -5692,6 +6877,9 @@ bool HttpEditor::show_unresolved(const std::vector<std::string>& missing, bool i
 }
 
 void HttpEditor::do_send() {
+  // Ctrl+Enter with a {{var}} list open: the list goes with the send (focus stays in the field).
+  for (wxStyledTextCtrl* s : var_list_bound_)
+    if (s->AutoCompActive()) s->AutoCompCancel();
   if (in_flight_) {
     host_->cancel();
     return;
@@ -5702,6 +6890,23 @@ void HttpEditor::do_send() {
   if (const std::string typed = url_text(); looks_like_curl(typed)) {
     import_curl(std::string(trim(typed)));
     if (looks_like_curl(url_text())) return;  // not imported: the banner says why, nothing sent
+  }
+  // GraphQL variables that are not JSON: the server could not parse the body at all (it would
+  // answer as if no variables were sent). Not sent; the lint under the editor says where.
+  if (body_mode_ == BodyMode::GraphQL) {
+    const std::string vars = gql_vars_text();
+    if (!trim(vars).empty())
+      if (const auto ji = check_json(vars)) {
+        if (gql_vars_) {
+          lint_gql_vars();
+          gql_vars_->SetFocus();
+          gql_vars_->GotoPos(static_cast<int>(std::min(ji->offset, vars.size())));
+        }
+        note(wxString::FromUTF8("Not sent: the GraphQL variables are not valid JSON (" + ji->message +
+                                "). Fix them, or clear them to send none."),
+             true);
+        return;
+      }
   }
   // A script that cannot parse fails in the sandbox anyway: say where now (the send goes on, and
   // its Log tab has the engine's own message).
@@ -5799,6 +7004,12 @@ void HttpEditor::do_send() {
         do_send();
         force_send_ = false;
       });
+      // The response pane must not keep showing the last answer as if this one was sent.
+      std::string names;
+      for (const auto& n : missing) names += (names.empty() ? "{{" : ", {{") + n + "}}";
+      host_->not_sent("Not sent: " + names + (missing.size() == 1 ? " is" : " are") + " not defined (" +
+                      (ws->active_env.empty() ? std::string("no environment") : "environment " + ws->active_env) +
+                      ").");
       return;
     }
   }
@@ -5855,9 +7066,10 @@ void HttpEditor::do_send() {
   sending_ = true;
   host_->send();
   sending_ = false;
-  // The shell asked to trust the scripts (if it had to) inside send(): read back the answer
-  // off the UI thread, and say so here when they were not run.
-  if (has_scripts()) refresh_trust(true);
+  // The shell may ask to trust the scripts (asynchronously): the status is read back again when
+  // the send starts and when the response arrives (set_in_flight), never left stale. The
+  // response itself says when the scripts were not run.
+  if (has_scripts()) refresh_trust();
 }
 
 void HttpEditor::show_upload_prompt(const std::vector<std::filesystem::path>& files,
@@ -5869,15 +7081,16 @@ void HttpEditor::show_upload_prompt(const std::vector<std::filesystem::path>& fi
   banner_->set_colours(t.warn_bg, t.warn_border);
   std::string title, text;
   if (files.size() == 1 && env.empty()) {
-    title = "This request uploads " + path_utf8(files[0]) + " from outside the workspace";
+    // The file name first (a long path cut at the end hid it); the full path is listed below.
+    title = "This request uploads " + path_utf8(files[0].filename()) + " from outside the workspace";
   } else if (!files.empty()) {
     title = "This request uploads " + std::to_string(files.size()) + " files from outside the workspace";
   } else {
     title = env.size() == 1 ? "This request reads the environment variable " + env[0] + " from your system"
                             : "This request reads environment variables from your system";
   }
-  if (files.size() > 1 || (!files.empty() && !env.empty())) {
-    for (const auto& f : files) text += "\xE2\x80\xA2 " + path_utf8(f) + "\n";
+  if (!files.empty()) {
+    for (const auto& f : files) text += "\xE2\x80\xA2 " + path_utf8(f.filename()) + "   " + path_utf8(f) + "\n";
   }
   if (!env.empty() && (env.size() > 1 || !files.empty())) {
     for (const auto& e : env) text += "\xE2\x80\xA2 environment variable " + e + "\n";
@@ -6031,18 +7244,26 @@ wxWindow* HttpEditor::build_tests_page() {
 }
 
 void HttpEditor::show_script_side(size_t side) {
+  // At most the side's first table now; the rest in timer ticks (finish_side_step): the whole
+  // side (two tables and a script editor) in one step was 40-55 ms on a first click.
+  // A page built ahead (prebuild_step, also while the tab waits as a spare) is already laid out
+  // at the book's size: then this only shows it.
+  const void* had[2] = {pre_, asserts_};
+  split_sides_ = true;
   want_side_ = side;
   ensure_page(kTabTests);
   want_side_ = 2;
-  book_->ChangeSelection(kTabTests);
-  tabs_->select(side == 1 ? kStripTests : kStripScripts);
   if (script_tabs_ && script_tabs_->selection() != side) {
-    if (side == 0) build_pre_side();
-    else build_post_side();
     script_tabs_->select(side);
     script_book_->ChangeSelection(side);
-    layout_tests_page();
   }
+  if (side == 0) build_pre_side();
+  else build_post_side();
+  split_sides_ = false;
+  book_->ChangeSelection(kTabTests);
+  tabs_->select(side == 1 ? kStripTests : kStripScripts);
+  if (had[side] != (side == 0 ? static_cast<const void*>(pre_) : static_cast<const void*>(asserts_))) layout_tests_page();
+  if (side == 0 ? !pre_js_ : !post_js_) side_timer_.StartOnce(1);
   if (side == 0) preview_pre();
 }
 
@@ -6078,7 +7299,11 @@ void HttpEditor::setup_tests_grid(KvGrid* g) {
 }
 
 void HttpEditor::build_pre_side() {
-  if (pre_ || !pre_pg_) return;
+  if (!pre_pg_) return;
+  if (pre_) {
+    if (!split_sides_) build_pre_script();
+    return;
+  }
   wxWindowUpdateLocker lock(pre_pg_);
   auto* ps = new wxBoxSizer(wxVERTICAL);
   // Pre-request: variables computed before the request is built, then the script.
@@ -6086,19 +7311,15 @@ void HttpEditor::build_pre_side() {
   pre_ = pp->grid();
   pre_panel_ = pp;
   add_help(pp, "Pre-request variables",
-           "Computed before each send, used as {{name}} in the URL, headers and body.\n\n"
+           "Computed before each send, used as {{name}} in the URL, headers and body. Plain text works as is: "
+           "{{userId}}-x\n\n"
            "Functions: hmacSha256(key, text[, \"base64\"]) hmacSha1 hmacSha512 sha256 sha1 sha512 md5 base64 base64url "
            "base64Decode hex urlencode urldecode lower upper trim replace substr length now() unix([+s]) iso([+s]) "
            "uuid() randomInt(lo, hi) randomHex(n) jsonPath({{json}}, \"$.a.b\")\n\n"
            "Inputs: 'text', {{var}}, req.method req.url req.body req.headers.<name>, joined with +\n\n"
            "Example: hmacSha256({{secret}}, req.method + req.url + {{ts}})");
   ps->Add(pp, 0, wxEXPAND);
-  ps->Add(make_script_label(pre_pg_, &pre_js_, false), 0, wxEXPAND | wxTOP | wxBOTTOM, FromDIP(4));
-  pre_js_ = make_script_editor(pre_pg_, "// pm. bru. req. complete as you type");
-  setup_script_help(pre_js_, false);
-  attach_find(pre_js_);
-  ps->Add(pre_js_, 1, wxEXPAND);
-  add_trust_row(pre_pg_, ps, 0);
+  pre_sizer_ = ps;
   pre_pg_->SetSizer(ps);
   setup_tests_grid(pre_);
   pre_->check = [g = pre_](int col, const std::string& text) -> std::string {
@@ -6117,18 +7338,43 @@ void HttpEditor::build_pre_side() {
   std::vector<KvRow> pr;
   for (const auto& x : pre_vals_) pr.push_back({x.var, x.expr, x.enabled, false, false, {}, x.scope.empty() ? "runtime" : x.scope});
   pre_->set_rows(pr);
-  pre_js_->SetText(wxString::FromUTF8(base_.pre_script));
-  pre_js_->EmptyUndoBuffer();
   loading_ = was;
   update_script_badges();
   update_pre_names();
   update_tests_hint();
+  if (!split_sides_) build_pre_script();
+  pre_pg_->Layout();
+  layout_tests_page();
+}
+
+void HttpEditor::build_pre_script() {
+  if (pre_js_ || !pre_sizer_) return;
+  wxWindowUpdateLocker lock(pre_pg_);
+  pre_sizer_->Add(make_script_label(pre_pg_, &pre_js_, false), 0, wxEXPAND | wxTOP | wxBOTTOM, FromDIP(4));
+  pre_js_ = make_script_editor(pre_pg_, "// pm. bru. req. complete as you type");
+  setup_script_help(pre_js_, false);
+  attach_find(pre_js_);
+  pre_sizer_->Add(pre_js_, 1, wxEXPAND);
+  add_trust_row(pre_pg_, pre_sizer_, 0);
+  const bool was = loading_;
+  loading_ = true;
+  pre_js_->SetText(wxString::FromUTF8(base_.pre_script));
+  pre_js_->EmptyUndoBuffer();
+  loading_ = was;
+  update_script_badges();
   pre_pg_->Layout();
   layout_tests_page();
 }
 
 void HttpEditor::build_post_side() {
-  if (asserts_ || !post_pg_) return;
+  if (!post_pg_) return;
+  if (asserts_) {
+    if (!split_sides_) {
+      build_post_captures();
+      build_post_script();
+    }
+    return;
+  }
   const Theme& t = Theme::get();
   wxWindowUpdateLocker lock(post_pg_);
   auto* qs = new wxBoxSizer(wxVERTICAL);
@@ -6140,6 +7386,46 @@ void HttpEditor::build_post_side() {
            "Checked on every response; pass / fail and the actual values show in the response's Tests tab.\n\n"
            "Targets: res.status, res.body.items[0].id, res.headers.content-type, res.responseTime, res.timing.ttfb, "
            "res.size");
+  setup_tests_grid(asserts_);
+  asserts_->check = [g = asserts_](int col, const std::string& text) -> std::string {
+    if (col != g->col_key() || trim(text).empty()) return {};
+    return check_target(std::string(trim(text)));
+  };
+  qs->Add(ap, 0, wxEXPAND | wxTOP, FromDIP(4));
+  inh_asserts_box_ = new wxPanel(post_pg_);
+  inh_asserts_box_->SetBackgroundColour(t.bg);
+  inh_asserts_box_->SetSizer(new wxBoxSizer(wxVERTICAL));
+  inh_asserts_box_->Hide();
+  qs->Add(inh_asserts_box_, 0, wxEXPAND | wxTOP, FromDIP(2));
+  // One line that keeps its row when empty, as the GraphQL lint: fixing an assertion never moves
+  // the Captures table up under the mouse. The whole message is the tooltip.
+  tests_hint_ = new wxStaticText(post_pg_, wxID_ANY, "", wxDefaultPosition, wxDefaultSize,
+                                 wxST_NO_AUTORESIZE | wxST_ELLIPSIZE_END);
+  tests_hint_->SetForegroundColour(t.var_bad);
+  tests_hint_->SetMinSize(wxSize(-1, GetCharHeight()));
+  qs->Add(tests_hint_, 0, wxEXPAND | wxTOP, FromDIP(4));
+  post_sizer_ = qs;
+  post_pg_->SetSizer(qs);
+  const bool was = loading_;
+  loading_ = true;
+  std::vector<KvRow> ar;
+  for (const auto& a : assert_vals_) ar.push_back({a.target, a.value, a.enabled, false, false, {}, a.op.empty() ? "eq" : a.op});
+  asserts_->set_rows(ar);
+  loading_ = was;
+  update_script_badges();
+  update_tests_hint();
+  show_inherited_asserts();
+  if (!split_sides_) {
+    build_post_captures();
+    build_post_script();
+  }
+  post_pg_->Layout();
+  layout_tests_page();
+}
+
+void HttpEditor::build_post_captures() {
+  if (captures_ || !post_sizer_) return;
+  wxWindowUpdateLocker lock(post_pg_);
   auto* cp = new KvPanel(post_pg_, KvGrid::Kind::Capture, "Captures");
   captures_ = cp->grid();
   capture_panel_ = cp;
@@ -6147,44 +7433,80 @@ void HttpEditor::build_post_side() {
            "Copy a response value into a {{variable}} for later requests.\n\n"
            "Scope: runtime = this session only; environment / globals = saved there (a secret variable is never "
            "overwritten).");
-  setup_tests_grid(asserts_);
   setup_tests_grid(captures_);
-  asserts_->check = [g = asserts_](int col, const std::string& text) -> std::string {
-    if (col != g->col_key() || trim(text).empty()) return {};
-    return check_target(std::string(trim(text)));
-  };
   captures_->check = [g = captures_](int col, const std::string& text) -> std::string {
     if (trim(text).empty()) return {};
     if (col == g->col_key()) return check_var_name(text);
     if (col == g->col_value()) return check_target(std::string(trim(text)));
     return {};
   };
-  qs->Add(ap, 0, wxEXPAND | wxTOP, FromDIP(4));
-  tests_hint_ = new wxStaticText(post_pg_, wxID_ANY, "");
-  tests_hint_->SetForegroundColour(t.var_bad);
-  tests_hint_->Hide();
-  qs->Add(tests_hint_, 0, wxEXPAND | wxTOP, FromDIP(4));
-  qs->Add(cp, 0, wxEXPAND | wxTOP, FromDIP(10));
-  qs->Add(make_script_label(post_pg_, &post_js_, true), 0, wxEXPAND | wxTOP | wxBOTTOM, FromDIP(4));
-  post_js_ = make_script_editor(post_pg_, "// pm.test('ok', () => pm.response.to.have.status(200))");
-  setup_script_help(post_js_, true);
-  attach_find(post_js_);
-  qs->Add(post_js_, 1, wxEXPAND);
-  add_trust_row(post_pg_, qs, 1);
-  post_pg_->SetSizer(qs);
+  post_sizer_->Add(cp, 0, wxEXPAND | wxTOP, FromDIP(10));
   const bool was = loading_;
   loading_ = true;
-  std::vector<KvRow> ar, cr;
-  for (const auto& a : assert_vals_) ar.push_back({a.target, a.value, a.enabled, false, false, {}, a.op.empty() ? "eq" : a.op});
+  std::vector<KvRow> cr;
   for (const auto& c : capture_vals_) cr.push_back({c.var, c.target, c.enabled, false, false, {}, capture_scope_name(c.scope)});
-  asserts_->set_rows(ar);
   captures_->set_rows(cr);
-  post_js_->SetText(wxString::FromUTF8(base_.post_script));
-  post_js_->EmptyUndoBuffer();
   loading_ = was;
   update_script_badges();
   update_tests_hint();
   post_pg_->Layout();
+  layout_tests_page();
+}
+
+void HttpEditor::build_post_script() {
+  if (post_js_ || !post_sizer_) return;
+  build_post_captures();  // above the script
+  wxWindowUpdateLocker lock(post_pg_);
+  post_sizer_->Add(make_script_label(post_pg_, &post_js_, true), 0, wxEXPAND | wxTOP | wxBOTTOM, FromDIP(4));
+  post_js_ = make_script_editor(post_pg_, "// pm.test('ok', () => pm.response.to.have.status(200))");
+  setup_script_help(post_js_, true);
+  attach_find(post_js_);
+  post_sizer_->Add(post_js_, 1, wxEXPAND);
+  add_trust_row(post_pg_, post_sizer_, 1);
+  const bool was = loading_;
+  loading_ = true;
+  post_js_->SetText(wxString::FromUTF8(base_.post_script));
+  post_js_->EmptyUndoBuffer();
+  loading_ = was;
+  update_script_badges();
+  post_pg_->Layout();
+  layout_tests_page();
+}
+
+void HttpEditor::show_inherited_asserts() {
+  if (!inh_asserts_box_) return;
+  std::vector<std::pair<std::string, std::string>> rows;
+  for (const auto& c : inh_.asserts) {
+    std::string text = c.assertion.target + " " + (c.assertion.op.empty() ? std::string("eq") : c.assertion.op);
+    if (!c.assertion.value.empty()) text += " " + c.assertion.value;
+    rows.emplace_back(std::move(text), c.from);
+  }
+  if (rows == inh_asserts_shown_) return;
+  inh_asserts_shown_ = rows;
+  const Theme& t = Theme::get();
+  wxWindowUpdateLocker lock(inh_asserts_box_);
+  inh_asserts_box_->DestroyChildren();
+  wxSizer* s = inh_asserts_box_->GetSizer();
+  s->Clear();
+  for (size_t i = 0; i < rows.size(); ++i) {
+    const auto& [text, from] = rows[i];
+    // A fixed-size, ellipsized label: an auto-sized one would push the page's minimum width.
+    auto* l = new wxStaticText(inh_asserts_box_, wxID_ANY,
+                               wxString::FromUTF8("\xE2\x86\xB3 " + text + "   (from " + from + ")"),
+                               wxDefaultPosition, wxDefaultSize, wxST_NO_AUTORESIZE | wxST_ELLIPSIZE_END);
+    l->SetMinSize(wxSize(FromDIP(80), l->GetBestSize().y));
+    l->SetForegroundColour(t.var_ok);
+    l->SetCursor(wxCursor(wxCURSOR_HAND));
+    l->SetToolTip(wxString::FromUTF8("Inherited from " + from + ": checked on every response of this request, "
+                                     "with the rows above. Click to edit the folder's assertions."));
+    const std::filesystem::path folder = inh_.asserts[i].folder;
+    l->Bind(wxEVT_LEFT_UP, [this, folder](wxMouseEvent&) {
+      if (const Workspace* ws = host_->workspace()) edit_folder(folder.empty() ? ws->root() : folder);
+    });
+    s->Add(l, 0, wxEXPAND | wxLEFT, FromDIP(6));
+  }
+  inh_asserts_box_->Show(!rows.empty());
+  if (post_pg_) post_pg_->Layout();
   layout_tests_page();
 }
 
@@ -6357,7 +7679,9 @@ wxWindow* HttpEditor::make_script_label(wxWindow* parent, wxStyledTextCtrl** edi
   l->SetForegroundColour(t.dim);
   h->Add(l, 0, wxALIGN_CENTER_VERTICAL);
   h->Add(help_button(row, post ? "Post-response script" : "Pre-request script",
-                     post ? "Runs on a worker thread once the response arrived. pm.test / test() results show next to "
+                     post ? "Runs on a worker thread once the response arrived, after the Captures above (so "
+                            "pm.variables.get / bru.getVar see this response's captured values). "
+                            "pm.test / test() results show next to "
                             "the assertions in the response's Tests tab, console output and errors in its Log tab; "
                             "pm.environment.set / bru.setVar values are kept like captures.\n\n"
                             "QuickJS sandbox (pm.* and bru.* APIs, crypto, CryptoJS, sendRequest): 1 s CPU, no files, "
@@ -6401,12 +7725,21 @@ wxWindow* HttpEditor::make_script_label(wxWindow* parent, wxStyledTextCtrl** edi
 FlatButton* HttpEditor::help_button(wxWindow* parent, const wxString& title, const wxString& text) {
   auto* b = new FlatButton(parent, "?", FlatButton::Style::Subtle);
   b->SetToolTip(title + ": reference");
-  b->on_click = [b, title, text] {
-    wxRichToolTip tip(title, text);
-    tip.SetIcon(wxICON_NONE);
-    tip.SetTimeout(0);  // stays until a click elsewhere: it is read, not glanced at
-    tip.SetTipKind(wxTipKind_TopLeft);
-    tip.ShowFor(b);
+  b->on_click = [this, b, title, text] {
+    // Stays until Esc, a click elsewhere or the app losing focus (it is read, not glanced at); as
+    // wide as the editor pane at most, below the button, never over the screen edge.
+    const wxRect pane = GetScreenRect();
+    const int width = std::clamp(pane.width - FromDIP(24), FromDIP(240), FromDIP(560));
+    auto* pop = new HelpPopup(b, title, text, width);
+    const wxSize sz = pop->GetSize();
+    wxPoint at = b->ClientToScreen(wxPoint(0, b->GetSize().y + FromDIP(2)));
+    at.x = std::max(pane.x + FromDIP(4), std::min(at.x, pane.GetRight() - sz.x - FromDIP(4)));
+    if (const int d = wxDisplay::GetFromWindow(this); d != wxNOT_FOUND) {
+      const wxRect area = wxDisplay(static_cast<unsigned>(d)).GetClientArea();
+      if (at.y + sz.y > area.GetBottom()) at.y = std::max(area.y, b->GetScreenPosition().y - sz.y - FromDIP(2));
+    }
+    pop->Position(at, wxSize(0, 0));
+    pop->Popup(pop->focus());
   };
   return b;
 }
@@ -6502,6 +7835,7 @@ void HttpEditor::script_completion(wxStyledTextCtrl* s, bool post, bool explicit
     return;
   }
   s->AutoCompShow(static_cast<int>(typed), wxString::FromUTF8(list));
+  guard_autocomp(s);
 }
 
 void HttpEditor::lint_script(wxStyledTextCtrl* s) {
@@ -6553,14 +7887,17 @@ void HttpEditor::update_script_badges() {
   }
   npre += pre_js_ ? pre_js_->GetLength() > 0 : !base_.pre_script.empty();
   if (asserts_) {
-    npost = asserts_->enabled_count() + captures_->enabled_count();
+    npost = asserts_->enabled_count();
+    if (captures_) npost += captures_->enabled_count();
+    else
+      for (const auto& c : capture_vals_) npost += c.enabled && !c.var.empty();
   } else {
     for (const auto& a : assert_vals_) npost += a.enabled && !a.target.empty();
     for (const auto& c : capture_vals_) npost += c.enabled && !c.var.empty();
   }
   npost += post_js_ ? post_js_->GetLength() > 0 : !base_.post_script.empty();
   script_tabs_->set_badge(0, npre ? wxString::Format("%zu", npre) : wxString());
-  script_tabs_->set_badge(1, npost ? wxString::Format("%zu", npost) : wxString(), tests_hint_ && tests_hint_->IsShown());
+  script_tabs_->set_badge(1, npost ? wxString::Format("%zu", npost) : wxString(), tests_hint_ && !tests_hint_->GetLabel().empty());
 }
 
 // The tables as tall as their rows (capped), the problem line right under the assertions, the
@@ -6575,11 +7912,6 @@ void HttpEditor::layout_tests_page() {
     for (auto& [n, text] : tests_notes_) {
       n->SetLabel(text);
       n->Wrap(cs.x - FromDIP(4));
-    }
-    if (tests_hint_ && tests_hint_->IsShown()) {
-      const wxString m = tests_hint_->GetToolTipText();
-      tests_hint_->SetLabel(m);
-      tests_hint_->Wrap(cs.x - FromDIP(4));
     }
   }
   if (pre_panel_) pre_panel_->fit_rows(std::max(FromDIP(90), h * 2 / 5));
@@ -6668,6 +8000,11 @@ void HttpEditor::update_tests_hint() {
       if (m.empty() && !(typing && live_col == g->col_key())) m = g->check(g->col_key(), rows[i].key);
       if (m.empty() && !(typing && live_col == g->col_value())) m = g->check(g->col_value(), rows[i].value);
       if (g == captures_ && m.empty() && !typing && trim(rows[i].value).empty()) m = "no response target to copy from";
+      // "contains <empty>" always passes: an operator that compares needs an expected value.
+      if (g == asserts_ && m.empty() && !typing && !trim(rows[i].key).empty() && rows[i].value.empty() &&
+          !assert_op_unary(rows[i].type.empty() ? std::string_view("eq") : std::string_view(rows[i].type)))
+        m = "no expected value (" + (rows[i].type.empty() ? std::string("eq") : rows[i].type) +
+            " with nothing always passes or fails; isEmpty checks for an empty value)";
       if (g == pre_ && m.empty() && !typing && trim(rows[i].value).empty()) m = "no expression, not set";
       if (m.empty()) continue;
       if (++n == 1) msg = wxString::FromUTF8(std::string("\xE2\x9A\xA0 ") + what + " " + std::to_string(i + 1) + ": " + m);
@@ -6677,13 +8014,9 @@ void HttpEditor::update_tests_hint() {
   scan(asserts_, "Assertion");
   scan(captures_, "Capture");
   if (n > 1) msg += wxString::Format("  (+%d more)", n - 1);
+  if (tests_hint_->GetLabel() == msg) return;
   tests_hint_->SetToolTip(msg);
-  tests_hint_->SetLabel(msg);
-  if (tests_page_ && tests_page_->GetClientSize().x > FromDIP(40)) tests_hint_->Wrap(tests_page_->GetClientSize().x - FromDIP(4));
-  if (tests_hint_->IsShown() != (n > 0)) {
-    tests_hint_->Show(n > 0);
-    tests_hint_->GetParent()->Layout();
-  }
+  tests_hint_->SetLabel(msg);  // its row stays: nothing below it moves
 }
 
 // ------------------------------------------------------------------ cookies
@@ -7041,6 +8374,7 @@ SavedRequest HttpEditor::export_request(std::string* warning) const {
     r.http.encode_url = eo.encode_url;
     r.http.tls_min_version = eo.tls_min_version;
   }
+  drop_shadowed_basic(r);  // an Authorization header that is sent beats Basic: never -H and -u both
   if (warning) *warning = std::move(warn);
   r.file = own_file;
   return r;
@@ -7185,6 +8519,217 @@ void HttpEditor::minify_then_send() {
       (void)ms;
     });
   }).detach();
+}
+
+// ------------------------------------------------------------------ GraphQL self test (WATT_HTTPED_GQLTEST)
+
+void HttpEditor::gql_self_test_tick() {
+  using namespace std::chrono;
+  const auto now = steady_clock::now();
+  const double since = duration<double, std::milli>(now - gqlst_t0_).count();
+  auto log = [this](const std::string& s) {
+    gqlst_log_ += s + "\n";
+    std::ofstream(gqlst_out_, std::ios::binary | std::ios::trunc) << gqlst_log_;
+  };
+  auto fmt = [](const char* f, auto... a) {
+    char buf[768];
+    std::snprintf(buf, sizeof buf, f, a...);
+    return std::string(buf);
+  };
+  auto next = [&](int state) {
+    gqlst_state_ = state;
+    gqlst_t0_ = steady_clock::now();
+  };
+  auto timed = [](auto&& fn) {
+    const auto a = steady_clock::now();
+    fn();
+    return duration<double, std::milli>(steady_clock::now() - a).count();
+  };
+  // Types text into the query as the keyboard does (CHARADDED runs gql_char_added).
+  auto type = [this](const std::string& text) {
+    for (char c : text) {
+      const int at = gql_query_->GetCurrentPos();
+      if (c == '\n') {
+        if (gql_pop_) {
+          gql_pop_->key(WXK_RETURN);  // Enter picks, as the key handler does
+          continue;
+        }
+        gql_query_->NewLine();
+      } else if ((c == ')' || c == '}' || c == ']') && gql_query_->GetCharAt(at) == c &&
+                 gql_query_->IndicatorValueAt(kIndAutoClose, at) != 0) {
+        gql_query_->GotoPos(at + 1);  // steps over the auto-closed one (gql_key)
+        continue;
+      } else {
+        const char b[2] = {c, 0};
+        gql_query_->AddTextRaw(b, 1);
+      }
+      gql_char_added(c);
+    }
+  };
+  auto list = [this] {
+    std::string l = gql_pop_ && gql_pop_->IsShown() ? "[shown] " : "[not shown] ";
+    for (const auto& i : gql_items_) l += i.name + " ";
+    return l;
+  };
+  auto lints = [this] {
+    return "query lint: [" + (gql_lint_->IsShown() ? gql_lint_->GetLabel().utf8_string() : std::string()) +
+           "] vars lint: [" + (gql_vars_lint_->IsShown() ? gql_vars_lint_->GetLabel().utf8_string() : std::string()) + "]";
+  };
+  switch (gqlst_state_) {
+    case 0: {
+      if (gqlst_t0_ == steady_clock::time_point{}) {
+        gqlst_t0_ = now;
+        return;
+      }
+      if (!IsShownOnScreen() || since < 2500 || !host_->workspace()) return;
+      wxString url;
+      if (!wxGetEnv("WATT_HTTPED_GQLURL", &url)) url = "http://127.0.0.1:18930/graphql";
+      gqlst_probe_ = std::make_shared<StallProbe>();
+      gqlst_probe_->hwnd = static_cast<HWND>(wxGetTopLevelParent(this)->GetHWND());
+      gqlst_probe_->start();
+      const double ms_url = timed([&] { set_url_text(url.utf8_string()); });
+      const double ms_tab = timed([&] {
+        tabs_->select(1);
+        if (tabs_->on_select) tabs_->on_select(1);
+      });
+      const double ms_page = timed([&] { ensure_body_page(6); });
+      const double ms = timed([&] { set_body_mode(BodyMode::GraphQL, true); });
+      log(fmt("URL %.1f ms, Body tab %.1f ms, GraphQL page build %.1f ms, switch to GraphQL: %.1f ms", ms_url, ms_tab,
+              ms_page, ms));
+      log("prebuilt: " + prebuild_times_);
+      const double ms2 = timed([&] {
+        gql_query_->SetText("query Q($id: ID!) {\n  user(id: $id) {\n    id\n  }\n}\n");
+        gql_vars_->SetText("{ \"id\": \"1\", \"idx\": 2 }");
+      });
+      log(fmt("set query + vars: %.1f ms; before the schema: %s", ms2, lints().c_str()));
+      next(1);
+      return;
+    }
+    case 1: {
+      if (since < 600) return;
+      log(fmt("idle: worst stall %.1f ms; chip [%s]", gqlst_probe_->take(), gql_chip_->GetLabel().utf8_string().c_str()));
+      const double ms = timed([&] { gql_fetch(); });
+      log(fmt("Fetch click: %.2f ms (worker from here)", ms));
+      next(2);
+      return;
+    }
+    case 2: {
+      if (gql_busy_ && since < 20000) return;
+      log(fmt("fetched after %.1f ms: chip [%s], worst UI stall while fetching %.1f ms", since,
+              gql_chip_->GetLabel().utf8_string().c_str(), gqlst_probe_->take()));
+      log("note: " + note_->GetLabel().utf8_string());
+      log("after the schema: " + lints());
+      // The caret at the end of "    id" (line 3), then a new field typed.
+      if (auto* top = wxGetTopLevelParent(this)) {
+        top->Raise();
+        ::SetForegroundWindow(static_cast<HWND>(top->GetHWND()));
+      }
+      gql_query_->SetFocus();
+      {
+        // The pieces of one completion: the walk, then Scintilla's list (the first one creates
+        // its window).
+        const std::string doc = gql_query_->GetText().utf8_string();
+        const double walk = timed([&] { (void)gql_complete(doc, doc.size() / 2, gql_schema_.get()); });
+        const double val = timed([&] { (void)gql_validate(doc, gql_schema_.get()); });
+        log(fmt("walk %.3f ms, validate %.3f ms (%zu bytes)", walk, val, doc.size()));
+      }
+      gql_query_->GotoPos(gql_query_->GetLineEndPosition(2));
+      double worst = 0;
+      for (const char* step : {"\n", "n", "a"}) {
+        const double one = timed([&] { type(step); });
+        worst = std::max(worst, one);
+        log(fmt("  typed [%s] %.2f ms: %s", step[0] == '\n' ? "Enter" : step, one, list().c_str()));
+      }
+      log(fmt("typed '\\n na': worst step %.2f ms; list: %s", worst, list().c_str()));
+      double ms = timed([&] {
+        if (gql_pop_) {
+          gql_pop_->key(WXK_RETURN);
+        } else if (!gql_items_.empty()) {  // no focus (another window is in front): as the pick would
+          const int p = gql_query_->GetCurrentPos(), from = gql_query_->WordStartPosition(p, true);
+          gql_query_->SetTargetRange(from, p);
+          gql_query_->ReplaceTarget(wxString::FromUTF8(gql_items_[0].name));
+          gql_query_->GotoPos(from + static_cast<int>(gql_items_[0].name.size()));
+        }
+      });
+      log(fmt("Enter picks: %.2f ms; line now [%s]", ms,
+              gql_query_->GetLine(gql_query_->GetCurrentLine()).utf8_string().c_str()));
+      ms = timed([&] { type("\nposts("); });
+      log(fmt("typed 'posts(': %.2f ms; text after caret [%s]", ms,
+              gql_query_->GetTextRange(gql_query_->GetCurrentPos(), gql_query_->GetCurrentPos() + 1).utf8_string().c_str()));
+      ms = timed([&] { gql_completion(true); });
+      log(fmt("Ctrl+Space in posts(): %.2f ms; list: %s", ms, list().c_str()));
+      gql_close_pop();
+      ms = timed([&] { type("first: $"); });
+      log(fmt("typed 'first: $': %.2f ms; list: %s", ms, list().c_str()));
+      gql_close_pop();
+      type("id) {");
+      ms = timed([&] { type("\n"); });
+      log(fmt("Enter inside {}: %.2f ms", ms));
+      next(3);
+      return;
+    }
+    case 3: {
+      if (since < 100) return;
+      double ms = timed([&] { type("titl"); });
+      log(fmt("typed 'titl': %.2f ms; list: %s", ms, list().c_str()));
+      gql_close_pop();
+      ms = timed([&] { type("e nope"); });
+      gql_close_pop();
+      log(fmt("typed 'e nope': %.2f ms; %s", ms, lints().c_str()));
+      log("query now:\n" + gql_query_->GetText().utf8_string());
+      // The big schema: parse on the worker, UI stall while it arrives.
+      wxString big;
+      if (wxGetEnv("WATT_HTTPED_GQLBIG", &big)) {
+        next(6);
+        return;
+      }
+      next(5);
+      return;
+    }
+    case 6: {
+      if (since < 500) return;
+      wxString big;
+      wxGetEnv("WATT_HTTPED_GQLBIG", &big);
+      double ms = 0;
+      log(fmt("idle before the big schema: worst stall %.1f ms", gqlst_probe_->take()));
+      {
+        set_url_text(big.utf8_string());
+        gql_lookup();
+        ms = timed([&] { gql_fetch(); });
+        log(fmt("big Fetch click: %.2f ms", ms));
+        next(4);
+        return;
+      }
+    }
+    case 4: {
+      if (gql_busy_ && since < 30000) return;
+      log(fmt("big schema after %.1f ms: chip [%s], worst UI stall %.1f ms; note: %s", since,
+              gql_chip_->GetLabel().utf8_string().c_str(), gqlst_probe_->take(), note_->GetLabel().utf8_string().c_str()));
+      const double ms = timed([&] { lint_gql(); });
+      log(fmt("lint with the big schema: %.2f ms; %s", ms, lints().c_str()));
+      next(5);
+      return;
+    }
+    case 5: {
+      if (since < 300) return;
+      gqlst_timer_.Stop();
+      log(fmt("done: worst stall %.1f ms", gqlst_probe_->take()));
+      if (!wxGetEnv("WATT_HTTPED_SELFTEST_STAY", nullptr)) {
+        gqlst_probe_->run = false;
+        ::TerminateProcess(::GetCurrentProcess(), 0);
+      }
+      // Staying, for a screenshot: a completion list in the nested selection.
+      gqlst_probe_->run = false;
+      gql_query_->SetFocus();
+      const int l = gql_query_->LineFromPosition(gql_query_->GetText().utf8_string().find("nope"));
+      gql_query_->GotoPos(gql_query_->GetLineEndPosition(l));
+      type("\n");
+      type("c");
+      return;
+    }
+    default:
+      return;
+  }
 }
 
 // ------------------------------------------------------------------ self test (WATT_HTTPED_SELFTEST)

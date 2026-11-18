@@ -25,6 +25,7 @@
 #include <wx/settings.h>
 #include <wx/sizer.h>
 #include <wx/splitter.h>
+#include <wx/stc/stc.h>
 #include <wx/stattext.h>
 #include <wx/textctrl.h>
 #include <wx/timer.h>
@@ -118,13 +119,6 @@ size_t count_requests(const CollectionNode& n) {
   size_t k = 0;
   for (const auto& c : n.children) k += count_requests(c);
   return k;
-}
-
-bool any_badge_missing(const CollectionNode& n) {
-  if (!n.is_folder) return !n.badge;
-  for (const auto& c : n.children)
-    if (any_badge_missing(c)) return true;
-  return false;
 }
 
 // Equal paths. The native strings first: fs::path's operator== compares element by element
@@ -637,6 +631,10 @@ class CollectionTree : public wxTreeCtrl {
   // row's name that a word matches are underlined, so it is plain why a row is listed.
   std::function<const std::string&()> filter_query;
   wxColour match_colour;
+  // The native tree starts top-level rows ~25 px in (its root-level margin, which no style
+  // removes): the control sits this much further left than the sizer puts it (its parent clips
+  // the margin), so top-level rows start ~3 px in, level with the section headings (Bruno).
+  int left_trim = 0;
 
   void clear_drag_mark() {
     SendMessage(static_cast<HWND>(GetHWND()), TVM_SETINSERTMARK, FALSE, 0);
@@ -644,6 +642,13 @@ class CollectionTree : public wxTreeCtrl {
 
  protected:
   WXLRESULT MSWWindowProc(WXUINT msg, WXWPARAM wp, WXLPARAM lp) override {
+    if (msg == WM_WINDOWPOSCHANGING && left_trim > 0) {
+      auto* pos = reinterpret_cast<WINDOWPOS*>(lp);
+      if (!(pos->flags & (SWP_NOMOVE | SWP_NOSIZE))) {
+        pos->x -= left_trim;
+        pos->cx += left_trim;
+      }
+    }
     if (dragging && msg == WM_MOUSEMOVE && drag_mark) {
       const WXLRESULT r = wxTreeCtrl::MSWWindowProc(msg, wp, lp);
       const HWND hw = static_cast<HWND>(GetHWND());
@@ -751,7 +756,7 @@ class CollectionTree : public wxTreeCtrl {
         *reinterpret_cast<HTREEITEM*>(&full) = item;
         if (SendMessage(hw, TVM_GETITEMRECT, FALSE, reinterpret_cast<LPARAM>(&full))) {
           HBRUSH b = ::CreateSolidBrush(RGB(accent_colour.Red(), accent_colour.Green(), accent_colour.Blue()));
-          RECT bar{0, full.top, std::max(2, FromDIP(3)), full.bottom};
+          RECT bar{left_trim, full.top, left_trim + std::max(2, FromDIP(3)), full.bottom};
           ::FillRect(dc, &bar, b);
           ::DeleteObject(b);
         }
@@ -763,8 +768,15 @@ class CollectionTree : public wxTreeCtrl {
         SIZE sz{};
         ::GetTextExtentPoint32W(dc, buf, len, &sz);
         const int x = client.right - pad - sz.cx;
+        // On the selected row of the focused tree (the blue band) in its text colour: the dimmed
+        // grey was nearly invisible on blue.
+        const UINT st = static_cast<UINT>(
+            SendMessage(hw, TVM_GETITEMSTATE, reinterpret_cast<WPARAM>(item), TVIS_SELECTED | TVIS_DROPHILITED));
+        const bool on_band = (st & (TVIS_SELECTED | TVIS_DROPHILITED)) && ::GetFocus() == hw;
+        if (on_band) ::SetTextColor(dc, ::GetSysColor(COLOR_HIGHLIGHTTEXT));
         // Never over the name: a long name keeps its row to itself.
         if (x > rc.right + pad) ::TextOutW(dc, x, rc.top + (rc.bottom - rc.top - sz.cy) / 2, buf, len);
+        if (on_band) ::SetTextColor(dc, RGB(count_colour.Red(), count_colour.Green(), count_colour.Blue()));
       }
       item = reinterpret_cast<HTREEITEM>(SendMessage(hw, TVM_GETNEXTITEM, TVGN_NEXTVISIBLE, reinterpret_cast<LPARAM>(item)));
     }
@@ -846,6 +858,7 @@ wxStaticText* section_label(wxWindow* parent, const wxString& text) {
 class Sidebar : public wxPanel, public SidebarPanel {
  public:
   Sidebar(wxWindow* parent, SidebarHost* host) : wxPanel(parent, wxID_ANY), host_(host) {
+    install_crash_log();
     SetBackgroundColour(window_colour());
     build_ui();
     rebuild();
@@ -870,24 +883,13 @@ class Sidebar : public wxPanel, public SidebarPanel {
       });
     }
     hist_focus_timer_.Bind(wxEVT_TIMER, [this](wxTimerEvent&) { hist_focus_tick(); });
-    preview_timer_.Bind(wxEVT_TIMER, [this](wxTimerEvent&) {
+    // A tab just switched to: variables a send captured or a script set since it last coloured
+    // its {{vars}} (runtime variables) show as defined now. The editor re-reads its folders on a
+    // worker (no reload of the editor here).
+    vars_timer_.Bind(wxEVT_TIMER, [this](wxTimerEvent&) {
       wxAuiNotebook* nb = notebook();
       auto* t = nb ? dynamic_cast<RequestTab*>(nb->GetCurrentPage()) : nullptr;
-      if (!t || !t->realized()) return;
-      // Its folder variables have landed by now: the editor colours {{baseUrl}} with them (not
-      // red as undefined) when it shows the request again. Not while the user types in the tab
-      // (the caret would move), nor in a tab with a large body (a reload would cost a frame) or
-      // a send in flight.
-      bool typing = false;
-      for (wxWindow* f = wxWindow::FindFocus(); f; f = f->GetParent())
-        if (f == t) typing = true;
-      if (!typing && !t->in_flight() && t->request_kind() == RequestKind::Http && t->file() == preview_file_) {
-        const SavedRequest& r = t->request();
-        if (r.http.url.find("{{") != std::string::npos && r.http.body.size() < (256u << 10) &&
-            recoloured_.insert({t, t->file()}).second)  // once per tab and file
-          reload_editor(t);
-      }
-      t->vars_changed();
+      if (t && t->realized() && !t->in_flight()) t->vars_changed();
     });
     inh_timer_.Bind(wxEVT_TIMER, [this](wxTimerEvent&) {
       if (host_) host_->folder_settings_changed();  // the "Sent as" lines, with what was read
@@ -942,7 +944,6 @@ class Sidebar : public wxPanel, public SidebarPanel {
         nb->Bind(wxEVT_AUINOTEBOOK_PAGE_CHANGING, mute);
       }
       dormant_timer_.Bind(wxEVT_TIMER, [this](wxTimerEvent&) { dormant_tick(); });
-      heal_timer_.Bind(wxEVT_TIMER, [this](wxTimerEvent&) { heal_stale_tabs(); });
       dormant_timer_.Start(400);
       restore_width();
       width_restored_ = true;
@@ -1015,7 +1016,20 @@ class Sidebar : public wxPanel, public SidebarPanel {
         in_nb += pg.first->GetParent() == nb;
       }
     return "nb " + std::to_string(nb ? nb->GetPageCount() : 0) + " tabs, parked " + std::to_string(parked) +
-           " (in notebook " + std::to_string(in_nb) + ")";
+           " (in notebook " + std::to_string(in_nb) + "), USER objects " +
+           std::to_string(::GetGuiResources(::GetCurrentProcess(), GR_USEROBJECTS)) + ", GDI " +
+           std::to_string(::GetGuiResources(::GetCurrentProcess(), GR_GDIOBJECTS));
+  }
+
+  // The open tabs' titles in tab order, the selected one in [brackets].
+  std::string st_tab_order() {
+    wxAuiNotebook* nb = notebook();
+    std::string out;
+    for (size_t i = 0; nb && i < nb->GetPageCount(); ++i) {
+      const std::string t = nb->GetPageText(i).utf8_string();
+      out += (static_cast<int>(i) == nb->GetSelection() ? "[" + t + "]" : t) + "; ";
+    }
+    return out;
   }
 
   void st_collapse_all() {
@@ -1039,8 +1053,26 @@ class Sidebar : public wxPanel, public SidebarPanel {
       st_build_dup();
       return;
     }
+    // Ctrl+P's dialog left open (with WATT_SIDEBAR_SELFTEST_STAY) for a screenshot.
+    if (only == "qo") {
+      add("quick open", [this] { CallAfter([this] { quick_open_dialog(); }); }, 300);
+      return;
+    }
     if (only == "big") {
       st_build_big();
+      return;
+    }
+    // The critic's round 28 crash loop: workspace round trips (WATT_SIDEBAR_SELFTEST_WS2), then
+    // single-click previews and double-click opens from the tree, repeated.
+    if (only == "none") return;  // just the crash log and the probe (a manual session)
+    if (only == "stress") {
+      st_build_stress();
+      return;
+    }
+    // A workspace round trip keeps the tree's scroll position and the tab strip on the active
+    // tab; the tree has no click-to-rename style.
+    if (only == "view") {
+      st_build_view();
       return;
     }
     // Many open tabs with responses (the critic's round 19 case): Ctrl+B, a sash drag, a
@@ -1048,6 +1080,220 @@ class Sidebar : public wxPanel, public SidebarPanel {
     // tab must each stay under 50 ms.
     if (only == "tabs") {
       st_build_tabs();
+      return;
+    }
+    // Double-clicks on 10 requests 350 ms apart: each a preview open (the first click) and
+    // a permanent open (the second), as the tree's handlers do.
+    if (only == "dclick") {
+      auto reqs = std::make_shared<std::vector<fs::path>>();
+      add("collect", [this, reqs] {
+        collect_requests(tree_root_, *reqs);
+        std::erase_if(*reqs, [this](const fs::path& p) { return tab_for(p) != nullptr; });
+        st_log_ += "# candidates " + std::to_string(reqs->size()) + "\n";
+      }, 3000);
+      for (size_t i = 0; i < 10; ++i) {
+        add("click " + std::to_string(i), [this, reqs, i] {
+          if (i < reqs->size()) st_timed("preview", [&] { host_->open_request((*reqs)[i], true); });
+        }, 120);
+        add("dclick " + std::to_string(i), [this, reqs, i] {
+          if (i < reqs->size()) st_timed("permanent", [&] { host_->open_request((*reqs)[i], false); });
+        }, 230);
+      }
+      add("settle", [] {}, 1500);
+      return;
+    }
+    // The OS folder / save pickers (on their own thread) open and close without a UI stall; the
+    // export result shows in the notice band (no modal box).
+    if (only == "pick") {
+      auto close_dialog = [this](const wchar_t* title) {
+        HWND h = ::FindWindowW(L"#32770", title);
+        st_log_ += std::string("# dialog ") + (h ? "found" : "NOT FOUND") + "\n";
+        if (h) ::PostMessageW(h, WM_CLOSE, 0, 0);
+      };
+      add("restored tabs built", [] {}, 8000);  // the frame's prebuild slices are not this test's
+      add("open workspace dialog", [this] { open_workspace_dialog(false); }, 2500);
+      add("close it", [close_dialog] { close_dialog(L"Open a workspace folder"); }, 1500);
+      add("export dialog", [this] { export_folder(ws_->root(), false); }, 2500);
+      add("close it", [close_dialog] { close_dialog(L"Export as a Postman collection"); }, 1500);
+      add("export to file", [this] {
+        wxString out;
+        wxGetEnv("WATT_SIDEBAR_SELFTEST", &out);
+        run_export(ws_->root(), "ws", fs::path(out.ToStdWstring() + L".postman.json"), false);
+      }, 1500);
+      add("note", [this] { st_log_ += "# note: " + (note_ && note_->IsShown() ? note_->GetLabel().utf8_string() : std::string("<none>")) + "\n"; }, 50);
+      add("filter by url", [this] {
+        filter_->ChangeValue("echo");
+        apply_filter();
+      }, 1500);
+      add("label", [this] { st_log_ += "# label: " + coll_label_->GetLabel().utf8_string() + "\n"; }, 50);
+      return;
+    }
+    // Folder rows the user opened stay open through a rename, a duplicate and a restart.
+    if (only == "expand") {
+      auto state = [this](const char* when) {
+        std::string s = std::string("# ") + when + ": saved {";
+        for (const auto& p : expanded_) s += u8(p.filename()) + " ";
+        s += "} rows open {";
+        if (ws_)
+          for (const char* f : {"Shop API", "auth", "users", "orders", "catalog"}) {
+            fs::path p = ws_->root() / "Shop API";
+            if (std::string(f) != "Shop API") p /= f;
+            const wxTreeItemId id = item_for(p, false);
+            s += std::string(f) + (id.IsOk() ? (tree_->IsExpanded(id) ? "=open " : "=closed ") : "=norow ");
+          }
+        st_log_ += s + "}\n";
+      };
+      add("state at start", [state] { state("start"); }, 50);
+      add("open auth+users", [this] {
+        for (const char* f : {"auth", "users"})
+          if (wxTreeItemId id = item_for(ws_->root() / "Shop API" / f, false); id.IsOk()) tree_->Expand(id);
+      }, 600);
+      add("state", [state] { state("opened"); }, 50);
+      add("rename", [this] {
+        if (fs::path p = st_find("Login"); !p.empty()) rename_node(p, "Login renamed");
+      }, 1500);
+      add("state", [state] { state("after rename"); }, 50);
+      add("rename back", [this] {
+        if (fs::path p = st_find("Login renamed"); !p.empty()) rename_node(p, "Login");
+      }, 1500);
+      add("duplicate", [this] { duplicate_item(st_find("Login")); }, 1200);
+      add("duplicate enter", [this] {
+        if (tree_->GetEditControl()) tree_->EndEditLabel(tree_->GetFocusedItem(), false);
+      }, 2000);
+      add("state", [state] { state("after duplicate"); }, 50);
+      add("delete copy", [this] {
+        if (fs::path p = st_find("Login copy"); !p.empty()) delete_confirmed(p, requests_under(p));
+      }, 2500);
+      add("state", [state] { state("after delete"); }, 50);
+      return;
+    }
+    // An open tab follows an F2 rename and a move: its breadcrumb ends with the new name.
+    if (only == "crumb") {
+      auto crumb = [this](const char* when, const std::string& want) {
+        std::string text = "<none>";
+        if (wxWindow* pg = notebook() ? notebook()->GetCurrentPage() : nullptr) {
+          std::function<void(wxWindow*)> walk = [&](wxWindow* w) {
+            for (wxWindow* c : w->GetChildren()) {
+              if (auto* s = dynamic_cast<wxStaticText*>(c); s && s->IsShown() && s->GetLabel().Contains("  /  ")) {
+                text = s->GetLabel().utf8_string();
+                return;
+              }
+              walk(c);
+            }
+          };
+          walk(pg);
+        }
+        if (const size_t dot = text.find("  \xE2\x97\x8F"); dot != std::string::npos) text.erase(dot);
+        const bool ok = text.size() >= want.size() && text.compare(text.size() - want.size(), want.size(), want) == 0;
+        st_log_ += std::string("# crumb ") + when + ": '" + text + "' " + (ok ? "OK" : "FAIL") + "\n";
+      };
+      add("open Login", [this] { open_tab(st_find("Login")); }, 1500);
+      add("crumb", [crumb] { crumb("before", "Login"); }, 50);
+      add("rename", [this] {
+        if (fs::path p = st_find("Login"); !p.empty()) st_timed("rename", [&] { rename_node(p, "Login renamed"); });
+      }, 1500);
+      add("crumb", [crumb] { crumb("after rename", "Login renamed"); }, 50);
+      add("move", [this] {
+        const fs::path p = st_find("Login renamed");
+        const fs::path dest = p.parent_path().parent_path();
+        if (!p.empty() && dest != ws_->root().parent_path()) {
+          const fs::path to = dest / p.filename();
+          std::error_code ec;
+          fs::rename(p, to, ec);
+          if (!ec) {
+            note_own_write(to);
+            host_->file_moved(p, to);
+            rescan();
+          }
+        }
+      }, 1500);
+      add("crumb", [crumb] { crumb("after move", "Login renamed"); }, 50);
+      add("rename 2", [this] {
+        if (fs::path p = st_find("Login renamed"); !p.empty()) rename_node(p, "Login again");
+      }, 1500);
+      add("crumb", [crumb] { crumb("after rename 2", "Login again"); }, 50);
+      return;
+    }
+    // Typing "get" into the filter at 60-100 ms a key (the critic's r23 case), through the
+    // filter box's own debounce, then clearing it.
+    if (only == "typing") {
+      auto key = [this](const char* q) {
+        filter_->ChangeValue(wxString::FromUTF8(q));
+        filter_timer_.StartOnce(70);  // what the box's wxEVT_TEXT does
+      };
+      for (int round = 0; round < 4; ++round) {
+        const int gap = round % 2 ? 100 : 60;
+        add("type g", [this, key] {
+          focus_filter();
+          key("g");
+        }, gap);
+        add("type ge", [key] { key("ge"); }, gap);
+        add("type get", [key] { key("get"); }, 1500);
+        add("clear", [key] { key(""); }, 1500);
+      }
+      return;
+    }
+    // New HTTP request from a folder's menu (first and second time), Enter; then one more,
+    // cancelled with Esc: no file stays behind.
+    if (only == "newreq") {
+      auto folder = std::make_shared<fs::path>();
+      add("find folder", [this, folder] { *folder = st_find("Refund order v2").parent_path(); }, 50);
+      for (int i = 0; i < 2; ++i) {
+        add("new request", [this, folder] { st_timed("new_request_in", [&] { new_request_in(RequestKind::Http, *folder); }); }, 1500);
+        add("enter", [this] {
+          if (tree_->GetEditControl()) tree_->EndEditLabel(tree_->GetFocusedItem(), false);
+          else st_log_ += "# no rename editor\n";
+        }, 2500);
+      }
+      add("new request (esc)", [this, folder] { new_request_in(RequestKind::Http, *folder); }, 1500);
+      add("esc", [this] {
+        st_esc_ = true;  // the Esc key, as far as the end-edit handler can tell
+        if (tree_->GetEditControl()) tree_->EndEditLabel(tree_->GetFocusedItem(), true);
+        else st_log_ += "# no rename editor\n";
+        st_esc_ = false;
+      }, 1500);
+      add("files", [this, folder] {
+        std::string s;
+        std::error_code ec;
+        for (const auto& e : fs::directory_iterator(*folder, ec))
+          if (u8(e.path().filename()).rfind("new-request", 0) == 0) s += u8(e.path().filename()) + " ";
+        st_log_ += "# new-request files: " + s + "(expect 2)\n";
+      }, 50);
+      return;
+    }
+    // Ctrl+D, then a name typed into the editor: the copy stays directly under its original.
+    if (only == "dupname") {
+      auto rows = [this](const char* when) {
+        std::string out;
+        const fs::path folder = st_find("Refund order v2").parent_path();
+        if (const CollectionNode* n = find_node(tree_root_, folder)) {
+          std::vector<const CollectionNode*> kids;
+          for (const auto& c : n->children) kids.push_back(&c);
+          sort_kids(folder, kids);
+          for (const auto* k : kids) out += k->name + " | ";
+        }
+        st_log_ += std::string("# ") + when + ": " + out + "\n";
+      };
+      add("rows", [rows] { rows("before"); }, 50);
+      add("ctrl+d", [this] { duplicate_item(st_find("Refund order v2")); }, 1500);
+      add("rows", [rows] { rows("copy"); }, 50);
+      add("type name", [this] {
+        if (wxTextCtrl* ed = tree_->GetEditControl()) {
+          ed->ChangeValue("Partial refund");
+          tree_->EndEditLabel(tree_->GetFocusedItem(), false);
+        } else {
+          st_log_ += "# no rename editor\n";
+        }
+      }, 2500);
+      add("rows", [rows] { rows("named"); }, 50);
+      add("cleanup", [this] {
+        if (fs::path p = st_find("Partial refund"); !p.empty()) delete_confirmed(p, requests_under(p));
+      }, 1500);
+      return;
+    }
+    // {{vars}} colouring of every tab after a restart and a workspace round trip.
+    if (only == "vars") {
+      st_build_vars();
       return;
     }
     // Copy / paste between folders, a paste next to the original and Ctrl+D: the copies' rows.
@@ -1166,23 +1412,38 @@ class Sidebar : public wxPanel, public SidebarPanel {
     // back (WATT_SIDEBAR_SELFTEST_WS2=<other workspace>), several round trips.
     if (wxString ws2; only == "switch" && wxGetEnv("WATT_SIDEBAR_SELFTEST_WS2", &ws2)) {
       const fs::path a = ws_->root(), b = fs::path(ws2.ToStdWstring());
-      add("open 3 tabs", [this] {
-        std::vector<fs::path> reqs;
-        collect_requests(tree_root_, reqs);
-        for (size_t i = 0; i < reqs.size() && i < 3; ++i) open_tab(reqs[i]);
-      }, 1500);
-      for (int round = 0; round < 6; ++round) {
+      // WATT_SIDEBAR_SELFTEST_NTABS=<n> (default 3): tabs open in the first workspace, one per
+      // step (the critic's case is ~50), and WATT_SIDEBAR_SELFTEST_ROUNDS round trips (6).
+      long ntabs = 3, rounds = 6;
+      if (wxString v; wxGetEnv("WATT_SIDEBAR_SELFTEST_NTABS", &v)) v.ToLong(&ntabs);
+      if (wxString v; wxGetEnv("WATT_SIDEBAR_SELFTEST_ROUNDS", &v)) v.ToLong(&rounds);
+      auto reqs = std::make_shared<std::vector<fs::path>>();
+      add("collect", [this, reqs] { collect_requests(tree_root_, *reqs); }, 100);
+      for (long i = 0; i < ntabs; ++i)
+        add("open tab", [this, reqs, i] {
+          if (static_cast<size_t>(i) < reqs->size()) open_tab((*reqs)[static_cast<size_t>(i) * 7 % reqs->size()]);
+        }, ntabs > 3 ? 400 : 1500);
+      add("opened", [this] { st_log_ += "# " + st_tab_state() + "\n# order " + st_tab_order() + "\n"; }, 1500);
+      long ntabs2 = 0;  // WATT_SIDEBAR_SELFTEST_NTABS2: tabs opened in the second workspace too
+      if (wxString v; wxGetEnv("WATT_SIDEBAR_SELFTEST_NTABS2", &v)) v.ToLong(&ntabs2);
+      for (long round = 0; round < rounds; ++round) {
         add("switch to ws2", [this, b] { switch_workspace(b, true); }, 1500);
-        add("parked", [this] { st_log_ += "# " + st_tab_state() + "\n"; }, 50);
+        if (round == 0)
+          for (long i = 0; i < ntabs2; ++i)
+            add("open tab 2", [this, i] {
+              std::vector<fs::path> reqs2;
+              collect_requests(tree_root_, reqs2);
+              if (static_cast<size_t>(i) < reqs2.size()) open_tab(reqs2[static_cast<size_t>(i)]);
+            }, 600);
+        add("parked", [this] { st_log_ += "# " + st_tab_state() + "\n# order2 " + st_tab_order() + "\n"; }, 50);
         add("switch back", [this, a] { switch_workspace(a, true); }, 1500);
-        add("back", [this] { st_log_ += "# " + st_tab_state() + "\n"; }, 50);
+        add("back", [this] { st_log_ += "# " + st_tab_state() + "\n# order " + st_tab_order() + "\n"; }, 50);
       }
       return;
     }
     // A relaunch on a saved session: the tab active at launch must have what it inherits from
     // folder.json (variables, headers, auth), so a send goes where its folder says.
     if (only == "restart") {
-      add("restart heal", [this] { st_log_ += "# " + heal_log_; }, 50);
       add("restart send", [this] {
         auto* t = notebook() ? dynamic_cast<RequestTab*>(notebook()->GetCurrentPage()) : nullptr;
         st_log_ += "# active " + (t ? u8(t->file().filename()) + " name '" + t->request().name + "'" : std::string("none")) + "\n";
@@ -1208,6 +1469,26 @@ class Sidebar : public wxPanel, public SidebarPanel {
       add("import notice", [this] {
         st_log_ += "# notice: " + (note_ && note_->IsShown() ? note_->GetLabel().utf8_string() : std::string("<none>")) +
                    "\n";
+      }, 50);
+      // The rows show the request names, not the file slugs ("resource17-op02-update"), also
+      // after overlapping rescans (the import's and the file watcher's).
+      add("import rescan", [this] { rescan(); }, 4000);
+      add("import names", [this] {
+        size_t total = 0, slugs = 0;
+        std::function<void(const CollectionNode&)> walk = [&](const CollectionNode& n) {
+          for (const auto& c : n.children) {
+            if (c.is_folder) {
+              walk(c);
+              continue;
+            }
+            std::string stem = u8(c.path.filename());
+            if (stem.ends_with(".req.json")) stem.resize(stem.size() - 9);
+            ++total;
+            slugs += c.name == stem && stem.find('-') != std::string::npos;
+          }
+        };
+        walk(tree_root_);
+        st_log_ += "# names: " + std::to_string(slugs) + " of " + std::to_string(total) + " rows show the file slug\n";
       }, 50);
       // WATT_SIDEBAR_SELFTEST_REQ=<imported request>: open and send it, log status and URL.
       if (wxString rq; wxGetEnv("WATT_SIDEBAR_SELFTEST_REQ", &rq)) {
@@ -1428,6 +1709,127 @@ class Sidebar : public wxPanel, public SidebarPanel {
     }, 50);
   }
 
+  // A row clicked as the tree's handlers do it: selected (SEL_CHANGED opens the preview), and
+  // for a double click activated a moment later (a permanent tab).
+  void st_click_row(const fs::path& p, bool activate) {
+    if (const wxTreeItemId id = item_for(p, true); id.IsOk()) {
+      tree_->EnsureVisible(id);
+      tree_->SelectItem(id);
+      if (activate) {
+        wxTreeEvent ev(wxEVT_TREE_ITEM_ACTIVATED, tree_, id);
+        tree_->GetEventHandler()->ProcessEvent(ev);
+      }
+    } else {
+      host_->open_request(p, !activate);
+    }
+  }
+
+  std::string st_view_state() {
+    std::string s = "top=";
+    if (const auto* d = data(tree_->GetFirstVisibleItem())) s += u8(d->node->path.filename());
+    s += " sel=";
+    if (const auto* d = data(tree_->GetSelection())) s += u8(d->node->path.filename());
+    wxAuiNotebook* nb = notebook();
+    wxWindow* p = nb ? nb->GetCurrentPage() : nullptr;
+    wxAuiTabCtrl* tc = nullptr;
+    int idx = -1;
+    if (p && nb->FindTab(p, &tc, &idx) && tc) {
+      wxClientDC dc(tc);
+      s += " tab=" + std::to_string(idx) + " offset=" + std::to_string(tc->GetTabOffset()) +
+           (tc->IsTabVisible(idx, static_cast<int>(tc->GetTabOffset()), &dc, tc) ? " visible" : " HIDDEN");
+    }
+    const LONG_PTR st = GetWindowLongPtr(static_cast<HWND>(tree_->GetHWND()), GWL_STYLE);
+    s += (st & TVS_EDITLABELS) ? " EDITLABELS" : " no-editlabels";
+    if (wxTreeItemId f = tree_->GetFirstVisibleItem(); f.IsOk()) {
+      RECT rc{};
+      *reinterpret_cast<HTREEITEM*>(&rc) = static_cast<HTREEITEM>(f.GetID());
+      SendMessage(static_cast<HWND>(tree_->GetHWND()), TVM_GETITEMRECT, TRUE, reinterpret_cast<LPARAM>(&rc));
+      s += " text_left=" + std::to_string(rc.left) + " indent=" +
+           std::to_string(SendMessage(static_cast<HWND>(tree_->GetHWND()), TVM_GETINDENT, 0, 0)) + " style=" +
+           wxString::Format("%llx", static_cast<unsigned long long>(st)).utf8_string() + " level=" +
+           std::to_string(data(f) ? std::distance(ws_->root().begin(), ws_->root().end()) : 0);
+    }
+    return s;
+  }
+
+  void st_build_view() {
+    auto add = [this](std::string n, std::function<void()> fn, int wait = 800) {
+      st_steps_.push_back(TestStep{std::move(n), std::move(fn), wait});
+    };
+    wxString ws2;
+    wxGetEnv("WATT_SIDEBAR_SELFTEST_WS2", &ws2);
+    const fs::path a = ws_->root(), b = fs::path(ws2.ToStdWstring());
+    auto reqs = std::make_shared<std::vector<fs::path>>();
+    add("collect", [this, reqs] { collect_requests(tree_root_, *reqs); }, 4000);
+    add("open far tab", [this, reqs] {
+      if (reqs->size() > 1500) st_click_row((*reqs)[1500], true);
+    }, 1500);
+    add("scroll tree", [this, reqs] {
+      if (reqs->size() > 1480)
+        if (wxTreeItemId id = item_for((*reqs)[1480], true); id.IsOk()) set_first_visible(id);
+    }, 800);
+    add("before", [this] { st_log_ += "# before: " + st_view_state() + "\n"; }, 10);
+    for (int i = 0; i < 2; ++i) {
+      add("to ws2", [this, b] { switch_workspace(b, true); }, 2500);
+      add("back", [this, a] { switch_workspace(a, true); }, 4000);
+      add("after", [this] { st_log_ += "# after: " + st_view_state() + "\n"; }, 10);
+    }
+  }
+
+  void st_build_stress() {
+    auto add = [this](std::string n, std::function<void()> fn, int wait = 800) {
+      st_steps_.push_back(TestStep{std::move(n), std::move(fn), wait});
+    };
+    long iters = 10;
+    if (wxString v; wxGetEnv("WATT_SIDEBAR_SELFTEST_ITERS", &v)) v.ToLong(&iters);
+    wxString ws2;
+    wxGetEnv("WATT_SIDEBAR_SELFTEST_WS2", &ws2);
+    const fs::path a = ws_->root(), b = fs::path(ws2.ToStdWstring());
+    auto reqs = std::make_shared<std::vector<fs::path>>();
+    auto next = std::make_shared<size_t>(0);
+    add("collect", [this, reqs] {
+      collect_requests(tree_root_, *reqs);
+      // A fixed shuffle: rows from all over the tree, the same every run.
+      uint64_t s = 0x9E3779B97F4A7C15ull;
+      for (size_t i = reqs->size(); i > 1; --i) {
+        s ^= s << 13, s ^= s >> 7, s ^= s << 17;
+        std::swap((*reqs)[i - 1], (*reqs)[s % i]);
+      }
+      st_log_ += "# candidates " + std::to_string(reqs->size()) + ", " + st_tab_state() + "\n";
+    }, 6000);
+    auto pick = [this, reqs, next]() -> fs::path {
+      while (*next < reqs->size()) {
+        const fs::path& p = (*reqs)[(*next)++];
+        if (!tab_for(p)) return p;
+      }
+      return {};
+    };
+    for (long it = 0; it < iters; ++it) {
+      const std::string n = std::to_string(it);
+      if (!b.empty())
+        for (int rt = 0; rt < 2; ++rt) {
+          add("it" + n + " to ws2", [this, b] { switch_workspace(b, true); }, 1300);
+          add("it" + n + " back", [this, a] { switch_workspace(a, true); }, 1300);
+        }
+      add("it" + n + " state", [this] { st_log_ += "# " + st_tab_state() + "\n"; }, 10);
+      for (int i = 0; i < 6; ++i)
+        add("it" + n + " preview", [this, pick] {
+          if (const fs::path p = pick(); !p.empty()) st_click_row(p, false);
+        }, 350);
+      for (int i = 0; i < 12; ++i) {
+        auto p = std::make_shared<fs::path>();
+        add("it" + n + " click", [this, pick, p] {
+          *p = pick();
+          if (!p->empty()) st_click_row(*p, false);
+        }, 90);
+        add("it" + n + " dclick", [this, p] {
+          if (!p->empty()) st_click_row(*p, true);
+        }, 550);
+      }
+    }
+    add("end", [this] { st_log_ += "# end, " + st_tab_state() + "\n"; }, 1500);
+  }
+
   void st_build_tabs() {
     auto add = [this](std::string n, std::function<void()> fn, int wait = 800) {
       st_steps_.push_back(TestStep{std::move(n), std::move(fn), wait});
@@ -1501,6 +1903,69 @@ class Sidebar : public wxPanel, public SidebarPanel {
       const fs::path folder = reqs->back().parent_path();
       if (wxTreeItemId id = item_for(folder, true); id.IsOk()) tree_->SelectItem(id);
     }, 600);
+  }
+
+  // "<file>: ok|BAD|-" per tab: the colour of the first {{var}} in its URL field (the
+  // editor's indicators 8 = defined, 10 = undefined), "unrealized" for a tab not built yet.
+  std::string st_var_colours() {
+    std::string out;
+    wxAuiNotebook* nb = notebook();
+    if (!nb) return out;
+    for (size_t i = 0; i < nb->GetPageCount(); ++i) {
+      auto* t = dynamic_cast<RequestTab*>(nb->GetPage(i));
+      if (!t || t->request_kind() != RequestKind::Http) continue;
+      std::string state = "unrealized";
+      if (t->realized()) {
+        state = "no url field";
+        const std::string url = t->request().http.url;
+        std::function<wxStyledTextCtrl*(wxWindow*)> find = [&](wxWindow* w) -> wxStyledTextCtrl* {
+          for (wxWindow* c : w->GetChildren()) {
+            if (auto* s = dynamic_cast<wxStyledTextCtrl*>(c); s && s->GetText().utf8_string() == url) return s;
+            if (wxStyledTextCtrl* s = find(c)) return s;
+          }
+          return nullptr;
+        };
+        if (wxStyledTextCtrl* s = find(t)) {
+          const int at = s->FindText(0, s->GetLength(), "{{");
+          if (at < 0) state = "-";
+          else state = s->IndicatorValueAt(8, at + 2) ? "ok" : s->IndicatorValueAt(10, at + 2) ? "BAD" : "uncoloured";
+        }
+      }
+      out += "#   " + std::string(static_cast<int>(i) == nb->GetSelection() ? "*" : " ") + u8(t->file().filename()) +
+             ": " + state + "\n";
+    }
+    return out;
+  }
+
+  void st_build_vars() {
+    auto add = [this](std::string n, std::function<void()> fn, int wait = 800) {
+      st_steps_.push_back(TestStep{std::move(n), std::move(fn), wait});
+    };
+    auto check_all = [this, add](const std::string& when) {
+      add("colours " + when, [this] { st_log_ += st_var_colours(); }, 50);
+      wxAuiNotebook* nb = notebook();
+      for (size_t i = 0; nb && i < 6; ++i)
+        add("show tab " + std::to_string(i), [this, i] {
+          wxAuiNotebook* nb = notebook();
+          if (nb && i < nb->GetPageCount()) nb->SetSelection(i);
+        }, 1200);
+      add("colours after showing " + when, [this] { st_log_ += st_var_colours(); }, 50);
+    };
+    add("wait", [] {}, 2500);
+    check_all("start");
+    if (wxString ws2; wxGetEnv("WATT_SIDEBAR_SELFTEST_WS2", &ws2)) {
+      const fs::path a = ws_->root(), b = fs::path(ws2.ToStdWstring());
+      add("switch to ws2", [this, b] { switch_workspace(b, true); }, 2500);
+      add("switch back", [this, a] { switch_workspace(a, true); }, 3000);
+      check_all("round trip");
+    }
+    // WATT_SIDEBAR_SELFTEST_END=<i>: end on that tab (for a screenshot with _STAY).
+    if (long end = 0; wxGetEnv("WATT_SIDEBAR_SELFTEST_END", nullptr) &&
+                      wxGetenv("WATT_SIDEBAR_SELFTEST_END") && wxString(wxGetenv("WATT_SIDEBAR_SELFTEST_END")).ToLong(&end))
+      add("end tab", [this, end] {
+        wxAuiNotebook* nb = notebook();
+        if (nb && end >= 0 && static_cast<size_t>(end) < nb->GetPageCount()) nb->SetSelection(static_cast<size_t>(end));
+      }, 2500);
   }
 
   // A 10 MB response: its history row and its tree row (last run from the history) reopened.
@@ -1585,6 +2050,7 @@ class Sidebar : public wxPanel, public SidebarPanel {
                                     std::chrono::duration<double, std::milli>(at - st_t0_).count(), ms)
                        .utf8_string();
       st_log_ += wxString::Format("%s\t%.1f\t%.1f\n", s.name, st_sync_, st_probe_->max_ms()).utf8_string();
+      std::ofstream(st_out_, std::ios::binary) << st_log_;  // a crash keeps the steps before it
     }
     if (st_i_ >= st_steps_.size()) {
       std::ofstream(st_out_, std::ios::binary) << st_log_;
@@ -1603,18 +2069,6 @@ class Sidebar : public wxPanel, public SidebarPanel {
   wxWindow* window() override { return this; }
 
   void set_workspace(Workspace* ws) override {
-    // Tabs built before the first workspace arrived (the session's active tab is restored into
-    // the window before it shows): their editors loaded the request without the workspace, so
-    // nothing they inherit from folder.json (variables, headers, auth) is known to them.
-    if (ws && !ws_seen_) {
-      ws_seen_ = true;
-      if (wxAuiNotebook* nb = notebook())
-        for (size_t i = 0; i < nb->GetPageCount(); ++i)
-          if (auto* t = dynamic_cast<RequestTab*>(nb->GetPage(i)); t && t->realized())
-            stale_tabs_.emplace_back(t);
-      heal_log_ += "stale tabs at first workspace: " + std::to_string(stale_tabs_.size()) + "\n";
-      if (!stale_tabs_.empty()) later([this] { heal_stale_tabs(); });
-    }
     ws_ = ws;
     session_resp_.clear();  // another workspace's history
     session_resp_bytes_ = 0;
@@ -1709,12 +2163,7 @@ class Sidebar : public wxPanel, public SidebarPanel {
     learn_later(file_in);
     if (file_in != active_file_) {
       sticky_sel_.clear();
-      // The editor of a tab just opened reads its folder variables on a worker: its "Sent as"
-      // line shows them once that has landed.
-      if (!file_in.empty()) {
-        preview_file_ = file_in;
-        preview_timer_.StartOnce(200);
-      }
+      if (!file_in.empty()) vars_timer_.StartOnce(200);
     }
     // Ctrl+P opened a request the filter hides: clear the filter so the tree can show it.
     if (!file_in.empty() && !filter_q_.empty() && sidebar::take_quick_pick(file_in)) {
@@ -1904,7 +2353,10 @@ class Sidebar : public wxPanel, public SidebarPanel {
         "Ctrl+P opens any saved request by fuzzy name.");
     sz->Add(filter_, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, pad);
     filter_timer_.Bind(wxEVT_TIMER, [this](wxTimerEvent&) { apply_filter(); });
-    filter_->Bind(wxEVT_TEXT, [this](wxCommandEvent&) { filter_timer_.StartOnce(70); });
+    filter_->Bind(wxEVT_TEXT, [this](wxCommandEvent&) {
+      filter_typed_at_ = std::chrono::steady_clock::now();
+      filter_timer_.StartOnce(70);
+    });
     filter_->Bind(wxEVT_KEY_DOWN, [this](wxKeyEvent& e) {
       const int k = e.GetKeyCode();
       if (k == WXK_ESCAPE && !filter_->IsEmpty()) {
@@ -2000,6 +2452,7 @@ class Sidebar : public wxPanel, public SidebarPanel {
     // Left / Right / Enter.
     tree_->SetImages(tree_images(this));
     tree_->SetIndent(FromDIP(14));
+    ctree_->left_trim = FromDIP(22);
     ctree_->count_colour = dim_colour();
     ctree_->guide_colour = mix(window_colour(), text_colour(), is_dark() ? 0.14 : 0.16);
     ctree_->accent_colour = is_dark() ? wxColour(0x4C, 0x9A, 0xFF) : wxColour(0x1A, 0x73, 0xE8);
@@ -2012,6 +2465,7 @@ class Sidebar : public wxPanel, public SidebarPanel {
       const HWND hw = static_cast<HWND>(tree_->GetHWND());
       SetWindowLongPtr(hw, GWL_STYLE, GetWindowLongPtr(hw, GWL_STYLE) | TVS_NOHSCROLL);
     }
+    set_label_edits(false);  // only while edit_label() opens the editor
     ctree_->folder_count = [this](const wxTreeItemId& id) -> size_t {
       const auto* d = data(id);
       return d && d->node->is_folder ? count_requests(*d->node) : 0;
@@ -2099,6 +2553,7 @@ class Sidebar : public wxPanel, public SidebarPanel {
     history_->describe = [this](const HistoryEntry& e, std::string* name, std::string* target) {
       describe_history(e, name, target);
     };
+    history_->identity = [this](const HistoryEntry& e) { return history_id(e); };
     history_->grpc_kind = [this](const HistoryEntry& e) { return grpc_kind_of(grpc_method_of(e)); };
     history_->on_delete = [this](const std::vector<HistoryEntry>& v) { delete_history(v); };
     history_->on_clear = [this] { clear_history_all(); };
@@ -2177,9 +2632,16 @@ class Sidebar : public wxPanel, public SidebarPanel {
     if (hist_full_) {
       hist_saved_sash_ = split_->GetSashPosition();
       hist_saved_user_ = user_sash_;
+      hist_saved_filter_ = filter_->GetValue();
       user_sash_ = true;
       split_->Unsplit(split_->GetWindow1());  // the collection pane hides; history fills the sidebar
     } else {
+      // A query typed to search the full-height history was for the history: the collection
+      // comes back with the filter it had before (it showed 7 of 25 rows by URL otherwise).
+      if (filter_->GetValue() != hist_saved_filter_) {
+        filter_->ChangeValue(hist_saved_filter_);
+        apply_filter();
+      }
       user_sash_ = hist_saved_user_;
       split_->SplitHorizontally(top_pane_, split_->GetWindow1(),
                                 hist_saved_sash_ > 0 ? hist_saved_sash_ : split_->GetClientSize().y / 2);
@@ -2187,7 +2649,7 @@ class Sidebar : public wxPanel, public SidebarPanel {
     }
   }
 
-  // History pane height follows its content (an empty one is small), up to 45% of the
+  // History pane height follows its content (an empty one is small), up to 5 rows and 30% of the
   // sidebar, until the user drags the sash.
   void update_history_pane() {
     const bool empty = history_->shown() == 0;
@@ -2210,9 +2672,10 @@ class Sidebar : public wxPanel, public SidebarPanel {
       want = FromDIP(64);
     } else {
       // The rows it shows (day headers included) plus its header, no empty space under them,
-      // up to 40% of the sidebar: the collection keeps the rest.
-      want = FromDIP(34) + history_->content_height(12) + FromDIP(4);
-      want = std::clamp(want, FromDIP(96), std::max(FromDIP(96), h * 40 / 100));
+      // at most 5 rows (the list scrolls; Expand or a drag of the divider shows more) and 30% of
+      // the sidebar: the collection keeps the rest of the column, as in Bruno.
+      want = FromDIP(34) + history_->content_height(5) + FromDIP(4);
+      want = std::clamp(want, FromDIP(96), std::max(FromDIP(96), h * 30 / 100));
     }
     const int pos = h - want - split_->GetSashSize();
     if (std::abs(split_->GetSashPosition() - pos) > 2) split_->SetSashPosition(pos);
@@ -2296,6 +2759,20 @@ class Sidebar : public wxPanel, public SidebarPanel {
       SendMessage(static_cast<HWND>(tree_->GetHWND()), TVM_SETINSERTMARKCOLOR, 0,
                   static_cast<LPARAM>(RGB(c.Red(), c.Green(), c.Blue())));
     }
+    // Characters typed into the filter that land in the tree (it takes the focus when a rebuild
+    // deletes its selected row, before the filter gets it back) go on into the filter: the tree's
+    // own type-to-select would pick the first row starting with that letter and open it in the
+    // preview tab while the user is still typing the query.
+    tree_->Bind(wxEVT_CHAR, [this](wxKeyEvent& e) {
+      const int c = static_cast<int>(e.GetUnicodeKey());
+      const bool typing = std::chrono::steady_clock::now() - filter_typed_at_ < std::chrono::milliseconds(800);
+      if (!typing || c < 32 || c == 127 || e.HasAnyModifiers() || !filter_->IsShownOnScreen()) {
+        e.Skip();
+        return;
+      }
+      filter_->SetFocus();
+      filter_->WriteText(wxString(wxUniChar(static_cast<unsigned>(c))));
+    });
     // The drop of a row onto a sibling reorders (see END_DRAG): it takes the sibling's place,
     // so the line goes after it when moving down and before it when moving up.
     ctree_->drag_mark = [this](const wxTreeItemId& hit) -> int {
@@ -2431,6 +2908,13 @@ class Sidebar : public wxPanel, public SidebarPanel {
           }
           e.Skip();
           return;
+        case 'Z':  // Ctrl+Z: undo the last delete
+          if (e.GetKeyEvent().GetModifiers() == wxMOD_CONTROL && !undo_.empty()) {
+            undo_delete();
+            return;
+          }
+          e.Skip();
+          return;
         case 'D':  // Ctrl+D: duplicate (Bruno, Postman)
           if (e.GetKeyEvent().GetModifiers() == wxMOD_CONTROL) {
             if (const auto* d = data(sel)) {
@@ -2451,6 +2935,9 @@ class Sidebar : public wxPanel, public SidebarPanel {
       if (!data(e.GetItem()) || !edit_ok_) e.Veto();
     });
     tree_->Bind(wxEVT_TREE_END_LABEL_EDIT, [this](wxTreeEvent& e) {
+      CallAfter([this] {
+        if (!tree_->GetEditControl()) set_label_edits(false);
+      });
       if (rebuild_after_edit_ || deferred_scan_) {
         rebuild_after_edit_ = false;
         CallAfter([this] {
@@ -2469,7 +2956,39 @@ class Sidebar : public wxPanel, public SidebarPanel {
       // A new or duplicated request opens now that it has its name (or kept the proposed one).
       const bool open_after = !from.empty() && from == open_after_edit_;
       if (open_after) open_after_edit_.clear();
+      // The native tree reports Enter on an unchanged name as cancelled too: only the Esc key
+      // itself (being handled now) cancels a new item.
+      const bool esc = e.IsEditCancelled() && ((::GetKeyState(VK_ESCAPE) & 0x8000) != 0 || st_esc_);
+      const bool discard = open_after && esc && from == discard_on_esc_;
+      if (st_probe_)
+        st_log_ += "# end edit " + u8(from.filename()) + (e.IsEditCancelled() ? " cancelled" : "") +
+                   (discard ? " discard" : "") + " label '" + e.GetLabel().utf8_string() + "'\n";
+      const fs::path was_discard = std::move(discard_on_esc_);
+      discard_on_esc_.clear();
       const std::string name = e.IsEditCancelled() ? std::string() : e.GetLabel().Strip(wxString::both).utf8_string();
+      // An editor reopened by resume_now() that something in the app ended again at once (the
+      // resumed_ grace) opens once more. Leaving the app commits the name (see watch_activation),
+      // and Enter on the proposed name opens the tab at once.
+      const bool enter = (::GetKeyState(VK_RETURN) & 0x8000) != 0;
+      // Only for a focus grab inside the app right after the editor opened (a tab restoring its
+      // own focus): never when the app was left (leaving_app_) or a mouse click ended it.
+      const bool clicked = wxGetMouseState().LeftIsDown() || wxGetMouseState().RightIsDown();
+      if (open_after && !esc && !enter && !leaving_app_ && !clicked && d && (name.empty() || name == d->node->name) &&
+          app_foreground() && from == resumed_ && std::chrono::steady_clock::now() < resumed_until_ &&
+          resume_tries_ < 4) {
+        if (!e.IsEditCancelled()) e.Veto();
+        open_after_edit_ = from;
+        discard_on_esc_ = was_discard;
+        resume_name_ = from;
+        if (app_foreground()) resume_now();
+        return;
+      }
+      // Esc while naming a new request or a copy cancels it (Bruno and Postman ask for the name
+      // before they create anything): no file named "New request" is left behind.
+      if (discard) {
+        later([this, from] { discard_fresh(from); });
+        return;
+      }
       if (!d || name.empty() || name == d->node->name) {
         if (!e.IsEditCancelled()) e.Veto();
         // Enter or Esc on the proposed name: the item keeps it and opens with the caret in its
@@ -2525,10 +3044,22 @@ class Sidebar : public wxPanel, public SidebarPanel {
 
   // ---------------------------------------------------------------- tree
 
+  // The native tree has TVS_EDITLABELS only while edit_label() opens its editor: without it a
+  // slow second click on the selected row can never start a rename (F2 and the menu only).
+  void set_label_edits(bool on) {
+    const HWND hw = static_cast<HWND>(tree_->GetHWND());
+    const LONG_PTR st = GetWindowLongPtr(hw, GWL_STYLE);
+    const LONG_PTR want = on ? (st | TVS_EDITLABELS) : (st & ~static_cast<LONG_PTR>(TVS_EDITLABELS));
+    if (want != st) SetWindowLongPtr(hw, GWL_STYLE, want);
+  }
+
   void edit_label(const wxTreeItemId& id) {
+    watch_activation();
     edit_ok_ = true;
+    set_label_edits(true);
     tree_->EditLabel(id);  // BEGIN_LABEL_EDIT is sent from in here
     edit_ok_ = false;
+    if (!tree_->GetEditControl()) set_label_edits(false);
     // The native edit box is white; give it the tree's colours (a slightly raised field).
     if (wxTextCtrl* ed = tree_->GetEditControl()) {
       // Dark scroll bars / border for the native edit (its colours: CollectionTree).
@@ -2665,9 +3196,16 @@ class Sidebar : public wxPanel, public SidebarPanel {
       view_root_ = CollectionNode{};
       if (search_keys_.empty()) build_keys(tree_root_, "", meta_, search_keys_);
       std::vector<const CollectionNode*> hits;
-      filter_node(tree_root_, filter_q_, search_keys_, view_root_, &hits,
-                  phrase_names_folder(tree_root_, filter_q_, search_keys_));
-      rank_hits(hits);
+      st_timed("filter_node", [&] {
+        filter_node(tree_root_, filter_q_, search_keys_, view_root_, &hits,
+                    phrase_names_folder(tree_root_, filter_q_, search_keys_));
+      });
+      st_timed("rank", [&] { rank_hits(hits); });
+      // Requests that match only by their URL, file or folder (not a word of their name): the
+      // count says so, or 'echo' showing 7 rows named otherwise looks like a broken filter.
+      filter_not_name_ = 0;
+      for (const CollectionNode* h : hits)
+        if (!any_word_in(filter_q_, ascii_lower(h->name))) ++filter_not_name_;
       view_root_.name = tree_root_.name;
       view_root_.path = tree_root_.path;
       view_root_.is_folder = true;
@@ -2686,7 +3224,7 @@ class Sidebar : public wxPanel, public SidebarPanel {
     const uint64_t gen = ++rebuild_gen_;
     bool synced = false;
     if (try_sync) {
-      synced = sync_tree();
+      st_timed("sync_tree", [&] { synced = sync_tree(); });
       // The highlight follows the active tab (also when its row was not in the tree before).
       if (synced && !sel_path.empty()) {
         const auto* d = data(tree_->GetSelection());
@@ -2699,7 +3237,7 @@ class Sidebar : public wxPanel, public SidebarPanel {
     }
     if (!synced) {
       tree_->UnselectAll();  // deleting the selected item would move the focus to the tree
-      delete_all_rows();
+      st_timed("delete_all_rows", [&] { delete_all_rows(); });
       root_populated_ = false;
       expand_budget_ = 0;  // a filter's matched folders open breadth first, below
       const wxTreeItemId root = tree_->AddRoot("root");
@@ -2716,7 +3254,14 @@ class Sidebar : public wxPanel, public SidebarPanel {
       if (!query_changed && !top_path.empty())
         if (wxTreeItemId id = item_for(top_path, false); id.IsOk()) set_first_visible(id);
     }
-    if (!filter_q_.empty()) later([this, gen] { expand_more(gen, 1); });
+    // Back in a workspace: the tree scrolls to where it was when the workspace was left (once
+    // its rows are in; a scan pass may come before them).
+    if (!restore_top_.empty() && filter_q_.empty())
+      if (wxTreeItemId id = item_for(restore_top_, false); id.IsOk()) {
+        set_first_visible(id);
+        restore_top_.clear();
+      }
+    if (!filter_q_.empty()) later([this, gen] { st_timed("expand 1", [&] { expand_more(gen, 1); }); });
     mark_best_match();
     // A new query shows its results from the first row (the best match is ranked into view);
     // the old view's scroll position belongs to another, longer list. A rescan with the same
@@ -2946,10 +3491,10 @@ class Sidebar : public wxPanel, public SidebarPanel {
     expand_budget_ = 0;  // a filter's closed folders are opened by expand_more()
     sync_queue_.clear();
     deferring_ = true;
-    sync_children(root, view_root_);
+    st_timed(" root rows", [&] { sync_children(root, view_root_); });
     deferring_ = false;
     expand_budget_ = saved;
-    run_sync_queue(rebuild_gen_, 8.0);
+    st_timed(" queue", [&] { run_sync_queue(rebuild_gen_, 5.0); });  // the root rows were synced in this step already
     return true;
   }
 
@@ -2962,8 +3507,15 @@ class Sidebar : public wxPanel, public SidebarPanel {
       if (filter_q_.empty() && expanded_.count(n.path)) open_row(id);
       return;
     }
-    if (unfilter_ && !expanded_.count(n.path) && !holds_selection(id)) reset_row(id, n);
-    else sync_children(id, n);
+    if (unfilter_ && !expanded_.count(n.path) && !holds_selection(id)) {
+      reset_row(id, n);
+    } else {
+      // A folder the filter opened that stays open (it holds the row the user picked): it is
+      // open now as far as the user can tell, so a rename, a rescan or a restart keeps it so.
+      if (unfilter_ && !expanded_.count(n.path) && tree_->IsExpanded(id) && expanded_.insert(n.path).second)
+        save_expanded();
+      sync_children(id, n);
+    }
     folder_image(id, tree_->IsExpanded(id));
   }
 
@@ -2975,14 +3527,33 @@ class Sidebar : public wxPanel, public SidebarPanel {
     return rc.bottom > 0 && rc.top < tree_->GetClientSize().y;
   }
 
-  void run_sync_work(const SyncWork& w) {
+  void run_sync_work(const SyncWork& w, std::chrono::steady_clock::time_point deadline) {
     if (w.node) {
       sync_folder_row(w.row, *w.node);
       return;
     }
-    const auto hi = static_cast<HTREEITEM>(w.row.GetID());  // a folder row that left the view
-    delete_descendants(hi);
+    // A folder row that left the view: a big one (a filter that had opened 2000 rows below it)
+    // is deleted over several steps, the rest of it queued again.
+    const auto hi = static_cast<HTREEITEM>(w.row.GetID());
+    if (!delete_descendants_until(hi, deadline)) {
+      sync_queue_.push_front(w);
+      return;
+    }
     SendMessage(tree_hwnd(), TVM_DELETEITEM, 0, reinterpret_cast<LPARAM>(hi));
+  }
+
+  // delete_descendants() that stops at the deadline (after at least one row): true when every
+  // row below parent is gone. The rows left are untouched (valid handles).
+  bool delete_descendants_until(HTREEITEM parent, std::chrono::steady_clock::time_point deadline) {
+    const HWND hw = tree_hwnd();
+    std::vector<HTREEITEM> kids;
+    for (HTREEITEM c = tv_next(hw, parent, TVGN_CHILD); c; c = tv_next(hw, c, TVGN_NEXT)) kids.push_back(c);
+    for (auto it = kids.rbegin(); it != kids.rend(); ++it) {
+      if (tv_next(hw, *it, TVGN_CHILD) && !delete_descendants_until(*it, deadline)) return false;
+      SendMessage(hw, TVM_DELETEITEM, 0, reinterpret_cast<LPARAM>(*it));
+      if (std::chrono::steady_clock::now() >= deadline) return std::next(it) == kids.rend();
+    }
+    return true;
   }
 
   // Runs queued folder updates: every one whose row is on screen (also those that come into
@@ -3020,24 +3591,29 @@ class Sidebar : public wxPanel, public SidebarPanel {
     }
     redraw_off();
     deferring_ = true;  // folders below a synced one are queued too (one folder's rows per item)
-    // On screen first (a pass can bring more rows into view; at most ~24 ms for all of them).
-    for (bool any = true; any && elapsed() < 24.0;) {
+    // On screen first (a pass can bring more rows into view). Never more than ~10 ms in one
+    // step, also for the rows on screen: a keystroke every 60 ms must find the UI free (a 2000-row
+    // view narrowed to a few rows took 28-32 ms here in one step, 60-106 ms on a loaded machine).
+    const double screen_ms = std::min(10.0, budget_ms + 2.0);
+    const auto screen_end = t0 + std::chrono::microseconds(static_cast<long long>(screen_ms * 1000));
+    const auto budget_end = t0 + std::chrono::microseconds(static_cast<long long>(std::max(screen_ms, budget_ms) * 1000));
+    for (bool any = true; any && elapsed() < screen_ms;) {
       any = false;
-      for (size_t i = 0; i < sync_queue_.size() && elapsed() < 24.0;) {
+      for (size_t i = 0; i < sync_queue_.size() && elapsed() < screen_ms;) {
         if (!row_on_screen(sync_queue_[i].row)) {
           ++i;
           continue;
         }
         const SyncWork w = sync_queue_[i];
         sync_queue_.erase(sync_queue_.begin() + static_cast<std::ptrdiff_t>(i));
-        run_sync_work(w);
+        run_sync_work(w, screen_end);
         any = true;
       }
     }
     while (!sync_queue_.empty() && elapsed() < budget_ms) {
       const SyncWork w = sync_queue_.front();
       sync_queue_.pop_front();
-      run_sync_work(w);
+      run_sync_work(w, budget_end);
     }
     deferring_ = false;
     if (anchor) {
@@ -3050,7 +3626,7 @@ class Sidebar : public wxPanel, public SidebarPanel {
     redraw_on();
     if (!nested) rebuilding_ = false;
     if (sync_queue_.empty()) free_stale_views();
-    else later([this, gen] { run_sync_queue(gen, 8.0); });
+    else later([this, gen] { st_timed("sync step", [&] { run_sync_queue(gen, 8.0); }); });
   }
 
   // The rows of `item` follow node's children. While deferring_, the folders below it (kept,
@@ -3127,7 +3703,7 @@ class Sidebar : public wxPanel, public SidebarPanel {
       if (const wxString name = wxString::FromUTF8(n->name); tree_->GetItemText(row) != name) tree_->SetItemText(row, name);
       if (n->is_folder) {
         if (!d->populated) {
-          tree_->SetItemHasChildren(row, !n->children.empty());
+          if (tree_->ItemHasChildren(row) != !n->children.empty()) tree_->SetItemHasChildren(row, !n->children.empty());
           folder_image(row, tree_->IsExpanded(row));  // gained or lost its chevron
         } else if (deferring_) {
           sync_queue_.push_back({row, n});
@@ -3142,6 +3718,67 @@ class Sidebar : public wxPanel, public SidebarPanel {
         tree_->SetItemImage(row, img, wxTreeItemIcon_Selected);
       }
     }
+  }
+
+  // The foreground window belongs to this process.
+  static bool app_foreground() {
+    HWND fg = ::GetForegroundWindow();
+    DWORD pid = 0;
+    if (fg) ::GetWindowThreadProcessId(fg, &pid);
+    return fg && pid == ::GetCurrentProcessId();
+  }
+
+  // Naming a new item is interrupted by a switch to another app: the editor opens again on
+  // the item when this window is active again. Watches the frame's activation (bound once,
+  // when the first rename editor opens).
+  void watch_activation() {
+    if (resume_bound_) return;
+    wxWindow* top = wxGetTopLevelParent(this);
+    if (!top) return;
+    resume_bound_ = true;
+    top->Bind(wxEVT_ACTIVATE, [this, alive = std::weak_ptr<int>(alive_)](wxActivateEvent& e) {
+      e.Skip();
+      if (alive.expired()) return;
+      if (!e.GetActive()) {
+        // Focus leaves the app: the rename editor commits what it holds (the proposed name for a
+        // new item or a copy, which then opens), instead of staying open where a later key
+        // (Del) would edit its text rather than act on the tree.
+        if (tree_->GetEditControl()) {
+          leaving_app_ = true;
+          tree_->EndEditLabel(tree_->GetFocusedItem(), false);
+          leaving_app_ = false;
+        }
+        return;
+      }
+      // The focus restore that follows this handler may end the editor (see END_LABEL_EDIT).
+      CallAfter([this] { away_naming_.clear(); });
+      if (!resume_name_.empty()) resume_now();
+    });
+  }
+
+  // At once, not after a timer: the first key typed after the switch back must land in the
+  // editor.
+  void resume_now() {
+    CallAfter([this] {
+      fs::path p = std::move(resume_name_);
+      resume_name_.clear();
+      if (p.empty() || open_after_edit_ != p || tree_->GetEditControl()) return;
+      // Something may still take the focus back right after the activation (a tab restoring
+      // its own): an editor that ends unchanged within this grace is opened again.
+      if (resumed_ != p) resume_tries_ = 0;
+      ++resume_tries_;
+      resumed_ = p;
+      resumed_until_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+      if (wxTreeItemId it = item_for(p, false); it.IsOk()) {
+        syncing_ = true;  // no preview while it is named
+        tree_->SelectItem(it);
+        syncing_ = false;
+        tree_->SetFocus();
+        edit_label(it);
+        if (tree_->GetEditControl()) return;
+      }
+      name_new_item(p);
+    });
   }
 
   // A new or duplicated item is in the tree: select it and open the rename editor on it.
@@ -3231,7 +3868,7 @@ class Sidebar : public wxPanel, public SidebarPanel {
     if (top.IsOk()) set_first_visible(top);
     redraw_on();
     expand_budget_ = saved_budget;
-    if (more) later([this, gen, step] { expand_more(gen, step + 1); });
+    if (more) later([this, gen, step] { st_timed("expand step", [&] { expand_more(gen, step + 1); }); });
   }
 
   // While filtering, the request Enter opens is shown in bold.
@@ -3252,6 +3889,12 @@ class Sidebar : public wxPanel, public SidebarPanel {
     if (ws_ && n) {
       if (filter_q_.empty()) c += wxString::Format("   %zu", n);
       else c += wxString::Format("   %zu of %zu", count_requests(view_root_), n);
+      if (!filter_q_.empty() && filter_not_name_) {
+        const size_t shown = count_requests(view_root_);
+        c += filter_not_name_ >= shown ? wxString::FromUTF8("  \xC2\xB7  by URL / folder")
+                                       : wxString::Format(wxString::FromUTF8("  \xC2\xB7  %zu by URL / folder"),
+                                                          filter_not_name_);
+      }
     }
     if (coll_label_->GetLabel() != c) coll_label_->SetLabel(c);
     wxString h = "HISTORY";
@@ -3420,21 +4063,7 @@ class Sidebar : public wxPanel, public SidebarPanel {
           apply_scan(std::move(h->first), std::move(h->second), final, idx.get());
         });
       };
-      CollectionNode first = copy->tree(25);
-      const bool missing = any_badge_missing(first);
-      MetaMap meta = names ? names->apply_cached(first) : MetaMap{};
-      CollectionNode latest = missing ? CollectionNode{} : first;
-      deliver(std::move(first), std::move(meta), !missing);
-      if (missing) {
-        latest = copy->tree(-1);
-        CollectionNode full = latest;
-        MetaMap m2 = names ? names->apply_cached(full) : MetaMap{};
-        deliver(std::move(full), std::move(m2), true);
-      }
-      if (!names) return;
-      bool changed = false;
-      MetaMap m3 = names->refresh(latest, &changed);
-      if (changed) deliver(std::move(latest), std::move(m3), true);
+      scan_tree(*copy, names.get(), deliver);
     }).detach();
   }
 
@@ -3449,6 +4078,32 @@ class Sidebar : public wxPanel, public SidebarPanel {
     // The old tree and names are freed on a worker (10k nodes: ~5 ms). Nothing points into
     // them: the rows point into view_root_, the keys that point into tree_root_ are cleared
     // below.
+    // Requests that are gone (deleted, moved away): their last name stays for the history rows,
+    // which otherwise fell back to the name they were sent under ("Refund order v2" became
+    // "Refund order" again). One merge of two sorted maps (2000 requests: well under 1 ms).
+    if (final || !meta_.empty()) {
+      NativePathLess less;
+      auto a = meta_.begin();
+      auto b = meta.begin();
+      while (a != meta_.end()) {
+        if (b == meta.end() || less(a->first, b->first)) {
+          if (!a->second.name.empty()) {
+            gone_names_[a->first] = a->second.name;
+            if (!a->second.id.empty()) gone_ids_[a->second.id] = a->second.name;
+          }
+          ++a;
+        } else if (less(b->first, a->first)) {
+          ++b;
+        } else {
+          ++a;
+          ++b;
+        }
+      }
+      if (gone_names_.size() > 5000) {  // bounded (only a fallback for labels)
+        gone_names_.clear();
+        gone_ids_.clear();
+      }
+    }
     auto old = std::make_shared<std::pair<CollectionNode, MetaMap>>(std::move(tree_root_), std::move(meta_));
     tree_root_ = std::move(root);
     meta_ = std::move(meta);
@@ -3514,6 +4169,7 @@ class Sidebar : public wxPanel, public SidebarPanel {
         hist_names_ = std::move(*nm);
         for (const auto& [snap, rel] : *og)
           snapshot_origin_.emplace(snapshot_dir() / from_u8(snap), ws_->root() / from_u8(rel));
+        refresh_snapshot_tabs();
         history_->set_entries(std::move(*h));
         update_counts();
         update_history_pane();
@@ -3551,6 +4207,7 @@ class Sidebar : public wxPanel, public SidebarPanel {
       apply_filter();
     }
     name_then_open(r->file);
+    discard_on_esc_ = r->file;
   }
 
   void new_folder_in(const fs::path& folder) {
@@ -3787,8 +4444,96 @@ class Sidebar : public wxPanel, public SidebarPanel {
                               " open with unsaved changes: the tab stays open as an unsaved request "
                               "(Ctrl+S saves it again, Ctrl+W closes it).");
     }
-    if (!confirm(wxGetTopLevelParent(this), title, q, "Move to Recycle Bin", true)) return;
+    // A single request with no unsaved tab goes at once, as in Explorer and VS Code: Ctrl+Z (or
+    // the notice) brings it back. A folder or unsaved edits are still asked about.
+    if ((d->node->is_folder || !dirty.empty()) &&
+        !confirm(wxGetTopLevelParent(this), title, q + "\n\nCtrl+Z in the collection tree brings it back.",
+                 "Move to Recycle Bin", true))
+      return;
     delete_confirmed(p, files);
+  }
+
+  // What a delete took away, kept in memory for Ctrl+Z (the Recycle Bin has its own copy).
+  struct Deleted {
+    fs::path root;   // the workspace it was deleted from
+    fs::path path;   // the deleted file or folder
+    std::string name;
+    std::vector<fs::path> dirs;
+    std::vector<std::pair<fs::path, std::string>> files;
+  };
+
+  // Reads what is about to be deleted (worker thread). Too big (over 16 MB or 5000 files): no
+  // undo, the Recycle Bin is the way back.
+  static std::shared_ptr<Deleted> snapshot_for_undo(const fs::path& root, const fs::path& p) {
+    auto out = std::make_shared<Deleted>();
+    out->root = root;
+    out->path = p;
+    size_t bytes = 0;
+    auto read = [&](const fs::path& f) {
+      std::error_code ec;
+      const auto size = fs::file_size(f, ec);
+      if (ec || (bytes += static_cast<size_t>(size)) > (16u << 20) || out->files.size() >= 5000) return false;
+      std::ifstream in(f, std::ios::binary);
+      if (!in) return false;
+      std::string s(static_cast<size_t>(size), '\0');
+      in.read(s.data(), static_cast<std::streamsize>(s.size()));
+      s.resize(static_cast<size_t>(in.gcount()));
+      out->files.emplace_back(f, std::move(s));
+      return true;
+    };
+    std::error_code ec;
+    if (fs::is_directory(p, ec)) {
+      out->dirs.push_back(p);
+      for (fs::recursive_directory_iterator it(p, ec), end; !ec && it != end; it.increment(ec)) {
+        if (it->is_symlink(ec)) return nullptr;
+        if (it->is_directory(ec)) out->dirs.push_back(it->path());
+        else if (it->is_regular_file(ec) && !read(it->path())) return nullptr;
+      }
+      if (ec) return nullptr;
+    } else if (!read(p)) {
+      return nullptr;
+    }
+    return out;
+  }
+
+  // Ctrl+Z after a delete: the files are written back where they were (never over a file that
+  // is there now, never outside the workspace), then the row is selected again.
+  void undo_delete() {
+    if (undo_.empty() || !ws_) return;
+    std::shared_ptr<Deleted> d = std::move(undo_.back());
+    undo_.pop_back();
+    if (!d || d->root != ws_->root() || !is_under(d->path, ws_->root())) return;
+    hide_note();
+    std::weak_ptr<int> alive = alive_;
+    std::thread([this, d, alive] {
+      size_t written = 0, kept = 0;
+      std::error_code ec;
+      for (const auto& dir : d->dirs)
+        if (is_under(dir, d->root)) fs::create_directories(dir, ec);
+      for (const auto& [f, body] : d->files) {
+        if (!is_under(f, d->root) || fs::exists(f, ec)) {
+          ++kept;
+          continue;
+        }
+        std::ofstream out(f, std::ios::binary | std::ios::trunc);
+        out.write(body.data(), static_cast<std::streamsize>(body.size()));
+        written += static_cast<bool>(out);
+      }
+      if (wxAppConsole* app = wxTheApp) app->CallAfter([this, d, alive, written, kept] {
+        if (alive.expired() || !ws_) return;
+        pending_select_ = d->path;
+        sticky_sel_ = d->path;
+        rescan_then_select();
+        const wxString what = wxString::FromUTF8(d->name);
+        if (kept)
+          show_note(wxString::Format("Restored \"%s\" (%zu kept: a file of that name is there now)", what, kept),
+                    "The deleted files were written back.");
+        else
+          show_note(wxString::Format("Restored \"%s\"", what), wxString::Format("%zu file%s written back.", written,
+                                                                               written == 1 ? "" : "s"),
+                    4000);
+      });
+    }).detach();
   }
 
   // The row to select once p is gone: the next sibling, else the previous one, else the folder.
@@ -3824,16 +4569,31 @@ class Sidebar : public wxPanel, public SidebarPanel {
       syncing_ = false;
     }
     std::weak_ptr<int> alive = alive_;
-    std::thread([this, p, files, alive, back_to, neighbour, active_deleted] {
+    std::string shown_name;
+    if (const CollectionNode* n = find_node(tree_root_, p)) shown_name = n->name;
+    if (shown_name.empty()) shown_name = u8(p.filename());
+    std::thread([this, p, files, alive, back_to, neighbour, active_deleted, root = ws_->root(), shown_name] {
+      std::shared_ptr<Deleted> undo = snapshot_for_undo(root, p);
+      if (undo) undo->name = shown_name;
       const HRESULT co = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
       const bool ok = recycle(p);
       if (SUCCEEDED(co)) CoUninitialize();
-      if (wxAppConsole* app = wxTheApp) app->CallAfter([this, p, files, alive, ok, back_to, neighbour, active_deleted] {
+      if (wxAppConsole* app = wxTheApp) app->CallAfter([this, p, files, alive, ok, back_to, neighbour, active_deleted, undo] {
         if (alive.expired() || !ws_) return;
         if (!ok && !ws_->remove(p)) {
           rescan();
           notify(wxGetTopLevelParent(this), "Could not delete", "It is in use, or outside the workspace.");
           return;
+        }
+        if (undo && undo->root == ws_->root()) {
+          undo_.push_back(undo);
+          if (undo_.size() > 20) undo_.erase(undo_.begin());
+          show_note(wxString::Format(wxString::FromUTF8("Undo (Ctrl+Z)  \xC2\xB7  deleted \"%s\""),
+                                     wxString::FromUTF8(undo->name)),
+                    wxString::Format("\"%s\" was deleted (it is also in the Recycle Bin). Click here or press Ctrl+Z in "
+                                     "the collection tree to bring it back.",
+                                     wxString::FromUTF8(undo->name)),
+                    10000, [this] { undo_delete(); });
         }
         expanded_.erase(p);
         // The user keeps their place: the deleted request's neighbour row (a request) is shown,
@@ -3841,20 +4601,18 @@ class Sidebar : public wxPanel, public SidebarPanel {
         // closed or built then); else the tab that was active before it. That happens before
         // its tab closes, so the notebook never falls back to whatever tab it picks (the first
         // one). Showing the neighbour, closing the tab and the rescan are separate UI steps.
-        // The neighbour only where showing it is cheap (the deleted request's tab is the preview
-        // and is reused, a few ms) or there is no earlier tab; a permanent tab gives way to the
-        // tab that was active before it (activating it builds nothing; a new tab is ~70 ms).
+        // The neighbour always wins, as in Bruno and VS Code: the tree keeps the place where the
+        // user deleted (the tab that was active before could be far up the tree). It opens in
+        // the preview tab, or in the frame's spare tab (built in a quiet moment).
         fs::path show;
         if (active_deleted) {
           const bool neighbour_req = !neighbour.empty() && is_request_file(neighbour);
           const bool have_back = !back_to.empty() && tab_for(back_to);
-          RequestTab* gone = tab_for(active_file_);
-          const bool reusable = gone && gone->preview() && !gone->dirty();
-          if (neighbour_req && (reusable || !have_back)) show = neighbour;
+          if (neighbour_req) show = neighbour;
           else if (have_back) show = back_to;
         }
         if (!show.empty()) st_timed("show neighbour", [&] { host_->open_request(show, true); });
-        later([this, files, show, neighbour] {
+        later([this, files, show, neighbour, active_deleted] {
           st_timed("close tab", [&] {
             for (const auto& f : files) {
               detach_closed_tab(f);
@@ -3867,9 +4625,17 @@ class Sidebar : public wxPanel, public SidebarPanel {
           if (wxAuiNotebook* nb = notebook(); nb && nb->GetSelection() != wxNOT_FOUND)
             if (auto* t = dynamic_cast<RequestTab*>(nb->GetPage(static_cast<size_t>(nb->GetSelection()))))
               shown = t->file();
-          if (!shown.empty() || !show.empty()) {
+          if (active_deleted && (!shown.empty() || !show.empty())) {
             select_file(shown);
           } else if (!neighbour.empty()) {
+            // Another row than the active tab's went: the selection stays on its neighbour (the
+            // active tab's row can be anywhere), so Del, arrows and Enter go on from there.
+            if (wxTreeItemId n = item_for(neighbour, false); n.IsOk() && !tree_->IsSelected(n)) {
+              syncing_ = true;
+              tree_->SelectItem(n);
+              syncing_ = false;
+            }
+            sticky_sel_ = neighbour;
             pending_select_ = neighbour;
             select_after_scan_ = true;
           }
@@ -3907,6 +4673,7 @@ class Sidebar : public wxPanel, public SidebarPanel {
       name_cache_->note(r->file, r->name, r->kind == RequestKind::Grpc ? r->grpc_method : r->http.url, r->id);
     place_after(r->file, p);
     name_then_open(r->file);
+    discard_on_esc_ = r->file;
   }
 
   // The copy goes directly under its original (as in Bruno and Postman), not at the end of a
@@ -3914,14 +4681,17 @@ class Sidebar : public wxPanel, public SidebarPanel {
   void place_after(const fs::path& copy, const fs::path& original) {
     const fs::path folder = original.parent_path();
     if (copy.parent_path() != folder) return;
+    // The order on screen: a dragged order may not list every item (one added or renamed since
+    // sorts by name after the listed ones), and an unlisted original would leave the copy to sort
+    // by its name too, jumping above the original once it is named.
     std::vector<std::wstring> names;
-    if (auto it = order_.find(folder); it != order_.end()) {
-      names = it->second;
-    } else if (const CollectionNode* parent = find_folder(tree_root_, folder)) {
+    if (const CollectionNode* parent = find_folder(tree_root_, folder)) {
       std::vector<const CollectionNode*> kids;
       for (const auto& c : parent->children) kids.push_back(&c);
       sort_kids(folder, kids);
       for (const CollectionNode* k : kids) names.push_back(k->path.filename().wstring());
+    } else if (auto it = order_.find(folder); it != order_.end()) {
+      names = it->second;
     }
     const std::wstring o = original.filename().wstring(), c = copy.filename().wstring();
     std::erase(names, c);
@@ -3939,6 +4709,30 @@ class Sidebar : public wxPanel, public SidebarPanel {
     pending_edit_ = file;
     open_after_edit_ = file;
     rescan();
+  }
+
+  // A new request or copy whose naming was cancelled: its file goes (on a worker), with its row
+  // and its place in the folder's order; the row it was made from (or its neighbour) stays selected.
+  void discard_fresh(const fs::path& file) {
+    if (!ws_ || file.empty() || !is_under(file, ws_->root()) || !is_request_file(file) || tab_for(file)) return;
+    const fs::path neighbour = neighbour_of(file);
+    if (wxTreeItemId it = item_for(file, false); it.IsOk()) {
+      syncing_ = true;
+      if (wxTreeItemId n = neighbour.empty() ? wxTreeItemId() : item_for(neighbour, false); n.IsOk()) tree_->SelectItem(n);
+      tree_->Delete(it);
+      syncing_ = false;
+    }
+    if (auto o = order_.find(file.parent_path()); o != order_.end() && std::erase(o->second, file.filename().wstring()))
+      save_order();
+    note_own_write(file);
+    auto copy = std::make_shared<Workspace>(*ws_);
+    std::weak_ptr<int> alive = alive_;
+    std::thread([this, copy, file, alive] {
+      copy->remove(file);
+      if (wxAppConsole* app = wxTheApp) app->CallAfter([this, alive] {
+        if (!alive.expired() && ws_) rescan();
+      });
+    }).detach();
   }
 
   // "Payments" -> "Payments copy" next to it, every request in it with a new id (so history
@@ -4181,7 +4975,7 @@ class Sidebar : public wxPanel, public SidebarPanel {
     const fs::path in = folder ? path : path.parent_path();
     enum {
       kOpen = 1, kHttp, kGrpc, kFolder, kRename, kDup, kDelete, kCopyPath, kReveal, kCollapse, kCurl, kCurlAll, kExport, kSortAz,
-      kRun, kSettings, kOrder, kCopy, kPaste, kInfo, kTerminal, kWs, kCodeBase = 900
+      kRun, kSettings, kOrder, kCopy, kPaste, kInfo, kTerminal, kWs, kMock, kCodeBase = 900
     };
     const bool can_run = host_runs_folders(host_);
     wxMenu m;
@@ -4193,6 +4987,8 @@ class Sidebar : public wxPanel, public SidebarPanel {
       wxMenuItem* run = m.Append(kRun, d ? "R&un folder" : "R&un collection");
       run->Enable(can_run && !requests_under(path).empty());
       if (!can_run) run->SetHelp("Runs need the collection runner");
+      // Serve the saved examples of the requests below from a local listener (mock_view.h).
+      m.Append(kMock, "Start &mock server");
       m.AppendSeparator();
     }
     m.Append(kHttp, "New &HTTP request");
@@ -4221,7 +5017,7 @@ class Sidebar : public wxPanel, public SidebarPanel {
     if (folder)
       m.Append(kSettings, wxString::FromUTF8(d ? "Folder &settings (auth, headers, vars, asserts)\xE2\x80\xA6"
                                                : "Collection &settings (auth, headers, vars, asserts)\xE2\x80\xA6"));
-    if (d && folder) m.Append(kOrder, wxString::FromUTF8("Rena&me, order and contents\xE2\x80\xA6"));
+    if (d && folder) m.Append(kOrder, wxString::FromUTF8("Folder contents and item &order\xE2\x80\xA6"));
     m.AppendSeparator();
     if (!folder) m.Append(kCurl, d && d->node->kind == RequestKind::Grpc ? "&Copy as grpcurl" : "&Copy as cURL");
     if (!folder && d && d->node->kind == RequestKind::Http) {
@@ -4239,7 +5035,9 @@ class Sidebar : public wxPanel, public SidebarPanel {
     m.Append(kReveal, "Reveal in File Exp&lorer");
     m.Append(kTerminal, folder ? "Open in &Terminal" : "Open folder in &Terminal");
     if (folder) m.Append(kCollapse, "Coll&apse all");
-    if (folder && order_.count(path)) m.Append(kSortAz, "Sort &by name (forget the dragged order)");
+    // Only when the kept order (dragged, or imported from a Postman / Insomnia collection) really
+    // differs from the name order: an order entry alone says nothing.
+    if (folder && custom_order_differs(path)) m.Append(kSortAz, "Sort &by name (replaces the imported or dragged order)");
     const int choice = tree_->GetPopupMenuSelectionFromUser(m);
     if (choice >= kImportBase && choice < kImportBase + kImportKinds) {
       import_kind(choice - kImportBase, in);
@@ -4267,6 +5065,7 @@ class Sidebar : public wxPanel, public SidebarPanel {
         else duplicate_item(path);
         break;
       case kRun: host_run_folder(host_, d ? path : fs::path()); break;  // empty: the whole workspace
+      case kMock: host_->start_mock(d ? path : fs::path()); break;
       case kSettings: open_folder_settings(path); break;
       case kOrder: folder_settings_dialog(path); break;
       case kDelete: delete_item(id); break;
@@ -4340,6 +5139,23 @@ class Sidebar : public wxPanel, public SidebarPanel {
     return out;
   }
 
+  // Drops entries from the Recent list (this window's and the shared config's); the folders
+  // themselves are not touched.
+  static void forget_workspaces(const std::vector<fs::path>& gone) {
+    auto drop = [&](std::vector<fs::path>& v) {
+      std::erase_if(v, [&](const fs::path& p) { return std::find(gone.begin(), gone.end(), p) != gone.end(); });
+    };
+    drop(own_recent());
+    wxConfigBase* c = wxConfigBase::Get();
+    if (!c) return;
+    auto recent = recent_workspaces();
+    drop(recent);
+    wxString s;
+    for (const auto& p : recent) s += wxString(p.wstring()) + "\n";
+    c->Write("Workspace/Recent", s);
+    c->Flush();
+  }
+
   static void remember_workspace(const fs::path& root) {
     {
       auto& own = own_recent();
@@ -4403,21 +5219,30 @@ class Sidebar : public wxPanel, public SidebarPanel {
 
   // Open (or make) a workspace folder: the workspace menu and the empty collection's button.
   void open_workspace_dialog(bool create) {
-    wxDirDialog dlg(this, create ? "Choose or create an empty folder for the new workspace" : "Open a workspace folder",
-                    ws_ ? wxString(ws_->root().parent_path().wstring()) : wxString(),
-                    wxDD_DEFAULT_STYLE | (create ? 0 : wxDD_DIR_MUST_EXIST));
-    if (dlg.ShowModal() != wxID_OK) return;
-    const fs::path dir(dlg.GetPath().ToStdWstring());
-    std::error_code ec;
-    if (!create && !fs::exists(dir / "watt.json", ec)) {
-      if (!confirm(wxGetTopLevelParent(this), "Make this folder a workspace?",
-                   wxString::Format("\"%s\" is not a watt workspace yet. This adds watt.json, .gitignore and "
-                                    ".gitattributes; existing files are not touched.",
-                                    dir.wstring()),
-                   "Make workspace"))
-        return;
-    }
-    switch_workspace(dir, true);
+    // The OS folder picker on a thread of its own (pick_file_async): wxDirDialog held the UI
+    // thread 80-180 ms while it opened and ~50 ms when it closed.
+    if (picking_) return;
+    picking_ = true;
+    const std::wstring title = create ? L"Choose or create an empty folder for the new workspace"
+                                      : L"Open a workspace folder";
+    const fs::path start = ws_ ? ws_->root().parent_path() : fs::path();
+    pick_file_async(wxGetTopLevelParent(this), title, {}, true,
+                    [this, create, alive = std::weak_ptr<int>(alive_)](const fs::path& dir) {
+                      if (alive.expired()) return;
+                      picking_ = false;
+                      if (dir.empty()) return;
+                      std::error_code ec;
+                      if (!create && !fs::exists(dir / "watt.json", ec)) {
+                        if (!confirm(wxGetTopLevelParent(this), "Make this folder a workspace?",
+                                     wxString::Format("\"%s\" is not a watt workspace yet. This adds watt.json, "
+                                                      ".gitignore and .gitattributes; existing files are not touched.",
+                                                      dir.wstring()),
+                                     "Make workspace"))
+                          return;
+                      }
+                      switch_workspace(dir, true);
+                    },
+                    start);
   }
 
   // A folder's (the workspace root: the collection's) settings dialog; a save refreshes open tabs.
@@ -4433,7 +5258,7 @@ class Sidebar : public wxPanel, public SidebarPanel {
   }
 
   void workspace_menu() {
-    enum { kOpen = 1, kNew, kReveal, kReload, kCookies, kRecent = 100 };
+    enum { kOpen = 1, kNew, kReveal, kReload, kCookies, kClearRecent, kRecent = 100, kForget = 200 };
     wxMenu m;
     if (ws_) {
       m.Append(wxID_ANY, short_path(ws_->root().wstring(), 56))->Enable(false);
@@ -4452,9 +5277,19 @@ class Sidebar : public wxPanel, public SidebarPanel {
       // Several workspaces are often all called "ws": each label gets as many parent folders as
       // it takes to tell them apart ("ws  ·  cs5", "ws  ·  big"); the right column a short path.
       const auto labels = distinct_labels(others);
-      for (size_t i = 0; i < others.size(); ++i)
-        m.Append(kRecent + static_cast<int>(i),
-                 wxString::Format("%s\t%s", labels[i], short_path(others[i].parent_path().wstring(), 40)));
+      // The folder is part of the label: the text after a tab is read as an accelerator, and a
+      // path there is not shown.
+      wxMenu* forget = new wxMenu;
+      for (size_t i = 0; i < others.size(); ++i) {
+        wxString where = short_path(others[i].parent_path().wstring(), 40);
+        where.Replace("&", "&&");
+        const wxString label = labels[i] + wxString::FromUTF8("   \xE2\x80\x94  ") + where;
+        m.Append(kRecent + static_cast<int>(i), label);
+        forget->Append(kForget + static_cast<int>(i), label);
+      }
+      forget->AppendSeparator();
+      forget->Append(kClearRecent, "Clear the whole list");
+      m.AppendSubMenu(forget, "Remo&ve from Recent");
     }
     if (ws_) {
       m.AppendSeparator();
@@ -4467,6 +5302,10 @@ class Sidebar : public wxPanel, public SidebarPanel {
       open_workspace_dialog(id == kNew);
     } else if (id >= kRecent && id < kRecent + static_cast<int>(others.size())) {
       switch_workspace(others[static_cast<size_t>(id - kRecent)], true);
+    } else if (id >= kForget && id < kForget + static_cast<int>(others.size())) {
+      forget_workspaces({others[static_cast<size_t>(id - kForget)]});
+    } else if (id == kClearRecent) {
+      forget_workspaces(others);
     } else if (id == kReveal && ws_) {
       wxExecute(wxString::Format("explorer.exe \"%s\"", ws_->root().wstring()), wxEXEC_ASYNC);
     } else if (id == kReload && ws_) {
@@ -4530,6 +5369,12 @@ class Sidebar : public wxPanel, public SidebarPanel {
         // the new one's come back: no tab is built or destroyed, so this costs a few ms.
         const bool other = !w->root().empty() && w->root() != ws_->root();
         const fs::path old_root = ws_->root();
+        // What the tree showed (its first row), so coming back scrolls to the same place.
+        if (other && filter_q_.empty()) {
+          if (const auto* d = data(tree_->GetFirstVisibleItem())) ws_top_[old_root] = d->node->path;
+          if (auto it = ws_top_.find(w->root()); it != ws_top_.end()) restore_top_ = it->second;
+          else restore_top_.clear();
+        }
         *ws_ = std::move(*w);
         if (other) {
           st_timed("  swap_tabs", [&] { swap_tabs(old_root, ws_->root()); });
@@ -4546,13 +5391,19 @@ class Sidebar : public wxPanel, public SidebarPanel {
         later([this, alive, gen] {
           if (alive.expired() || gen != ws_gen_ || !ws_) return;
           st_timed("  workspace_ready", [&] { workspace_ready(); });
-          later([this, alive, gen] {
-            if (alive.expired() || gen != ws_gen_ || !ws_) return;
-            st_timed("  env_changed", [&] { host_->environment_changed(); });
-          });
+          env_when_unparked(alive, gen);
         });
       }
     }
+  }
+
+  // The tabs' {{var}} previews for the new workspace, once all its tabs are back (unpark_slice()).
+  void env_when_unparked(const std::weak_ptr<int>& alive, uint64_t gen) {
+    later([this, alive, gen] {
+      if (alive.expired() || gen != ws_gen_ || !ws_) return;
+      if (!unpark_.pending.empty()) return env_when_unparked(alive, gen);
+      st_timed("  env_changed", [&] { host_->environment_changed(); });
+    });
   }
 
   // ---------------------------------------------------------------- tab sets per workspace
@@ -4581,24 +5432,51 @@ class Sidebar : public wxPanel, public SidebarPanel {
     set.lost.push_back({t->file(), t->last_response(), index, selected});
   }
 
+  // The tabs of the workspace switched to that are not back in the notebook yet (swap_tabs()):
+  // `order` is where every tab of that workspace goes, `pending` the ones still in the park.
+  struct Unpark {
+    fs::path root;
+    std::vector<wxWeakRef<wxWindow>> order;
+    std::vector<std::pair<wxWeakRef<wxWindow>, wxString>> pending;
+  };
+
+  // What swap_tabs() hands to take_off_old_tabs().
+  struct Swap {
+    fs::path old_root, new_root;
+    TabSet old;                          // the old workspace's tabs
+    std::map<wxWindow*, int> old_index;  // their positions in the old workspace
+    wxWindow* next_selected = nullptr;
+    Unpark up;
+    std::vector<fs::path> reopen;
+    std::vector<std::pair<RequestTab*, int>> placed;  // lent tabs and the position they go to
+    RequestTab* lent_selected = nullptr;
+    bool blanked = false;  // the shown tab stayed but holds another request now
+  };
+
   // Hides the tabs of old_root (every tab that is not an empty start tab) and shows the ones
   // new_root had when it was left. At least one tab stays: a clean old tab is reused (blanked)
   // when the new workspace has none, its file reopened when the old one comes back.
+  //
+  // With 50 tabs open this step stays at ~20-30 ms: only the shown tab comes back and the old
+  // ones only leave the notebook here; park_slice() / unpark_slice() move the rest between the
+  // park and the notebook a few at a time (SetParent is ~0.3 ms a tab). It was 97-101 ms.
   void swap_tabs(const fs::path& old_root, const fs::path& new_root) {
     wxAuiNotebook* nb = notebook();
     if (!nb) return;
-    // Frozen once for all the pages added and removed (each RemovePage() freezes the notebook
-    // too, and lays its pages out): with the hidden tabs dormant (dormant_tick()) this walks
-    // the shown tab only.
-    nb->Freeze();
-    TabSet old;
-    std::map<wxWindow*, int> old_index;  // tab positions in the old workspace
+    unpark_all();  // a switch back before the last one had put all its tabs back
+    // Frozen once for everything below (each RemovePage() freezes the notebook too, and lays its
+    // pages out): with the hidden tabs dormant (dormant_tick()) this walks the shown tab only.
+    st_timed("   freeze", [&] { nb->Freeze(); });
+    auto sw = std::make_shared<Swap>();
+    sw->old_root = old_root;
+    sw->new_root = new_root;
+    TabSet& old = sw->old;
     const int sel = nb->GetSelection();
     for (size_t i = 0; i < nb->GetPageCount(); ++i) {
       auto* t = dynamic_cast<RequestTab*>(nb->GetPage(i));
       if (!t || t->pristine()) continue;
       old.pages.emplace_back(t, nb->GetPageText(i));
-      old_index[t] = static_cast<int>(i);
+      sw->old_index[t] = static_cast<int>(i);
       if (static_cast<int>(i) == sel) old.selected = t;
     }
     TabSet next;
@@ -4606,25 +5484,34 @@ class Sidebar : public wxPanel, public SidebarPanel {
       next = std::move(it->second);
       tab_sets_.erase(it);
     }
+    sw->next_selected = next.selected;
+    // Only the tab that is shown comes back in this step; the others follow in slices
+    // (unpark_slice()): moving a tab from the park into the notebook (SetParent) and adding its
+    // page are ~0.4 ms each, 20 ms for 50 tabs. Each goes to its place in `order`.
+    wxWindow* const first = next.selected ? next.selected : (next.pages.empty() ? nullptr : next.pages.front().first);
+    Unpark& up = sw->up;
+    up.root = new_root;
+    for (auto& [w, title] : next.pages) {
+      up.order.emplace_back(w);
+      if (w != first) up.pending.emplace_back(wxWeakRef<wxWindow>(w), title);
+    }
     st_timed("   add back", [&] {
-      for (auto& [w, title] : next.pages) {
-        w->Reparent(nb);  // from the park (see tab_park())
-        nb->AddPage(w, title, false);
-      }
+      for (auto& [w, title] : next.pages)
+        if (w == first) {
+          w->Reparent(nb);  // from the park (see tab_park())
+          nb->AddPage(w, title, false);
+        }
     });
     // Select the tab coming back before the old ones go: removing the selected page makes the
     // notebook show (and lay out) a neighbour first, ~25 ms for nothing.
     st_timed("   select", [&] {
-      if (wxWindow* first = next.selected ? next.selected : (next.pages.empty() ? nullptr : next.pages.front().first))
+      if (first)
         if (const int i = nb->GetPageIndex(first); i >= 0) nb->SetSelection(static_cast<size_t>(i));
     });
     const auto st_lend0 = std::chrono::steady_clock::now();
     // Files of the new workspace whose tab was lent to the old one last time: lend a clean
     // tab back (a few ms) instead of building a new one (~200 ms each). Each comes back with the
     // response it showed and at the position it had.
-    std::vector<fs::path> reopen;
-    std::vector<std::pair<RequestTab*, int>> placed;  // lent tabs and the position they go to
-    RequestTab* lent_selected = nullptr;
     std::sort(next.lost.begin(), next.lost.end(), [](const LostTab& a, const LostTab& b) {
       return static_cast<unsigned>(a.index) < static_cast<unsigned>(b.index);  // -1 (append) last
     });
@@ -4643,94 +5530,249 @@ class Sidebar : public wxPanel, public SidebarPanel {
       std::optional<SavedRequest> r;
       if (loan) r = ws_->load_request(lost.file);
       if (!r) {
-        reopen.push_back(lost.file);
+        sw->reopen.push_back(lost.file);
         continue;
       }
-      remember_lent(old, loan, old_index.count(loan) ? old_index[loan] : -1, loan == old.selected);
+      remember_lent(old, loan, sw->old_index.count(loan) ? sw->old_index[loan] : -1, loan == old.selected);
       std::erase_if(old.pages, [&](const auto& pg) { return pg.first == loan; });
       if (old.selected == loan) old.selected = nullptr;
       loan->set_request(std::move(*r), false);  // clears the old workspace's response
       if (lost.last)  // shown in a later turn: no single UI step pays the editor and the response view
-        later([alive = std::weak_ptr<int>(alive_), w = wxWeakRef<RequestTab>(loan), file = lost.file,
+        later([this, alive = std::weak_ptr<int>(alive_), w = wxWeakRef<RequestTab>(loan), file = lost.file,
                last = std::move(lost.last)]() mutable {
           if (!alive.expired() && w && w->file() == file && !w->in_flight() && !w->last_response())
-            w->restore_response(std::move(last));
+            st_timed("  lent response", [&] { w->restore_response(std::move(last)); });
         });
       if (const int i = nb->GetPageIndex(loan); i >= 0) nb->SetPageText(static_cast<size_t>(i), loan->title());
-      placed.emplace_back(loan, lost.index);
-      if (lost.selected && !next.selected) lent_selected = loan;
+      sw->placed.emplace_back(loan, lost.index);
+      if (lost.selected && !next.selected) sw->lent_selected = loan;
     }
     if (st_probe_)
       st_log_ += wxString::Format("#      lend %.1f ms (%zu lost)\n",
                                   std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - st_lend0).count(),
                                   next.lost.size()).utf8_string();
-    // Parked outside the notebook: a removed page left as a hidden child of the notebook is what
-    // coincided with the access violation in wxAuiNotebook::RemoveEmptyTabFrames (the frame's
-    // spare tabs are parked the same way).
-    wxWindow* park = tab_park();
-    // Each removed page makes wxAuiNotebook select the current page again, with a page change
-    // event the frame answers (realize, select in the tree, save the session): 10-15 ms per
-    // parked tab for nothing. Muted while the tabs go; one event at the end if the page changed.
-    wxWindow* const shown_before = nb->GetCurrentPage();
-    mute_page_events_ = true;
-    st_timed("   park", [&] {
-      for (auto& [w, title] : old.pages) {
-        const int i = nb->GetPageIndex(w);
-        if (i >= 0) nb->RemovePage(static_cast<size_t>(i));
-        w->Hide();
-        if (park) w->Reparent(park);
-      }
-    });
-    // Lent tabs back where they stood (in increasing order, so earlier moves stay put).
-    for (const auto& [t, want] : placed) {
-      const int cur = nb->GetPageIndex(t);
-      const int count = static_cast<int>(nb->GetPageCount());
-      const int to = want < 0 ? count - 1 : std::min(want, count - 1);
-      if (cur < 0 || cur == to) continue;
-      const wxString text = nb->GetPageText(static_cast<size_t>(cur));
-      nb->RemovePage(static_cast<size_t>(cur));
-      nb->InsertPage(static_cast<size_t>(to), t, text, false);
-    }
-    mute_page_events_ = false;
-    if (nb->GetCurrentPage() != shown_before && nb->GetSelection() >= 0) {
-      wxAuiNotebookEvent ev(wxEVT_AUINOTEBOOK_PAGE_CHANGED, nb->GetId());
-      ev.SetSelection(nb->GetSelection());
-      ev.SetOldSelection(wxNOT_FOUND);
-      ev.SetEventObject(nb);
-      nb->GetEventHandler()->ProcessEvent(ev);
-    }
-    if (nb->GetPageCount() == 0) {
-      // Nothing to show: reuse a clean tab of the old workspace as the start tab.
+    // Nothing to show: a clean tab of the old workspace stays in the notebook as the start tab
+    // (blanked), the shown one if it can: no page is removed and added again for it.
+    if (nb->GetPageCount() == old.pages.size()) {
       RequestTab* carrier = nullptr;
       for (auto it = old.pages.rbegin(); it != old.pages.rend(); ++it) {
         auto* t = static_cast<RequestTab*>(it->first);
         if (lendable(t) && (it->first == old.selected || !carrier)) carrier = t;
       }
       if (carrier) {
-        remember_lent(old, carrier, old_index.count(carrier) ? old_index[carrier] : -1, carrier == old.selected);
+        sw->blanked = true;
+        remember_lent(old, carrier, sw->old_index.count(carrier) ? sw->old_index[carrier] : -1, carrier == old.selected);
         std::erase_if(old.pages, [&](const auto& p) { return p.first == carrier; });
         if (old.selected == carrier) old.selected = nullptr;
-        carrier->set_request(SavedRequest{}, false);  // a blank start tab: no response either
-        carrier->Reparent(nb);
-        nb->AddPage(carrier, carrier->title(), true);
+        if (const int i = nb->GetPageIndex(carrier); i >= 0 && i != nb->GetSelection())
+          nb->SetSelection(static_cast<size_t>(i));
+        st_timed("   blank", [&] { carrier->set_request(SavedRequest{}, false); });  // no response either
+        if (const int i = nb->GetPageIndex(carrier); i >= 0) nb->SetPageText(static_cast<size_t>(i), carrier->title());
       }
+    } else if (old.selected && nb->GetCurrentPage() == old.selected) {
+      // A start tab stays: shown before the old ones go (no neighbour laid out on the way).
+      for (size_t i = 0; i < nb->GetPageCount(); ++i)
+        if (std::none_of(old.pages.begin(), old.pages.end(), [&](const auto& p) { return p.first == nb->GetPage(i); })) {
+          nb->SetSelection(i);
+          break;
+        }
     }
-    if (wxWindow* s = next.selected ? next.selected : lent_selected) {
-      if (const int i = nb->GetPageIndex(s); i >= 0) nb->SetSelection(static_cast<size_t>(i));
+    take_off_old_tabs(*sw);
+    st_timed("   thaw", [&] { nb->Thaw(); });
+  }
+
+  // The rest of swap_tabs() (the notebook is frozen): the old workspace's tabs leave it.
+  void take_off_old_tabs(Swap& swp) {
+    wxAuiNotebook* nb = notebook();
+    if (!nb) return;
+    Swap* const sw = &swp;
+    TabSet& old = sw->old;
+    Unpark& up = sw->up;
+    // Parked outside the notebook (as the frame's spare tabs are): the frame counts hidden
+    // non-page children of the notebook as unsaved tabs when it quits, and the notebook's
+    // Freeze() would walk them. The hover reset is the frame's guard against the wx 3.3.1
+    // dangling close-button pointer (forget_tab_hover in main_frame.cpp), before any removal.
+    wxWindow* park = tab_park();
+    forget_tab_hover(nb);
+    // Each removed page makes wxAuiNotebook select the current page again, with a page change
+    // event the frame answers (realize, select in the tree, save the session): 10-15 ms per
+    // parked tab for nothing. Muted while the tabs go; one event at the end if the page changed.
+    wxWindow* const shown_before = nb->GetCurrentPage();
+    mute_page_events_ = true;
+    // Only taken off the notebook here: moving each to the park (SetParent, ~0.3 ms a tab) is
+    // as much again, so it follows in slices of a few ms (park_slice()). Taken off from the
+    // last: no page after it shifts down.
+    std::set<wxWindow*> gone;  // closed by the user in between (no longer a page)
+    st_timed("   park", [&] {
+      for (auto it = old.pages.rbegin(); it != old.pages.rend(); ++it) {
+        wxWindow* w = it->first;
+        const int i = nb->GetPageIndex(w);
+        if (i < 0) {
+          gone.insert(w);
+          continue;
+        }
+        nb->RemovePage(static_cast<size_t>(i));
+        w->Hide();
+        if (park) to_park_.emplace_back(w);
+      }
+    });
+    std::erase_if(old.pages, [&](const auto& p) { return gone.count(p.first) != 0; });
+    // Lent tabs back where they stood (in increasing order, so earlier moves stay put): their
+    // place in the final order, and in the notebook after the tabs before them that are back.
+    for (const auto& [t, want] : sw->placed) {
+      const size_t at = want < 0 ? up.order.size() : std::min(static_cast<size_t>(want), up.order.size());
+      up.order.insert(up.order.begin() + static_cast<std::ptrdiff_t>(at), wxWeakRef<wxWindow>(t));
+    }
+    for (const auto& [t, want] : sw->placed) {
+      const int cur = nb->GetPageIndex(t);
+      const int to = std::min(unpark_index(nb, up.order, t), static_cast<int>(nb->GetPageCount()) - 1);
+      if (cur < 0 || cur == to) continue;
+      const wxString text = nb->GetPageText(static_cast<size_t>(cur));
+      nb->RemovePage(static_cast<size_t>(cur));
+      nb->InsertPage(static_cast<size_t>(to), t, text, false);
+    }
+    mute_page_events_ = false;
+    if ((sw->blanked || nb->GetCurrentPage() != shown_before) && nb->GetSelection() >= 0) {
+      wxAuiNotebookEvent ev(wxEVT_AUINOTEBOOK_PAGE_CHANGED, nb->GetId());
+      ev.SetSelection(nb->GetSelection());
+      ev.SetOldSelection(wxNOT_FOUND);
+      ev.SetEventObject(nb);
+      st_timed("   changed", [&] { nb->GetEventHandler()->ProcessEvent(ev); });
+    }
+    if (wxWindow* s = sw->next_selected ? sw->next_selected : sw->lent_selected) {
+      if (const int i = nb->GetPageIndex(s); i >= 0 && i != nb->GetSelection()) nb->SetSelection(static_cast<size_t>(i));
     } else if (nb->GetPageCount() && nb->GetSelection() < 0) {
       nb->SetSelection(0);
     }
     st_timed("   plus", [&] { ensure_plus_button(nb); });
-    st_timed("   thaw", [&] { nb->Thaw(); });
-    if (!old.pages.empty() || !old.lost.empty()) tab_sets_[old_root] = std::move(old);
+    // The tabs that left stay frozen (dormant, see dormant_tick()): still children of the notebook
+    // until park_slice(), the thaw would otherwise walk and repaint every window of the one that
+    // was shown (it is frozen with the notebook now, so this only counts).
+    for (const auto& [w, title] : old.pages)
+      if (!w->IsShown()) dormant_freeze(w);
+    if (!to_park_.empty())
+      later([this, alive = std::weak_ptr<int>(alive_)] {
+        if (!alive.expired()) park_slice();
+      });
+    if (!up.pending.empty()) {
+      unpark_ = std::move(up);
+      later([this, alive = std::weak_ptr<int>(alive_)] {
+        if (!alive.expired()) unpark_slice();
+      });
+    }
+    if (!old.pages.empty() || !old.lost.empty()) tab_sets_[sw->old_root] = std::move(old);
     if (nb->GetPageCount() == 0) host_->new_request(RequestKind::Http, {});
     // No clean tab to lend: open them (one per turn).
-    for (const auto& f : reopen)
-      CallAfter([this, f, root = new_root] {
+    for (const auto& f : sw->reopen)
+      CallAfter([this, f, root = sw->new_root] {
         std::error_code ec;
         if (ws_ && ws_->root() == root && fs::exists(f, ec)) host_->open_request(f, false);
       });
-    if (auto* t = dynamic_cast<RequestTab*>(nb->GetCurrentPage())) select_file(t->file());
+    st_timed("   select_file", [&] {
+      if (auto* t = dynamic_cast<RequestTab*>(nb->GetCurrentPage())) select_file(t->file());
+    });
+    if (up.pending.empty() && unpark_.pending.empty()) strip_check_ = 2;
+  }
+
+  // The tab strip shows the selected tab (not the first ones) after tabs were put back. From
+  // dormant_tick (strip_check_): the strip has its size only once the notebook was laid out.
+  void show_active_tab() {
+    wxAuiNotebook* nb = notebook();
+    wxWindow* p = nb ? nb->GetCurrentPage() : nullptr;
+    wxAuiTabCtrl* tc = nullptr;
+    int idx = -1;
+    if (p && nb->FindTab(p, &tc, &idx) && tc && idx >= 0) {
+      tc->MakeTabVisible(idx, tc);
+      tc->Refresh(false);
+    }
+  }
+
+  // wx 3.3.1: a tab ctrl's hover pointer into a removed page's close button dangles (see
+  // forget_tab_hover in main_frame.cpp); a leave event resets it. Before page removals.
+  static void forget_tab_hover(wxAuiNotebook* nb) {
+    for (wxAuiTabCtrl* tc : nb->GetAllTabCtrls()) {
+      wxMouseEvent leave(wxEVT_LEAVE_WINDOW);
+      leave.SetEventObject(tc);
+      tc->GetEventHandler()->ProcessEvent(leave);
+    }
+  }
+
+  // Where w goes in the notebook: right after the last tab before it in `order` that is a page.
+  static int unpark_index(wxAuiNotebook* nb, const std::vector<wxWeakRef<wxWindow>>& order, wxWindow* w) {
+    int at = 0;
+    const int self = nb->GetPageIndex(w);
+    for (const auto& o : order) {
+      if (o.get() == w) break;
+      if (!o) continue;
+      if (const int i = nb->GetPageIndex(o.get()); i >= 0) at = std::max(at, self >= 0 && i > self ? i : i + 1);
+    }
+    return std::min(at, static_cast<int>(nb->GetPageCount()));
+  }
+
+  // Puts pending tabs back (each to its place) for up to ~10 ms, the rest in the next step.
+  // all: every one of them now (a new switch, quitting).
+  void unpark_slice(bool all = false) {
+    wxAuiNotebook* nb = notebook();
+    if (!nb || unpark_.pending.empty()) return;
+    if (!ws_ || ws_->root() != unpark_.root) {  // cannot happen (a switch puts them back first)
+      unpark_.pending.clear();
+      return;
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    size_t done = 0;
+    // Only the tab strips are frozen: that skips the page layout of each insert (wxAuiTabFrame::
+    // DoSizing; the pages are hidden and laid out when shown), and freezing the notebook would
+    // freeze, thaw and lay out the shown tab again in every slice (15-25 ms).
+    const std::vector<wxAuiTabCtrl*> strips = nb->GetAllTabCtrls();
+    for (wxAuiTabCtrl* tc : strips) tc->Freeze();
+    while (!unpark_.pending.empty()) {
+      auto [w, title] = unpark_.pending.front();
+      unpark_.pending.erase(unpark_.pending.begin());
+      if (!w || nb->GetPageIndex(w.get()) >= 0) continue;
+      w->Reparent(nb);
+      const int at = unpark_index(nb, unpark_.order, w.get());
+      if (at >= static_cast<int>(nb->GetPageCount())) nb->AddPage(w.get(), title, false);
+      else nb->InsertPage(static_cast<size_t>(at), w.get(), title, false);
+      ++done;
+      if (!all && (done >= 16 || std::chrono::steady_clock::now() - t0 > std::chrono::milliseconds(8))) break;
+    }
+    for (wxAuiTabCtrl* tc : strips) tc->Thaw();
+    if (unpark_.pending.empty()) strip_check_ = 2;  // the strip scrolled to its first tabs meanwhile
+    if (st_probe_)
+      st_log_ += wxString::Format("#   unpark_slice %zu in %.1f ms\n", done,
+                                  std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count())
+                     .utf8_string();
+    if (!unpark_.pending.empty())
+      later([this, alive = std::weak_ptr<int>(alive_)] {
+        if (!alive.expired()) unpark_slice();
+      });
+  }
+  void unpark_all() { unpark_slice(true); }
+
+  // Moves the tabs swap_tabs() took off the notebook to the park, ~12 per step (a few ms each).
+  // A tab that went back into the notebook meanwhile (a quick switch back) stays where it is.
+  void park_slice() {
+    wxAuiNotebook* nb = notebook();
+    wxWindow* park = tab_park();
+    const auto t0 = std::chrono::steady_clock::now();
+    size_t done = 0;
+    while (!to_park_.empty()) {
+      wxWeakRef<wxWindow> w = to_park_.back();
+      to_park_.pop_back();
+      if (!w || !park || w->GetParent() == park) continue;
+      if (nb && nb->GetPageIndex(w) >= 0) continue;
+      w->Hide();
+      w->Reparent(park);
+      if (++done >= 12 || std::chrono::steady_clock::now() - t0 > std::chrono::milliseconds(8)) break;
+    }
+    if (st_probe_)
+      st_log_ += wxString::Format("#   park_slice %zu in %.1f ms\n", done,
+                                  std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count())
+                     .utf8_string();
+    if (!to_park_.empty())
+      later([this, alive = std::weak_ptr<int>(alive_)] {
+        if (!alive.expired()) park_slice();
+      });
   }
 
   // The frame's "+" (new tab) lives on the notebook's main tab control, which wxAuiNotebook
@@ -4766,7 +5808,7 @@ class Sidebar : public wxPanel, public SidebarPanel {
         waiting = true;
         continue;
       }
-      reload_editor(t);
+      t->vars_changed();  // the editor reads its folders again on a worker (refresh_inherited)
     }
     // The editors read the folders on a worker: show the "Sent as" line with the new values once
     // that has landed (and once more for a slow disk).
@@ -4778,17 +5820,6 @@ class Sidebar : public wxPanel, public SidebarPanel {
     }
   }
 
-  // The HTTP editor shows t's current request again (its own state stored first, so unsaved
-  // edits stay, and so does the dirty mark); the response is not touched. load() is what makes
-  // the editor read its folders' settings again and colour the {{vars}} with them.
-  static void reload_editor(RequestTab* t) {
-    HttpEditorPanel* ed = find_http_editor(t);
-    if (!ed) return;
-    const bool was_dirty = t->dirty();
-    SavedRequest r = t->request();  // stores the editor's state first
-    ed->load(r);
-    if (was_dirty && !t->dirty()) t->mark_dirty();
-  }
 
   static bool is_under(const fs::path& file, const fs::path& folder) {
     const fs::path f = file.lexically_normal(), d = folder.lexically_normal();
@@ -4833,7 +5864,12 @@ class Sidebar : public wxPanel, public SidebarPanel {
     if (!tab_park_) {
       wxWindow* top = wxGetTopLevelParent(this);
       if (!top) return nullptr;
-      tab_park_ = new wxWindow(top, wxID_ANY, wxDefaultPosition, wxSize(1, 1));
+      // A (never shown, pageless) notebook, not a plain window: the HTTP editor builds its
+      // lazy parts ahead of time in tabs outside any notebook (the frame's spare tabs,
+      // HttpEditor::parked()), which for 50 parked tabs was 400-700 ms UI stalls after each
+      // switch. These are open tabs of another workspace: built when shown, like any other.
+      tab_park_ = new wxAuiNotebook(top, wxID_ANY, wxDefaultPosition, wxSize(1, 1), 0);
+      tab_park_->SetName("watt.workspace_tab_park");
       tab_park_->Hide();
     }
     return tab_park_;
@@ -4841,6 +5877,7 @@ class Sidebar : public wxPanel, public SidebarPanel {
 
   // Quitting with unsaved tabs hidden in another workspace: ask, as the frame does for its own.
   void on_close_tlw(wxCloseEvent& e) {
+    unpark_all();  // tabs still on their way back belong to this workspace's session
     size_t dirty = 0;
     for (const auto& [root, set] : tab_sets_)
       for (const auto& p : set.pages) dirty += static_cast<RequestTab*>(p.first)->dirty();
@@ -4954,85 +5991,7 @@ class Sidebar : public wxPanel, public SidebarPanel {
     width_timer_.StartOnce(400);
   }
 
-  // Reloads each tab of stale_tabs_ (see set_workspace) in the notebook, the active one first and
-  // one per UI step, so its editor reads the folder settings with the workspace there: the
-  // inherited variables, headers and auth then show and are sent. Edits, the unsaved mark, the
-  // preview state and the shown response are kept. Tabs of another workspace (parked by a
-  // switch) wait until they are shown again; a tab with a send in flight is tried later.
-  void heal_stale_tabs() {
-    wxAuiNotebook* nb = notebook();
-    if (!nb || !ws_) return;
-    stale_tabs_.erase(std::remove_if(stale_tabs_.begin(), stale_tabs_.end(),
-                                     [](const wxWeakRef<RequestTab>& w) { return !w; }),
-                      stale_tabs_.end());
-    RequestTab* cur = dynamic_cast<RequestTab*>(nb->GetCurrentPage());
-    auto pick = stale_tabs_.end();
-    for (auto it = stale_tabs_.begin(); it != stale_tabs_.end(); ++it) {
-      if (nb->GetPageIndex(it->get()) == wxNOT_FOUND || (*it)->in_flight()) continue;
-      if (pick == stale_tabs_.end() || it->get() == cur) pick = it;
-      if (it->get() == cur) break;
-    }
-    if (pick == stale_tabs_.end()) {
-      // In flight, or parked with another workspace: look again later.
-      if (std::any_of(stale_tabs_.begin(), stale_tabs_.end(),
-                      [nb](const wxWeakRef<RequestTab>& w) { return nb->GetPageIndex(w.get()) != wxNOT_FOUND; }))
-        heal_timer_.StartOnce(500);
-      return;
-    }
-    RequestTab* t = pick->get();
-    stale_tabs_.erase(pick);
-    if (t->request_kind() == RequestKind::Http && !t->pristine()) {
-      // The editor's title row (breadcrumb) is redrawn only when the file, name or unsaved mark
-      // differ from what it last showed, and it last showed them without the folders: the shown
-      // tab is loaded once with a trailing space on its name (invisible), and a moment later
-      // (after an idle pass redrew the row) with the real name.
-      const bool shown = t == cur && t->IsShownOnScreen();
-      const std::string name = t->request().name;
-      // The tree's highlight follows the active tab (its row may not have been there yet when
-      // the frame first said which file is active).
-      if (t == cur && !t->file().empty()) later([this, w = wxWeakRef<RequestTab>(t)] {
-        if (w && notebook() && notebook()->GetCurrentPage() == w.get()) select_file(w->file());
-      });
-      heal_log_ += "heal " + u8(t->file().filename()) + (shown ? " (shown)\n" : "\n");
-      st_timed("  heal tab", [&] { reload_tab(t, shown ? std::optional<std::string>(name + " ") : std::nullopt); });
-      if (shown) {
-        wxWeakRef<RequestTab> w(t);
-        // After two idle passes of the tab (its editor, a child, gets the same passes and redraws
-        // the title row in them); not on a timer, as start-up work can hold idle back for long.
-        auto passes = std::make_shared<int>(0);
-        t->Bind(wxEVT_IDLE, [this, w, name, passes](wxIdleEvent& e) {
-          e.Skip();
-          if (*passes < 0) return;  // done (the handler stays bound: one int compare per idle)
-          if (++*passes < 2) {
-            e.RequestMore();
-            return;
-          }
-          *passes = -1;
-          CallAfter([this, w, name] {
-            const bool again = w && !w->in_flight() && w->request().name == name + " ";
-            heal_log_ += std::string("heal name step: ") + (again ? "reloaded" : "skipped") + "\n";
-            if (again) st_timed("  heal tab (name)", [&] { reload_tab(w.get(), name); });
-          });
-        });
-      }
-    }
-    if (!stale_tabs_.empty()) later([this] { heal_stale_tabs(); });
-  }
-
-  // Loads t's request into its editor again (edits, unsaved mark, preview state and the shown
-  // response kept), with `name` in place of its name if given.
-  static void reload_tab(RequestTab* t, const std::optional<std::string>& name) {
-    const bool dirty = t->dirty(), preview = t->preview();
-    SavedRequest r = t->request();
-    if (name) r.name = *name;
-    LastResponse last = t->last_response();
-    t->set_request(std::move(r), preview);
-    if (dirty) t->mark_dirty();
-    t->restore_response(std::move(last));
-  }
-
   void workspace_ready() {
-    if (!stale_tabs_.empty()) later([this] { heal_stale_tabs(); });  // tabs a switch brought back
     release_lock();
     take_lock();
     if (width_restored_) later([this] { restore_width(); });
@@ -5047,6 +6006,8 @@ class Sidebar : public wxPanel, public SidebarPanel {
     search_keys_.clear();
     rank_keys_.clear();
     meta_.clear();
+    gone_names_.clear();
+    gone_ids_.clear();
     name_cache_ = std::make_shared<NameCache>(ws_->root());
     load_expanded();
     load_order();
@@ -5423,6 +6384,7 @@ class Sidebar : public wxPanel, public SidebarPanel {
       it.kind = c.kind;
       it.method = c.method;
       it.badge = c.badge;
+      if (auto m = meta_.find(c.path); m != meta_.end()) it.url = m->second.url;
       out.push_back(std::move(it));
     }
   }
@@ -5456,6 +6418,27 @@ class Sidebar : public wxPanel, public SidebarPanel {
     paths_by_key_ = std::move(x.paths_by_key);
     path_by_id_ = std::move(x.path_by_id);
     history_->relabel();
+    refresh_snapshot_tabs();
+  }
+
+  // A history snapshot tab inherits the folder settings of the request it was sent from
+  // (snapshot_origin). Restored at start-up (or brought back by a workspace switch), its editor
+  // asked before the origins (.watt/snapshots/origins.json) and the request ids were read, got
+  // the collection's settings only and painted {{baseUrl}} as undefined: once its origin is
+  // known (or changes), it reads its folders again.
+  void refresh_snapshot_tabs() {
+    wxAuiNotebook* nb = notebook();
+    if (!nb || !ws_) return;
+    for (size_t i = 0; i < nb->GetPageCount(); ++i) {
+      auto* t = dynamic_cast<RequestTab*>(nb->GetPage(i));
+      if (!t || !t->realized() || !is_snapshot(t->file())) continue;
+      fs::path origin = snapshot_origin(t->file(), {});
+      if (origin.empty()) origin = snapshot_origin(t->file(), t->request().id);  // by its request id
+      fs::path& seen = snap_seen_[t];
+      if (origin.empty() || origin == seen) continue;
+      seen = origin;
+      t->vars_changed();
+    }
   }
 
   // The saved request a history entry was sent from: the live entry's own file, else the file
@@ -5470,6 +6453,9 @@ class Sidebar : public wxPanel, public SidebarPanel {
       if (auto it = snapshot_origin_.find(e.request.file);
           it != snapshot_origin_.end() && !it->second.empty() && find_node(tree_root_, it->second))
         return it->second;
+    // Sent from an unsaved tab ("Untitled", no file): no saved request it came from, even if
+    // one sends the same method and target.
+    if (e.request.file.empty() && history_name(e) == "Untitled") return {};
     const std::string key = history_key(e);
     if (auto it = path_by_key_.find(key); it != path_by_key_.end()) return it->second;
     // Several saved requests send this: the one with the entry's request name.
@@ -5620,7 +6606,14 @@ class Sidebar : public wxPanel, public SidebarPanel {
         ok = copy->save_request(*r, &err);
       }
       const bool found = r.has_value();
-      if (wxAppConsole* app = wxTheApp) app->CallAfter([this, alive, gen, snap, inherit, sent_as, ok, found, permanent, resp] {
+      // The snapshot as the tab will read it, read back here: the UI thread does not read it
+      // again (the first read of a file just written took ~7 ms there).
+      std::shared_ptr<SavedRequest> written;
+      if (ok) {
+        std::string err;
+        if (auto back = copy->load_request(snap, &err)) written = std::make_shared<SavedRequest>(std::move(*back));
+      }
+      if (wxAppConsole* app = wxTheApp) app->CallAfter([this, alive, gen, snap, inherit, sent_as, ok, found, permanent, resp, written] {
         if (alive.expired() || gen != open_gen_) return;
         if (!found) {
           load_history();  // the segment was trimmed under the entry: list again
@@ -5635,10 +6628,12 @@ class Sidebar : public wxPanel, public SidebarPanel {
         // request is gone), kept across restarts for a restored snapshot tab.
         snapshot_origin_[snap] = inherit.empty() ? folder_origin(sent_as) : inherit;
         persist_snapshot_origins();
-        host_->open_request(snap, !permanent);
+        if (written) host_->open_loaded(std::move(*written), !permanent);
+        else host_->open_request(snap, !permanent);
         keep_history_focus(permanent, snap);
         // Its stored response (body and timing) in the next UI step: the tab swap and the
-        // response view each stay under the budget.
+        // response view each stay under the budget (posted after open_loaded's swap, so the
+        // tab is in the notebook by then).
         if (resp)
           later([this, alive, snap, resp] {
             if (alive.expired()) return;
@@ -5650,6 +6645,10 @@ class Sidebar : public wxPanel, public SidebarPanel {
             const LastResponse& have = t->last_response();
             const bool head_only = have.http && have.http->body.empty() && resp->http && !resp->http->body.empty();
             if (!have || head_only) t->restore_response(*resp);
+            // A stream the user paced (Manual) opens in Manual again, as it was sent; any other
+            // gRPC entry opens as an ordinary call (the tab may be a reused Manual one).
+            if (resp->grpc && t->request_kind() == RequestKind::Grpc && t->grpc_manual() != resp->grpc->pacing.on)
+              t->restore_grpc_manual(resp->grpc->pacing.on);
           });
       });
     }).detach();
@@ -6005,6 +7004,9 @@ class Sidebar : public wxPanel, public SidebarPanel {
   void dormant_tick() {
     wxAuiNotebook* nb = notebook();
     if (!nb) return;
+    if (wxWindow* c = nb->GetCurrentPage()) shown_at_[c] = ++shown_clock_;
+    if (strip_check_ > 0 && --strip_check_ < 2) show_active_tab();
+    hibernate_tick();
     const auto t0 = std::chrono::steady_clock::now();
     auto budget_left = [&] { return std::chrono::steady_clock::now() - t0 < std::chrono::milliseconds(8); };
     for (size_t i = 0; i < nb->GetPageCount(); ++i) {
@@ -6042,6 +7044,58 @@ class Sidebar : public wxPanel, public SidebarPanel {
     return true;
   }
 
+  // ---------------------------------------------------------------- window budget
+
+  // Windows gives a process 10,000 USER handles. A built tab (editor + response view, every page
+  // prebuilt) holds ~330, so 30 built tabs plus the frame use most of them: past the quota every
+  // CreateWindow fails and wx crashes on the null window (wxWindowBase::SetSizer in the error
+  // dialog, wxStyledTextCtrl::SetLexer in a half-built editor; round 28). Above kHighUser the
+  // tabs not shown longest give their windows back (RequestTab::hibernate, built again when shown)
+  // until the count is under kLowUser; tabs never built stay unbuilt (the frame's prebuild skips
+  // them). Shown, preview, dirty, busy and gRPC tabs are never touched.
+  static constexpr DWORD kHighUser = 6000, kLowUser = 5000, kPanicUser = 8000;
+  std::vector<RequestTab*> budget_candidates() {
+    std::vector<RequestTab*> all;
+    if (wxAuiNotebook* nb = notebook())
+      for (size_t i = 0; i < nb->GetPageCount(); ++i)
+        if (auto* t = dynamic_cast<RequestTab*>(nb->GetPage(i))) all.push_back(t);
+    for (const auto& [root, set] : tab_sets_)
+      for (const auto& pg : set.pages)
+        if (auto* t = dynamic_cast<RequestTab*>(pg.first)) all.push_back(t);
+    return all;
+  }
+  void hibernate_tick() {
+    const DWORD users = ::GetGuiResources(::GetCurrentProcess(), GR_USEROBJECTS);
+    if (users > kHighUser) shedding_ = true;
+    if (users < kLowUser) shedding_ = false;
+    if (!shedding_) return;
+    const auto t0 = std::chrono::steady_clock::now();
+    std::vector<RequestTab*> built;
+    for (RequestTab* t : budget_candidates()) {
+      if (t->IsShown() || t->preview() || t->hibernated()) continue;
+      if (!t->realized()) t->hibernate();  // only marked: never built in the background now
+      else if (!t->dirty() && !t->in_flight() && t->request_kind() != RequestKind::Grpc) built.push_back(t);
+    }
+    auto age = [this](RequestTab* t) {
+      auto it = shown_at_.find(t);
+      return it == shown_at_.end() ? uint64_t{0} : it->second;
+    };
+    std::sort(built.begin(), built.end(), [&](RequestTab* a, RequestTab* b) { return age(a) < age(b); });
+    const size_t most = users > kPanicUser ? 4 : 1;
+    size_t done = 0;
+    for (RequestTab* t : built) {
+      if (done >= most || std::chrono::steady_clock::now() - t0 > std::chrono::milliseconds(12)) break;
+      bool ok = false;
+      st_timed("hibernate", [&] { ok = t->hibernate(); });
+      done += ok;
+    }
+    if (st_probe_ && done)
+      st_log_ += wxString::Format("#   hibernated %zu (USER %lu -> %lu) in %.1f ms\n", done, users,
+                                  ::GetGuiResources(::GetCurrentProcess(), GR_USEROBJECTS),
+                                  std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count())
+                     .utf8_string();
+  }
+
   void dormant_wake(wxWindow* w) {
     if (!dormant_.erase(w)) return;
     w->Thaw();
@@ -6071,7 +7125,14 @@ class Sidebar : public wxPanel, public SidebarPanel {
   void describe_history(const HistoryEntry& e, std::string* name, std::string* target) {
     // The saved request's current name (it may have been renamed since), else the name it was
     // sent under.
-    if (const fs::path f = history_file(e); !f.empty()) *name = meta_name(f);
+    const fs::path f = history_file(e);
+    if (!f.empty()) *name = meta_name(f);
+    if (f.empty()) {  // deleted since: the name it had last (by id, else by the file it was)
+      if (const std::string id = history_id(e); !id.empty())
+        if (auto g = gone_ids_.find(id); g != gone_ids_.end()) *name = g->second;
+      if (name->empty() && !e.request.file.empty())
+        if (auto g = gone_names_.find(e.request.file); g != gone_names_.end()) *name = g->second;
+    }
     if (name->empty())
       if (auto it = name_by_key_.find(history_key(e)); it != name_by_key_.end()) *name = it->second;
     if (name->empty()) *name = history_name(e);
@@ -6127,6 +7188,28 @@ class Sidebar : public wxPanel, public SidebarPanel {
       return natural_less(a.file, b.file);
     });
     for (size_t i = 0; i < v.size(); ++i) kids[i] = v[i].n;
+  }
+
+  // The folder's kept order puts its rows otherwise than the natural name order would.
+  bool custom_order_differs(const fs::path& folder) const {
+    if (!order_.count(folder)) return false;
+    const CollectionNode* parent = find_folder(tree_root_, folder);
+    if (!parent) return false;
+    std::vector<const CollectionNode*> kids;
+    for (const auto& c : parent->children) kids.push_back(&c);
+    std::vector<const CollectionNode*> by_name = kids;
+    sort_kids(folder, kids);
+    auto stem = [](const CollectionNode* k) {
+      const auto u = k->path.filename().u8string();
+      std::string f(u.begin(), u.end());
+      if (!k->is_folder && f.size() > 9 && f.compare(f.size() - 9, 9, ".req.json") == 0) f.resize(f.size() - 9);
+      return f;
+    };
+    std::stable_sort(by_name.begin(), by_name.end(), [&](const CollectionNode* a, const CollectionNode* b) {
+      if (a->is_folder != b->is_folder) return a->is_folder;
+      return natural_less(stem(a), stem(b));
+    });
+    return kids != by_name;
   }
 
   // Drag a request onto a sibling (a folder onto a sibling folder with Alt): it takes that
@@ -6364,15 +7447,21 @@ class Sidebar : public wxPanel, public SidebarPanel {
     picking_ = true;
     std::weak_ptr<int> alive = alive_;
     const fs::path root = ws_->root();
+    // Starts where the last import came from (Postman / Insomnia: their exports pile up in one
+    // folder), else in the workspace; never in the process's working directory.
+    fs::path start = root;
+    if (wxConfigBase* c = wxConfigBase::Get())
+      if (wxString last; c->Read("Sidebar/ImportDir", &last) && !last.empty()) start = fs::path(last.ToStdWstring());
     pick_file_async(top, title, filters, kind == kImportBruno, [this, alive, root, dest](const fs::path& src) {
       if (alive.expired()) return;
       picking_ = false;
       focus_tree_after_dialog();
       if (src.empty() || !ws_ || ws_->root() != root) return;
+      if (wxConfigBase* c = wxConfigBase::Get()) c->Write("Sidebar/ImportDir", wxString(src.parent_path().wstring()));
       later([this, alive, src, dest] {
         if (!alive.expired()) start_import(src, dest);
       });
-    });
+    }, start);
   }
 
   // A modal OS dialog hands the focus back to the first control of the frame (the sidebar's
@@ -6641,15 +7730,26 @@ class Sidebar : public wxPanel, public SidebarPanel {
   // and written on a worker.
   void export_folder(const fs::path& folder, bool curl) {
     if (!ws_ || folder.empty()) return;
-    wxWindow* top = wxGetTopLevelParent(this);
     const std::string name = u8(folder == ws_->root() ? ws_->root().filename() : folder.filename());
-    fs::path out;
-    if (!curl) {
-      wxFileDialog dlg(top, "Export as a Postman collection", "", wxString::FromUTF8(name + ".postman_collection.json"),
-                       "Postman collection v2.1 (*.json)|*.json", wxFD_SAVE | wxFD_OVERWRITE_PROMPT);
-      if (dlg.ShowModal() != wxID_OK) return;
-      out = fs::path(dlg.GetPath().ToStdWstring());
+    if (curl) {
+      run_export(folder, name, {}, true);
+      return;
     }
+    // The OS "Save as" dialog on its own thread (wxFileDialog held the UI thread ~90 ms opening
+    // it and ~50 ms closing it).
+    if (picking_) return;
+    picking_ = true;
+    save_file_async(wxGetTopLevelParent(this), L"Export as a Postman collection",
+                    {{L"Postman collection v2.1 (*.json)", L"*.json"}},
+                    wxString::FromUTF8(name + ".postman_collection.json").ToStdWstring(),
+                    [this, folder, name, alive = std::weak_ptr<int>(alive_)](const fs::path& out) {
+                      if (alive.expired()) return;
+                      picking_ = false;
+                      if (!out.empty() && ws_) run_export(folder, name, out, false);
+                    });
+  }
+
+  void run_export(const fs::path& folder, const std::string& name, const fs::path& out, bool curl) {
     auto copy = std::make_shared<Workspace>(*ws_);
     auto order = std::make_shared<std::map<fs::path, std::vector<std::wstring>>>(order_);
     std::weak_ptr<int> alive = alive_;
@@ -6663,17 +7763,24 @@ class Sidebar : public wxPanel, public SidebarPanel {
       }
       if (wxAppConsole* app = wxTheApp) app->CallAfter([this, res, err, out, curl, alive] {
         if (alive.expired()) return;
-        wxWindow* top = wxGetTopLevelParent(this);
+        // A notice band (as the import's), not a modal box: nothing to confirm.
         if (!err.empty()) {
-          notify(top, "Could not export", wxString::FromUTF8(err));
+          show_note(wxString::FromUTF8("\xE2\x9A\xA0 Could not export: " + err), wxString::FromUTF8(err), 0);
           return;
         }
         auto plural = [](size_t n, const char* one) { return std::to_string(n) + " " + one + (n == 1 ? "" : "s"); };
-        std::string msg = (curl ? "Copied " + plural(res->requests, "curl command") : "Exported " + plural(res->requests, "request") + ", " + plural(res->folders, "folder") + " to " + u8(out)) +
-                          (res->skipped.empty() ? "." : ", " + std::to_string(res->skipped.size()) + " skipped:");
-        for (size_t i = 0; i < res->skipped.size() && i < 8; ++i) msg += "\n\xE2\x80\xA2 " + res->skipped[i];
+        const std::string line = curl ? "Copied " + plural(res->requests, "curl command")
+                                      : "Exported " + plural(res->requests, "request") + ", " +
+                                            plural(res->folders, "folder") + " to " + u8(out.filename());
+        std::string tip = curl ? line + " to the clipboard." : line + "\n" + u8(out);
+        for (size_t i = 0; i < res->skipped.size() && i < 8; ++i) tip += "\n\xE2\x80\xA2 " + res->skipped[i];
         if (curl) copy_text(wxString::FromUTF8(res->text));
-        if (!curl || !res->skipped.empty()) notify(top, curl ? "Copied as cURL" : "Exported", wxString::FromUTF8(msg));
+        if (res->skipped.empty())
+          show_note(wxString::FromUTF8("\xE2\x9C\x93 " + line), wxString::FromUTF8(tip), 6000);
+        else
+          show_note(wxString::FromUTF8("\xE2\x9A\xA0 " + line + ", " + std::to_string(res->skipped.size()) +
+                                       " skipped (hover for which)"),
+                    wxString::FromUTF8(tip), 0);
       });
     }).detach();
   }
@@ -6808,10 +7915,6 @@ class Sidebar : public wxPanel, public SidebarPanel {
   std::set<fs::path> disk_pending_;
   wxTimer disk_timer_;
   bool first_ws_ = true;
-  bool ws_seen_ = false;                           // set_workspace had a workspace once
-  std::string heal_log_;                           // what heal_stale_tabs did (self test)
-  std::vector<wxWeakRef<RequestTab>> stale_tabs_;  // heal_stale_tabs()
-  wxTimer heal_timer_;
   fs::path locked_root_;  // the workspace whose window.lock this window wrote
   bool restoring_width_ = false, width_restored_ = false;
   wxTimer width_timer_;
@@ -6822,9 +7925,12 @@ class Sidebar : public wxPanel, public SidebarPanel {
   CollectionNode tree_root_;  // last scan
   CollectionNode view_root_;  // what the tree shows (tree_root_ or its filtered copy)
   std::set<fs::path> expanded_;
+  size_t filter_not_name_ = 0;  // filter hits whose name holds no word of the query
+  std::map<const void*, fs::path> snap_seen_;  // refresh_snapshot_tabs(): origin each snapshot tab last read
   std::string filter_q_;
   std::string rebuilt_q_;  // the filter the tree's rows were last built for
   bool rebuilding_ = false, syncing_ = false, root_populated_ = false, sash_set_ = false;
+  std::chrono::steady_clock::time_point filter_typed_at_{};  // last edit of the filter text (see bind_tree)
   bool quick_open_shown_ = false;
   bool edit_ok_ = false;
   bool rebuild_after_edit_ = false;
@@ -6845,6 +7951,19 @@ class Sidebar : public wxPanel, public SidebarPanel {
   bool rebuild_after_purge_ = false;
   bool unfilter_ = false;  // the current update closes the folders a cleared filter opened     // rows a filtered rebuild may still open folders for
   fs::path open_after_edit_;  // a new / duplicated request: opened when its rename ends
+  std::vector<std::shared_ptr<Deleted>> undo_;  // deletes Ctrl+Z can take back, newest last
+  fs::path resume_name_;      // naming it was interrupted by an app switch: resumed on activate
+  bool resume_bound_ = false;
+  fs::path resumed_;           // the item whose naming was resumed last, until resumed_until_
+  std::chrono::steady_clock::time_point resumed_until_{};
+  int resume_tries_ = 0;
+  fs::path away_naming_;      // the item being named when the window was deactivated
+  bool st_esc_ = false;  // self test: an EndEditLabel(cancel) stands for the Esc key
+  bool leaving_app_ = false;  // the rename editor is ending because the app lost the focus
+  std::map<fs::path, fs::path> ws_top_;  // per workspace left: the tree's first visible row
+  fs::path restore_top_;                 // that row for the workspace just switched to (rebuild)
+  int strip_check_ = 0;                  // dormant ticks left that bring the active tab into the strip
+  fs::path discard_on_esc_;  // a new request / copy being named: Esc removes it again
   struct HistMeta {
     std::string name, id;
     fs::path file;  // the file the entry was sent as (its folder's settings applied)
@@ -6859,22 +7978,25 @@ class Sidebar : public wxPanel, public SidebarPanel {
   // row is the one highlighted in the history list.
   std::map<fs::path, std::pair<std::string, std::string>> snapshot_entry_;
   std::map<fs::path, TabSet> tab_sets_;  // hidden tabs of the workspaces switched away from
+  wxTimer vars_timer_;           // see select_file()
   wxTimer inh_timer_;            // see refresh_inherit_tabs()
-  wxTimer preview_timer_;        // see select_file()
   mutable wxWeakRef<wxAuiNotebook> nb_cache_;
   fs::path clip_;                           // Ctrl+C (copy_item())
   std::map<fs::path, fs::file_time_type> own_writes_;  // see note_own_write()
   bool mute_page_events_ = false;           // see swap_tabs()
   wxTimer dormant_timer_;                   // see dormant_tick()
   std::set<wxWindow*> dormant_;             // hidden tabs frozen by dormant_tick()
+  std::unordered_map<wxWindow*, uint64_t> shown_at_;  // when each tab was last the shown one (hibernate_tick)
+  uint64_t shown_clock_ = 0;
+  bool shedding_ = false;                   // above the USER handle budget (hibernate_tick)
   std::set<wxWindow*> dormant_bound_;       // tabs with the wake / destroy handlers
-  fs::path preview_file_;
-  std::set<std::pair<const void*, fs::path>> recoloured_;  // tabs whose editor preview_timer_ reloaded
   int inh_ticks_ = 0;
   fs::path pending_inherit_;     // a folder saved while a tab under it was sending
   bool pending_inherit_set_ = false;
   fs::path inh_saved_;           // the folder last saved from here, and when
   std::chrono::steady_clock::time_point inh_saved_at_{};
+  Unpark unpark_;                            // tabs on their way back (unpark_slice())
+  std::vector<wxWeakRef<wxWindow>> to_park_;  // off the notebook, not yet in the park (park_slice())
   wxWindow* tab_park_ = nullptr;         // their parent while hidden (see tab_park())
   wxButton* cookie_btn_ = nullptr;
   std::unique_ptr<std::pair<CollectionNode, MetaMap>> deferred_scan_;  // a scan pass held during an edit
@@ -6896,6 +8018,8 @@ class Sidebar : public wxPanel, public SidebarPanel {
   std::unordered_map<const CollectionNode*, RankKey> rank_keys_;  // see build_rank_keys()
   fs::path best_path_;                             // the filter's best hit (rebuild)
   SearchKeys search_keys_;                         // filter text per node of tree_root_ (lazy)
+  std::map<fs::path, std::string, NativePathLess> gone_names_;  // last names of requests now gone
+  std::map<std::string, std::string> gone_ids_;                 // the same by request id
   std::map<std::string, std::string> name_by_key_;  // "get {{base}}/x" -> request name ("" if ambiguous)
   std::map<std::string, fs::path> path_by_key_;     // same key -> its file (only when unique)
   std::multimap<std::string, std::pair<std::string, fs::path>> paths_by_key_;  // key -> (name, file), all
@@ -6942,6 +8066,7 @@ class Sidebar : public wxPanel, public SidebarPanel {
   int hist_saved_sash_ = 0;
   wxWindow* top_pane_ = nullptr;
   bool hist_saved_user_ = false;
+  wxString hist_saved_filter_;  // the filter text when the history went full height
   wxTreeCtrl* tree_ = nullptr;
   CollectionTree* ctree_ = nullptr;  // tree_, for its drag insert mark
   wxStaticText* empty_ = nullptr;

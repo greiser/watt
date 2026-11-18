@@ -2,6 +2,7 @@
 // Custom-drawn pieces of the response view: the status strip, the timing waterfall and the tab
 // strip. All painting is wxDC on the UI thread over a handful of rectangles: nothing here scales
 // with the response size.
+#include <wx/listctrl.h>
 #include <wx/timer.h>
 #include <wx/window.h>
 
@@ -46,6 +47,13 @@ class StatusStrip : public wxWindow {
   // Running clock: draws "label  12.3 ms" with the time since `since`, repainted ~30x/s until set().
   void set_busy(const std::string& label, Clock::time_point since);
   void set_busy_label(const std::string& label) { busy_label_ = label; Refresh(); }
+  // While the clock runs: the time shown is `ms`, set by the caller on its own tick (so it reads
+  // the same as the waterfall's live total next to it) instead of the strip's own clock.
+  void set_busy_ms(double ms) {
+    busy_ms_ = ms;
+    timer_.Stop();
+    Refresh(false);
+  }
   // While the clock runs: the response's status pill ("200 OK") once its head arrived, drawn
   // before the label (empty: none). Cleared by set() / set_busy().
   void set_busy_badge(const std::string& badge, Tone tone) {
@@ -76,6 +84,7 @@ class StatusStrip : public wxWindow {
   std::string busy_badge_;
   Tone busy_badge_tone_ = Tone::Plain;
   Clock::time_point since_{};
+  double busy_ms_ = -1;  // set_busy_ms(): the time shown (-1: the strip's own clock)
   wxTimer timer_;
 };
 
@@ -119,6 +128,16 @@ struct TimingModel {
   std::string server_label = "server wait";  // footer label for server_wait
   std::string server_tip =
       "Request fully sent -> first response byte: server processing plus one network round trip.";
+  // A user-paced (Manual) stream: the time the stream sat open at the user's pace (idle before
+  // the first message plus the user's sends until End). Its own footer part, so total =
+  // server_wait + network + client + paced; < 0: not user-paced.
+  double paced = -1;
+  std::string paced_tip;
+  // The OAuth 2.0 token step (fetch, refresh or cache lookup) that ran before the request: its
+  // own footer / header part, never counted as client (watt) time; total = server_wait +
+  // network + client + auth. < 0: no token step.
+  double auth = -1;
+  std::string auth_tip;
   // A response whose head is in and whose body still arrives (or was cut by a cancel): the phase
   // at live_row (Download) runs, live_head says what is arriving; live_cut: cancelled.
   int live_row = -1;
@@ -149,6 +168,10 @@ class Waterfall : public wxWindow {
   // came at first_ms after the send (< 0: nothing yet), with `bytes` body bytes (HTTP) or `msgs`
   // messages (gRPC) so far. The phases before it are drawn as done, the transfer as running.
   void set_live(double first_ms, uint64_t bytes, size_t msgs);
+  // While waiting on a user-paced (Manual) stream: `sent` messages went out, `ended`: End was
+  // clicked. Before the first one the rows say the stream is open and idle, not "waiting for the
+  // response". Reset by set_waiting().
+  void set_paced(int sent, bool ended);
   // The request was cancelled: the reserved rows stay (nothing below moves) and say so; the
   // figures of an earlier run are not shown under a cancelled request. Ends with set() / clear().
   void set_cancelled(double after_ms);
@@ -187,6 +210,8 @@ class Waterfall : public wxWindow {
   double live_first_ms_ = -1;
   uint64_t live_bytes_ = 0;
   size_t live_msgs_ = 0;
+  int paced_sent_ = -1;  // set_paced(); -1: not a user-paced stream
+  bool paced_ended_ = false;
   wxTimer wait_timer_;
   void paint_waiting(wxDC& dc);
   std::function<void(const wxRect&)> on_conn_;
@@ -228,6 +253,21 @@ class TabStrip : public wxWindow {
 
 // A flat toolbar of text "chips": a left group (segmented, e.g. Pretty | Raw | Hex), a note in the
 // middle and right-aligned action chips. Custom drawn so it looks the same in light and dark.
+// A report-mode list that paints each row once. Under dark mode wx draws a whole row itself on
+// every sub-item notification (columns x columns text draws per row: 15-45 ms for an 8 x 5
+// list's first paint), and the row ends up in the last column's colours. This one draws the row
+// on its item notification, every cell with its own colour and font.
+class FastList : public wxListCtrl {
+ public:
+  using wxListCtrl::wxListCtrl;
+#ifdef __WXMSW__
+  bool MSWOnNotify(int id, WXLPARAM lp, WXLPARAM* result) override;
+
+ private:
+  void paint_row(WXHDC dc, long item);
+#endif
+};
+
 class ChipBar : public wxWindow {
  public:
   ChipBar(wxWindow* parent, std::function<void(int)> on_click);
@@ -251,6 +291,7 @@ class ChipBar : public wxWindow {
     bool right, on = false, enabled = true, visible = true;
     bool folded = false;  // no room on the bar: listed under the "more" chip instead
     wxRect rect;
+    wxSize ext;  // the label's text extent in the bar's font (measured on first paint)
   };
   wxRect more_rect_;  // the "more" chip (right chips that did not fit), empty when all fit
   void more_menu();

@@ -32,6 +32,11 @@ class DetailPane : public wxPanel {
   // "Open in tab" (also double click / Enter on a result row).
   std::function<void()> on_open;
   void set_can_open(bool on);
+  // "Run again" on a restored run's Response tab (its bodies were not kept).
+  std::function<void()> on_run_again;
+  // While a run streams in and the selection follows it: big response bodies wait for a click.
+  // rebuild: build a body deferred so far now (when on turns false).
+  void set_defer_big(bool on, bool rebuild = true);
   // Creates the body viewer now (it is otherwise created on first use).
   void warm_up();
   // Window-wide keys (Ctrl+Enter, Esc): offered first by every control in the pane, since

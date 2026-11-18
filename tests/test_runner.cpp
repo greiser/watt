@@ -169,11 +169,14 @@ TEST_CASE("runs a folder in order with captures feeding later requests", "[runne
   CHECK(seen[3]->asserts.empty());
   CHECK(seen[4]->iteration == 1);
   CHECK(seen[7]->seq == 7);
-  // Phases add up to the total.
+  // The network phases add up to the response time; Prepare and Queue (watt's setup before
+  // the first I/O) to prep_ms, apart from it.
   for (const auto& r : seen) {
-    double sum = 0;
-    for (const auto& p : r->phases) sum += p.ms;
+    double sum = 0, setup = 0;
+    for (const auto& p : r->phases) (is_setup_phase(p) ? setup : sum) += p.ms;
     CHECK(sum == Catch::Approx(r->timing.total_ms).margin(0.01));
+    CHECK(setup == Catch::Approx(r->prep_ms).margin(0.01));
+    CHECK(r->prep_ms > 0);
     CHECK(r->timing.total_ms > 0);
   }
   CHECK(s.p50_ms > 0);
@@ -196,6 +199,46 @@ TEST_CASE("runs a folder in order with captures feeding later requests", "[runne
   CHECK(xml.find("api (iteration 2)") != std::string::npos);
   CHECK(xml.find("type=\"assert\"") != std::string::npos);
   CHECK(xml.find("type=\"status\"") != std::string::npos);
+
+  // Run history across restarts: saved per user, read back with the same pass / fail, times and checks.
+  meta.label = "rerun failed";
+  meta.plan = "4 requests x 2 iterations";
+  const std::wstring key = L"test-history-key";
+  for (int i = 0; i < 14; ++i) REQUIRE(save_history(key, "2026-11-18T03:04:05Z", history_json(meta, s, seen), 12));
+  const auto files = load_history(key, 50);
+  CHECK(files.size() == 12);  // the newest 12 kept
+  REQUIRE_FALSE(files.empty());
+  LoadedRun lr;
+  REQUIRE(from_json(files.front(), lr));
+  CHECK(lr.meta.label == "rerun failed");
+  CHECK(lr.meta.plan == "4 requests x 2 iterations");
+  CHECK(lr.meta.iterations == meta.iterations);
+  CHECK_FALSE(lr.partial);
+  CHECK(lr.summary.passed == 4);
+  CHECK(lr.summary.failed == 4);
+  CHECK(lr.summary.p95_ms == Catch::Approx(s.p95_ms).margin(0.001));
+  CHECK(lr.summary.per_request.size() == 4);
+  REQUIRE(lr.steps.size() == seen.size());
+  for (size_t i = 0; i < seen.size(); ++i) {
+    INFO(i);
+    CHECK(lr.steps[i]->passed() == seen[i]->passed());
+    CHECK(lr.steps[i]->failed() == seen[i]->failed());
+    CHECK(lr.steps[i]->status == seen[i]->status);
+    CHECK(lr.steps[i]->rel == seen[i]->rel);
+    CHECK(lr.steps[i]->iteration == seen[i]->iteration);
+    CHECK(lr.steps[i]->asserts.size() == seen[i]->asserts.size());
+    CHECK(lr.steps[i]->timing.total_ms == Catch::Approx(seen[i]->timing.total_ms).margin(0.001));
+    CHECK(lr.steps[i]->prep_ms == Catch::Approx(seen[i]->prep_ms).margin(0.001));
+    CHECK(lr.steps[i]->phases.size() == seen[i]->phases.size());
+    CHECK(lr.steps[i]->reason() == seen[i]->reason());
+  }
+  CHECK(lr.steps[0]->from_history);
+  CHECK(lr.steps[0]->item == lr.steps[4]->item);  // the same request in both iterations
+  CHECK(lr.steps[0]->item != lr.steps[1]->item);
+  CHECK(load_history(L"another-key", 5).empty());
+  LoadedRun bad;
+  CHECK_FALSE(from_json("{\"tool\":\"other\"}", bad));
+  CHECK_FALSE(from_json("not json", bad));
 }
 
 TEST_CASE("stop cancels the request in flight and the delay", "[runner]") {
@@ -767,10 +810,37 @@ TEST_CASE("scripts run in the runner: tests, variables, console, phases", "[runn
   }
   CHECK(pre_phase);
   CHECK(vars_phase);
+  // The response time (Time column, percentiles, Newman's figure) leaves the scripts out: the
+  // network phases add up to timing.total_ms, the script phases to script_ms.
   for (const auto& r : seen) {
-    double sum = 0;
-    for (const auto& p : r->phases) sum += p.ms;
-    CHECK(sum == Catch::Approx(r->timing.total_ms).margin(0.01));
+    double net = 0, scr = 0;
+    for (const auto& p : r->phases)
+      if (!is_setup_phase(p)) (is_script_phase(p) ? scr : net) += p.ms;
+    CHECK(net == Catch::Approx(r->timing.total_ms).margin(0.01));
+    CHECK(scr == Catch::Approx(r->script_ms).margin(0.01));
+    CHECK(r->total_incl_scripts_ms() == Catch::Approx(net + scr).margin(0.01));
+  }
+  CHECK(r1.script_ms > 0);  // its post-response script
+  CHECK(r2.script_ms > 0);  // pre-request vars, pre-request and post-response scripts
+  {
+    // A slow post-response script does not move the response time or its percentiles.
+    SavedRequest slow = http("slow script", "GET", base() + "/echo");
+    slow.post_script = "let x = 0; for (let i = 0; i < 3000000; ++i) x += i; test('ran', () => expect(x > 0).to.equal(true));";
+    TempWs t2;
+    REQUIRE(t2.ws.trust_scripts(true));
+    t2.add(slow, "api");
+    auto it2 = collect(t2.ws, t2.dir / "api");
+    Workspace w2 = t2.ws;
+    RunControl c2;
+    std::vector<std::shared_ptr<const StepResult>> got;
+    const auto s2 = run_plan(it2, all(1), opts, w2, {}, c2, [&](auto r) { got.push_back(r); });
+    REQUIRE(got.size() == 1);
+    INFO(got[0]->reason());
+    CHECK(got[0]->passed());
+    CHECK(got[0]->script_ms > got[0]->timing.total_ms);
+    CHECK(s2.max_ms == Catch::Approx(got[0]->timing.total_ms));
+    CHECK(s2.scripted == 1);
+    CHECK(s2.avg_script_ms == Catch::Approx(got[0]->script_ms));
   }
   CHECK(seen[2]->failed());
   CHECK(seen[2]->reason().find("boom") != std::string::npos);
@@ -1732,7 +1802,10 @@ int json_int(const std::string& line, const std::string& key) {
 // The runner window itself (watt.exe next to this test, WATT_RUNNER_LAYOUT_CHECK): nothing
 // that shows or hides the "Plan changed" note (a run, typing a filter, unchecking a request, a
 // request edited on disk, the next run) may move Iterations, Parallel or Run, or a click aimed at
-// Iterations lands in Delay.
+// Iterations lands in Delay. Then the run-order chips: moving a request (the capture-order hint
+// clears, the reset chip turns active) and resetting the order may not move the up / down chips
+// (a second click on up would land on down) or the request list's top (a click after Alt+Up would
+// pick another row).
 TEST_CASE("runner settings never move when the Plan changed note shows or hides", "[runner][app]") {
   wchar_t self[MAX_PATH] = {};
   GetModuleFileNameW(nullptr, self, MAX_PATH);
@@ -1742,8 +1815,13 @@ TEST_CASE("runner settings never move when the Plan changed note shows or hides"
   TempWs t;
   SavedRequest a = http("A", "GET", base() + "/json/3");
   a.asserts.push_back(as("res.status", "eq", "200"));
+  a.http.headers.push_back({"X-Id", "{{firstId}}"});  // read before B captures it: the hint shows
   t.add(a, "Shop");
   SavedRequest b = http("B", "GET", base() + "/json/2");
+  Capture cap;
+  cap.var = "firstId";
+  cap.target = "res.status";
+  b.captures.push_back(cap);
   t.add(b, "Shop");
   const fs::path out = t.cfg / "layout.jsonl";
   SetEnvironmentVariableW(L"WATT_RUN_FOLDER", (t.dir / "Shop").wstring().c_str());
@@ -1784,6 +1862,66 @@ TEST_CASE("runner settings never move when the Plan changed note shows or hides"
   CHECK(line.find("\"note_filter\":true") != std::string::npos);   // the note did show
   CHECK(line.find("\"note_uncheck\":true") != std::string::npos);
   CHECK(line.find("\"note_after\":false") != std::string::npos);   // and the run cleared it
+  for (const char* step : {"reordered", "reset"})
+    CHECK(got.find(std::string("\"check\":\"chips\",\"step\":\"") + step + "\"") != std::string::npos);
+  CHECK(json_int(line, "chips_moved") == 0);                       // up / down and the list stayed
+  CHECK(line.find("\"hint_before\":true") != std::string::npos);   // the capture hint did show
+  CHECK(line.find("\"hint_after\":false") != std::string::npos);   // and the move cleared it
+}
+
+// Open request on a result of a big parallel run, close that tab with its X, open it again and
+// close it again (the runner drives it: WATT_RUNNER_OPEN_CHECK). wx 3.3.1's tab strip kept a
+// pointer to the closed tab's close button; the next mouse move wrote into the freed block and a
+// later close crashed in ~wxSizer. After each close no hover pointer may be left.
+TEST_CASE("open request from a big parallel run: open, close, reopen, close", "[runner][app]") {
+  wchar_t self[MAX_PATH] = {};
+  GetModuleFileNameW(nullptr, self, MAX_PATH);
+  const fs::path exe = fs::path(self).parent_path() / "watt.exe";
+  if (!fs::exists(exe)) SKIP("watt.exe is not built next to this test");
+  KeepRegValue last(L"Last"), recent(L"Recent");
+  TempWs t;
+  SavedRequest a = http("List", "GET", base() + "/json/3");
+  a.asserts.push_back(as("res.status", "eq", "200"));
+  t.add(a, "Shop");
+  SavedRequest b = http("Missing", "GET", base() + "/status/404");
+  b.asserts.push_back(as("res.status", "eq", "200"));  // fails: the result opened is a failure
+  t.add(b, "Shop");
+  const fs::path out = t.cfg / "open.jsonl";
+  SetEnvironmentVariableW(L"WATT_RUN_FOLDER", (t.dir / "Shop").wstring().c_str());
+  SetEnvironmentVariableW(L"WATT_RUNNER_OPEN_CHECK", out.wstring().c_str());
+  std::wstring cmd = L"\"" + exe.wstring() + L"\" --new-instance \"" + t.dir.wstring() + L"\"";
+  STARTUPINFOW si{};
+  si.cb = sizeof si;
+  PROCESS_INFORMATION pi{};
+  const BOOL started = CreateProcessW(exe.wstring().c_str(), cmd.data(), nullptr, nullptr, FALSE, 0, nullptr,
+                                      nullptr, &si, &pi);
+  SetEnvironmentVariableW(L"WATT_RUN_FOLDER", nullptr);
+  SetEnvironmentVariableW(L"WATT_RUNNER_OPEN_CHECK", nullptr);
+  REQUIRE(started);
+  std::string got;
+  DWORD code = 0;
+  const auto t0 = std::chrono::steady_clock::now();
+  while (std::chrono::steady_clock::now() - t0 < std::chrono::seconds(70)) {
+    got = read_all(out);
+    if (got.find("\"done\"") != std::string::npos || got.find("\"timeout\"") != std::string::npos) break;
+    if (WaitForSingleObject(pi.hProcess, 100) == WAIT_OBJECT_0) {
+      got = read_all(out);
+      break;
+    }
+  }
+  if (WaitForSingleObject(pi.hProcess, 5000) != WAIT_OBJECT_0) TerminateProcess(pi.hProcess, 9);
+  GetExitCodeProcess(pi.hProcess, &code);
+  CloseHandle(pi.hThread);
+  CloseHandle(pi.hProcess);
+  INFO(got);
+  CHECK(code == 0);  // not an access violation (0xC0000005) or the check's timeout
+  REQUIRE(got.find("\"done\"") != std::string::npos);
+  CHECK(got.find("{\"check\":\"ran\",\"steps\":600}") != std::string::npos);
+  for (const char* n : {"1", "2"}) {
+    const std::string line = std::string("{\"check\":\"close\",\"n\":") + n +
+                             ",\"hovered\":true,\"hover_left\":false,\"closed\":true}";
+    CHECK(got.find(line) != std::string::npos);
+  }
 }
 
 namespace {
@@ -1942,4 +2080,56 @@ TEST_CASE("a client-side error or an error status is a failure even when inherit
   CHECK(sum.passed == 1);
   CHECK(sum.failed == 1);
   CHECK(sum.errors == 1);
+}
+
+TEST_CASE("run history masks credential values and keeps only failures of a big run", "[runner][history]") {
+  std::vector<std::shared_ptr<const StepResult>> steps;
+  for (size_t i = 0; i < kHistorySteps + 10; ++i) {
+    auto s = std::make_shared<StepResult>();
+    s->seq = i;
+    s->rel = "r";
+    s->sent = true;
+    s->transport_ok = true;
+    s->status = i % 1000 == 0 ? 500 : 200;  // a few failures
+    s->timing.total_ms = 1;
+    StepResult::Cap c;
+    c.ok = true;
+    c.var = "authToken";
+    c.value = "s3cret";
+    s->captures.push_back(c);
+    steps.push_back(std::move(s));
+  }
+  RunMeta meta;
+  const RunSummary sum = summarize(steps, steps.size(), 10, false, true);
+  CHECK(to_json(meta, sum, {steps.front()}).find("s3cret") != std::string::npos);  // an export keeps it
+  const std::string h = history_json(meta, sum, steps);
+  CHECK(h.find("s3cret") == std::string::npos);
+  LoadedRun lr;
+  REQUIRE(from_json(h, lr));
+  CHECK(lr.partial);
+  CHECK(lr.steps.size() == 6);
+  for (const auto& s : lr.steps) CHECK(s->failed());
+  CHECK(lr.summary.total == steps.size());
+}
+
+TEST_CASE("failure causes count the steps sent with unresolved variables", "[runner]") {
+  std::vector<std::shared_ptr<const StepResult>> steps;
+  for (int i = 0; i < 4; ++i) {
+    auto s = std::make_shared<StepResult>();
+    s->seq = static_cast<size_t>(i);
+    s->iteration = i;
+    s->rel = "get";
+    s->sent = true;
+    s->transport_ok = true;
+    s->status = 404;
+    if (i < 3) s->unresolved = {"firstId"};
+    steps.push_back(std::move(s));
+  }
+  auto g = group_failures(steps);
+  REQUIRE(g.size() == 1);
+  CHECK(g[0].check == "expected status < 400");
+  CHECK(g[0].count == 4);
+  CHECK(g[0].unresolved == 3);
+  REQUIRE(g[0].unresolved_names.size() == 1);
+  CHECK(g[0].unresolved_names[0] == "firstId");
 }

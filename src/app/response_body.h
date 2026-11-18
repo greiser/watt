@@ -58,6 +58,16 @@ class BodyView : public wxPanel {
   void set_visualize_chosen(bool on) { vis_chosen_ = on; }
   // The user picked Visualize (true) or another view (false) for a body that has a template.
   std::function<void(bool)> on_visualize_chosen;
+  // The body's right-click menu on a JSON value: "Add assertion" (target, op, value: the request
+  // gets `target op value`) and "Capture into variable" (target, a suggested variable name).
+  std::function<void(const std::string&, const std::string&, const std::string&)> on_add_assert;
+  std::function<void(const std::string&, const std::string&)> on_add_capture;
+  // Whether a capture added from here sticks (the request editor adopts it). False: the menu does
+  // not offer "Capture into variable" at all (empty: offered whenever on_add_capture is set).
+  std::function<bool()> capture_ok;
+  // Whether the request already checks target/op/value: "" no, else how it went ("pass", "fail",
+  // "not run", "inherited from api, pass"). The menu then shows that instead of "Add assertion".
+  std::function<std::string(const std::string&, const std::string&, const std::string&)> asserted;
   // An event stream's body: an "Events" chip before Pretty / Raw goes back to the event list
   // (the response view's SSE page). Empty: no such chip.
   void set_events_chip(std::function<void()> on_events);
@@ -153,6 +163,12 @@ class BodyView : public wxPanel {
   void append_raw(const std::string& s);  // gRPC document: append, following the tail
   void save_body();
   void on_margin_click(wxStyledTextEvent& e);
+  // Right-click: Copy / Select all, and on a JSON body the value under the mouse (copy its
+  // value or path, assert it, capture it). A big document is searched on a thread.
+  void body_menu(wxPoint screen);
+  void show_body_menu(wxPoint screen, int mode, size_t off, std::shared_ptr<const void> owner, bool found,
+                      const JsonHit& hit);
+  uint64_t menu_seq_ = 0;
   void auto_wrap(const Doc& d);
   int shown_mode() const;
   int base_mode() const;   // shown_mode() before Wrap of a heavy document is applied
@@ -292,6 +308,7 @@ class BodyView : public wxPanel {
   bool create_web();    // the WebView2 control, hidden (false: no Edge runtime)
   void prewarm_web();   // creates it ahead of the first Preview click (after an HTML response)
   bool web_prewarm_ = false;
+  wxTimer prewarm_timer_;  // creates the prewarmed control once the user is idle (no input for 1 s)
   std::string origin_note_;
   void web_load(const std::string& page);
   bool wrap_chosen_ = false;  // the user toggled Wrap for this body (no more automatic choice)

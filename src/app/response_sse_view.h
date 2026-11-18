@@ -34,8 +34,11 @@ class SsePage : public wxPanel {
   void append(std::vector<SseEvent>&& evs);
   size_t count() const { return events_.size() + dropped_; }
   const std::vector<SseEvent>& events() const { return events_; }
-  // The note in the bar above the list ("live · 12 events · 3 keep-alive comments").
+  // The note in the bar above the list ("live · 12 events · 3 keep-alive comments"). Events cut
+  // at the size limit and events not listed (past kMaxRows, or dropped by the tap while the UI
+  // fell behind: set_tap_dropped) are added to it.
   void set_caption(const std::string& text, Tone tone);
+  void set_tap_dropped(uint64_t n) { tap_dropped_ = n; }
   // The Raw chip: the stream's bytes as received, in the body view.
   std::function<void()> on_raw;
 
@@ -50,6 +53,7 @@ class SsePage : public wxPanel {
   long rows() const { return filter_.empty() ? static_cast<long>(events_.size()) : static_cast<long>(view_.size()); }
   size_t event_of(long row) const { return filter_.empty() ? static_cast<size_t>(row) : view_[static_cast<size_t>(row)]; }
   void apply_filter();
+  void show_note();  // the caption, plus "15 of 50 match" while a filter is set
   void show_detail(long row);
   void copy_data();
   std::string filter_;          // lower case; empty: no filter
@@ -59,6 +63,8 @@ class SsePage : public wxPanel {
   std::vector<SseEvent> events_;
   std::vector<std::string> previews_;
   size_t dropped_ = 0;  // events past kMaxRows (counted, not listed)
+  size_t truncated_ = 0;     // events whose line or data went past SseParser's limit
+  uint64_t tap_dropped_ = 0;  // dropped by the tap before they reached the list
   long detail_row_ = -2;
   size_t detail_size_ = 0;  // data size of the event shown when it was formatted (the live tail)
   bool user_picked_ = false;

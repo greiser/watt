@@ -2615,15 +2615,48 @@ TEST_CASE("curl: shells expand variables, curl reads files: imported as they wou
     CHECK(header(imp->http, "Cookie") == "<missing>");
     CHECK(any_warning(*imp, "watt-missing-jar.txt"));
   }
-  SECTION("--digest/--ntlm keep -u disabled instead of sending Basic; dropped options and globs warn") {
+  SECTION("--digest/--ntlm/--negotiate/--aws-sigv4 import as that scheme; dropped options and globs warn") {
     auto imp = parse_curl("curl --digest -u a:b https://h.test/");
     REQUIRE(imp);
     CHECK_FALSE(imp->basic_auth.enabled);
-    CHECK(imp->basic_auth.user == "a");
-    CHECK(imp->basic_auth.password == "b");
-    CHECK(any_warning(*imp, "--digest"));
+    CHECK(imp->auth.type == HttpAuth::Type::Digest);
+    CHECK(imp->auth.user == "a");
+    CHECK(imp->auth.password == "b");
+    CHECK(imp->warnings.empty());
     imp = parse_curl("curl --ntlm -u a:b https://h.test/");
     CHECK_FALSE(imp->basic_auth.enabled);
+    CHECK(imp->auth.type == HttpAuth::Type::Ntlm);
+    imp = parse_curl("curl --negotiate -u : https://h.test/");
+    CHECK(imp->auth.type == HttpAuth::Type::Negotiate);
+    CHECK(imp->auth.user.empty());
+    imp = parse_curl("curl --aws-sigv4 aws:amz:eu-west-1:execute-api -u AK:SK https://h.test/");
+    CHECK(imp->auth.type == HttpAuth::Type::AwsSigV4);
+    CHECK(imp->auth.aws_access_key == "AK");
+    CHECK(imp->auth.aws_secret_key == "SK");
+    CHECK(imp->auth.aws_region == "eu-west-1");
+    CHECK(imp->auth.aws_service == "execute-api");
+    CHECK_FALSE(imp->basic_auth.enabled);
+    {  // Copy as curl writes the scheme back: export -> import keeps it
+      SavedRequest sr;
+      sr.http.url = "https://h.test/";
+      sr.auth.type = HttpAuth::Type::Digest;
+      sr.auth.user = "ada";
+      sr.auth.password = "pw";
+      const std::string cmd = to_curl_command(sr, CurlShell::Bash);
+      CHECK(cmd.find("--digest -u ") != std::string::npos);
+      auto back = parse_curl(cmd);
+      REQUIRE(back);
+      CHECK(back->auth == sr.auth);
+      sr.auth = {};
+      sr.auth.type = HttpAuth::Type::AwsSigV4;
+      sr.auth.aws_access_key = "AK";
+      sr.auth.aws_secret_key = "SK";
+      sr.auth.aws_region = "us-east-1";
+      sr.auth.aws_service = "s3";
+      back = parse_curl(to_curl_command(sr, CurlShell::Bash));
+      REQUIRE(back);
+      CHECK(back->auth == sr.auth);
+    }
     imp = parse_curl("curl -u a:b --basic https://h.test/");
     CHECK(imp->basic_auth.enabled);
     CHECK(imp->warnings.empty());

@@ -12,6 +12,7 @@
 #include <map>
 #include <memory>
 #include <set>
+#include <utility>
 #include <vector>
 
 #include "app/panels.h"
@@ -65,12 +66,14 @@ class MainFrame : public wxFrame, public SidebarHost {
 
   // SidebarHost
   void open_request(const std::filesystem::path& file, bool preview) override;
+  void open_loaded(SavedRequest r, bool preview) override;
   void open_history(const HistoryEntry& entry) override;
   void new_request(RequestKind kind, const std::filesystem::path& folder) override;
   void file_moved(const std::filesystem::path& from, const std::filesystem::path& to) override;
   void environment_changed() override;
   void folder_settings_changed() override { vars_changed(); }
   void run_folder(const std::filesystem::path& folder) override;
+  void start_mock(const std::filesystem::path& folder) override;
 
  private:
   // lazy: not selected, editor built when first shown; at: insert position (-1: append).
@@ -99,6 +102,10 @@ class MainFrame : public wxFrame, public SidebarHost {
   void session_changed();  // writes the session ~1.5 s later, off the UI thread
   void apply_session(Session& s);
   void on_close(wxCloseEvent& e);
+  // After the window was closed (hidden): one tab destroyed per turn of the message loop, then the
+  // frame, so no single UI step tears down every editor and response view at once.
+  void close_slice();
+  wxTimer* close_timer_ = nullptr;  // drives close_slice()
   void first_idle();  // once, after the window has been shown and painted
   void self_test();
   int sidebar_width() const;
@@ -123,9 +130,36 @@ class MainFrame : public wxFrame, public SidebarHost {
   static int spare_slot(RequestKind k) { return k == RequestKind::Http ? 0 : k == RequestKind::Grpc ? 1 : 2; }
   wxWindow* spare_park_ = nullptr;              // hidden parent for spares, outside the notebook
   std::vector<wxWindow*> retired_;  // tabs replaced by a spare, parked hidden, destroyed in a quiet moment
-  RequestTab* replace_with_spare(size_t idx, SavedRequest& r, bool preview);
+  std::vector<RequestTab*> closed_;  // closed tabs, parked hidden, torn down in slices (prebuild_step)
+  RequestTab* replace_with_spare(size_t idx, SavedRequest& r, bool preview, bool defer = false);
+  // A swap replace_with_spare(defer) loaded but has not shown yet (finish_swap does, from a posted
+  // kSwapMsg, or first thing in any call that looks at or changes the pages).
+  struct PendingSwap {
+    RequestTab* t = nullptr;   // the loaded spare, hidden in spare_park_
+    wxWindow* old = nullptr;   // the page it replaces
+    bool preview = false;
+  };
+  PendingSwap swap_;
+  void finish_swap();
+  static constexpr unsigned kSwapMsg = 0x8000 + 0x47;  // WM_APP + 0x47
+  WXLRESULT MSWWindowProc(WXUINT msg, WXWPARAM wp, WXLPARAM lp) override;
+  void open_impl(const std::filesystem::path& file, SavedRequest* loaded, bool preview);
   bool want_grpc_spare_ = false;  // gRPC is in use: keep a spare gRPC tab too
   wxTimer* prebuild_timer_ = nullptr;
+  // [0] HTTP, [1] gRPC: a tab of that kind was opened (or, HTTP, a spare built): refill the spare soon
+  bool spare_built_[2] = {false, false};
+  // HTTP / gRPC spares beyond spare_[k]: a second finished one (so tabs opened in a burst never
+  // build a tab inline), and the one being built in idle slices (shell + editor, response view,
+  // layout), never handed out before it is finished.
+  RequestTab* reserve_[2] = {nullptr, nullptr};
+  RequestTab* building_[2] = {nullptr, nullptr};
+  bool spare_slice(int k, bool run);  // one slice of spare k's refill; false: nothing to do
+  void promote_reserve(RequestKind kind) {  // an empty spare slot takes its finished reserve
+    const int k = spare_slot(kind);
+    if (k < 2 && !spare_[k] && reserve_[k]) std::swap(spare_[k], reserve_[k]);
+  }
+  bool spare_ready(RequestTab* t) const;  // built and laid out at the notebook's page size
+  wxSize page_size() const;
   wxTimer* session_timer_ = nullptr;
   bool session_due_ = false;      // a session write is scheduled
   Clock::time_point session_first_change_{};

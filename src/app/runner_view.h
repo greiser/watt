@@ -27,9 +27,10 @@ namespace watt::app {
 // (null while it is still opening) and is read when the window opens and when Run is pressed;
 // captured values are merged back into it after a run when "Keep variable values" is on.
 // The runner is a tab of parent's wxAuiNotebook (the main window's request tabs).
-// select = false (a restored session): the tab is added behind the current one.
+// select = false (a restored session): the tab is added behind the current one. at >= 0: the
+// tab goes at that index of the notebook (a restored session keeps its tab order).
 void open_runner(wxWindow* parent, std::function<Workspace*()> workspace, const std::filesystem::path& folder,
-                 std::function<std::shared_ptr<GrpcClient>()> grpc, bool select = true);
+                 std::function<std::shared_ptr<GrpcClient>()> grpc, bool select = true, int at = -1);
 // When `page` is a runner tab: true, with *folder the folder it was opened for (as given to
 // open_runner). The session keeps it to open the runner again after a restart.
 bool runner_folder(wxWindow* page, std::filesystem::path* folder);

@@ -53,6 +53,9 @@ class EditorHost {
   // The user chose "Send as written" for these undefined {{names}} in the editor's banner: the
   // shell's own check (it also sees inherited headers and auth) must not ask about them again.
   virtual void accept_unresolved(const std::vector<std::string>& names) { (void)names; }
+  // The editor's own check refused to send (its "Not sent" banner is up): the response pane
+  // says so too, as it does when the shell's check refuses, instead of keeping the last answer.
+  virtual void not_sent(const std::string& why) { (void)why; }
 
   // gRPC only ---------------------------------------------------------------
   // Load the schema for r (reflection when r.proto_files is empty, else .proto / .protoset files)
@@ -92,6 +95,12 @@ class RequestEditorPanel {
   // The workspace opened, or its environment / variables changed: refresh what shows resolved
   // {{variables}} (the HTTP editor's "Sent as" line).
   virtual void vars_changed() {}
+  // The request was renamed outside the editor (sidebar F2 / move): show the new name (breadcrumb)
+  // without a load(), keeping unsaved edits. false: no such hook, the tab reloads a clean editor.
+  virtual bool adopt_name(const std::string& name) {
+    (void)name;
+    return false;
+  }
   // The shell found {{names}} that would go out literally (inherited headers / auth included):
   // show the editor's own "Not sent" banner, whose "Send as written" calls send_anyway (null or
   // in_url: no such button). false: this editor has no banner (the shell reports it otherwise).
@@ -102,6 +111,9 @@ class RequestEditorPanel {
     (void)send_anyway;
     return false;
   }
+  // The tab is closing (hidden, never shown again): let one heavy part go (a big document) and
+  // return true while there is more; false: the editor can be deleted now in one cheap step.
+  virtual bool teardown_step() { return false; }
 };
 
 class HttpEditorPanel : public RequestEditorPanel {};
@@ -115,6 +127,9 @@ class GrpcEditorPanel : public RequestEditorPanel {
   // EditorHost::stream_send() / stream_close(). false: the body is sent whole (a JSON array of
   // messages for client / bidi streams) and the send side closed.
   virtual bool interactive() const { return false; }
+  // The Manual checkbox (kept in the session for a client / bidi stream tab), whatever the method.
+  virtual bool manual_wanted() const { return false; }
+  virtual void set_manual(bool on) { (void)on; }
 };
 
 HttpEditorPanel* make_http_editor(wxWindow* parent, EditorHost* host);
@@ -159,6 +174,9 @@ class HttpBodyTap {
   // feed(). Its timing.queue_ms / total_ms include the shell's click-to-engine time, like
   // show_http's. Optional (a stream that never ends shows its status and headers from it).
   virtual void head(std::shared_ptr<const HttpResponse> h) { (void)h; }
+  // What goes out (a copy, pre-request script included), on the worker right before the send:
+  // a send cancelled or failed after its head still shows the request it made. Optional.
+  virtual void sent(std::shared_ptr<const SentHttp> s) { (void)s; }
 };
 
 class ResponsePanel {
@@ -191,6 +209,10 @@ class ResponsePanel {
   // stop the running clock and say so, so think-time never reads as request time. The next
   // show_sending() / show_error() replaces it. Ignored when nothing is being sent.
   virtual void show_waiting_for_user(const std::string& what) { (void)what; }
+  // A Manual (user-paced) gRPC stream in flight: `sent` messages went out so far, `ended`: End
+  // half-closed it. Called right after show_sending() (0, false) and after each send / End, so
+  // the view never says "waiting for the response" before the client has sent anything.
+  virtual void show_paced(int sent, bool ended) { (void)sent; (void)ended; }
   // The next restored show_http / show_grpc (one without show_sending) is a history entry's
   // response received at `when_iso` (UTC ISO); empty: a tab's response from an earlier session.
   virtual void set_history_when(const std::string& when_iso) { (void)when_iso; }
@@ -234,6 +256,11 @@ class SidebarHost {
   // Single click (preview = true: reuses an unmodified preview tab, like VS Code) or double
   // click / Enter (preview = false: a permanent tab). Activates the tab if the file is open.
   virtual void open_request(const std::filesystem::path& file, bool preview) = 0;
+  // open_request() for a request the caller has just loaded or written (r.file set, e.g. a
+  // history snapshot): the shell uses r instead of reading the file again on the UI thread, and
+  // may finish a tab swap in the next UI step (each step stays under the budget). A call posted
+  // after this one (PostMessage) sees the tab in the notebook.
+  virtual void open_loaded(SavedRequest r, bool preview) { open_request(r.file, preview); }
   // A history entry was chosen: the shell loads its request (Workspace::history_request) in a new tab.
   virtual void open_history(const HistoryEntry& entry) = 0;
   // "New request" in a folder (empty = workspace root): opens an unsaved tab whose first save
@@ -246,6 +273,9 @@ class SidebarHost {
   // "Run folder": opens the collection runner (runner_view.h) for every request under folder
   // (empty = the whole workspace; a .req.json file runs alone), or raises the one already open.
   virtual void run_folder(const std::filesystem::path& folder) { (void)folder; }
+  // "Start mock server": opens the mock server tab (mock_view.h) for the requests under folder
+  // (empty = the whole workspace) and starts it, or raises the one already open.
+  virtual void start_mock(const std::filesystem::path& folder) { (void)folder; }
   // A folder's / the collection's settings (folder.json) were saved from the sidebar: open tabs
   // refresh what they inherit.
   virtual void folder_settings_changed() {}

@@ -4,6 +4,8 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <chrono>
+#include <future>
+#include <thread>
 #include <fstream>
 #include <set>
 #include <filesystem>
@@ -15,6 +17,7 @@
 #include "app/sidebar_files.cpp"
 #include "app/sidebar_fuzzy.cpp"
 #include "app/sidebar_import.cpp"
+#include "app/sidebar_names.cpp"
 #include "../tools/httpserver/http_server.h"
 #include "core/http_client.h"
 
@@ -140,6 +143,38 @@ TEST_CASE("duplicate and new request use kebab file names", "[sidebar]") {
   auto r = rename_item(t.ws, c1->file, "Get user by id", nullptr);
   REQUIRE(r);
   CHECK(*r == t.dir / "get-user-by-id.req.json");
+}
+
+// The open tab of a renamed (then moved) request re-reads its file (RequestTab::file_moved) and
+// hands that name to its editor, whose breadcrumb is "<folders>  /  <name>". The name must be the
+// new one after each step, and the id must stay (history groups repeats by it).
+TEST_CASE("rename then move: the tab's breadcrumb name and the request id follow", "[sidebar]") {
+  TempWs t;
+  fs::create_directories(t.dir / "Shop API" / "catalog");
+  auto n = create_request(t.ws, t.dir / "Shop API" / "catalog", RequestKind::Http, "New request", nullptr);
+  REQUIRE(n);
+  const std::string id = t.ws.load_request(n->file)->id;
+  REQUIRE(!id.empty());
+  auto crumb = [&](const fs::path& file) {
+    // What the tab's editor shows after file_moved(): the folders, then the re-read name.
+    std::string s;
+    for (const auto& part : fs::relative(file.parent_path(), t.dir)) s += part.string() + "  /  ";
+    return s + t.ws.load_request(file)->name;
+  };
+  auto to = rename_item(t.ws, n->file, "Product stock", nullptr);
+  REQUIRE(to);
+  CHECK(*to == t.dir / "Shop API" / "catalog" / "product-stock.req.json");
+  CHECK(crumb(*to).ends_with("Product stock"));
+  CHECK(crumb(*to) == "Shop API  /  catalog  /  Product stock");
+  CHECK(t.ws.load_request(*to)->id == id);
+  // Drag to the collection root (a plain file move, as the sidebar's move_item does).
+  const fs::path moved = t.dir / "Shop API" / to->filename();
+  fs::rename(*to, moved);
+  CHECK(crumb(moved) == "Shop API  /  Product stock");
+  auto again = rename_item(t.ws, moved, "Stock level", nullptr);
+  REQUIRE(again);
+  CHECK(crumb(*again).ends_with("Stock level"));
+  CHECK(t.ws.load_request(*again)->id == id);
 }
 
 TEST_CASE("filter rank: exact name before folder path matches", "[sidebar]") {
@@ -1290,4 +1325,72 @@ TEST_CASE("restart: a request whose URL host comes only from folder.json is sent
   CHECK(resp.status == 200);
   CHECK(std::string(resp.body).find("Bearer dev-token-123") != std::string::npos);
   CHECK(std::string(resp.body).find("POST") != std::string::npos);
+}
+
+namespace {
+// Requests whose shown name is still the file slug ("req-7" for "req-7.req.json").
+size_t slug_named(const CollectionNode& n) {
+  size_t k = 0;
+  for (const auto& c : n.children) {
+    if (c.is_folder) {
+      k += slug_named(c);
+      continue;
+    }
+    std::string stem = c.path.filename().string();
+    if (stem.ends_with(".req.json")) stem.resize(stem.size() - 9);
+    k += c.name == stem;
+  }
+  return k;
+}
+}  // namespace
+
+TEST_CASE("names: overlapping scans after a 2000-request import end with the request names", "[sidebar][names]") {
+  std::string coll = R"({"info":{"name":"Big","schema":"https://schema.getpostman.com/json/collection/v2.1.0/collection.json"},"item":[)";
+  for (int f = 0; f < 20; ++f) {
+    coll += std::string(f ? "," : "") + R"({"name":"resource)" + std::to_string(f) + R"(","item":[)";
+    for (int i = 0; i < 100; ++i)
+      coll += std::string(i ? "," : "") + R"({"name":"resource)" + std::to_string(f) + " op" + std::to_string(i) +
+              R"( update","request":{"method":"PATCH","url":{"raw":"{{base}}/items/)" + std::to_string(i) + R"("}}})";
+    coll += "]}";
+  }
+  coll += "]}";
+  std::string err;
+  auto r = parse_collection_text(coll, &err);
+  REQUIRE(r);
+  TempWs t;
+  REQUIRE(write_import(t.ws, t.dir, *r).requests == 2000);
+  NameCache cache(t.dir);
+
+  // Scan B (the newer one, the only one whose deliveries the sidebar applies) reads the empty
+  // cache, then waits inside its first delivery while scan A reads every file and saves the
+  // cache. B's own refresh then finds nothing new in the cache.
+  std::promise<void> b_delivering, a_done;
+  auto a_done_f = a_done.get_future();
+  CollectionNode b_last;
+  size_t b_deliveries = 0, b_first_slugs = 0;
+  std::thread b([&] {
+    scan_tree(t.ws, &cache, [&](CollectionNode node, MetaMap, bool) {
+      if (b_deliveries++ == 0) {
+        b_first_slugs = slug_named(node);
+        b_delivering.set_value();
+        a_done_f.wait();
+      }
+      b_last = std::move(node);
+    });
+  });
+  b_delivering.get_future().wait();
+  scan_tree(t.ws, &cache, [](CollectionNode, MetaMap, bool) {});
+  a_done.set_value();
+  b.join();
+  CHECK(b_first_slugs == 2000);  // the race really happened: B first showed the slugs
+  CHECK(b_deliveries >= 2);
+  CHECK(slug_named(b_last) == 0);
+
+  // A later scan with the saved cache shows the names at once, ids included (no file re-read).
+  NameCache again(t.dir);
+  CollectionNode tree = t.ws.tree(-1);
+  MetaMap m = again.apply_cached(tree);
+  CHECK(m.size() == 2000);
+  CHECK(slug_named(tree) == 0);
+  CHECK(std::all_of(m.begin(), m.end(), [](const auto& kv) { return !kv.second.id.empty(); }));
 }

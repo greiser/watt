@@ -244,6 +244,16 @@ std::shared_ptr<const HttpResponse> SseTap::head_response() const {
   return head_;
 }
 
+void SseTap::sent(std::shared_ptr<const SentHttp> s) {
+  std::lock_guard lk(m_);
+  sent_ = std::move(s);
+}
+
+std::shared_ptr<const SentHttp> SseTap::sent_request() const {
+  std::lock_guard lk(m_);
+  return sent_;
+}
+
 std::string SseTap::partial() const {
   std::lock_guard lk(m_);
   return partial_;

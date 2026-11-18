@@ -1311,7 +1311,8 @@ std::optional<CurlImport> parse_curl(const std::string& cmd_in, std::string* err
   std::vector<std::string> url_query;
   std::vector<std::string> cookies;
   std::vector<std::string> cookie_files;
-  std::string auth_scheme;  // --digest, --ntlm, ... (watt sends Basic only)
+  std::string auth_scheme;  // --digest, --ntlm, --negotiate, --anyauth (the last one wins)
+  std::string aws_sigv4;    // --aws-sigv4 "aws:amz:<region>:<service>"
   bool agent_from_A = false;  // a User-Agent header added by -A (the last -A wins)
   auto stdin_reader = [&](const std::string&, std::string& content) { return read_stdin(content, warnings); };
   auto add_data = [&](CurlData::Kind kind, const std::string& v) {
@@ -1500,6 +1501,9 @@ std::optional<CurlImport> parse_curl(const std::string& cmd_in, std::string* err
       auth_scheme = opt;
     } else if (opt == "--basic") {
       auth_scheme.clear();
+    } else if (opt == "--aws-sigv4") {
+      if (!arg()) return false;
+      aws_sigv4 = val;
     } else if (ignored_with_arg(opt)) {
       if (!arg()) return false;
       static const std::pair<std::string_view, const char*> noted[] = {
@@ -1673,13 +1677,37 @@ std::optional<CurlImport> parse_curl(const std::string& cmd_in, std::string* err
     out.basic_auth.enabled = true;
     out.basic_auth.user = user.substr(0, colon);
     out.basic_auth.password = colon == std::string::npos ? std::string() : user.substr(colon + 1);
-    if (!auth_scheme.empty() && auth_scheme != "--anyauth") {
-      // Sending Basic instead would put the credentials in another scheme than asked for.
+    // --aws-sigv4 "aws:amz:<region>:<service>" -u <access key>:<secret>; curl signs with it
+    // whatever --digest & co say.
+    std::vector<std::string> sig;
+    for (size_t at = 0; !aws_sigv4.empty();) {
+      const size_t c = aws_sigv4.find(':', at);
+      sig.push_back(aws_sigv4.substr(at, c == std::string::npos ? std::string::npos : c - at));
+      if (c == std::string::npos) break;
+      at = c + 1;
+    }
+    if (!aws_sigv4.empty() && sig.size() >= 4) {
+      out.auth.type = HttpAuth::Type::AwsSigV4;
+      out.auth.aws_access_key = out.basic_auth.user;
+      out.auth.aws_secret_key = out.basic_auth.password;
+      out.auth.aws_region = sig[2];
+      out.auth.aws_service = sig[3];
       out.basic_auth.enabled = false;
-      warnings.push_back(auth_scheme + ": watt has Basic auth only; the -u credentials are kept but disabled");
+    } else if (!aws_sigv4.empty()) {
+      warnings.push_back("--aws-sigv4 " + aws_sigv4 + " is not applied: expected \"aws:amz:<region>:<service>\"");
+    } else if (!auth_scheme.empty() && auth_scheme != "--anyauth") {
+      // The scheme asked for, with the -u credentials (never sent as Basic instead).
+      out.auth.type = auth_scheme == "--digest" ? HttpAuth::Type::Digest
+                      : auth_scheme == "--negotiate" ? HttpAuth::Type::Negotiate
+                                                     : HttpAuth::Type::Ntlm;  // --ntlm, --ntlm-wb
+      out.auth.user = out.basic_auth.user;
+      out.auth.password = out.basic_auth.password;
+      out.basic_auth.enabled = false;
     } else if (auth_scheme == "--anyauth") {
       warnings.push_back("--anyauth: imported as Basic auth (curl would use the best scheme the server offers)");
     }
+  } else if (!aws_sigv4.empty()) {
+    warnings.push_back("--aws-sigv4 " + aws_sigv4 + " is not applied: no -u access key and secret");
   }
   size_t jar_count = 0;
   for (const auto& f : cookie_files) {
@@ -1836,6 +1864,26 @@ std::string to_curl_impl(const HttpRequest& r, const std::vector<FormPart>& form
   if (auth.enabled) {
     out += sep;
     out += "-u " + q(auth.user + ":" + auth.password);
+  } else if (refs) {
+    // The request's own scheme (what parse_curl reads back): --digest / --ntlm / --negotiate
+    // with -u, --aws-sigv4 with -u <key>:<secret>.
+    const HttpAuth& a = refs->auth;
+    const char* flag = a.type == HttpAuth::Type::Digest      ? "--digest"
+                       : a.type == HttpAuth::Type::Ntlm      ? "--ntlm"
+                       : a.type == HttpAuth::Type::Negotiate ? "--negotiate"
+                                                             : nullptr;
+    if (flag) {
+      out += sep;
+      out += std::string(flag) + " -u " + q(a.user + ":" + a.password);
+    } else if (a.type == HttpAuth::Type::AwsSigV4) {
+      out += sep;
+      out += "--aws-sigv4 " + q("aws:amz:" + a.aws_region + ":" + a.aws_service) + " -u " +
+             q(a.aws_access_key + ":" + a.aws_secret_key);
+      if (!a.aws_session_token.empty()) {
+        out += sep;
+        out += "-H " + q("X-Amz-Security-Token: " + a.aws_session_token);
+      }
+    }
   }
   if (upload && as_T) {
     out += sep;

@@ -18,6 +18,7 @@ struct QuickItem {
   std::string folder;  // "folder/sub" relative to the workspace root ("" at the root)
   RequestKind kind = RequestKind::Http;
   std::string method;
+  std::string url;     // HTTP url (unexpanded) or gRPC method, shown dimmed at the right
   bool badge = false;
   int recent = -1;     // MRU rank (0 = most recent) or -1
 };

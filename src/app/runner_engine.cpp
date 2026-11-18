@@ -388,16 +388,40 @@ void find_unresolved(StepResult& s, std::string_view text) {
   }
 }
 
+// The time was measured inside the runner's setup (Queue, and so total_ms): it moves out of
+// both into script_ms, so total_ms stays the response time.
 void script_phase_front(StepResult& s, const char* name, double ms) {
   if (ms <= 0) return;
   for (auto& p : s.phases)
     if (std::strcmp(p.name, "Queue") == 0) p.ms = std::max(0.0, p.ms - ms);
   s.timing.queue_ms = std::max(0.0, s.timing.queue_ms - ms);
+  s.timing.total_ms = std::max(0.0, s.timing.total_ms - ms);
+  s.script_ms += ms;
   s.phases.insert(s.phases.begin(), Phase{name, ms});
+}
+
+// The runner's own setup (expansion, files, consent checks), watt's request setup and the
+// client's queue before the first I/O (Prepare, Queue): out of total_ms into prep_ms, so the
+// Time column and every percentile measure the server and the network, not watt (Newman and
+// Postman report their prepare time apart too). Called after the script phases left Queue.
+void setup_phases_out(StepResult& s) {
+  double prep = 0;
+  for (const auto& p : s.phases)
+    if (is_setup_phase(p)) prep += std::max(0.0, p.ms);
+  s.prep_ms = prep;
+  s.timing.total_ms = std::max(0.0, s.timing.total_ms - prep);
 }
 
 
 }  // namespace
+
+bool is_script_phase(const Phase& p) {
+  for (const char* n : {"Pre-request vars", "Pre-request script", "Auth / token", "Post-response script"})
+    if (std::strcmp(p.name, n) == 0) return true;
+  return false;
+}
+
+bool is_setup_phase(const Phase& p) { return std::strcmp(p.name, "Prepare") == 0 || std::strcmp(p.name, "Queue") == 0; }
 
 std::string strip_ext(std::string s) {
   static const std::string ext = ".req.json";
@@ -982,6 +1006,12 @@ RunSummary summarize(const std::vector<std::shared_ptr<const StepResult>>& steps
     s.asserts_passed += static_cast<size_t>(r.asserts_passed);
     s.asserts_failed += static_cast<size_t>(r.asserts_failed);
     if (r.sent && !r.stopped()) {
+      s.prep_sum_ms += r.prep_ms;
+      if (r.script_ms > 0) {
+        ++s.scripted;
+        s.script_sum_ms += r.script_ms;
+        s.max_script_ms = std::max(s.max_script_ms, r.script_ms);
+      }
       t.push_back(r.timing.total_ms);
       s.sum_ms += r.timing.total_ms;
       sq += r.timing.total_ms * r.timing.total_ms;
@@ -996,11 +1026,13 @@ RunSummary summarize(const std::vector<std::shared_ptr<const StepResult>>& steps
     }
   }
   if (stopped && planned > s.total + s.skipped) s.skipped = planned - s.total;
+  if (s.scripted) s.avg_script_ms = s.script_sum_ms / static_cast<double>(s.scripted);
   if (!t.empty()) {
     const double n = static_cast<double>(t.size());
     s.avg_ms = s.sum_ms / n;
     s.stddev_ms = std::sqrt(std::max(0.0, sq / n - s.avg_ms * s.avg_ms));
     s.avg_ttfb_ms = ttfb / n;
+    s.avg_prep_ms = s.prep_sum_ms / n;
     if (s.new_connections) {
       const double nc = static_cast<double>(s.new_connections);
       s.avg_dns_ms = dns / nc;
@@ -1176,7 +1208,7 @@ void after_response(const SavedRequest& saved, const SavedRequest& sent, const R
     }
     if (post_ms > 0) {
       s.phases.push_back({"Post-response script", post_ms});
-      s.timing.total_ms += post_ms;
+      s.script_ms += post_ms;  // not response time (nor is it Newman's)
     }
   }
   std::vector<StepResult::Check> script_checks;
@@ -1348,6 +1380,7 @@ void run_http(const SavedRequest& saved, Workspace& ws, Engines& eng, RunControl
   script_phase_front(s, "Auth / token", token_ms);
   script_phase_front(s, "Pre-request script", pre_ms);
   script_phase_front(s, "Pre-request vars", pre_vars_ms);
+  setup_phases_out(s);
   s.transport_ok = resp.ok;
   s.status = resp.status;
   s.status_text = resp.status_text;
@@ -1462,6 +1495,7 @@ void run_grpc(const SavedRequest& original, Workspace& ws, Engines& eng, const G
   s.timing = resp.timing;
   grpc_phases(s, resp);
   script_phase_front(s, "Pre-request script", pre_ms);
+  setup_phases_out(s);
   s.transport_ok = resp.ok;
   s.status = resp.status_code;
   s.status_text = resp.status_name;
@@ -1974,7 +2008,11 @@ void kv_b(JW& w, const char* k, bool v) {
 }
 }  // namespace
 
-std::string to_json(const RunMeta& meta, const RunSummary& s, const std::vector<std::shared_ptr<const StepResult>>& steps) {
+namespace {
+// history: a run history file (history_json): a big run keeps its failed steps only, and
+// credential-like variable values are masked.
+std::string report_json(const RunMeta& meta, const RunSummary& s, const std::vector<std::shared_ptr<const StepResult>>& steps,
+                        bool history) {
   rapidjson::StringBuffer sb;
   JW w(sb);
   w.StartObject();
@@ -1984,6 +2022,10 @@ std::string to_json(const RunMeta& meta, const RunSummary& s, const std::vector<
   kv(w, "started", meta.started_iso);
   w.Key("iterations");
   w.Int(meta.iterations);
+  if (!meta.label.empty()) kv(w, "label", meta.label);
+  if (!meta.plan.empty()) kv(w, "plan", meta.plan);
+  const bool partial = history && steps.size() > kHistorySteps;
+  if (partial) kv_b(w, "partial", true);
   w.Key("summary");
   w.StartObject();
   kv_u(w, "total", s.total);
@@ -1998,6 +2040,9 @@ std::string to_json(const RunMeta& meta, const RunSummary& s, const std::vector<
   kv(w, "avgMs", s.avg_ms);
   kv(w, "p50Ms", s.p50_ms);
   kv(w, "p95Ms", s.p95_ms);
+  kv(w, "p90Ms", s.p90_ms);
+  kv(w, "p99Ms", s.p99_ms);
+  kv_u(w, "samples", s.samples);
   kv(w, "minMs", s.min_ms);
   kv(w, "maxMs", s.max_ms);
   kv(w, "stdDevMs", s.stddev_ms);
@@ -2005,6 +2050,11 @@ std::string to_json(const RunMeta& meta, const RunSummary& s, const std::vector<
   kv(w, "avgConnectMs", s.avg_connect_ms);
   kv(w, "avgTlsMs", s.avg_tls_ms);
   kv(w, "avgTtfbMs", s.avg_ttfb_ms);
+  kv(w, "scriptSumMs", s.script_sum_ms);  // outside every time above (Newman leaves scripts out too)
+  kv(w, "avgScriptMs", s.avg_script_ms);
+  kv(w, "maxScriptMs", s.max_script_ms);
+  kv_u(w, "scripted", s.scripted);
+  kv(w, "avgPrepMs", s.avg_prep_ms);  // setup before the first I/O, outside every time above
   kv_u(w, "newConnections", s.new_connections);
   kv_u(w, "bytesReceived", s.bytes_received);
   kv_u(w, "stoppedSteps", s.stopped_steps);
@@ -2020,6 +2070,7 @@ std::string to_json(const RunMeta& meta, const RunSummary& s, const std::vector<
       kv(w, "name", q.name);
       kv(w, "path", q.rel);
       kv(w, "method", q.method);
+      kv(w, "kind", std::string(q.kind == RequestKind::Http ? "http" : "grpc"));
       kv_u(w, "count", q.count);
       kv_u(w, "failures", q.failures);
       kv(w, "avgMs", q.avg_ms);
@@ -2033,8 +2084,11 @@ std::string to_json(const RunMeta& meta, const RunSummary& s, const std::vector<
   }
   w.Key("results");
   w.StartArray();
+  size_t kept = 0;
   for (const auto& p : steps) {
     const StepResult& r = *p;
+    if (partial && (!r.failed() || kept >= kHistorySteps)) continue;
+    ++kept;
     w.StartObject();
     kv_u(w, "seq", r.seq + 1);
     w.Key("iteration");
@@ -2052,12 +2106,43 @@ std::string to_json(const RunMeta& meta, const RunSummary& s, const std::vector<
     w.Int64(r.status);
     kv(w, "statusText", r.status_text);
     if (!r.error.empty()) kv(w, "error", r.error);
+    if (r.transport_ok) kv_b(w, "transportOk", true);
+    if (r.client_error) kv_b(w, "clientError", true);
+    if (!r.http_version.empty()) kv(w, "httpVersion", r.http_version);
     kv_u(w, "size", r.size);
+    kv_u(w, "bytesReceived", r.bytes_received);
     kv(w, "startedMs", r.started_ms);
+    if (r.data_index >= 0) {
+      w.Key("dataIndex");
+      w.Int(r.data_index);
+      if (r.data_row) {
+        w.Key("data");
+        w.StartArray();
+        for (const auto& [k, v] : *r.data_row) {
+          w.StartArray();
+          w.String(k.data(), static_cast<rapidjson::SizeType>(k.size()));
+          w.String(v.data(), static_cast<rapidjson::SizeType>(v.size()));
+          w.EndArray();
+        }
+        w.EndArray();
+      }
+    }
+    if (!r.unresolved.empty()) {
+      w.Key("unresolved");
+      w.StartArray();
+      for (const auto& n : r.unresolved) w.String(n.data(), static_cast<rapidjson::SizeType>(n.size()));
+      w.EndArray();
+    }
     w.Key("timing");
     w.StartObject();
-    kv(w, "totalMs", r.timing.total_ms);
+    kv(w, "totalMs", r.timing.total_ms);  // response time, without scripts
+    kv(w, "scriptMs", r.script_ms);
+    kv(w, "prepMs", r.prep_ms);  // setup and client queue, apart from totalMs
     kv_b(w, "connectionReused", r.timing.connection_reused);
+    kv(w, "dnsMs", r.timing.dns_ms);
+    kv(w, "connectMs", r.timing.connect_ms);
+    kv(w, "tlsMs", r.timing.tls_ms);
+    kv(w, "ttfbMs", r.timing.ttfb_ms);
     w.Key("phases");
     w.StartArray();
     for (const auto& ph : r.phases) {
@@ -2079,6 +2164,7 @@ std::string to_json(const RunMeta& meta, const RunSummary& s, const std::vector<
       kv_b(w, "passed", a.pass);
       if (a.script) kv_b(w, "script", true);
       if (!a.message.empty()) kv(w, "message", a.message);
+      if (!a.from.empty()) kv(w, "from", a.from);
       w.EndObject();
     }
     w.EndArray();
@@ -2102,7 +2188,7 @@ std::string to_json(const RunMeta& meta, const RunSummary& s, const std::vector<
       kv(w, "var", c.var);
       kv(w, "scope", std::string(capture_scope_name(c.scope)));
       kv_b(w, "ok", c.ok);
-      kv(w, "value", c.value);
+      kv(w, "value", history && !c.value.empty() && sensitive_header(c.var) ? std::string("\xE2\x80\xA2\xE2\x80\xA2\xE2\x80\xA2\xE2\x80\xA2 (not kept in history)") : c.value);
       if (!c.message.empty()) kv(w, "message", c.message);
       if (c.script) kv_b(w, "script", true);
       if (c.removed) kv_b(w, "removed", true);
@@ -2114,6 +2200,285 @@ std::string to_json(const RunMeta& meta, const RunSummary& s, const std::vector<
   w.EndArray();
   w.EndObject();
   return std::string(sb.GetString(), sb.GetSize());
+}
+}  // namespace
+
+std::string to_json(const RunMeta& meta, const RunSummary& s, const std::vector<std::shared_ptr<const StepResult>>& steps) {
+  return report_json(meta, s, steps, false);
+}
+
+std::string history_json(const RunMeta& meta, const RunSummary& s, const std::vector<std::shared_ptr<const StepResult>>& steps) {
+  return report_json(meta, s, steps, true);
+}
+
+namespace {
+// Phase::name is a static string: names read back from a file are kept once for the process.
+const char* intern_phase(const std::string& n) {
+  static std::mutex m;
+  static std::set<std::string> names;
+  std::lock_guard lk(m);
+  return names.insert(n).first->c_str();
+}
+std::string jstr(const rapidjson::Value& o, const char* k) {
+  if (!o.IsObject()) return {};
+  const auto it = o.FindMember(k);
+  return it != o.MemberEnd() && it->value.IsString() ? std::string(it->value.GetString(), it->value.GetStringLength())
+                                                      : std::string();
+}
+double jnum(const rapidjson::Value& o, const char* k) {
+  if (!o.IsObject()) return 0;
+  const auto it = o.FindMember(k);
+  return it != o.MemberEnd() && it->value.IsNumber() ? it->value.GetDouble() : 0.0;
+}
+uint64_t juint(const rapidjson::Value& o, const char* k) {
+  if (!o.IsObject()) return 0;
+  const auto it = o.FindMember(k);
+  return it != o.MemberEnd() && it->value.IsUint64() ? it->value.GetUint64() : 0;
+}
+bool jbool(const rapidjson::Value& o, const char* k) {
+  if (!o.IsObject()) return false;
+  const auto it = o.FindMember(k);
+  return it != o.MemberEnd() && it->value.IsBool() && it->value.GetBool();
+}
+const rapidjson::Value* jarr(const rapidjson::Value& o, const char* k) {
+  if (!o.IsObject()) return nullptr;
+  const auto it = o.FindMember(k);
+  return it != o.MemberEnd() && it->value.IsArray() ? &it->value : nullptr;
+}
+}  // namespace
+
+bool from_json(const std::string& text, LoadedRun& out, std::string* err) {
+  rapidjson::Document d;
+  d.Parse(text.data(), text.size());
+  if (d.HasParseError() || !d.IsObject() || jstr(d, "tool") != "watt") {
+    if (err) *err = "not a watt run report";
+    return false;
+  }
+  out = LoadedRun();
+  out.meta.name = jstr(d, "collection");
+  out.meta.environment = jstr(d, "environment");
+  out.meta.started_iso = jstr(d, "started");
+  out.meta.iterations = std::max(1, static_cast<int>(jnum(d, "iterations")));
+  out.meta.label = jstr(d, "label");
+  out.meta.plan = jstr(d, "plan");
+  out.partial = jbool(d, "partial");
+  RunSummary& s = out.summary;
+  if (const auto it = d.FindMember("summary"); it != d.MemberEnd() && it->value.IsObject()) {
+    const auto& v = it->value;
+    s.total = juint(v, "total");
+    s.planned = juint(v, "planned");
+    s.passed = juint(v, "passed");
+    s.failed = juint(v, "failed");
+    s.errors = juint(v, "errors");
+    s.asserts_passed = juint(v, "assertsPassed");
+    s.asserts_failed = juint(v, "assertsFailed");
+    s.wall_ms = jnum(v, "wallMs");
+    s.sum_ms = jnum(v, "sumMs");
+    s.avg_ms = jnum(v, "avgMs");
+    s.p50_ms = jnum(v, "p50Ms");
+    s.p90_ms = jnum(v, "p90Ms");
+    s.p95_ms = jnum(v, "p95Ms");
+    s.p99_ms = jnum(v, "p99Ms");
+    s.samples = juint(v, "samples");
+    s.min_ms = jnum(v, "minMs");
+    s.max_ms = jnum(v, "maxMs");
+    s.stddev_ms = jnum(v, "stdDevMs");
+    s.avg_dns_ms = jnum(v, "avgDnsMs");
+    s.avg_connect_ms = jnum(v, "avgConnectMs");
+    s.avg_tls_ms = jnum(v, "avgTlsMs");
+    s.avg_ttfb_ms = jnum(v, "avgTtfbMs");
+    s.script_sum_ms = jnum(v, "scriptSumMs");
+    s.avg_script_ms = jnum(v, "avgScriptMs");
+    s.max_script_ms = jnum(v, "maxScriptMs");
+    s.scripted = juint(v, "scripted");
+    s.avg_prep_ms = jnum(v, "avgPrepMs");
+    s.new_connections = juint(v, "newConnections");
+    s.bytes_received = juint(v, "bytesReceived");
+    s.stopped_steps = juint(v, "stoppedSteps");
+    s.skipped = juint(v, "skipped");
+    s.stopped = jbool(v, "stopped");
+  }
+  std::map<std::string, size_t> items;  // path -> item (first-appearance order)
+  auto item_of = [&](const std::string& rel) { return items.try_emplace(rel, items.size()).first->second; };
+  if (const auto* a = jarr(d, "requests"))
+    for (const auto& q : a->GetArray()) {
+      RequestStats r;
+      r.name = jstr(q, "name");
+      r.rel = jstr(q, "path");
+      r.item = item_of(r.rel);
+      r.method = jstr(q, "method");
+      r.kind = jstr(q, "kind") == "grpc" ? RequestKind::Grpc : RequestKind::Http;
+      r.count = juint(q, "count");
+      r.failures = juint(q, "failures");
+      r.avg_ms = jnum(q, "avgMs");
+      r.min_ms = jnum(q, "minMs");
+      r.p50_ms = jnum(q, "p50Ms");
+      r.p95_ms = jnum(q, "p95Ms");
+      r.max_ms = jnum(q, "maxMs");
+      s.per_request.push_back(std::move(r));
+    }
+  if (const auto* a = jarr(d, "results")) {
+    out.steps.reserve(a->Size());
+    std::map<size_t, size_t> pos;  // item -> its place in an iteration (first-seen order)
+    for (const auto& v : a->GetArray()) {
+      if (!v.IsObject()) continue;
+      auto r = std::make_shared<StepResult>();
+      r->seq = static_cast<size_t>(std::max<uint64_t>(juint(v, "seq"), 1) - 1);
+      r->iteration = std::max(0, static_cast<int>(jnum(v, "iteration")) - 1);
+      r->name = jstr(v, "name");
+      r->rel = jstr(v, "path");
+      r->item = item_of(r->rel);
+      r->pos = pos.try_emplace(r->item, pos.size()).first->second;
+      r->kind = jstr(v, "kind") == "grpc" ? RequestKind::Grpc : RequestKind::Http;
+      r->method = jstr(v, "method");
+      r->url = jstr(v, "url");
+      r->sent = jbool(v, "sent");
+      r->skipped = jbool(v, "skipped");
+      r->transport_ok = jbool(v, "transportOk");
+      r->client_error = jbool(v, "clientError");
+      if (const auto it = v.FindMember("status"); it != v.MemberEnd() && it->value.IsInt64()) r->status = static_cast<long>(it->value.GetInt64());
+      r->status_text = jstr(v, "statusText");
+      r->error = jstr(v, "error");
+      if (jbool(v, "stopped") && r->error.empty()) r->error = "Stopped";
+      r->http_version = jstr(v, "httpVersion");
+      r->size = juint(v, "size");
+      r->bytes_received = juint(v, "bytesReceived");
+      r->started_ms = jnum(v, "startedMs");
+      if (const auto it = v.FindMember("dataIndex"); it != v.MemberEnd() && it->value.IsInt()) r->data_index = it->value.GetInt();
+      if (const auto* da = jarr(v, "data")) {
+        auto row = std::make_shared<DataRow>();
+        for (const auto& kvp : da->GetArray())
+          if (kvp.IsArray() && kvp.Size() == 2 && kvp[0].IsString() && kvp[1].IsString())
+            row->emplace_back(kvp[0].GetString(), kvp[1].GetString());
+        r->data_row = std::move(row);
+      }
+      if (const auto* ua = jarr(v, "unresolved"))
+        for (const auto& n : ua->GetArray())
+          if (n.IsString()) r->unresolved.emplace_back(n.GetString(), n.GetStringLength());
+      if (const auto it = v.FindMember("timing"); it != v.MemberEnd() && it->value.IsObject()) {
+        const auto& t = it->value;
+        r->timing.total_ms = jnum(t, "totalMs");
+        r->script_ms = jnum(t, "scriptMs");
+        r->prep_ms = jnum(t, "prepMs");  // 0 in runs saved before it (their totalMs included it)
+        r->timing.connection_reused = jbool(t, "connectionReused");
+        r->timing.dns_ms = jnum(t, "dnsMs");
+        r->timing.connect_ms = jnum(t, "connectMs");
+        r->timing.tls_ms = jnum(t, "tlsMs");
+        r->timing.ttfb_ms = jnum(t, "ttfbMs");
+        if (const auto* pa = jarr(t, "phases"))
+          for (const auto& ph : pa->GetArray())
+            if (ph.IsObject()) {
+              const std::string n = jstr(ph, "name");
+              if (n == "Queue") r->timing.queue_ms = jnum(ph, "ms");
+              r->phases.push_back({intern_phase(n), jnum(ph, "ms")});
+            }
+      }
+      if (const auto* aa = jarr(v, "asserts"))
+        for (const auto& x : aa->GetArray()) {
+          StepResult::Check c;
+          c.target = jstr(x, "target");
+          c.op = jstr(x, "op");
+          c.expected = jstr(x, "expected");
+          c.actual = jstr(x, "actual");
+          c.pass = jbool(x, "passed");
+          c.script = jbool(x, "script");
+          c.message = jstr(x, "message");
+          c.from = jstr(x, "from");
+          ++(c.pass ? r->asserts_passed : r->asserts_failed);
+          if (c.script) ++r->script_tests;
+          r->asserts.push_back(std::move(c));
+        }
+      if (const auto* la = jarr(v, "console"))
+        for (const auto& x : la->GetArray()) {
+          StepResult::Log l;
+          l.post = jstr(x, "script") == "post-response";
+          const std::string lv = jstr(x, "level");
+          l.level = lv == "info" ? ScriptLog::Level::Info : lv == "warn" ? ScriptLog::Level::Warn
+                  : lv == "error" ? ScriptLog::Level::Error : ScriptLog::Level::Log;
+          l.text = jstr(x, "text");
+          r->logs.push_back(std::move(l));
+        }
+      if (const auto* ca = jarr(v, "captures"))
+        for (const auto& x : ca->GetArray()) {
+          StepResult::Cap c;
+          c.var = jstr(x, "var");
+          c.scope = capture_scope_from(jstr(x, "scope"));
+          c.ok = jbool(x, "ok");
+          c.value = jstr(x, "value");
+          c.message = jstr(x, "message");
+          c.script = jbool(x, "script");
+          c.removed = jbool(x, "removed");
+          r->captures.push_back(std::move(c));
+        }
+      r->from_history = true;
+      r->has_scripts = r->script_ms > 0 || r->script_tests > 0;
+      r->scripts_ran = r->script_ms > 0;
+      out.steps.push_back(std::move(r));
+    }
+  }
+  return true;
+}
+
+namespace {
+fs::path history_dir_for(const std::wstring& key) {
+  const fs::path base = Workspace::user_config_dir();
+  if (base.empty()) return {};
+  uint64_t h = 1469598103934665603ull;  // FNV-1a over the key's UTF-16 units
+  for (wchar_t c : key) {
+    h ^= static_cast<uint16_t>(c);
+    h *= 1099511628211ull;
+  }
+  char name[24];
+  std::snprintf(name, sizeof name, "%016llx", static_cast<unsigned long long>(h));
+  return base / "runs" / name;
+}
+}  // namespace
+
+bool save_history(const std::wstring& key, const std::string& started_iso, const std::string& json, size_t keep,
+                  std::string* err) {
+  const fs::path dir = history_dir_for(key);
+  if (dir.empty()) {
+    if (err) *err = "no per-user config directory";
+    return false;
+  }
+  std::error_code ec;
+  fs::create_directories(dir, ec);
+  // "2026-11-18T03:04:05Z" -> "20261118T030405Z-<n>.json": names sort by time.
+  std::string stamp;
+  for (char c : started_iso)
+    if (std::isalnum(static_cast<unsigned char>(c))) stamp += c;
+  if (stamp.empty()) stamp = "run";
+  static std::atomic<unsigned> seq{0};
+  char tail[48];
+  std::snprintf(tail, sizeof tail, "-%06u-%06d.json", seq++ % 1000000u, _getpid());
+  const std::string file = stamp + tail;
+  if (!detail::write_file_atomic(dir / file, json, err)) return false;
+  std::vector<fs::path> all;
+  for (const auto& e : fs::directory_iterator(dir, ec))
+    if (e.path().extension() == ".json") all.push_back(e.path());
+  std::sort(all.begin(), all.end());
+  while (all.size() > keep) {
+    fs::remove(all.front(), ec);
+    all.erase(all.begin());
+  }
+  return true;
+}
+
+std::vector<std::string> load_history(const std::wstring& key, size_t max) {
+  std::vector<std::string> out;
+  const fs::path dir = history_dir_for(key);
+  if (dir.empty()) return out;
+  std::error_code ec;
+  std::vector<fs::path> all;
+  for (const auto& e : fs::directory_iterator(dir, ec))
+    if (e.path().extension() == ".json") all.push_back(e.path());
+  std::sort(all.rbegin(), all.rend());
+  for (const auto& p : all) {
+    if (out.size() >= max) break;
+    std::string t;
+    if (detail::read_file(p, t)) out.push_back(std::move(t));
+  }
+  return out;
 }
 
 std::string xml_escape(const std::string& s) {
@@ -2461,10 +2826,10 @@ std::vector<Failure> failures_of(const StepResult& r) {
       f.push_back({a.script ? (a.op == "error" ? std::string("script error") : "test: " + a.target) : a.label(), a.text()});
   if (f.empty()) {
     if (r.kind == RequestKind::Grpc)
-      f.push_back({"gRPC status OK", "gRPC " + (r.status_text.empty() ? std::to_string(r.status) : r.status_text) +
+      f.push_back({"expected gRPC OK", "gRPC " + (r.status_text.empty() ? std::to_string(r.status) : r.status_text) +
                                          (r.error.empty() || r.error == r.status_text ? "" : ": " + r.error)});
     else
-      f.push_back({"status < 400", "HTTP " + std::to_string(r.status) + (r.status_text.empty() ? "" : " " + r.status_text)});
+      f.push_back({"expected status < 400", "HTTP " + std::to_string(r.status) + (r.status_text.empty() ? "" : " " + r.status_text)});
   }
   return f;
 }
@@ -2512,6 +2877,13 @@ std::vector<FailureGroup> group_failures(const std::vector<std::shared_ptr<const
       }
       FailureGroup& x = g[it->second];
       ++x.count;
+      if (!r.unresolved.empty()) {
+        ++x.unresolved;
+        for (const auto& n : r.unresolved)
+          if (x.unresolved_names.size() < 4 &&
+              std::find(x.unresolved_names.begin(), x.unresolved_names.end(), n) == x.unresolved_names.end())
+            x.unresolved_names.push_back(n);
+      }
       // Steps arrive in finishing order (parallel workers): the first / last message by sequence
       // number, but the iteration range by iteration number (completion order does not follow it).
       if (r.seq < x.first_seq) {

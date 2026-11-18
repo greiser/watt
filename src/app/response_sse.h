@@ -78,6 +78,9 @@ class SseTap : public HttpBodyTap {
   // Any thread: the latest head, null before it arrived; when it arrived (ms after t0).
   std::shared_ptr<const HttpResponse> head_response() const;
   double head_ms() const { return head_ms_.load(std::memory_order_acquire); }
+  // Worker: what goes out (HttpBodyTap::sent); any thread: read back, null before the send.
+  void sent(std::shared_ptr<const SentHttp> s) override;
+  std::shared_ptr<const SentHttp> sent_request() const;
 
   struct Batch {
     std::vector<SseEvent> events;
@@ -111,6 +114,7 @@ class SseTap : public HttpBodyTap {
   std::function<void()> notify_;
   std::function<void()> on_head_;
   std::shared_ptr<const HttpResponse> head_;  // under m_
+  std::shared_ptr<const SentHttp> sent_;      // under m_
   std::atomic<double> head_ms_{-1};
   std::atomic<int> state_{-1};  // -1 undecided, 0 not an event stream (inert), 1 event stream
   std::atomic<uint64_t> bytes_{0};

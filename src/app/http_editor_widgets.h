@@ -185,6 +185,9 @@ class PickPopup : public wxPopupWindow {
   void pick_selected();
   std::function<void(const wxString&)> on_pick;  // then closed
   std::function<void()> on_close;                // closed, picked or not
+  // The key that picked (WXK_TAB / WXK_RETURN; 0: a click), readable in on_pick: a grid moves on
+  // to the next cell after a Tab pick and stays after Enter.
+  int picked_with = 0;
   // Non-empty: Enter with a filter that matches nothing picks the typed text itself, and this
   // hint replaces "no match" (the method list: "Enter: custom method").
   wxString free_hint;
@@ -196,6 +199,9 @@ class PickPopup : public wxPopupWindow {
 #endif
   // Compact: no filter line (a completion list whose filter is the text typed in the owner).
   bool compact = false;
+  // Nothing highlighted until Up / Down (a completion list: Enter / Tab then keep what was typed
+  // instead of taking the first entry). The mouse only hovers; a click picks.
+  bool no_preselect = false;
   // New items (the selection goes to the first match / `current`); the size follows on the
   // next show_below.
   void set_items(std::vector<PickItem> items, const wxString& current);
@@ -220,6 +226,7 @@ class PickPopup : public wxPopupWindow {
   std::vector<Row> rows_;
   wxString filter_, current_;
   int sel_ = -1;  // index into rows_
+  int hover_ = -1;  // the row under the mouse (no_preselect)
   int top_ = 0;   // first row drawn
   bool closed_ = false;
   wxRect anchor_;  // the screen rectangle it was shown under

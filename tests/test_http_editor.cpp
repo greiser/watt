@@ -2,6 +2,8 @@
 // the Params table and the URL, URL normalisation at send time, bulk edit text, header cleaning.
 #include <catch2/catch_test_macros.hpp>
 
+#include <winsock2.h>  // before anything that may pull in windows.h (the embedded test server)
+
 #include <algorithm>
 #include <chrono>
 #include <string>
@@ -12,6 +14,7 @@
 #include "app/http_editor_codegen.cpp"
 #include "app/http_editor_jshelp.cpp"
 #include "app/http_editor_cookies.cpp"
+#include "app/http_editor_gql.cpp"
 #include "core/model.h"
 
 #include <filesystem>
@@ -376,6 +379,14 @@ TEST_CASE("pre-request: values, vars, req fields and functions", "[http_editor][
   CHECK(pre_eval("hmacSha256({{secret}}, req.body)", ws, r) == hmac_sha256_hex("k3y", R"({"id":k3y})"));
   CHECK(pre_eval("hmacSha256(secret, 'x')", ws, r) == hmac_sha256_hex("k3y", "x"));
   CHECK(pre_eval("'Bearer {{secret}}'", ws) == "Bearer k3y");
+  // '+' as in JavaScript: numbers add, a string anywhere on the left concatenates.
+  CHECK(pre_eval("\"p-\" + (1+1)", ws) == "p-2");
+  CHECK(pre_eval("1 + 2 + 'x'", ws) == "3x");
+  CHECK(pre_eval("'x' + 1 + 2", ws) == "x12");
+  CHECK(pre_eval("0.5 + 1", ws) == "1.5");
+  CHECK(pre_eval("007", ws) == "007");  // a lone number stays as written
+  CHECK(pre_eval("length('abc') + 1", ws) == "4");
+  CHECK(pre_eval("{{secret}} + 1", ws) == "k3y1");  // variables are strings
   CHECK(pre_eval("jsonPath({{login}}, '$.data.token')", ws) == "abc");
   CHECK(pre_eval("jsonPath(login, 'data.list[-1]')", ws) == "3");
   CHECK(pre_eval("jsonPath(login, 'data.list.length')", ws) == "3");
@@ -432,6 +443,20 @@ TEST_CASE("pre-request: errors and safety", "[http_editor][pre]") {
   std::string err;
   CHECK(pre_eval("undefinedName", ws, {}, &err) == "<error>");
   CHECK(err.find("not defined") != std::string::npos);
+  // Bruno-style plain text: taken as text (vars expanded) when it is no expression
+  ws.globals["userId"] = "42";
+  CHECK(check_pre_expr("{{userId}}-x").empty());
+  CHECK(pre_eval("{{userId}}-x", ws) == "42-x");
+  CHECK(pre_eval("  v1/{{userId}}/items ", ws) == "v1/42/items");
+  CHECK(pre_eval("{{nope}}-x", ws, {}, &err) == "<error>");  // an unresolved var is still refused
+  // JavaScript methods: the error says what to write instead
+  err = check_pre_expr("req.method.toLowerCase()");
+  CHECK(err.find("lower(req.method)") != std::string::npos);
+  CHECK(pre_eval("req.method.toLowerCase()", ws, {}, &err) == "<error>");
+  CHECK(err.find("lower(req.method)") != std::string::npos);
+  // a broken expression (quotes / parentheses / +) is never taken as text
+  CHECK(!check_pre_expr("sha256('a'").empty());
+  CHECK(check_pre_expr("{{a}} - 'x'").find("plain text") != std::string::npos);
   CHECK(pre_eval("jsonPath('not json', 'a')", ws, {}, &err) == "<error>");
   CHECK(pre_eval("'{{unresolved}}'", ws, {}, &err) == "<error>");  // would be expanded again
   CHECK(err.find("{{") != std::string::npos);
@@ -1058,4 +1083,521 @@ TEST_CASE("Options: what applies is the request's own, else the levels above, el
   CHECK(h.max_redirects == 0);
   CHECK(h.encode_url);
   CHECK(h.tls_min_version == watt::TlsVersion::Tls1_3);
+}
+
+TEST_CASE("Basic auth inside a folder that sets an Authorization header: sent and exported as Basic", "[http_editor][auth]") {
+  const auto dir = std::filesystem::temp_directory_path() / "watt_test_basic_vs_folder_auth";
+  std::filesystem::remove_all(dir);
+  std::filesystem::create_directories(dir / "api");
+  watt::Workspace ws = watt::Workspace::create(dir);
+  ws.globals = {{"token", "tok-777"}};
+  watt::FolderSettings coll;
+  coll.headers = {{"Authorization", "Bearer {{token}}", {}, true}, {"X-Team", "core", {}, true}};
+  REQUIRE(ws.save_collection_settings(coll));
+  watt::SavedRequest r;  // as pasted from curl -u 'ada:s3cret'
+  r.name = "b";
+  r.file = dir / "api" / "b.req.json";
+  r.http.url = "http://127.0.0.1:18080/echo";
+  r.auth.type = watt::HttpAuth::Type::None;
+  r.basic_auth = watt::BasicAuth{true, "ada", "s3cret"};
+  const auto h = ws.http_to_send(r);
+  REQUIRE(h);
+  std::vector<std::string> auth;
+  for (const auto& [k, v] : h->headers)
+    if (iequals(k, "Authorization")) auth.push_back(v);
+  CHECK(auth == std::vector<std::string>{"Basic YWRhOnMzY3JldA=="});
+  // Copy as curl: -u only, the collection's Bearer is not exported; X-Team still is.
+  watt::SavedRequest x = ws.expanded(r);
+  drop_shadowed_basic(x);
+  const std::string cmd = watt::to_curl_command(x);
+  CHECK(cmd.find("Bearer") == std::string::npos);
+  CHECK(cmd.find("ada:s3cret") != std::string::npos);
+  CHECK(cmd.find("X-Team") != std::string::npos);
+  // The request's own Authorization header wins on the wire: the export drops -u.
+  r.http.headers = {{"Authorization", "Bearer mine"}};
+  x = ws.expanded(r);
+  drop_shadowed_basic(x);
+  CHECK_FALSE(x.basic_auth.enabled);
+  const std::string own = watt::to_curl_command(x);
+  CHECK(own.find("Bearer mine") != std::string::npos);
+  CHECK(own.find("s3cret") == std::string::npos);
+  CHECK(to_code(x, CodeLang::PythonRequests).find("auth=") == std::string::npos);
+  // A disabled own header does not count.
+  for (size_t i = 0; i < x.http.headers.size(); ++i)
+    if (iequals(x.http.headers[i].first, "Authorization")) x.disabled_headers.insert(i);
+  x.basic_auth = watt::BasicAuth{true, "ada", "s3cret"};
+  drop_shadowed_basic(x);
+  CHECK(x.basic_auth.enabled);
+  std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("Auto headers: the losing row of each name is marked", "[http_editor][auth]") {
+  const std::string from_auth = "   (Auth tab)";
+  const std::vector<std::pair<std::string, std::string>> rows = {
+      {"Host", "127.0.0.1:18080"},
+      {"Authorization", "Basic <user:password>" + from_auth},
+      {"Authorization", "Bearer {{token}}   (from Collection)"},
+      {"X-Team", "core   (from Collection)"},
+      {"Accept", "*/*"}};
+  // Basic on the Auth tab: the collection's Authorization loses, the Auth tab's is sent.
+  auto lost = auto_header_losers(rows, {}, "Authorization", from_auth);
+  CHECK(lost == std::vector<std::string>{"", "", "(replaced by the Auth tab)", "", ""});
+  // An Authorization row in the Headers table beats both; Accept in the table replaces the default.
+  lost = auto_header_losers(rows, {"authorization", "ACCEPT"}, "Authorization", from_auth);
+  CHECK(lost == std::vector<std::string>{"", "(replaced by your header)", "(replaced by your header)", "",
+                                         "(replaced by your header)"});
+  // No auth header from the Auth tab (inherit / none): the inherited one is sent.
+  lost = auto_header_losers(rows, {}, "", from_auth);
+  CHECK(lost == std::vector<std::string>(5));
+}
+
+#include "../tools/httpserver/http_server.h"
+#include "core/http_client.h"
+#include "core/oauth2.h"
+
+// The Auth tab's scheme beats an Authorization header inherited from the collection: OAuth 2.0
+// (in the header), Digest, NTLM, Negotiate and SigV4 as Basic does (core resolve_with()). Before
+// the fix the collection's "Bearer {{token}}" went out and /oauth/protected answered 401.
+TEST_CASE("Auth tab schemes beat an inherited Authorization header", "[http_editor][auth][oauth2]") {
+  static watt::httpserver::Server srv;
+  static const bool started = srv.start(0);
+  REQUIRE(started);
+  const std::string host = "http://127.0.0.1:" + std::to_string(srv.port());
+  const auto dir = std::filesystem::temp_directory_path() / "watt_test_auth_inherit";
+  std::filesystem::remove_all(dir);
+  std::filesystem::create_directories(dir);
+  {
+    watt::Workspace ws = watt::Workspace::create(dir);
+    watt::FolderSettings coll;
+    coll.headers = {watt::SettingsRow{"Authorization", "Bearer tok-777", {}, true},
+                    watt::SettingsRow{"X-Team", "core", {}, true}};
+    REQUIRE(ws.save_collection_settings(coll));
+    watt::oauth2_clear_cache();
+    watt::SavedRequest r;
+    r.id = "auth-inherit-oauth";
+    r.file = dir / "o.req.json";
+    r.http.url = host + "/oauth/protected";
+    r.auth.type = watt::HttpAuth::Type::OAuth2;
+    r.auth.oauth2.grant = watt::OAuth2Config::Grant::ClientCredentials;
+    r.auth.oauth2.token_url = host + "/oauth/token";
+    r.auth.oauth2.client_id = "watt-client";
+    r.auth.oauth2.client_secret = "s3cret";
+    auto auth_of = [](const watt::HttpRequest& h) {
+      std::vector<std::string> out;
+      for (const auto& [k, v] : h.headers)
+        if (iequals(k, "Authorization")) out.push_back(v);
+      return out;
+    };
+    std::string err;
+    auto h = ws.http_to_send(r, &err);
+    INFO(err);
+    REQUIRE(h);
+    const auto a = auth_of(*h);
+    REQUIRE(a.size() == 1);
+    CHECK(a[0].rfind("Bearer tok-client_credentials-", 0) == 0);
+    bool team = false;
+    for (const auto& [k, v] : h->headers) team = team || (k == "X-Team" && v == "core");
+    CHECK(team);  // other inherited headers still go out
+    watt::HttpClient c;
+    CHECK(c.send(*h).status == 200);
+    // Effective settings mark the collection's Authorization as overridden.
+    bool over = false;
+    for (const auto& eh : ws.effective_settings(r).headers)
+      if (eh.row.name == "Authorization" && eh.from.level == watt::SettingsOrigin::Level::Collection) over = eh.overridden;
+    CHECK(over);
+    // Copy as curl (export: resolved()) follows the same rule.
+    CHECK(watt::to_curl_command(ws.expanded(r)).find("tok-777") == std::string::npos);
+
+    // OAuth 2.0 with the token in the query: the inherited header is kept (nothing replaces it).
+    watt::SavedRequest q = r;
+    q.id = "auth-inherit-oauth-q";
+    q.auth.oauth2.add_to = watt::OAuth2Config::AddTo::Query;
+    h = ws.http_to_send(q, &err);
+    REQUIRE(h);
+    CHECK(auth_of(*h) == std::vector<std::string>{"Bearer tok-777"});
+
+    // Digest / SigV4 (libcurl writes Authorization): no inherited header either.
+    watt::SavedRequest d = r;
+    d.auth = watt::HttpAuth{};
+    d.auth.type = watt::HttpAuth::Type::Digest;
+    d.auth.user = "bob";
+    d.auth.password = "pw";
+    d.http.url = host + "/digest-auth/bob/pw";
+    h = ws.http_to_send(d, &err);
+    REQUIRE(h);
+    CHECK(auth_of(*h).empty());
+    CHECK(c.send(*h).status == 200);
+    d.auth.type = watt::HttpAuth::Type::AwsSigV4;
+    d.auth.aws_access_key = "AKIDEXAMPLE";
+    d.auth.aws_secret_key = "secret";
+    d.auth.aws_region = "eu-west-1";
+    d.auth.aws_service = "execute-api";
+    h = ws.http_to_send(d, &err);
+    REQUIRE(h);
+    CHECK(auth_of(*h).empty());
+
+    // Inherited from a folder: the folder's OAuth 2.0 beats the collection's header too.
+    std::filesystem::create_directories(dir / "api");
+    watt::FolderSettings api;
+    api.auth = r.auth;
+    REQUIRE(ws.save_folder_settings(dir / "api", api));
+    watt::SavedRequest in = r;
+    in.id = "auth-inherit-folder";
+    in.file = dir / "api" / "i.req.json";
+    in.auth = watt::HttpAuth{};
+    in.auth.type = watt::HttpAuth::Type::Inherit;
+    h = ws.http_to_send(in, &err);
+    INFO(err);
+    REQUIRE(h);
+    const auto ai = auth_of(*h);
+    REQUIRE(ai.size() == 1);
+    CHECK(ai[0].rfind("Bearer tok-client_credentials-", 0) == 0);
+  }
+  std::filesystem::remove_all(dir);
+}
+
+
+TEST_CASE("GraphQL query lint: brackets and strings", "[http_editor][graphql]") {
+  CHECK_FALSE(check_graphql("query { user(id: $id) { id name } }"));
+  CHECK_FALSE(check_graphql("# a } comment\n{ a(s: \"}\" b: \"\"\"\n ) \"\"\") }"));
+  auto i = check_graphql("query { user(id: 1) { id name }");
+  REQUIRE(i);
+  CHECK(i->offset == 6);
+  CHECK(i->message == "'{' is never closed");
+  i = check_graphql("{ a(x: 1 }");
+  REQUIRE(i);
+  CHECK(i->message == "expected ')' before '}'");
+  i = check_graphql("{ a }}");
+  REQUIRE(i);
+  CHECK(i->offset == 5);
+  i = check_graphql("{ a(s: \"open) }");
+  REQUIRE(i);
+  CHECK(i->message == "unterminated string");
+  CHECK(check_graphql("{ a(s: \"\"\"x) }"));
+}
+
+
+// ------------------------------------------------------------------ GraphQL schema (http_editor_gql)
+
+namespace {
+
+// A small introspection result: Query { user(id: ID!): User, users(filter: UserFilter, first: Int): [User!]!,
+// search(q: String!): [SearchResult] }, User { id, name, role: Role, posts(first: Int): [Post] },
+// Post { id, title }, Role enum, UserFilter input, SearchResult union, Mutation { rename }.
+const char* kGqlSchemaJson = R"({"data":{"__schema":{
+ "queryType":{"name":"Query"},"mutationType":{"name":"Mutation"},"subscriptionType":null,
+ "types":[
+  {"kind":"OBJECT","name":"Query","description":null,"fields":[
+    {"name":"user","description":"One user by id","args":[{"name":"id","description":null,"type":{"kind":"NON_NULL","name":null,"ofType":{"kind":"SCALAR","name":"ID","ofType":null}},"defaultValue":null}],
+     "type":{"kind":"OBJECT","name":"User","ofType":null},"isDeprecated":false},
+    {"name":"users","description":null,"args":[
+       {"name":"filter","description":null,"type":{"kind":"INPUT_OBJECT","name":"UserFilter","ofType":null},"defaultValue":null},
+       {"name":"first","description":null,"type":{"kind":"SCALAR","name":"Int","ofType":null},"defaultValue":"10"}],
+     "type":{"kind":"NON_NULL","name":null,"ofType":{"kind":"LIST","name":null,"ofType":{"kind":"NON_NULL","name":null,"ofType":{"kind":"OBJECT","name":"User","ofType":null}}}},"isDeprecated":false},
+    {"name":"search","description":null,"args":[{"name":"q","description":null,"type":{"kind":"NON_NULL","name":null,"ofType":{"kind":"SCALAR","name":"String","ofType":null}},"defaultValue":null}],
+     "type":{"kind":"LIST","name":null,"ofType":{"kind":"UNION","name":"SearchResult","ofType":null}},"isDeprecated":false}
+  ],"inputFields":null,"enumValues":null},
+  {"kind":"OBJECT","name":"Mutation","fields":[{"name":"rename","args":[{"name":"id","type":{"kind":"SCALAR","name":"ID"}},{"name":"name","type":{"kind":"SCALAR","name":"String"}}],"type":{"kind":"OBJECT","name":"User"}}]},
+  {"kind":"OBJECT","name":"User","description":"A person","fields":[
+    {"name":"id","args":[],"type":{"kind":"NON_NULL","name":null,"ofType":{"kind":"SCALAR","name":"ID"}}},
+    {"name":"name","description":"Display name","args":[],"type":{"kind":"SCALAR","name":"String"}},
+    {"name":"role","args":[],"type":{"kind":"ENUM","name":"Role"}},
+    {"name":"posts","args":[{"name":"first","type":{"kind":"SCALAR","name":"Int"}}],"type":{"kind":"LIST","ofType":{"kind":"OBJECT","name":"Post"}}}]},
+  {"kind":"OBJECT","name":"Post","fields":[{"name":"id","args":[],"type":{"kind":"SCALAR","name":"ID"}},{"name":"title","args":[],"type":{"kind":"SCALAR","name":"String"}}]},
+  {"kind":"ENUM","name":"Role","enumValues":[{"name":"ADMIN"},{"name":"USER"}]},
+  {"kind":"INPUT_OBJECT","name":"UserFilter","inputFields":[{"name":"role","type":{"kind":"ENUM","name":"Role"}},{"name":"nameLike","type":{"kind":"SCALAR","name":"String"}}]},
+  {"kind":"UNION","name":"SearchResult","possibleTypes":[{"kind":"OBJECT","name":"User"},{"kind":"OBJECT","name":"Post"}]},
+  {"kind":"SCALAR","name":"ID"},{"kind":"SCALAR","name":"String"},{"kind":"SCALAR","name":"Int"},{"kind":"SCALAR","name":"Boolean"},
+  {"kind":"OBJECT","name":"__Schema","fields":[{"name":"types","args":[],"type":{"kind":"LIST","ofType":{"kind":"OBJECT","name":"__Type"}}}]},
+  {"kind":"OBJECT","name":"__Type","fields":[{"name":"name","args":[],"type":{"kind":"SCALAR","name":"String"}}]}
+ ]}}})";
+
+std::shared_ptr<const GqlSchema> gql_fixture() {
+  std::string err;
+  auto s = parse_gql_schema(kGqlSchemaJson, &err);
+  INFO(err);
+  REQUIRE(s);
+  return s;
+}
+
+std::vector<std::string> names_of(const GqlCompletion& c) {
+  std::vector<std::string> v;
+  for (const auto& i : c.items) v.push_back(i.name);
+  return v;
+}
+
+// "|" marks the caret.
+GqlCompletion complete_at(const std::string& with_caret, const GqlSchema* s) {
+  const size_t at = with_caret.find('|');
+  std::string doc = with_caret;
+  doc.erase(at, 1);
+  return gql_complete(doc, at, s);
+}
+
+}  // namespace
+
+TEST_CASE("GraphQL schema: introspection parse", "[http_editor][graphql]") {
+  const auto s = gql_fixture();
+  CHECK(s->query == "Query");
+  CHECK(s->mutation == "Mutation");
+  CHECK(s->subscription.empty());
+  CHECK(s->user_type_count() == 11);
+  const GqlType* q = s->type("Query");
+  REQUIRE(q);
+  const GqlField* users = q->field("users");
+  REQUIRE(users);
+  CHECK(users->type == "[User!]!");
+  CHECK(users->named == "User");
+  REQUIRE(users->arg("first"));
+  CHECK(users->arg("first")->default_value == "10");
+  CHECK(q->field("user")->args[0].type == "ID!");
+  std::string err;
+  CHECK_FALSE(parse_gql_schema(R"({"errors":[{"message":"introspection is disabled"}]})", &err));
+  CHECK(err == "introspection is disabled");
+  CHECK_FALSE(parse_gql_schema("<html>", &err));
+  CHECK(err == "the response is not JSON");
+  // A bigger schema (~1.5 MB) parses on the worker in well under a second.
+  std::string big = R"({"data":{"__schema":{"queryType":{"name":"Query"},"types":[)";
+  for (int t = 0; t < 1500; ++t) {
+    if (t) big += ",";
+    big += R"({"kind":"OBJECT","name":"T)" + std::to_string(t) + R"(","description":"type number )" + std::to_string(t) +
+           R"(","fields":[)";
+    for (int f = 0; f < 8; ++f)
+      big += std::string(f ? "," : "") + R"({"name":"f)" + std::to_string(f) +
+             R"(","description":"a field","args":[],"type":{"kind":"NON_NULL","ofType":{"kind":"SCALAR","name":"String"}}})";
+    big += "]}";
+  }
+  big += "]}}}";
+  const auto t0 = std::chrono::steady_clock::now();
+  const auto bs = parse_gql_schema(big, &err);
+  const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+  REQUIRE(bs);
+  CHECK(bs->types.size() == 1500);
+  CHECK(ms < 1000);
+}
+
+TEST_CASE("GraphQL schema: field, argument and value completion", "[http_editor][graphql]") {
+  const auto s = gql_fixture();
+  // The critic's case: "query { user(id: 1) { id na" offers name.
+  auto c = complete_at("query { user(id: 1) { id na|", s.get());
+  CHECK(c.kind == GqlCompletion::Kind::Field);
+  CHECK(c.on == "User");
+  CHECK(names_of(c) == std::vector<std::string>{"name"});
+  CHECK(c.items[0].detail == "String");
+  CHECK(c.items[0].desc == "Display name");
+  CHECK(c.from == std::string("query { user(id: 1) { id ").size());
+  // Right after "{": every field of the type, __typename last.
+  c = complete_at("{ user(id: 1) { | } }", s.get());
+  CHECK(names_of(c) == std::vector<std::string>{"id", "name", "posts", "role", "__typename"});
+  CHECK(c.items[2].detail == "(first: Int): [Post]");
+  // Root fields, nesting, aliases.
+  c = complete_at("query Q { |", s.get());
+  CHECK(names_of(c) == std::vector<std::string>{"search", "user", "users", "__schema", "__type", "__typename"});
+  c = complete_at("{ me: user(id: 1) { posts(first: 2) { t| } } }", s.get());
+  CHECK(names_of(c) == std::vector<std::string>{"title"});
+  c = complete_at("{ me: u|", s.get());
+  CHECK(names_of(c) == std::vector<std::string>{"user", "users"});
+  // Inline fragments on a union.
+  c = complete_at("{ search(q: \"x\") { ... on Post { | } } }", s.get());
+  CHECK(c.on == "Post");
+  c = complete_at("{ search(q: \"x\") { ... on |", s.get());
+  CHECK(c.kind == GqlCompletion::Kind::Type);
+  CHECK(names_of(c) == std::vector<std::string>{"Mutation", "Post", "Query", "SearchResult", "User"});
+  // Fragments.
+  c = complete_at("fragment F on User { po| }", s.get());
+  CHECK(names_of(c) == std::vector<std::string>{"posts"});
+  // Arguments: those not given yet.
+  c = complete_at("{ users(|) }", s.get());
+  CHECK(c.kind == GqlCompletion::Kind::Argument);
+  CHECK(c.on == "Query.users");
+  CHECK(names_of(c) == std::vector<std::string>{"filter", "first"});
+  CHECK(c.items[1].detail == "Int = 10");
+  c = complete_at("{ users(first: 2, |) }", s.get());
+  CHECK(names_of(c) == std::vector<std::string>{"filter"});
+  // Input object fields and enum values.
+  c = complete_at("{ users(filter: { |", s.get());
+  CHECK(c.kind == GqlCompletion::Kind::InputField);
+  CHECK(names_of(c) == std::vector<std::string>{"nameLike", "role"});
+  c = complete_at("{ users(filter: { role: A| }) { id } }", s.get());
+  CHECK(c.kind == GqlCompletion::Kind::EnumValue);
+  CHECK(names_of(c) == std::vector<std::string>{"ADMIN"});
+  // Variables declared by the operation.
+  c = complete_at("query Q($id: ID!, $n: Int) { user(id: $|", s.get());
+  CHECK(c.kind == GqlCompletion::Kind::Variable);
+  CHECK(names_of(c) == std::vector<std::string>{"id", "n"});
+  CHECK(c.items[0].detail == "ID!");
+  c = complete_at("query Q($id: ID!, $n: Int) { users(first: $n|", s.get());
+  CHECK(names_of(c) == std::vector<std::string>{"n"});
+  // Types in variable definitions.
+  c = complete_at("query Q($f: User|", s.get());
+  CHECK(names_of(c) == std::vector<std::string>{"UserFilter"});
+  // Never inside a string or a comment; keywords at the top.
+  CHECK(complete_at("{ search(q: \"na|\") }", s.get()).items.empty());
+  CHECK(complete_at("{ user(id: 1) { # na|\n } }", s.get()).items.empty());
+  CHECK(names_of(complete_at("mu|", s.get())) == std::vector<std::string>{"mutation"});
+  // No schema: $variables still complete.
+  c = complete_at("query Q($id: ID!) { user(id: $|", nullptr);
+  CHECK(names_of(c) == std::vector<std::string>{"id"});
+  CHECK(complete_at("{ user { |", nullptr).items.empty());
+}
+
+TEST_CASE("GraphQL schema: unknown fields, arguments and variables", "[http_editor][graphql]") {
+  const auto s = gql_fixture();
+  CHECK(gql_validate("query Q($id: ID!) { user(id: $id) { id name role posts(first: 2) { title } } }", s.get()).empty());
+  CHECK(gql_validate("{ me: user(id: 1) { ...F __typename } } fragment F on User { name }", s.get()).empty());
+  CHECK(gql_validate("{ search(q: \"x\") { __typename ... on User { name } ... on Post { title } } }", s.get()).empty());
+  CHECK(gql_validate("{ users(filter: {role: ADMIN, nameLike: \"a\"}, first: {{n}}) { id } }", s.get()).empty());
+  CHECK(gql_validate("{ __schema { types { name } } }", s.get()).empty());
+  CHECK(gql_validate("{ user(id: 1) @include(if: true) { id } }", s.get()).empty());
+
+  const std::string doc = "query { user(id: 1) { id nam } }";
+  auto v = gql_validate(doc, s.get());
+  REQUIRE(v.size() == 1);
+  CHECK(v[0].offset == doc.find("nam"));
+  CHECK(v[0].length == 3);
+  CHECK(v[0].message == "Unknown field 'nam' on type User");
+  v = gql_validate("{ user(id: 1, x: 2) { id } }", s.get());
+  REQUIRE(v.size() == 1);
+  CHECK(v[0].message == "Unknown argument 'x' on field Query.user");
+  v = gql_validate("{ users(filter: {rol: ADMIN}) { id } }", s.get());
+  REQUIRE(v.size() == 1);
+  CHECK(v[0].message == "Unknown field 'rol' on input type UserFilter");
+  v = gql_validate("{ users(filter: {role: ROOT}) { id } }", s.get());
+  REQUIRE(v.size() == 1);
+  CHECK(v[0].message == "Unknown value 'ROOT' for enum Role");
+  v = gql_validate("{ search(q: \"x\") { name } }", s.get());
+  REQUIRE(v.size() == 1);
+  CHECK(v[0].message == "Unknown field 'name' on union SearchResult (select through ... on Type)");
+  v = gql_validate("{ user(id: 1) { name { x } } }", s.get());
+  REQUIRE(v.size() == 1);
+  CHECK(v[0].message == "Field 'name' is a scalar and has no fields to select");
+  v = gql_validate("fragment F on Nope { id }", s.get());
+  REQUIRE(v.size() == 1);
+  CHECK(v[0].message == "Unknown type 'Nope'");
+  v = gql_validate("subscription { x }", s.get());
+  REQUIRE(v.size() == 1);
+  CHECK(v[0].message == "The schema has no subscription type");
+  // A required argument left out, with or without "(...)".
+  v = gql_validate("{ user { id } }", s.get());
+  REQUIRE(v.size() == 1);
+  CHECK(v[0].message == "Field 'user' is missing the required argument 'id: ID!'");
+  CHECK(v[0].offset == 2);
+  CHECK(v[0].length == 4);
+  v = gql_validate("{ search { __typename } }", s.get());
+  CHECK(v.size() == 1);
+  v = gql_validate("{ user(x: 1) { id } }", s.get());
+  CHECK(v.size() == 2);  // x unknown, id missing
+  // An object field without its selection set.
+  v = gql_validate("{ user(id: 1) }", s.get());
+  REQUIRE(v.size() == 1);
+  CHECK(v[0].message == "Field 'user' of type User needs a selection of fields: { ... }");
+  v = gql_validate("{ user(id: 1) { id posts(first: 2) name } }", s.get());
+  REQUIRE(v.size() == 1);
+  CHECK(v[0].message.find("Field 'posts'") == 0);
+  v = gql_validate("{ user(id: 1) { posts(first: 2) ...F } } fragment F on User { id }", s.get());
+  CHECK(v.size() == 1);
+  // Still being typed at the end of the text: not flagged yet.
+  CHECK(gql_validate("{ user(id: 1) { posts", s.get()).empty());
+  // An unknown field's own selection is not checked again (one issue, not a cascade).
+  v = gql_validate("{ nope { a b c } }", s.get());
+  CHECK(v.size() == 1);
+  // Undeclared variables, with or without a schema.
+  v = gql_validate("query Q($id: ID!) { user(id: $uid) { id } }", nullptr);
+  REQUIRE(v.size() == 1);
+  CHECK(v[0].message == "Variable $uid is not declared by the operation Q");
+  CHECK(gql_validate("fragment F on User { posts(first: $n) { id } }", nullptr).empty());
+  // A document still being typed: no crash, and only what is wrong so far.
+  for (const char* partial : {"{", "query (", "{ user(", "{ user(id:", "{ users(filter: {", "{ ... on", "query Q($", "{ a: ",
+                              "{ user(id: 1) { posts(first: [{", ")))}}}", "\"\"\"", "{ user(id: \"x"})
+    CHECK(gql_validate(partial, s.get()).size() <= 1);
+}
+
+TEST_CASE("GraphQL schema: variables JSON against the declarations", "[http_editor][graphql]") {
+  const std::string q = "query Q($id: ID!, $n: Int, $r: Role! = USER) { user(id: $id) { id } }";
+  CHECK(gql_check_variables(q, "{ \"id\": \"{{userId}}\", \"n\": 2 }").empty());
+  CHECK(gql_check_variables(q, "{ \"id\": 1, \"r\": \"ADMIN\" }").empty());
+  const std::string vars = "{\n  \"id\": 1,\n  \"idx\": {\"nested\": 1}\n}";
+  auto v = gql_check_variables(q, vars);
+  REQUIRE(v.size() == 1);
+  CHECK(v[0].offset == vars.find("\"idx\""));
+  CHECK(v[0].length == 5);
+  CHECK(v[0].message == "Variable \"idx\" is not declared by query Q (declared: $id, $n, $r)");
+  v = gql_check_variables(q, "{ \"n\": 2 }");
+  REQUIRE(v.size() == 1);
+  CHECK(v[0].message == "Missing required variable $id (ID!)");
+  CHECK(gql_check_variables(q, "").size() == 1);
+  CHECK(gql_check_variables(q, "[1]").empty());  // not an object: the JSON check reports it
+  // The named operation of several.
+  const std::string two = "query A($a: Int!) { x } query B($b: Int) { y }";
+  CHECK(gql_check_variables(two, "{\"b\": 1}", "B").empty());
+  CHECK(gql_check_variables(two, "{\"b\": 1}").size() == 2);  // the first one: b undeclared, a missing
+  v = gql_check_variables("{ user(id: 1) { id } }", "{\"x\": 1}");
+  REQUIRE(v.size() == 1);
+  CHECK(v[0].message == "Variable \"x\" is not declared by the query (it declares none)");
+}
+
+TEST_CASE("GraphQL schema: cache key, file name and age", "[http_editor][graphql]") {
+  CHECK(gql_cache_key("https://a/graphql", "dev") != gql_cache_key("https://a/graphql", "prod"));
+  const std::string f = gql_cache_file_name(gql_cache_key("https://a/graphql", "dev"));
+  CHECK(f.size() == 21);
+  CHECK(f.substr(16) == ".json");
+  CHECK(f == gql_cache_file_name(gql_cache_key("https://a/graphql", "dev")));
+  CHECK(gql_age(10) == "just now");
+  CHECK(gql_age(4 * 60) == "4 min ago");
+  CHECK(gql_age(3 * 3600) == "3 h ago");
+  CHECK(gql_age(3 * 86400) == "3 d ago");
+  CHECK(std::string(graphql_introspection_query()).find("__schema") != std::string::npos);
+}
+
+TEST_CASE("Headers grid by keyboard: a typed value is never replaced by a suggestion", "[http_editor][kv]") {
+  // The critic's case: X-Api-Version, Tab, 1, Enter, then X-Mode gives two rows.
+  HeaderGridModel g;
+  g.type("X-Api-Version\t1\nX-Mode\tfast\n");
+  const auto h = g.headers();
+  REQUIRE(h.size() == 2);
+  CHECK(h[0] == std::pair<std::string, std::string>{"X-Api-Version", "1"});
+  CHECK(h[1] == std::pair<std::string, std::string>{"X-Mode", "fast"});
+  CHECK(g.row == 2);
+  CHECK(g.col == 0);
+  CHECK(g.text.empty());
+
+  // Unknown and X-* headers get no value list; known ones get their own.
+  CHECK(header_value_choices("X-Debug").empty());
+  CHECK(header_value_choices("X-Api-Version").empty());
+  CHECK(completions_for(header_value_choices("Authorization"), "x").empty());
+  CHECK(completions_for(header_value_choices("x-debug"), "t").empty());
+  CHECK(completions_for(header_value_choices("Expect"), "1") == std::vector<std::string>{"100-continue"});
+  CHECK(completions_for(header_value_choices("content-type"), "text/p") == std::vector<std::string>{"text/plain"});
+  CHECK(completions_for(header_value_choices("Accept-Encoding"), "GZ").front() == "gzip, deflate, br");
+  CHECK(completions_for(header_value_choices("Connection"), "close").empty());  // typed in full: no list
+
+  // Authorization, Tab, x, Enter: "x", not XMLHttpRequest. X-Debug, Tab, t, Enter: "t".
+  HeaderGridModel a;
+  a.type("Authorization\tx\nX-Debug\tt\n");
+  CHECK(a.headers() == std::vector<std::pair<std::string, std::string>>{{"Authorization", "x"}, {"X-Debug", "t"}});
+
+  // The name cell follows the same rule: X-Req, Tab stays X-Req.
+  HeaderGridModel n;
+  n.type("X-Req\tv\n");
+  CHECK(n.headers() == std::vector<std::pair<std::string, std::string>>{{"X-Req", "v"}});
+
+  // An entry chosen with Down goes in, and Enter still commits and moves on.
+  HeaderGridModel d;
+  d.type("Content-T\v\napplication/j\v\v\nAccept\t*\n");
+  CHECK(d.headers() == std::vector<std::pair<std::string, std::string>>{
+                           {"Content-Type", "application/json; charset=utf-8"}, {"Accept", "*"}});
+  CHECK(d.row == 2);
+  CHECK(d.col == 0);
+
+  // A chosen scheme continues: "Bearer " stays open for the token.
+  HeaderGridModel b;
+  b.type("Authorization\tB\v\ntok\n");
+  CHECK(b.headers() == std::vector<std::pair<std::string, std::string>>{{"Authorization", "Bearer tok"}});
+
+  // Tab walks Name -> Value -> Description -> next Name.
+  HeaderGridModel t;
+  t.type("X-A\t1\tnote\tX-B\t2\n");
+  REQUIRE(t.rows.size() == 3);
+  CHECK(t.rows[0].desc == "note");
+  CHECK(t.headers() == std::vector<std::pair<std::string, std::string>>{{"X-A", "1"}, {"X-B", "2"}});
 }

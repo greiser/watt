@@ -169,6 +169,24 @@ class ResourceBlocker final : public ICoreWebView2WebResourceRequestedEventHandl
   std::atomic<long> refs_{1};
 };
 
+// Whether an HTML page could paint a background of its own (CSS background / background-color,
+// or a bgcolor attribute), in any common capitalisation. A plain substring scan: false
+// positives only cost the page the after-load check below.
+bool mentions_background(std::string_view body) {
+  for (std::string_view w : {"background", "Background", "BACKGROUND", "bgcolor", "BGCOLOR", "bgColor", "BgColor"})
+    if (body.find(w) != std::string_view::npos) return true;
+  return false;
+}
+
+// Run by the host after each Preview load (page scripts stay off; ExecuteScript is not one of
+// them). When neither the root nor the body paints a background, the canvas would show the
+// WebView's dark default behind black text: give the root the Canvas colour of its own scheme.
+constexpr wchar_t kCanvasFixScript[] =
+    L"(function(){var d=document.documentElement,b=document.body;if(!d)return;"
+    L"function t(e){if(!e)return true;var s=getComputedStyle(e);return s.backgroundImage==='none'&&"
+    L"(s.backgroundColor==='transparent'||/^rgba\\(.*,\\s*0\\)$/.test(s.backgroundColor));}"
+    L"if(t(d)&&t(b))d.style.setProperty('background-color','Canvas');})();";
+
 // The page as the Preview loads it: a Content-Security-Policy that refuses every fetch and all
 // script (on top of the WebView2 settings and the request filter), and a <base> so relative
 // links name their real target, both placed at the start of <head>.
@@ -178,6 +196,15 @@ std::string preview_page(std::string_view body, const std::string& base_url) {
       "img-src data:; font-src data:; media-src data:\">";
   if (!base_url.empty() && base_url.find_first_of("\"<>") == std::string::npos)
     inject += "<base href=\"" + base_url + "\">";
+  // A page that paints no background reads black on white in any browser. Under a dark OS theme
+  // the WebView2 canvas instead comes up #121212 behind the default black text, whatever the
+  // page's color-scheme says (and neither wx nor WEBVIEW2_DEFAULT_BACKGROUND_COLOR reaches the
+  // controller's DefaultBackgroundColor). So a page that never mentions a background gets the
+  // canvas of its own colour scheme: Canvas is white for a plain page and stays dark for one
+  // that opts into dark (example.com's "color-scheme: light dark"). :where() keeps it below any
+  // rule of the page. Pages that do mention a background are checked after load
+  // (kCanvasFixScript), where the computed root and body backgrounds are known.
+  if (!mentions_background(body)) inject += "<style>:where(html){background-color:Canvas}</style>";
   auto lower = [](char c) { return (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c; };
   const size_t scan = std::min<size_t>(body.size(), 8192);
   auto find_tag = [&](std::string_view name) -> size_t {  // end of "<name ...>" (after '>'), or npos
@@ -517,6 +544,26 @@ BodyView::BodyView(wxWindow* parent)
   // Wrap of a heavy document follows the pane width once a resize settles (a worker rebuild).
   wrap_timer_.SetOwner(this);
   Bind(wxEVT_TIMER, [this](wxTimerEvent&) { sync_wrap(); }, wrap_timer_.GetId());
+  prewarm_timer_.SetOwner(this);
+  Bind(wxEVT_TIMER, [this](wxTimerEvent&) {
+#if WATT_EDGE_PREVIEW
+    if (web_) return;
+    // Creating the control is 15-65 ms of UI time: never right after a click or a key (opening
+    // a tab, a send), only once the user has left the app alone for a second.
+    LASTINPUTINFO li{sizeof(li), 0};
+    if (GetLastInputInfo(&li)) {
+      const DWORD idle = GetTickCount() - li.dwTime;
+      if (idle < 1000) {
+        prewarm_timer_.StartOnce(static_cast<int>(1000 - idle) + 50);
+        return;
+      }
+    }
+    const auto t0 = Clock::now();
+    create_web();
+    if (web_) web_->Hide();
+    body_trace("web_prewarm", t0);
+#endif
+  }, prewarm_timer_.GetId());
   stc_->Bind(wxEVT_SIZE, [this](wxSizeEvent& e) {
     e.Skip();
     if (!wrap_ || !resp_ || grpc_) return;
@@ -527,8 +574,11 @@ BodyView::BodyView(wxWindow* parent)
     const int k = e.GetKeyCode();
     if (k == 'F' && e.GetModifiers() == (wxMOD_CONTROL | wxMOD_SHIFT)) return show_filter();
     if (k == 'F' && e.GetModifiers() == wxMOD_CONTROL) return show_find();
-    if (k == WXK_ESCAPE && filterbar_ && filterbar_->IsShown() && wxWindow::FindFocus() == filter_text_)
-      return close_filter();
+    if (k == WXK_ESCAPE && filterbar_ && filterbar_->IsShown() && !find_shown()) {
+      // Esc closes the filter from its box or from the filtered body (focus anywhere in here).
+      for (wxWindow* w = wxWindow::FindFocus(); w; w = w->GetParent())
+        if (w == this) return close_filter();
+    }
     if (k == WXK_F3) {
       if (!find_shown()) return show_find();
       find_from(!e.ShiftDown(), false);
@@ -630,7 +680,12 @@ void BodyView::setup_stc() {
   stc_->SetScrollWidth(1);
   stc_->SetScrollWidthTracking(true);
   stc_->SetReadOnly(true);
-  stc_->UsePopUp(wxSTC_POPUP_ALL);
+  stc_->UsePopUp(wxSTC_POPUP_NEVER);
+  stc_->Bind(wxEVT_CONTEXT_MENU, [this](wxContextMenuEvent& e) {
+    wxPoint at = e.GetPosition();
+    if (at == wxDefaultPosition) at = stc_->ClientToScreen(stc_->PointFromPosition(stc_->GetCurrentPos()));
+    body_menu(at);
+  });
   cur_lexer_ = -1;
 }
 
@@ -959,13 +1014,7 @@ void BodyView::prewarm_web() {
     const bool ok = preview_runtime_present();
     post_ui(alive, [this, ok] {
       if (!ok || web_) return;
-      CallAfter([this] {
-        if (web_) return;
-        const auto t0 = Clock::now();
-        create_web();
-        if (web_) web_->Hide();
-        body_trace("web_prewarm", t0);
-      });
+      prewarm_timer_.StartOnce(1000);
     });
   });
 #endif
@@ -976,7 +1025,7 @@ bool BodyView::create_web() {
   if (web_) return true;
   if (!preview_runtime_present()) return false;
   {
-    web_ = wxWebView::New(this, wxID_ANY, "about:blank", wxDefaultPosition, wxDefaultSize, wxWebViewBackendEdge,
+    web_ =wxWebView::New(this, wxID_ANY, "about:blank", wxDefaultPosition, wxDefaultSize, wxWebViewBackendEdge,
                           wxBORDER_NONE);
     if (!web_) return false;
     web_->EnableContextMenu(false);
@@ -1019,6 +1068,10 @@ bool BodyView::create_web() {
       }
       e.Veto();
       bar_->set_note("link not followed in the Preview: " + url, Tone::Dim);
+    });
+    web_->Bind(wxEVT_WEBVIEW_LOADED, [this](wxWebViewEvent&) {
+      if (auto* wv = static_cast<ICoreWebView2*>(web_->GetNativeBackend()))
+        wv->ExecuteScript(kCanvasFixScript, nullptr);
     });
     web_->Bind(wxEVT_WEBVIEW_NEWWINDOW, [this](wxWebViewEvent& e) {
       bar_->set_note("new window not opened by the Preview: " + e.GetURL().utf8_string(), Tone::Dim);
@@ -1144,6 +1197,11 @@ void BodyView::build(int m) {
   if (d.doc || d.building || !resp_) return;
   const auto r = resp_;
   const size_t n = r->body.size();
+  const auto t_fac = Clock::now();
+  if (!factory_) {
+    factory();
+    body_trace("build.factory", t_fac);
+  }
   // No size hint: preallocating would zero-fill the buffer here on the UI thread (~5 ms for
   // 16 MB); the worker's AddData grows it instead.
   auto box = std::make_shared<LoaderBox>();
@@ -1353,7 +1411,13 @@ void BodyView::build(int m) {
     return b;
   };
   if (n <= kSyncBytes) {
-    if (auto b = job()) apply_built(my, m, *b);
+    const auto t0 = Clock::now();
+    if (auto b = job()) {
+      body_trace("build.job", t0);
+      const auto t1 = Clock::now();
+      apply_built(my, m, *b);
+      body_trace("build.apply", t1);
+    }
     return;
   }
   d.building = true;
@@ -1416,7 +1480,13 @@ void BodyView::show_doc(int m) {
   }
   const Keep kp = keep_;
   keep_ = Keep{};
+  auto t_lap = Clock::now();
+  auto lap = [&t_lap](const char* what) {
+    body_trace(what, t_lap);
+    t_lap = Clock::now();
+  };
   swap_doc(d.doc);
+  lap("show.swap");
   stc_->SetScrollWidth(1);
   if (holding_) {
     holding_ = false;
@@ -1432,11 +1502,16 @@ void BodyView::show_doc(int m) {
     if (d.lexer == wxSTC_LEX_JSON) stc_->SetKeyWords(0, "false true null");
     d.lexer_set = true;
   }
+  lap("show.lexer");
   apply_styles(d.lexer);
+  lap("show.styles");
   stc_->SetReadOnly(true);
   stc_->GotoPos(0);
+  lap("show.goto");
   if (m != Wrapped && m != RawWrap) auto_wrap(d);
+  lap("show.autowrap");
   update_margin();
+  lap("show.margin");
   if (const int same = m == Wrapped ? d.src : m == RawWrap ? Raw : m; kp.src >= 0 && kp.src == same) {
     if (kp.ratio >= 0) {
       stc_->SetFirstVisibleLine(static_cast<int>(kp.ratio * stc_->GetLineCount()));
@@ -1448,12 +1523,14 @@ void BodyView::show_doc(int m) {
   }
   display_break_note(d);
   update_note();
+  lap("show.note");
   if (find_shown()) {
     schedule_count();
     highlight_visible();
   }
   start_styling();
   if (resp_ && (wrap_ || m == Wrapped || m == RawWrap)) sync_wrap();
+  lap("show.wrap");
 }
 
 void BodyView::auto_wrap(const Doc& d) {
@@ -2861,7 +2938,144 @@ void BodyView::show_table() {
   });
 }
 
-void BodyView::note(const std::string& text, Tone tone) { bar_->set_note(text, tone); }
+// A transient message ("assertion added", "value copied") follows the body size rather than
+// replacing it: the size stays put (it is the part the bar always keeps) and only the message's
+// tail is elided on a narrow bar (the full text is the tooltip).
+void BodyView::note(const std::string& text, Tone tone) {
+  if (!resp_) return bar_->set_note(text, tone);
+  bar_->set_note(fmt::human_bytes(resp_->body.size()) + "   " + text, tone);
+}
+
+void BodyView::body_menu(wxPoint screen) {
+  const int k = on_screen();
+  const wxPoint cl = stc_->ScreenToClient(screen);
+  int pos = stc_->PositionFromPointClose(cl.x, cl.y);
+  if (pos < 0) pos = stc_->PositionFromPoint(cl);
+  // A JSON value under the mouse: Pretty or Raw of an HTTP JSON body, as the document holds it
+  // (no display breaks: positions are offsets in the JSON text).
+  const bool json = resp_ && !grpc_ && kind_ == fmt::BodyKind::Json && (k == Pretty || k == Raw) &&
+                    !docs_[k].building && !docs_[k].display_breaks && !docs_[k].text.empty() && pos >= 0 &&
+                    static_cast<size_t>(pos) < docs_[k].text.size();
+  const uint64_t seq = ++menu_seq_;
+  if (!json) return show_body_menu(screen, k, 0, nullptr, false, JsonHit{});
+  std::shared_ptr<const void> owner = docs_[k].owner;
+  const std::string_view text = docs_[k].text;
+  size_t off = static_cast<size_t>(pos);
+  // Past the end of a line ("id": 0,|): the value the line ends with, not the object around it.
+  {
+    size_t b = off;
+    while (b > 0 && (text[b] == ' ' || text[b] == ',' || text[b] == '\r' || text[b] == '\n' || text[b] == '\t') &&
+           text[b - 1] != '\n' && off - b < 4096)
+      --b;
+    if (b < off && text[b] != '{' && text[b] != '[' && text[b] != ':' && text[b] != ',' && text[b] != ' ') off = b;
+  }
+  // The scan reads the text up to the click: a few ms per MB. Past 1 MB it runs on a thread and
+  // the menu opens when it is done (the UI thread never waits on it).
+  if (off < (1u << 20)) {
+    JsonHit hit;
+    const bool found = json_value_at(text, off, hit);
+    return show_body_menu(screen, k, off, owner, found, hit);
+  }
+  std::thread([this, alive = alive_, owner, text, off, seq, screen, k] {
+    auto hit = std::make_shared<JsonHit>();
+    const bool found = json_value_at(text, off, *hit);
+    post_ui(alive, [this, owner, hit, found, off, seq, screen, k] {
+      if (seq != menu_seq_ || on_screen() != k) return;
+      show_body_menu(screen, k, off, owner, found, *hit);
+    });
+  }).detach();
+}
+
+void BodyView::show_body_menu(wxPoint screen, int mode, size_t off, std::shared_ptr<const void> owner, bool found,
+                              const JsonHit& hit) {
+  (void)off;
+  enum { kCopy = 1, kSelAll, kValue, kPath, kJsonPath, kAssert, kCapture };
+  auto clip = [](const std::string& t) {
+    if (wxTheClipboard->Open()) {
+      wxTheClipboard->SetData(new wxTextDataObject(wxString::FromUTF8(t.data(), t.size())));
+      wxTheClipboard->Close();
+    }
+  };
+  auto elide = [](std::string t, size_t n) {
+    for (char& c : t)
+      if (c == '\n' || c == '\r' || c == '\t') c = ' ';
+    if (t.size() > n) {
+      size_t cut = n;
+      while (cut > 0 && (static_cast<unsigned char>(t[cut]) & 0xC0) == 0x80) --cut;
+      t = t.substr(0, cut) + "\xE2\x80\xA6";
+    }
+    t.erase(std::remove(t.begin(), t.end(), '&'), t.end());  // no menu mnemonics
+    return t;
+  };
+  const auto t0 = Clock::now();
+  wxMenu m;
+  long from = 0, to = 0;
+  stc_->GetSelection(&from, &to);
+  m.Append(kCopy, "Copy\tCtrl+C")->Enable(from != to);
+  m.Append(kSelAll, "Select all\tCtrl+A");
+  std::string target, jpath, literal, value, op, aval;
+  if (found && mode >= 0 && mode < kModes && docs_[mode].owner == owner) {
+    const std::string_view text = docs_[mode].text;
+    target = target_string(hit.path);
+    jpath = path_string(hit.path);
+    if (hit.scalar && hit.at + hit.len <= text.size()) {
+      literal = std::string(text.substr(hit.at, hit.len));
+      value = json_scalar_text(literal);
+      const bool str = !literal.empty() && literal[0] == '"';
+      if (literal.size() <= 200 && literal.find("{{") == std::string::npos) {
+        op = "eq";
+        aval = literal;
+      } else {
+        op = str ? "isString" : "isDefined";
+      }
+    } else if (hit.at < text.size()) {
+      op = text[hit.at] == '[' ? "isArray" : "isDefined";
+    } else {
+      op = "isDefined";
+    }
+    m.AppendSeparator();
+    if (hit.scalar) m.Append(kValue, wxString::FromUTF8("Copy value   " + elide(value, 40)));
+    m.Append(kPath, wxString::FromUTF8("Copy path   " + elide(target, 60)));
+    m.Append(kJsonPath, wxString::FromUTF8("Copy JSONPath   " + elide(jpath, 60)));
+    m.AppendSeparator();
+    const std::string check = elide(target + " " + op + (aval.empty() ? "" : " " + aval), 80);
+    body_trace("menu.items", t0);
+    if (const std::string st = asserted ? asserted(target, op, aval) : std::string(); !st.empty())
+      m.Append(kAssert, wxString::FromUTF8("Already asserted (" + st + "):  " + check))->Enable(false);
+    else
+      m.Append(kAssert, wxString::FromUTF8("Add assertion:  " + check))->Enable(static_cast<bool>(on_add_assert));
+    if (on_add_capture && (!capture_ok || capture_ok()))
+      m.Append(kCapture, wxString::FromUTF8("Capture into variable\xE2\x80\xA6   " + elide(target, 50)));
+  }
+  body_trace("menu.build", t0);
+  const int id = GetPopupMenuSelectionFromUser(m, ScreenToClient(screen));
+  switch (id) {
+    case kCopy: stc_->Copy(); break;
+    case kSelAll: stc_->SelectAll(); break;
+    case kValue: clip(value); note("value copied", Tone::Dim); break;
+    case kPath: clip(target); note("path copied: " + target, Tone::Dim); break;
+    case kJsonPath: clip(jpath); note("JSONPath copied: " + jpath, Tone::Dim); break;
+    case kAssert:
+      if (on_add_assert) on_add_assert(target, op, aval);
+      break;
+    case kCapture: {
+      if (!on_add_capture) break;
+      // A suggested name: the last member name on the path ("token", "id"), else "value".
+      std::string var = "value";
+      for (auto it = hit.path.rbegin(); it != hit.path.rend(); ++it)
+        if (!it->is_index && !it->key.empty()) {
+          var.clear();
+          for (char c : it->key)
+            if (std::isalnum(static_cast<unsigned char>(c)) || c == '_') var += c;
+          if (var.empty()) var = "value";
+          break;
+        }
+      on_add_capture(target, var);
+      break;
+    }
+    default: break;
+  }
+}
 
 void BodyView::show_filter() {
   show_filter_row();
@@ -3106,7 +3320,7 @@ void BodyView::show_match(int at, int len) {
     schedule_count();
   } else {
     find_text_->SetForegroundColour(Theme::get().err);
-    find_chips_->set_note("no matches", Tone::Err);
+    find_chips_->set_note(filter_.empty() ? "no matches" : "no matches in the filtered body", Tone::Err);
   }
   find_text_->Refresh();
   highlight_visible();
@@ -3144,9 +3358,11 @@ void BodyView::schedule_count() {
   };
   auto show = [this, q](std::pair<size_t, size_t> r) {
     if (find_text_->GetValue().utf8_string() != q) return;
-    if (r.first == 0) find_chips_->set_note("no matches", Tone::Err);
+    // With a JSONPath filter on, Find searches what is shown: say so (Close the filter for all).
+    const std::string where = filter_.empty() ? "" : " in the filtered body";
+    if (r.first == 0) find_chips_->set_note("no matches" + where, Tone::Err);
     else
-      find_chips_->set_note(std::to_string(std::min(r.second + 1, r.first)) + " of " + std::to_string(r.first),
+      find_chips_->set_note(std::to_string(std::min(r.second + 1, r.first)) + " of " + std::to_string(r.first) + where,
                             Tone::Plain);
   };
   if (text.size() <= kSyncBytes) return show(run());

@@ -290,6 +290,38 @@ std::string brace_problem(std::string_view s) {
   return {};
 }
 
+std::optional<JsonIssue> check_graphql(std::string_view s) {
+  std::vector<std::pair<char, size_t>> open;
+  auto closer_of = [](char c) { return c == '{' ? '}' : c == '(' ? ')' : ']'; };
+  for (size_t i = 0; i < s.size(); ++i) {
+    const char c = s[i];
+    if (c == '#') {
+      while (i < s.size() && s[i] != '\n') ++i;
+    } else if (c == '"') {
+      const size_t at = i;
+      if (s.substr(i, 3) == "\"\"\"") {
+        const size_t end = s.find("\"\"\"", i + 3);
+        if (end == std::string_view::npos) return JsonIssue{at, 3, "unterminated block string"};
+        i = end + 2;
+      } else {
+        for (++i; i < s.size() && s[i] != '"' && s[i] != '\n'; ++i)
+          if (s[i] == '\\') ++i;
+        if (i >= s.size() || s[i] != '"') return JsonIssue{at, 1, "unterminated string"};
+      }
+    } else if (c == '{' || c == '(' || c == '[') {
+      open.emplace_back(c, i);
+    } else if (c == '}' || c == ')' || c == ']') {
+      if (open.empty()) return JsonIssue{i, 1, std::string("'") + c + "' without an opening one"};
+      if (closer_of(open.back().first) != c)
+        return JsonIssue{i, 1, std::string("expected '") + closer_of(open.back().first) + "' before '" + c + "'"};
+      open.pop_back();
+    }
+  }
+  if (!open.empty())
+    return JsonIssue{open.back().second, 1, std::string("'") + open.back().first + "' is never closed"};
+  return std::nullopt;
+}
+
 std::optional<JsonIssue> check_json(std::string_view s) {
   const size_t n = s.size();
   size_t i = 0;
@@ -1074,12 +1106,167 @@ std::string clean_header_value(std::string_view s) {
   return out;
 }
 
+std::vector<std::string> auto_header_losers(const std::vector<std::pair<std::string, std::string>>& rows,
+                                            const std::vector<std::string>& own, std::string_view auth_name,
+                                            std::string_view from_auth) {
+  std::vector<std::string> out(rows.size());
+  const std::string auth = clean_header_name(auth_name);
+  for (size_t i = 0; i < rows.size(); ++i) {
+    const std::string name = clean_header_name(rows[i].first);
+    const std::string& v = rows[i].second;
+    if (name.empty()) continue;
+    if (std::any_of(own.begin(), own.end(), [&](const std::string& o) { return iequals(clean_header_name(o), name); })) {
+      out[i] = "(replaced by your header)";
+      continue;
+    }
+    const bool mine = !from_auth.empty() && v.size() >= from_auth.size() &&
+                      std::string_view(v).substr(v.size() - from_auth.size()) == from_auth;
+    const size_t at = v.rfind("   (from ");
+    const bool inherited = !mine && at != std::string::npos && !v.empty() && v.back() == ')';
+    if (inherited && !auth.empty() && iequals(auth, name)) out[i] = "(replaced by the Auth tab)";
+  }
+  return out;
+}
+
 std::string var_closer(std::string_view before, std::string_view after) {
   const size_t n = before.size();
   if (n < 2 || before[n - 1] != '{' || before[n - 2] != '{') return {};
   if (n >= 3 && before[n - 3] == '{') return {};  // "{{{": a literal brace
   if (after.size() >= 2 && after[0] == '}' && after[1] == '}') return {};
   return !after.empty() && after[0] == '}' ? "}" : "}}";  // the body's auto-close may have put one
+}
+
+const std::vector<std::string>& header_name_choices() {
+  static const std::vector<std::string> names = {
+      "Accept", "Accept-Encoding", "Accept-Language", "Accept-Charset", "Authorization", "Cache-Control",
+      "Connection", "Content-Type", "Content-Length", "Content-Encoding", "Content-Disposition",
+      "Content-Language", "Cookie", "DNT", "Date", "Expect", "Forwarded", "From", "Host", "If-Match",
+      "If-Modified-Since", "If-None-Match", "If-Range", "If-Unmodified-Since", "Idempotency-Key",
+      "Keep-Alive", "Max-Forwards", "Origin", "Pragma", "Prefer", "Proxy-Authorization", "Range", "Referer",
+      "TE", "Traceparent", "Tracestate", "Upgrade", "User-Agent", "Via", "X-API-Key", "X-Correlation-ID",
+      "X-CSRF-Token", "X-Forwarded-For", "X-Forwarded-Host", "X-Forwarded-Proto", "X-HTTP-Method-Override",
+      "X-Request-ID", "X-Requested-With"};
+  return names;
+}
+
+const std::vector<std::string>& header_value_choices(std::string_view header_name) {
+  static const std::vector<std::string> none;
+  static const std::vector<std::string> media = {
+      "application/json", "application/json; charset=utf-8", "application/xml", "application/x-www-form-urlencoded",
+      "application/octet-stream", "application/grpc-web+proto", "application/problem+json", "multipart/form-data",
+      "text/plain", "text/html", "text/csv", "text/xml"};
+  static const std::vector<std::string> accept = [] {
+    std::vector<std::string> v = {"*/*"};
+    for (const auto& m : media)
+      if (m != "multipart/form-data" && m != "application/x-www-form-urlencoded") v.push_back(m);
+    return v;
+  }();
+  static const std::vector<std::string> codings = {"gzip, deflate, br", "gzip, deflate, br, zstd", "gzip", "deflate",
+                                                   "br", "zstd", "identity"};
+  static const std::vector<std::string> content_codings = {"gzip", "deflate", "br", "zstd", "identity"};
+  static const std::vector<std::string> languages = {"en-US,en;q=0.9", "en", "en-GB", "de-DE,de;q=0.9", "fr-FR,fr;q=0.9", "*"};
+  static const std::vector<std::string> charsets = {"utf-8", "iso-8859-1", "*"};
+  static const std::vector<std::string> schemes = {"Bearer ", "Basic ", "Digest ", "Negotiate ", "AWS4-HMAC-SHA256 "};
+  static const std::vector<std::string> cache = {"no-cache", "no-store", "max-age=0", "no-transform", "only-if-cached"};
+  static const std::vector<std::string> pragma = {"no-cache"};
+  static const std::vector<std::string> connection = {"keep-alive", "close", "Upgrade"};
+  static const std::vector<std::string> expect = {"100-continue"};
+  static const std::vector<std::string> prefer = {"return=representation", "return=minimal", "respond-async", "wait="};
+  static const std::vector<std::string> requested_with = {"XMLHttpRequest"};
+  static const std::vector<std::string> te = {"trailers"};
+  static const std::vector<std::string> upgrade = {"websocket", "h2c"};
+  static const std::vector<std::string> dnt = {"1", "0"};
+  static const std::vector<std::string> override_methods = {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"};
+  static const std::vector<std::string> disposition = {"inline", "attachment", "attachment; filename=\"\"",
+                                                       "form-data; name=\"\""};
+  static const std::pair<const char*, const std::vector<std::string>*> table[] = {
+      {"Content-Type", &media},          {"Accept", &accept},
+      {"Accept-Encoding", &codings},     {"Content-Encoding", &content_codings},
+      {"Accept-Language", &languages},   {"Content-Language", &languages},
+      {"Accept-Charset", &charsets},     {"Authorization", &schemes},
+      {"Proxy-Authorization", &schemes}, {"Cache-Control", &cache},
+      {"Pragma", &pragma},               {"Connection", &connection},
+      {"Expect", &expect},               {"Prefer", &prefer},
+      {"X-Requested-With", &requested_with}, {"TE", &te},
+      {"Upgrade", &upgrade},             {"DNT", &dnt},
+      {"X-HTTP-Method-Override", &override_methods}, {"Content-Disposition", &disposition}};
+  const std::string_view n = trim(header_name);
+  for (const auto& [name, list] : table)
+    if (iequals(n, name)) return *list;
+  return none;
+}
+
+std::vector<std::string> completions_for(const std::vector<std::string>& choices, std::string_view typed) {
+  std::vector<std::string> out;
+  if (typed.empty()) return out;
+  for (const auto& c : choices)
+    if (c.size() > typed.size() && istarts_with(c, typed)) out.push_back(c);
+  return out;
+}
+
+void HeaderGridModel::type(std::string_view keys) {
+  for (char k : keys) key(k);
+}
+
+void HeaderGridModel::open(int r, int c) {
+  row = r;
+  col = c;
+  const Row& rw = rows[static_cast<size_t>(r)];
+  text = c == 0 ? rw.name : c == 1 ? rw.value : rw.desc;
+  list.clear();
+  sel = -1;
+}
+
+void HeaderGridModel::refresh_list() {
+  const std::vector<std::string>* choices = nullptr;
+  if (col == 0) choices = &header_name_choices();
+  else if (col == 1) choices = &header_value_choices(rows[static_cast<size_t>(row)].name);
+  list = choices ? completions_for(*choices, text) : std::vector<std::string>{};
+  sel = -1;  // never chosen by itself
+}
+
+void HeaderGridModel::commit() {
+  Row& rw = rows[static_cast<size_t>(row)];
+  (col == 0 ? rw.name : col == 1 ? rw.value : rw.desc) = text;
+  const Row& last = rows.back();
+  if (!last.name.empty() || !last.value.empty() || !last.desc.empty()) rows.push_back(Row{});
+}
+
+void HeaderGridModel::key(char k) {
+  if (k == '\v' || k == '\f') {
+    if (list.empty()) return;
+    const int n = static_cast<int>(list.size());
+    sel = k == '\v' ? std::min(sel + 1, n - 1) : std::max(sel - 1, 0);
+    return;
+  }
+  if (k == '\t' || k == '\n') {
+    if (!list.empty() && sel >= 0) {
+      text = list[static_cast<size_t>(sel)];
+      list.clear();
+      sel = -1;
+      if (choice_continues(text)) return;  // "Bearer ": the token follows
+    }
+    list.clear();
+    commit();
+    const bool enter = k == '\n';
+    if (enter && col == 0 && text.empty()) return open(row, 0);  // nothing to commit: keep typing here
+    int r = row, c = col + 1;
+    if (c > (enter ? 1 : 2)) {
+      c = 0;
+      ++r;
+    }
+    if (r >= static_cast<int>(rows.size())) r = static_cast<int>(rows.size()) - 1;
+    return open(r, c);
+  }
+  text.push_back(k);
+  refresh_list();
+}
+
+std::vector<std::pair<std::string, std::string>> HeaderGridModel::headers() const {
+  std::vector<std::pair<std::string, std::string>> out;
+  for (const auto& r : rows)
+    if (!r.name.empty() || !r.value.empty()) out.emplace_back(r.name, r.value);
+  return out;
 }
 
 void TypingModel::type(char c) {

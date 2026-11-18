@@ -284,6 +284,136 @@ std::string path_string(const std::vector<PathStep>& path) {
   return s;
 }
 
+std::string target_string(const std::vector<PathStep>& path, const std::string& root) {
+  const std::string s = path_string(path);  // "$..." with the same plain / bracket rules
+  return root + s.substr(1);
+}
+
+bool json_value_at(std::string_view text, size_t off, JsonHit& hit) {
+  struct Frame {
+    bool arr = false;
+    long idx = 0;
+    std::string key;
+    bool want_key = true;
+  };
+  std::vector<Frame> st;
+  auto path_of = [&](size_t frames) {
+    std::vector<PathStep> out;
+    out.reserve(frames);
+    for (size_t i = 0; i < frames; ++i) {
+      PathStep ps;
+      if (st[i].arr) {
+        ps.is_index = true;
+        ps.index = st[i].idx;
+      } else {
+        ps.key = st[i].key;
+      }
+      out.push_back(std::move(ps));
+    }
+    return out;
+  };
+  auto container = [&](size_t frames) {
+    hit = {};
+    hit.path = path_of(frames);
+    return true;
+  };
+  if (off >= text.size()) return false;
+  Scanner sc{text};
+  for (;;) {
+    sc.ws();
+    if (sc.p >= text.size()) return false;
+    // `off` is on whitespace before this token: the innermost container around it.
+    if (sc.p > off) return st.empty() ? false : container(st.size() - 1);
+    const char c = text[sc.p];
+    const size_t s0 = sc.p;
+    if (c == '{' || c == '[') {
+      if (st.size() >= 64) return false;
+      if (off == s0) {
+        container(st.size());
+        hit.at = s0;
+        return true;
+      }
+      Frame f;
+      f.arr = c == '[';
+      st.push_back(std::move(f));
+      ++sc.p;
+      continue;
+    }
+    if (c == '}' || c == ']') {
+      if (st.empty()) return false;
+      if (off == s0) return container(st.size() - 1);
+      st.pop_back();
+      ++sc.p;
+      continue;
+    }
+    if (c == ',') {
+      if (st.empty()) return false;
+      if (off == s0) return container(st.size() - 1);
+      if (st.back().arr) ++st.back().idx;
+      else st.back().want_key = true;
+      ++sc.p;
+      continue;
+    }
+    if (c == ':') {
+      if (st.empty() || st.back().arr) return false;
+      if (off == s0) return container(st.size() - 1);
+      st.back().want_key = false;
+      ++sc.p;
+      continue;
+    }
+    const bool key = c == '"' && !st.empty() && !st.back().arr && st.back().want_key;
+    if (key) {
+      std::string k;
+      if (!sc.string(&k)) return false;
+      st.back().key = std::move(k);
+      st.back().want_key = false;
+      if (off >= sc.p) continue;
+      // On a key: its member's value.
+      if (st.size() > 64) return false;
+      hit = {};
+      hit.path = path_of(st.size());
+      sc.ws();
+      if (sc.p < text.size() && text[sc.p] == ':') ++sc.p;
+      sc.ws();
+      if (sc.p >= text.size()) return true;
+      hit.at = sc.p;
+      const char v = text[sc.p];
+      if (v == '{' || v == '[') return true;
+      const size_t v0 = sc.p;
+      if (!sc.skip()) return true;
+      hit.len = sc.p - v0;
+      hit.scalar = true;
+      return true;
+    }
+    if (!sc.skip()) return false;
+    if (c != '"') {  // a number or true / false / null, nothing else
+      const std::string_view lit = text.substr(s0, sc.p - s0);
+      const bool word = lit == "true" || lit == "false" || lit == "null";
+      const bool num = (lit[0] == '-' || (lit[0] >= '0' && lit[0] <= '9')) &&
+                       lit.find_first_not_of("0123456789+-.eE") == std::string_view::npos;
+      if (!word && !num) return false;
+    }
+    if (off < sc.p) {
+      if (st.size() > 64) return false;
+      hit = {};
+      hit.path = path_of(st.size());
+      hit.at = s0;
+      hit.len = sc.p - s0;
+      hit.scalar = true;
+      return true;
+    }
+    if (st.empty()) return false;  // one scalar document, `off` past it
+  }
+}
+
+std::string json_scalar_text(std::string_view literal) {
+  if (literal.empty() || literal.front() != '"') return std::string(literal);
+  Scanner sc{literal};
+  std::string out;
+  if (!sc.string(&out)) return std::string(literal);
+  return out;
+}
+
 std::string json_path_miss(std::string_view text, const std::vector<PathStep>& path, const std::string& root) {
   // The longest prefix of the path that exists, and the value there.
   std::vector<PathStep> pre;

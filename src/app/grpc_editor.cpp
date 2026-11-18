@@ -64,6 +64,7 @@
 #include <mutex>
 #include <thread>
 
+#include "app/autocomp_guard.h"
 #include "app/grpc_editor_tree.h"
 #include "app/grpc_editor_util.h"
 #include "app/grpc_editor_widgets.h"
@@ -414,7 +415,9 @@ class GrpcEditor : public wxPanel, public GrpcEditorPanel {
       ~Done() { out = "load " + elapsed_text(ms_between(t, Clock::now())); }
     } done{load_times_, t_load};
     loading_ = true;
-    pane_auto_hidden_ = false;
+    // Only a request opened with its method set gets the editor at full width, once, on its first
+    // schema; an explicit Enter / refresh (maybe_load_schema(true)) never hides the method list.
+    pane_auto_hidden_ = r.grpc_method.empty();
     base_ = r;
     base_.grpc_body.clear();
     base_.grpc_body.shrink_to_fit();
@@ -517,6 +520,14 @@ class GrpcEditor : public wxPanel, public GrpcEditorPanel {
   }
 
   bool interactive() const override { return stream_mode_ && manual_ && manual_->GetValue(); }
+  bool manual_wanted() const override { return manual_ ? manual_->GetValue() : want_manual_; }
+  void set_manual(bool on) override {
+    want_manual_ = on;
+    if (!manual_ || manual_->GetValue() == on) return;
+    manual_->SetValue(on);
+    update_stream_ui();
+    update_send_label();
+  }
 
   void set_schema(std::shared_ptr<const GrpcSchema> s) override {
     if (pending_loads_ > 0) --pending_loads_;
@@ -538,6 +549,7 @@ class GrpcEditor : public wxPanel, public GrpcEditorPanel {
                 s->error.find("Connection reset") != std::string::npos))
         hint = "\nIf this server uses TLS, switch Plaintext to TLS.";
       status_err_ = true;
+      pane_auto_hidden_ = true;  // the first schema of this open failed: never hide later
       schema_status_->SetForegroundColour(th_.error);
       schema_status_->set_text(wxString::FromUTF8("Could not load schema (" + elapsed_text(wall) + ")\n" + s->error + hint +
                                                   (keep ? "\nShowing the last schema that loaded." : "")));
@@ -586,6 +598,7 @@ class GrpcEditor : public wxPanel, public GrpcEditorPanel {
                                                 wxString::FromUTF8(elapsed_text(schema_->load_ms)),
                                                 wxString::FromUTF8(elapsed_text(wall))));
     tree_->set_empty_text("The schema has no services.");
+    prebuild_options(250);
     tree_->set_methods(schema_->methods);
     tree_->select(method_);
     left_->Layout();
@@ -628,6 +641,9 @@ class GrpcEditor : public wxPanel, public GrpcEditorPanel {
     send_ = new FlatButton(top_, "Send", FlatButton::Style::Primary);
     send_->set_width_labels({"Send", "Cancel", "Open stream"});
     send_->SetToolTip("Send the request (Ctrl+Enter)");
+    // The address takes the focus when the tab is shown (as the HTTP and WebSocket URLs do), not
+    // the Schema toggle: its focus ring read as "pressed" on a tab whose schema pane is hidden.
+    addr_->MoveBeforeInTabOrder(schema_btn_);
     grpcurl_ = new FlatButton(top_, "grpcurl", FlatButton::Style::Subtle, true);
     grpcurl_->set_width_labels({wxString::FromUTF8("✓ Copied"), "grpcurl"});
     grpcurl_->SetToolTip("Copy as grpcurl, or import a grpcurl command");
@@ -911,6 +927,11 @@ class GrpcEditor : public wxPanel, public GrpcEditorPanel {
     right_->SetSizer(rsz);
 
     tabs_->on_select = [this](size_t i) { show_page(i); };
+    // The editor is on screen (its tab strip paints): build the Options page ahead, in slices.
+    tabs_->Bind(wxEVT_PAINT, [this](wxPaintEvent& e) {
+      e.Skip();
+      if (!opt_page_built_) prebuild_options(300);
+    });
     method_btn_->on_click = [this] { show_method_menu(); };
     def_btn_->on_click = [this] { show_definition(); };
   }
@@ -924,6 +945,7 @@ class GrpcEditor : public wxPanel, public GrpcEditorPanel {
     stream_bar_ = new wxPanel(page);
     auto* sb = new wxBoxSizer(wxHORIZONTAL);
     manual_ = new CheckBox(stream_bar_, "Manual");
+    manual_->SetValue(want_manual_);
     manual_->SetToolTip("Manual stream: open the stream and send messages one at a time while responses arrive.\n"
                         "Off: Send streams every message in the list, then closes the send side.");
     stream_hint_ = new wxStaticText(stream_bar_, wxID_ANY, "", wxDefaultPosition, wxDefaultSize, wxST_ELLIPSIZE_END);
@@ -937,11 +959,16 @@ class GrpcEditor : public wxPanel, public GrpcEditorPanel {
     end_ = new FlatButton(stream_bar_, "End", FlatButton::Style::Outline);
     end_->SetToolTip("End stream (half-close): tell the server no more messages follow");
     sb->Add(manual_, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, FromDIP(8));
-    sb->Add(stream_hint_, 1, wxALIGN_CENTER_VERTICAL | wxRIGHT, FromDIP(6));
+    sb->AddStretchSpacer(1);
     sb->Add(send_one_, 0, wxRIGHT, FromDIP(4));
     sb->Add(send_all_, 0, wxRIGHT, FromDIP(4));
     sb->Add(end_, 0);
-    stream_bar_->SetSizer(sb);
+    // The stream state and its deadline warning get a line of their own: next to the buttons a
+    // narrow page cut them to "Stream open · close...".
+    auto* col = new wxBoxSizer(wxVERTICAL);
+    col->Add(sb, 0, wxEXPAND);
+    col->Add(stream_hint_, 0, wxEXPAND | wxTOP, FromDIP(4));
+    stream_bar_->SetSizer(col);
     page_sz_->Insert(0, stream_bar_, 0, wxEXPAND | wxTOP | wxBOTTOM, FromDIP(6));
 
     msg_col_ = new wxPanel(page);
@@ -966,6 +993,7 @@ class GrpcEditor : public wxPanel, public GrpcEditorPanel {
     mid_sz_->Insert(0, msg_col_, 0, wxEXPAND | wxBOTTOM, FromDIP(4));
 
     manual_->on_change = [this] {
+      want_manual_ = manual_->GetValue();
       update_stream_ui();
       update_send_label();
     };
@@ -1342,18 +1370,38 @@ class GrpcEditor : public wxPanel, public GrpcEditorPanel {
       md_holder_->Layout();
     } else if (i == 2 && !opt_page_built_) {
       wxWindowUpdateLocker lock(opt_holder_);
-      opt_holder_->GetSizer()->Add(build_options_page(opt_holder_), 1, wxEXPAND);
-      opt_page_built_ = true;
-      push_options();
-      opt_holder_->Layout();
+      while (!build_options_step()) {
+      }
     }
   }
 
-  wxWindow* build_options_page(wxWindow* parent) {
-    auto* page = new wxScrolledWindow(parent, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxVSCROLL | wxBORDER_NONE);
-    page->SetScrollRate(0, FromDIP(12));
-    auto* g = new wxFlexGridSizer(2, FromDIP(7), FromDIP(12));
-    g->AddGrowableCol(1);
+  // The Options page took 45 ms to build in one step on its first click. It is built in three
+  // slices (Call, Connection, TLS), ahead of time while the editor is idle on screen (opt_timer_),
+  // or all at once if it is clicked before that finished. true once the page is complete.
+  void prebuild_options(int ms) {
+    if (opt_page_built_) return;
+    if (opt_timer_.GetOwner() != this) {
+      opt_timer_.SetOwner(this, wxWindow::NewControlId());
+      Bind(wxEVT_TIMER, [this](wxTimerEvent&) {
+        if (opt_page_built_) return;
+        if (!IsShownOnScreen()) return;  // a background tab: its next paint starts it again
+        if (!build_options_step()) opt_timer_.StartOnce(30);
+      }, opt_timer_.GetId());
+    }
+    if (!opt_timer_.IsRunning()) opt_timer_.StartOnce(ms);
+  }
+
+  bool build_options_step() {
+    if (opt_page_built_) return true;
+    if (opt_stage_ == 0) {
+      opt_page_ = new wxScrolledWindow(opt_holder_, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxVSCROLL | wxBORDER_NONE);
+      opt_page_->SetScrollRate(0, FromDIP(12));
+      opt_grid_ = new wxFlexGridSizer(2, FromDIP(7), FromDIP(12));
+      opt_grid_->AddGrowableCol(1);
+    }
+    wxScrolledWindow* page = opt_page_;
+    wxFlexGridSizer* g = opt_grid_;
+    const int stage = opt_stage_++;
     auto label = [&](const char* s) {
       g->Add(new wxStaticText(page, wxID_ANY, s), 0, wxALIGN_CENTER_VERTICAL);
     };
@@ -1398,6 +1446,7 @@ class GrpcEditor : public wxPanel, public GrpcEditorPanel {
       return t;
     };
 
+    if (stage == 0) {
     section("Call");
     label("Deadline");
     deadline_ = spin(86400, 30, 1, "seconds  (0 = none)",
@@ -1423,7 +1472,10 @@ class GrpcEditor : public wxPanel, public GrpcEditorPanel {
       };
     }
     g->Add(jrow, 0, wxEXPAND);
+    return false;
+    }
 
+    if (stage == 1) {
     section("Connection");
     label("Authority");
     authority_ = text(":authority override", true);
@@ -1436,6 +1488,8 @@ class GrpcEditor : public wxPanel, public GrpcEditorPanel {
         spin(86400, 0, 0, "seconds between pings  (0 = off)", "HTTP/2 keepalive ping interval (grpcurl -keepalive-time)");
     label("Max message");
     max_msg_ = spin(2047, 0, 0, "MB  (0 = unlimited)", "Largest message sent or received (grpcurl -max-msg-sz)");
+    return false;
+    }
 
     section("TLS  (address bar set to TLS)");
     label("Verification");
@@ -1480,7 +1534,11 @@ class GrpcEditor : public wxPanel, public GrpcEditorPanel {
     auto* sz = new wxBoxSizer(wxVERTICAL);
     sz->Add(g, 0, wxEXPAND | wxALL, FromDIP(10));
     page->SetSizer(sz);
-    return page;
+    opt_holder_->GetSizer()->Add(page, 1, wxEXPAND);
+    opt_page_built_ = true;
+    push_options();
+    opt_holder_->Layout();
+    return true;
   }
 
   // A PEM file for the CA / client certificate / client key: read once when picked (a few KB);
@@ -2096,13 +2154,28 @@ class GrpcEditor : public wxPanel, public GrpcEditorPanel {
       end_->Enable(in_flight_);
       if (manual) {
         const bool ended = !in_flight_ && std::find(sent_.begin(), sent_.end(), static_cast<char>(1)) != sent_.end();
-        stream_hint_->SetLabel(in_flight_ ? "Stream open" : ended ? "Stream ended; sending opens a new one" : "Opens on first send");
-        stream_hint_->SetToolTip(in_flight_ ? "Send messages one at a time, then End to half-close"
-                                 : ended    ? "Ticks mark what went out on the last stream. Send opens a new stream."
-                                            : "The stream opens with the first message you send");
+        // The call's deadline also runs while the user composes: say so, or a paced stream dies
+        // with DEADLINE_EXCEEDED mid-thought and the next send silently opens a new one.
+        const long dl = opt_o_.deadline_ms;
+        const wxString dls = dl > 0 ? wxString::Format("%g s", static_cast<double>(dl) / 1000.0) : wxString();
+        wxString hint = in_flight_ ? wxString("Stream open") : ended ? wxString("Stream ended; sending opens a new one")
+                                                                     : wxString("Opens on first send");
+        if (dl > 0) hint += in_flight_ ? wxString::Format(L"  ·  closes at the %s deadline", dls)
+                                       : wxString::Format(L"  ·  %s deadline", dls);
+        stream_hint_->SetLabel(hint);
+        stream_hint_->SetForegroundColour(dl > 0 && dl < 60000 ? th_.error : th_.muted);
+        wxString tip = in_flight_ ? wxString("Send messages one at a time, then End to half-close")
+                       : ended    ? wxString("Ticks mark what went out on the last stream. Send opens a new stream.")
+                                  : wxString("The stream opens with the first message you send");
+        if (dl > 0)
+          tip += wxString::Format("\nThe call's deadline (%s, Options tab) counts from the first send, time spent "
+                                  "composing included: the server ends the stream with DEADLINE_EXCEEDED when it passes. "
+                                  "Set it to 0 for no deadline.", dls);
+        stream_hint_->SetToolTip(tip);
       } else {
         stream_hint_->SetLabel(wxString::Format("Sends %zu message%s, then closes", n, n == 1 ? "" : "s"));
         stream_hint_->SetToolTip("Send streams every message in the list in order, then half-closes");
+        stream_hint_->SetForegroundColour(th_.muted);
       }
       refresh_message_list();
     }
@@ -2167,7 +2240,9 @@ class GrpcEditor : public wxPanel, public GrpcEditorPanel {
   }
 
   void update_options_tab() {
+    const long deadline_was = opt_o_.deadline_ms;
     pull_options();
+    if (deadline_was != opt_o_.deadline_ms && stream_bar_ && stream_mode_) update_stream_ui();  // the deadline hint
     const GrpcTarget& t = opt_t_;
     const double dl = static_cast<double>(opt_o_.deadline_ms) / 1000.0;
     wxString badge;
@@ -2471,6 +2546,7 @@ class GrpcEditor : public wxPanel, public GrpcEditorPanel {
       list += k;
     }
     body_->AutoCompShow(body_->GetCurrentPos() - start, wxString::FromUTF8(list));
+    guard_autocomp(body_);
   }
 
   void after_completion(const std::string& word) {
@@ -2541,6 +2617,7 @@ class GrpcEditor : public wxPanel, public GrpcEditorPanel {
   }
 
   void maybe_load_schema(bool force) {
+    if (force) pane_auto_hidden_ = true;  // user-triggered: keep the pane as the user left it
     addr_timer_.Stop();
     addr_wait_ = false;
     const std::string key = schema_key();
@@ -3473,6 +3550,7 @@ class GrpcEditor : public wxPanel, public GrpcEditorPanel {
   TabStrip* tabs_ = nullptr;
   wxSimplebook* book_ = nullptr;
   wxPanel* stream_bar_ = nullptr;  // null until ensure_stream_ui()
+  bool want_manual_ = false;       // Manual, also before the stream bar exists (a restored session)
   wxWindow* msg_page_ = nullptr;
   wxBoxSizer* page_sz_ = nullptr;
   wxBoxSizer* mid_sz_ = nullptr;
@@ -3511,6 +3589,10 @@ class GrpcEditor : public wxPanel, public GrpcEditorPanel {
   Metadata md_model_;
   bool opt_page_built_ = false;
   wxPanel* opt_holder_ = nullptr;
+  wxScrolledWindow* opt_page_ = nullptr;  // the Options page while it is built in slices
+  wxFlexGridSizer* opt_grid_ = nullptr;
+  int opt_stage_ = 0;
+  wxTimer opt_timer_;
   wxPanel* md_holder_ = nullptr;
   struct Pem {
     std::wstring from;  // file name it was read from (empty: came with the request)

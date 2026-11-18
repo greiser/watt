@@ -53,6 +53,13 @@ namespace watt::app::sidebar {
 // empty path when cancelled. `folders`: pick a folder instead of a file.
 void pick_file_async(wxWindow* owner, const std::wstring& title,
                      const std::vector<std::pair<std::wstring, std::wstring>>& filters, bool folders,
-                     std::function<void(const std::filesystem::path&)> done);
+                     std::function<void(const std::filesystem::path&)> done,
+                     const std::filesystem::path& start = {});
+// The OS "Save as" dialog the same way (asks before overwriting; `name` is the suggested file
+// name, `start` the folder it opens in).
+void save_file_async(wxWindow* owner, const std::wstring& title,
+                     const std::vector<std::pair<std::wstring, std::wstring>>& filters, const std::wstring& name,
+                     std::function<void(const std::filesystem::path&)> done,
+                     const std::filesystem::path& start = {});
 
 }  // namespace watt::app::sidebar

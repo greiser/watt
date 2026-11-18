@@ -161,6 +161,9 @@ struct Phase {
   const char* name;  // static string: "DNS", "Connect", ...
   double ms;
 };
+// Pre-request vars / script, Auth / token, post-response script: time outside the response time.
+bool is_script_phase(const Phase& p);
+bool is_setup_phase(const Phase& p);  // Prepare, Queue: StepResult::prep_ms, not response time
 
 // One data file row: (column, value) in the file's column order.
 using DataRow = std::vector<std::pair<std::string, std::string>>;
@@ -183,8 +186,20 @@ struct StepResult {
   long status = 0;            // HTTP status / gRPC status code
   std::string status_text;    // reason phrase / gRPC status name
   std::string error;          // why it was not sent, or the transport / gRPC error message
-  Timing timing;              // timing.total_ms is the step's total (runner setup included in queue)
-  std::vector<Phase> phases;  // in order; they add up to timing.total_ms
+  // timing.total_ms is the response time as Newman / Postman report it: the network phases, DNS
+  // through Process. Neither the scripts (script_ms) nor the setup before the first I/O (prep_ms)
+  // are in it.
+  Timing timing;
+  // The runner's own setup (expansion, files, consent checks), watt's request setup and the
+  // client queue before the first I/O: the Prepare and Queue phases (is_setup_phase).
+  double prep_ms = 0;
+  // Pre-request vars, pre-request script, Auth / token and post-response script, apart from
+  // timing.total_ms (the Script column, the "incl. scripts" figures).
+  double script_ms = 0;
+  // In order; the network phases add up to timing.total_ms, the script ones (is_script_phase)
+  // to script_ms, the setup ones (is_setup_phase) to prep_ms.
+  std::vector<Phase> phases;
+  double total_incl_scripts_ms() const { return timing.total_ms + script_ms; }
   uint64_t size = 0;          // response body bytes
   double started_ms = 0;      // offset of the send from the run's start
   struct Check {
@@ -227,6 +242,7 @@ struct StepResult {
   bool req_body_truncated = false;
   uint64_t bytes_received = 0;            // on the wire: headers + body, all hops
   bool skipped = false;                   // planned but never run (the run was stopped first)
+  bool from_history = false;              // read back from a saved run (from_json): no bodies, no headers
   // Script console output (pre-request first), capped (see kLogKeep); logs_truncated when cut.
   struct Log {
     bool post = false;
@@ -403,6 +419,12 @@ struct RunSummary {
   // sent step.
   double avg_dns_ms = 0, avg_connect_ms = 0, avg_tls_ms = 0, avg_ttfb_ms = 0;
   size_t new_connections = 0;
+  // Script and token time (StepResult::script_ms), outside every time above: summed over the
+  // sent steps, their count, average and maximum.
+  double script_sum_ms = 0, avg_script_ms = 0, max_script_ms = 0;
+  // Setup before the first I/O (StepResult::prep_ms), outside every time above too.
+  double prep_sum_ms = 0, avg_prep_ms = 0;
+  size_t scripted = 0;
   uint64_t bytes_received = 0;  // on the wire, all sent steps
   size_t stopped_steps = 0;     // in flight / not yet sent when stopped (neither passed nor failed)
   size_t skipped = 0;           // planned but never run (a stopped run)
@@ -438,11 +460,37 @@ struct RunMeta {
   std::string environment;  // active environment ("" = none)
   std::string started_iso;  // UTC, "2026-11-17T10:00:00Z"
   int iterations = 1;
+  // Run history only (written when not empty): "rerun failed", and the plan By request compares.
+  std::string label, plan;
 };
 std::string now_iso();
 std::string to_json(const RunMeta& meta, const RunSummary& s, const std::vector<std::shared_ptr<const StepResult>>& steps);
 std::string to_junit(const RunMeta& meta, const RunSummary& s, const std::vector<std::shared_ptr<const StepResult>>& steps);
 std::string xml_escape(const std::string& s);  // text and attribute values; drops XML-invalid control bytes
+
+// ---- run history across restarts (Postman keeps past runs per collection)
+
+// A to_json report read back. Steps get item = the order their path first appears in (the
+// caller maps it onto its own items); no bodies or request headers (a report has none).
+struct LoadedRun {
+  RunMeta meta;
+  RunSummary summary;  // as saved, per_request included
+  std::vector<std::shared_ptr<const StepResult>> steps;
+  bool partial = false;  // only the failed steps were kept (a big run)
+};
+bool from_json(const std::string& text, LoadedRun& out, std::string* err = nullptr);
+// The report a history file keeps: every step up to kHistorySteps, else the failed ones (up to
+// kHistorySteps, "partial": true). Script-set and captured values whose names look like
+// credentials (token, secret, password, key...) are masked.
+constexpr size_t kHistorySteps = 5000;
+std::string history_json(const RunMeta& meta, const RunSummary& s, const std::vector<std::shared_ptr<const StepResult>>& steps);
+// Per user (<Workspace::user_config_dir()>/runs/<hash of key>/), never in the workspace (the
+// results hold URLs and values a repository should not get). save_history writes one run and
+// keeps the newest `keep`; load_history returns up to max files' contents, newest first. Disk
+// work: worker threads only.
+bool save_history(const std::wstring& key, const std::string& started_iso, const std::string& json, size_t keep,
+                  std::string* err = nullptr);
+std::vector<std::string> load_history(const std::wstring& key, size_t max);
 // Self-contained HTML report (Bruno's Download Report): summary, per-request table, every step
 // with its asserts; failed steps also with the response (escaped) and the request headers with
 // credentials masked. No script, no external resources.
@@ -455,7 +503,7 @@ bool sensitive_header(std::string_view name);
 // Every number in s ("123.5", "-4", "1e3") replaced by '#', so "got 123.5" and "got 129.9" read
 // the same.
 std::string normalize_numbers(std::string_view s);
-// One failed check of a step: what was checked ("res.status eq 201", "status < 400", "sent") and
+// One failed check of a step: what was checked ("res.status eq 201", "expected status < 400", "sent") and
 // the message ("expected res.status to equal 201, got 200", "HTTP 404 Not Found").
 struct Failure {
   std::string check, message;
@@ -478,6 +526,10 @@ struct FailureGroup {
   int first_iteration = 0, last_iteration = 0;  // lowest / highest failing iteration (0-based)
   size_t iterations = 1;                         // distinct failing iterations
   size_t first_seq = 0, last_seq = 0;
+  // Failed steps of this group sent with a {{name}} nothing defined, and the names (up to 4):
+  // often the cause ("Get order got 404" because {{firstId}} was not captured yet).
+  size_t unresolved = 0;
+  std::vector<std::string> unresolved_names;
 };
 // Most frequent first (ties: the one that happened first).
 std::vector<FailureGroup> group_failures(const std::vector<std::shared_ptr<const StepResult>>& steps);

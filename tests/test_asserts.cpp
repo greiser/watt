@@ -397,6 +397,20 @@ TEST_CASE("gRPC targets", "[asserts][targets][grpc]") {
   CHECK(one("res.body", "isUndefined", "", none));
   CHECK(one("res.messages.length", "eq", "0", none));
   CHECK(one("res.status", "eq", "OK", none));
+
+  // A user-paced (Manual) stream: open -> trailers is the user's pace; responseTime is the
+  // server's part after the client's last action, res.timing.total stays the wall time.
+  GrpcResponse paced = g;
+  paced.timing.total_ms = 18479;
+  paced.pacing.on = true;
+  paced.pacing.sent = 2;
+  paced.pacing.first_send_ms = 13168;
+  paced.pacing.end_ms = 18478;
+  paced.pacing.tail_ms = 0.75;
+  CHECK(one("res.responseTime", "lt", "3000", paced));
+  CHECK_FALSE(one("res.timing.total", "lt", "3000", paced));
+  paced.pacing.on = false;
+  CHECK_FALSE(one("res.responseTime", "lt", "3000", paced));
 }
 
 TEST_CASE("{{var}} values are expanded before comparison", "[asserts][vars]") {

@@ -1955,6 +1955,17 @@ std::string Workspace::passphrase_key(const SettingsOrigin& level, const std::st
   }
 }
 
+bool auth_sets_authorization(const HttpAuth& a) {
+  switch (a.type) {
+    case HttpAuth::Type::Digest:
+    case HttpAuth::Type::Ntlm:
+    case HttpAuth::Type::Negotiate:
+    case HttpAuth::Type::AwsSigV4: return true;
+    case HttpAuth::Type::OAuth2: return a.oauth2.add_to == OAuth2Config::AddTo::Header;
+    default: return false;
+  }
+}
+
 SavedRequest Workspace::resolve_with(const SavedRequest& r, const FolderChain& c) const {
   if (r.settings_merged) return r;
   SavedRequest x = r;
@@ -1984,6 +1995,9 @@ SavedRequest Workspace::resolve_with(const SavedRequest& r, const FolderChain& c
   }
   if (c.levels.empty()) return x;
   const bool basic_wins = r.kind == RequestKind::Http && x.auth.type == HttpAuth::Type::None && x.basic_auth.enabled;
+  // Every other scheme the Auth tab sends as Authorization (OAuth 2.0 in the header, Digest, NTLM,
+  // Negotiate, SigV4) beats an inherited Authorization header from further out, as Basic does.
+  const bool scheme_wins = r.kind == RequestKind::Http && auth_sets_authorization(x.auth);
   // Headers (gRPC: metadata): collection, folders outermost first, then the request's own. A
   // name set (enabled) at a nearer level replaces the inherited one; disabled rows are not sent.
   const bool grpc = r.kind == RequestKind::Grpc;
@@ -1993,7 +2007,7 @@ SavedRequest Workspace::resolve_with(const SavedRequest& r, const FolderChain& c
     if (grpc || !x.disabled_headers.count(k)) taken.insert(lower_ascii(own[k].first));
   std::vector<std::vector<Header>> per_level(c.levels.size());
   for (size_t i = c.levels.size(); i-- > 0;) {
-    if (basic_wins && i < basic_at) taken.insert("authorization");
+    if ((basic_wins || scheme_wins) && i < basic_at) taken.insert("authorization");
     std::vector<std::string> here;
     for (const auto& row : c.levels[i].data->s.headers) {
       if (!row.enabled || row.name.empty()) continue;
@@ -2175,7 +2189,7 @@ EffectiveSettings Workspace::effective_settings(const SavedRequest& r) const {
     }
   }
   // Basic auth beats an Authorization header inherited from a level further out (resolve_with()).
-  if (!grpc && e.auth.type == HttpAuth::Type::None && e.basic_auth.enabled) {
+  if (!grpc && ((e.auth.type == HttpAuth::Type::None && e.basic_auth.enabled) || auth_sets_authorization(e.auth))) {
     size_t k = 0;
     for (size_t i = 0; i < c.levels.size(); ++i)
       for (size_t j = 0; j < c.levels[i].data->s.headers.size(); ++j, ++k)

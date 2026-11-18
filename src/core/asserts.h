@@ -11,7 +11,8 @@
 //                       its name ("res.status eq OK", "eq 0", "eq not_found" all work)
 //   res.statusText      HTTP reason phrase / gRPC status name
 //   res.statusMessage   gRPC status message (HTTP: the transport error, if any)
-//   res.responseTime    timing.total_ms
+//   res.responseTime    timing.total_ms (a user-paced gRPC stream: GrpcResponse::pacing.tail_ms,
+//                       its last client action -> trailers)
 //   res.timing.<phase>  queue dns connect tls send ttfb download total (both); prepare socket
 //                       redirect process (HTTP); reflect (gRPC)
 //   res.size            response body bytes (HTTP: decoded; gRPC: sum of message wire bytes)

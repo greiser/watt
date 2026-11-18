@@ -31,31 +31,16 @@ wxFont mono(int pt) {
 
 }  // namespace
 
-NetworkPanel::NetworkPanel(wxWindow* parent, const fs::path& root, bool top)
+NetworkPanel::NetworkPanel(wxWindow* parent, const fs::path& root, bool top, bool staged)
     : wxPanel(parent), root_(root.lexically_normal()), top_(top) {
   const Theme& t = Theme::get();
   SetBackgroundColour(t.bg);
   auto* s = new wxBoxSizer(wxVERTICAL);
-  auto* grid = new wxFlexGridSizer(2, FromDIP(6), FromDIP(10));
-  grid->AddGrowableCol(1, 1);
   // One label column width for every section (the longest label is in the redirect one), so
   // the fields and choices of all sections start on one left edge.
   const int label_w = std::max(FromDIP(96), GetTextExtent("Credentials on redirect").x + FromDIP(4));
-  auto label = [&](const char* text) {
-    auto* l = new wxStaticText(this, wxID_ANY, text);
-    l->SetForegroundColour(t.fg);
-    l->SetMinSize(wxSize(label_w, -1));
-    grid->Add(l, 0, wxALIGN_CENTER_VERTICAL);
-    return l;
-  };
-  auto file_row = [&](wxTextCtrl* f, const wxString& title, const wxString& wildcard) {
-    auto* row = new wxBoxSizer(wxHORIZONTAL);
-    row->Add(f, 1, wxALIGN_CENTER_VERTICAL);
-    auto* b = new FlatButton(this, wxString::FromUTF8("Browse\xE2\x80\xA6"), FlatButton::Style::Subtle);
-    b->on_click = [this, f, title, wildcard] { browse(f, title, wildcard); };
-    row->Add(b, 0, wxALIGN_CENTER_VERTICAL | wxLEFT, FromDIP(6));
-    grid->Add(row, 1, wxEXPAND);
-  };
+  label_w_ = label_w;
+  sizer_ = s;
 
   {
     // Redirects, URL encoding, TLS version (Postman's / Bruno's / Insomnia's request settings).
@@ -127,36 +112,84 @@ NetworkPanel::NetworkPanel(wxWindow* parent, const fs::path& root, bool top)
       c->SetMinSize(wxSize(w, std::max(fh, c->GetBestSize().y)));
   }
 
+  // The inherited line goes last (stage 2); the sizer is the panel's from the start.
+  SetSizer(s);
+  if (!staged)
+    while (!build_step()) {
+    }
+}
+
+bool NetworkPanel::build_step() {
+  if (stage_ == 0) {
+    stage_ = 1;
+    build_certs();
+  } else if (stage_ == 1) {
+    stage_ = 2;
+    build_ca_proxy();
+    stage_ = 3;
+  }
+  return complete();
+}
+
+wxStaticText* NetworkPanel::add_label(wxFlexGridSizer* grid, const char* text) {
+  auto* l = new wxStaticText(this, wxID_ANY, text);
+  l->SetForegroundColour(Theme::get().fg);
+  l->SetMinSize(wxSize(label_w_, -1));
+  grid->Add(l, 0, wxALIGN_CENTER_VERTICAL);
+  return l;
+}
+
+void NetworkPanel::add_file_row(wxFlexGridSizer* grid, wxTextCtrl* f, const wxString& title, const wxString& wildcard) {
+  auto* row = new wxBoxSizer(wxHORIZONTAL);
+  row->Add(f, 1, wxALIGN_CENTER_VERTICAL);
+  auto* b = new FlatButton(this, wxString::FromUTF8("Browse\xE2\x80\xA6"), FlatButton::Style::Subtle);
+  b->on_click = [this, f, title, wildcard] { browse(f, title, wildcard); };
+  row->Add(b, 0, wxALIGN_CENTER_VERTICAL | wxLEFT, FromDIP(6));
+  grid->Add(row, 1, wxEXPAND);
+}
+
+void NetworkPanel::build_certs() {
+  const Theme& t = Theme::get();
+  const bool top = top_;
+  wxBoxSizer* s = sizer_;
   auto* h1 = new wxStaticText(this, wxID_ANY, "Client certificate (mutual TLS)");
   h1->SetForegroundColour(t.fg);
   h1->SetFont(GetFont().Bold());
+  auto* grid = new wxFlexGridSizer(2, FromDIP(6), FromDIP(10));
+  grid->AddGrowableCol(1, 1);
   s->Add(h1, 0, wxTOP, FromDIP(14));
-  label("Certificate");
+  add_label(grid, "Certificate");
   cert_ = field(top ? "certs/client.pem or client.pfx (empty: none)"
                     : "certs/client.pem or client.pfx (empty: inherit)");
-  file_row(cert_, "Client certificate",
+  add_file_row(grid, cert_, "Client certificate",
            "Certificates (*.pem;*.crt;*.cer;*.pfx;*.p12)|*.pem;*.crt;*.cer;*.pfx;*.p12|All files (*.*)|*.*");
-  label("Private key");
+  add_label(grid, "Private key");
   key_ = field("certs/client.key (PEM; empty with a .pfx or a PEM holding the key)");
-  file_row(key_, "Private key", "Keys (*.key;*.pem)|*.key;*.pem|All files (*.*)|*.*");
-  label("Passphrase");
+  add_file_row(grid, key_, "Private key", "Keys (*.key;*.pem)|*.key;*.pem|All files (*.*)|*.*");
+  add_label(grid, "Passphrase");
   pass_ = field("only for an encrypted key or a .pfx (kept DPAPI-sealed in .watt, never in git)", true);
   grid->Add(pass_, 1, wxEXPAND);
   s->Add(grid, 0, wxEXPAND | wxTOP, FromDIP(6));
   cert_off_ = new CheckButton(this, "No client certificate for these requests (even if a level above sets one)");
   s->Add(cert_off_, 0, wxTOP, FromDIP(6));
   cert_off_->Show(!top);
+  Layout();
+}
 
+void NetworkPanel::build_ca_proxy() {
+  const Theme& t = Theme::get();
+  const bool top = top_;
+  wxBoxSizer* s = sizer_;
   auto* h2 = new wxStaticText(this, wxID_ANY, "Server certificate");
   h2->SetForegroundColour(t.fg);
   h2->SetFont(GetFont().Bold());
   s->Add(h2, 0, wxTOP, FromDIP(14));
-  grid = new wxFlexGridSizer(2, FromDIP(6), FromDIP(10));
+  auto* grid = new wxFlexGridSizer(2, FromDIP(6), FromDIP(10));
   grid->AddGrowableCol(1, 1);
-  label("CA certificate");
+  add_label(grid, "CA certificate");
   ca_ = field(top ? "certs/ca.pem: trust this CA instead of the Windows roots (empty: Windows roots)"
                   : "certs/ca.pem (empty: inherit; the Windows roots at the top)");
-  file_row(ca_, "CA certificate (PEM)", "PEM certificates (*.pem;*.crt;*.cer)|*.pem;*.crt;*.cer|All files (*.*)|*.*");
+  add_file_row(grid, ca_, "CA certificate (PEM)", "PEM certificates (*.pem;*.crt;*.cer)|*.pem;*.crt;*.cer|All files (*.*)|*.*");
   s->Add(grid, 0, wxEXPAND | wxTOP, FromDIP(6));
   ca_off_ = new CheckButton(this, "Use the Windows trust store here (ignore a CA set above)");
   s->Add(ca_off_, 0, wxTOP, FromDIP(6));
@@ -168,7 +201,7 @@ NetworkPanel::NetworkPanel(wxWindow* parent, const fs::path& root, bool top)
   s->Add(h3, 0, wxTOP, FromDIP(14));
   grid = new wxFlexGridSizer(2, FromDIP(6), FromDIP(10));
   grid->AddGrowableCol(1, 1);
-  label("Proxy");
+  add_label(grid, "Proxy");
   proxy_ = new ChoiceButton(this, {top ? wxString("Default (HTTPS_PROXY / NO_PROXY variables)")
                                        : wxString("Inherit from parent"),
                                    "Environment variables (HTTPS_PROXY / NO_PROXY)", "Windows system proxy",
@@ -176,11 +209,11 @@ NetworkPanel::NetworkPanel(wxWindow* parent, const fs::path& root, bool top)
   proxy_->set_field_look(true);
   proxy_->SetMinSize(wxSize(proxy_->GetBestSize().x, std::max(proxy_->GetBestSize().y, ca_->GetBestSize().y)));
   grid->Add(proxy_, 0);
-  proxy_url_label_ = label("Proxy URL");
+  proxy_url_label_ = add_label(grid, "Proxy URL");
   proxy_url_ = field("http://proxy.corp:8080  (http, https, socks5h; user:{{pw}}@ for credentials)");
   grid->Add(proxy_url_, 1, wxEXPAND);
   proxy_url_row_ = proxy_url_;
-  no_proxy_label_ = label("Bypass");
+  no_proxy_label_ = add_label(grid, "Bypass");
   no_proxy_ = field("localhost, .internal.corp, 10.0.0.0/8  (hosts that go direct)");
   grid->Add(no_proxy_, 1, wxEXPAND);
   no_proxy_row_ = no_proxy_;
@@ -189,7 +222,6 @@ NetworkPanel::NetworkPanel(wxWindow* parent, const fs::path& root, bool top)
   inherited_ = new wxStaticText(this, wxID_ANY, "");
   inherited_->SetForegroundColour(t.dim);
   s->Add(inherited_, 0, wxEXPAND | wxTOP, FromDIP(12));
-  SetSizer(s);
 
   for (wxTextCtrl* f : {ca_, cert_, key_, pass_, proxy_url_, no_proxy_})
     f->Bind(wxEVT_TEXT, [this](wxCommandEvent&) {

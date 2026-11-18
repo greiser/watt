@@ -18,6 +18,7 @@
 #include <mutex>
 
 #include "core/crypto.h"
+#include "core/loopback_connect.h"
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "winhttp.lib")
@@ -277,6 +278,35 @@ struct WsClient::Impl {
     return static_cast<Impl*>(p)->cancelled.load() ? 1 : 0;
   }
 
+  // Loopback connects bypass libcurl's connect check (~10 ms on many fresh connections; see
+  // core/loopback_connect.h), as HttpClient does.
+  curl_socket_t preconnected = CURL_SOCKET_BAD;
+  static curl_socket_t on_opensocket(void* p, curlsocktype purpose, curl_sockaddr* a) {
+    auto* d = static_cast<Impl*>(p);
+    d->preconnected = CURL_SOCKET_BAD;
+    curl_socket_t s = socket(a->family, a->socktype, a->protocol);
+    const auto* sa = reinterpret_cast<const sockaddr*>(&a->addr);
+    if (s == CURL_SOCKET_BAD || purpose != CURLSOCKTYPE_IPCXN || a->socktype != SOCK_STREAM ||
+        !detail::loopback_sockaddr(sa))
+      return s;
+    switch (detail::loopback_preconnect(s, sa, static_cast<int>(a->addrlen))) {
+      case detail::PreConnect::Connected: d->preconnected = s; return s;
+      case detail::PreConnect::Refused:
+        closesocket(s);
+        WSASetLastError(WSAECONNREFUSED);
+        return CURL_SOCKET_BAD;  // curl tries the next address or reports the failure
+      case detail::PreConnect::Unknown: break;
+    }
+    closesocket(s);
+    return socket(a->family, a->socktype, a->protocol);  // curl connects this one itself
+  }
+  static int on_sockopt(void* p, curl_socket_t s, curlsocktype purpose) {
+    const auto* d = static_cast<const Impl*>(p);
+    return purpose == CURLSOCKTYPE_IPCXN && s != CURL_SOCKET_BAD && s == d->preconnected
+               ? CURL_SOCKOPT_ALREADY_CONNECTED
+               : CURL_SOCKOPT_OK;
+  }
+
   // Waits until the socket is readable (or writable); false on cancel / timeout / error.
   bool wait(bool write, int ms) {
     WSAPOLLFD pf{};
@@ -457,6 +487,10 @@ WsHandshake WsClient::connect(const HttpRequest& req) {
   curl_easy_setopt(e, CURLOPT_ERRORBUFFER, d.errbuf);
   curl_easy_setopt(e, CURLOPT_CONNECTTIMEOUT_MS, timeout);
   curl_easy_setopt(e, CURLOPT_TCP_NODELAY, 1L);
+  curl_easy_setopt(e, CURLOPT_OPENSOCKETFUNCTION, &Impl::on_opensocket);
+  curl_easy_setopt(e, CURLOPT_OPENSOCKETDATA, &d);
+  curl_easy_setopt(e, CURLOPT_SOCKOPTFUNCTION, &Impl::on_sockopt);
+  curl_easy_setopt(e, CURLOPT_SOCKOPTDATA, &d);
   curl_easy_setopt(e, CURLOPT_NOPROGRESS, 0L);
   curl_easy_setopt(e, CURLOPT_XFERINFOFUNCTION, &Impl::on_progress);
   curl_easy_setopt(e, CURLOPT_XFERINFODATA, &d);
