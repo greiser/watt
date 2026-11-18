@@ -311,6 +311,39 @@ HOST_FN(h_test) {
   return JS_UNDEFINED;
 }
 
+// H.vis(on, template, dataJson, error): pm.visualizer.set (on = 1) / clear (on = 0).
+HOST_FN(h_vis) {
+  Host& h = host(ctx);
+  ScriptRun& r = *h.run;
+  int32_t on = 0;
+  if (argc > 0) JS_ToInt32(ctx, &on, argv[0]);
+  r.visualizer_template.clear();
+  r.visualizer_data.clear();
+  r.visualizer_error.clear();
+  r.visualizer = false;
+  if (!on) {
+    r.visualizer_cleared = true;
+    return JS_UNDEFINED;
+  }
+  r.visualizer_cleared = false;
+  std::string err = arg_string(ctx, argc, argv, 3);
+  std::string tpl = arg_string(ctx, argc, argv, 1);
+  std::string data = arg_string(ctx, argc, argv, 2);
+  if (err.empty() && tpl.size() > kMaxVisualizerTemplate)
+    err = "pm.visualizer.set: the template is larger than " + std::to_string(kMaxVisualizerTemplate >> 20) + " MiB";
+  if (err.empty() && data.size() > kMaxVisualizerData)
+    err = "pm.visualizer.set: the data is larger than " + std::to_string(kMaxVisualizerData >> 20) + " MiB as JSON";
+  r.visualizer = true;
+  if (!err.empty()) {
+    if (err.size() > kMaxTestText) err.resize(kMaxTestText);
+    r.visualizer_error = std::move(err);
+    return JS_UNDEFINED;
+  }
+  r.visualizer_template = std::move(tpl);
+  r.visualizer_data = data.empty() ? std::string("{}") : std::move(data);
+  return JS_UNDEFINED;
+}
+
 int scope_of(JSContext* ctx, int argc, JSValueConst* argv) {
   const std::string s = arg_string(ctx, argc, argv, 0);
   return s == "e" ? 1 : s == "g" ? 2 : s == "a" ? 3 : 0;
@@ -723,6 +756,7 @@ const NativeFn kNatives[] = {
     {"uuid", h_uuid, 0},         {"utf8", h_utf8, 1},          {"utf8dec", h_utf8dec, 1},
     {"b64", h_b64, 2},           {"unb64", h_unb64, 1},        {"hex", h_hex, 1},
     {"unhex", h_unhex, 1},       {"sleep", h_sleep, 1},        {"send", h_send, 1},
+    {"vis", h_vis, 4},
 };
 
 // ------------------------------------------------------------------ errors
@@ -1185,6 +1219,14 @@ ScriptRun run_chain(const Workspace& ws, bool pre, const SavedRequest& req, Save
     for (auto& l : one.logs) total.logs.push_back(std::move(l));
     for (auto& t : one.tests) total.tests.push_back(std::move(t));
     for (auto& v : one.vars_set) total.vars_set.push_back(std::move(v));
+    // The last pm.visualizer.set / clear of the chain wins.
+    if (one.visualizer || one.visualizer_cleared) {
+      total.visualizer = one.visualizer;
+      total.visualizer_cleared = one.visualizer_cleared;
+      total.visualizer_template = std::move(one.visualizer_template);
+      total.visualizer_data = std::move(one.visualizer_data);
+      total.visualizer_error = std::move(one.visualizer_error);
+    }
     if (!one.ok) {
       total.ok = false;
       total.line = one.line;

@@ -33,6 +33,7 @@
 #include <vector>
 
 #include "core/asserts.h"
+#include "core/cookies.h"
 #include "core/grpc_client.h"
 #include "core/http_client.h"
 #include "core/model_form.h"
@@ -45,7 +46,18 @@ struct TreeIndex;
 struct FolderCache;
 }
 
-enum class RequestKind { Http, Grpc };
+// WebSocket: a ws:// / wss:// connection (core/ws_client.h). It keeps its address, headers and
+// auth in `http` like an HTTP request (http.url, http.headers; http.body is the message composer's
+// text, never sent with the handshake), so folder inheritance, {{vars}} and the consent checks
+// apply to its upgrade request exactly as to an HTTP GET. Saved as "kind": "ws".
+enum class RequestKind { Http, Grpc, WebSocket };
+// "http", "grpc", "ws" (the .req.json / history spelling) and back (anything else is Http).
+inline const char* request_kind_name(RequestKind k) {
+  return k == RequestKind::Grpc ? "grpc" : k == RequestKind::WebSocket ? "ws" : "http";
+}
+inline RequestKind request_kind_from(std::string_view s) {
+  return s == "grpc" ? RequestKind::Grpc : s == "ws" ? RequestKind::WebSocket : RequestKind::Http;
+}
 
 // HTTP basic auth (curl -u, Bruno's auth:basic, Postman's Auth tab). Kept as fields so user and
 // password can be {{vars}} or secrets instead of a fixed base64 header in git. The header
@@ -157,6 +169,13 @@ struct NetworkSettings {
   Proxy proxy = Proxy::Inherit;
   std::string proxy_url;  // Url: "http://host:port" (may hold {{vars}}, e.g. credentials)
   std::string no_proxy;   // Url / System: hosts that go direct, comma separated
+  // Redirect / URL / TLS options (the HttpRequest fields of the same meaning); each unset =
+  // inherit (the outer level's; at the top HttpRequest's default). Saved only when set.
+  std::optional<long> max_redirects;    // HttpRequest::max_redirects (0..100)
+  std::optional<bool> keep_method;      // HttpRequest::keep_method_on_redirect
+  std::optional<bool> keep_auth;        // HttpRequest::keep_auth_on_redirect
+  std::optional<bool> encode_url;       // HttpRequest::encode_url
+  std::optional<TlsVersion> tls_min;    // HttpRequest::tls_min_version
   bool empty() const { return *this == NetworkSettings{}; }
   bool operator==(const NetworkSettings&) const = default;
 };
@@ -198,6 +217,10 @@ struct SavedRequest {
   // their cookies for the URL go first in the Cookie header. Same file policy as body_file.
   std::vector<std::string> header_files;
   std::vector<std::string> cookie_files;
+  // Do not use the workspace cookie jar (core/cookies.h) for this request: no jar cookies are
+  // sent (http_to_send(), add_grpc_web_cookies()) and record_cookies() stores none from its
+  // responses (Postman's per-request "Disable cookie jar"). Saved as "no_cookie_jar": true.
+  bool no_cookie_jar = false;
   // gRPC
   GrpcTarget grpc_target;
   std::string grpc_method;        // full path "/pkg.Svc/Method"
@@ -310,6 +333,9 @@ struct EffectiveSettings {
   // sets it; Collection with an empty label "" when nothing sets it: the default).
   NetworkSettings network;
   SettingsOrigin ca_from, cert_from, proxy_from;
+  // Where each redirect / URL / TLS option of `network` comes from (set ones only; an unset one
+  // is HttpRequest's default, its origin Collection with an empty label).
+  SettingsOrigin max_redirects_from, keep_method_from, keep_auth_from, encode_url_from, tls_min_from;
   // folder.json files that could not be used (unreadable, invalid JSON, outside the workspace):
   // "<path>: <why>". http_to_send() refuses to send while there is one.
   std::vector<std::string> errors;
@@ -443,6 +469,26 @@ class Workspace {
   // A header (own or inherited) whose name or value holds CR, LF or NUL after expansion, or a
   // folder.json that cannot be read (EffectiveSettings::errors), fails the send.
   std::optional<HttpRequest> http_to_send(const SavedRequest& r, std::string* err = nullptr) const;
+
+  // Cookie jar of this workspace (<ws>/.watt/cookies.json, DPAPI-sealed, see core/cookies.h),
+  // shared by every Workspace of the root in this process: list / edit / delete / clear through
+  // it. http_to_send() adds its cookies for the URL to the Cookie header (after the request's own
+  // Cookie header and curl -b files; a name the request already sends is not added twice),
+  // unless r.no_cookie_jar.
+  std::shared_ptr<CookieJar> cookie_jar() const;
+  // Call after every response (UI and runner, on the worker thread that got it): stores its
+  // Set-Cookie headers in the jar for the URL that was sent (resp.effective_url when set, else
+  // sent_url). gRPC: initial metadata of a gRPC-Web call (r.grpc_target.web); plain gRPC
+  // responses are ignored. Returns the number of cookies stored, replaced or deleted (0 when
+  // r.no_cookie_jar). The jar writes to disk on a background thread.
+  size_t record_cookies(const SavedRequest& r, const std::string& sent_url, const HttpResponse& resp) const;
+  size_t record_cookies(const SavedRequest& r, const GrpcResponse& resp) const;
+  // gRPC-Web: appends ("cookie", jar cookies for the call's URL) to expanded_request's
+  // grpc_opts.metadata (merged into an existing cookie entry). No-op for plain gRPC or
+  // no_cookie_jar. Returns whether metadata changed.
+  bool add_grpc_web_cookies(SavedRequest& expanded_request) const;
+  // The http(s) URL a gRPC-Web call of r goes to ("" when not gRPC-Web).
+  static std::string grpc_web_url(const SavedRequest& r);
 
   // Files a request uploads (form file parts, body_file, body_data, header_files, cookie_files)
   // must be inside the workspace root once
@@ -659,6 +705,12 @@ std::optional<HttpRequest> parse_curl_command(const std::string& cmd, std::strin
 // ("..." with ^ continuations) or PowerShell (curl.exe, '...' quoting, ` continuations).
 enum class CurlShell { Bash, Cmd, PowerShell };
 std::string to_curl_command(const HttpRequest& r, CurlShell shell = CurlShell::Bash);
+// HttpRequest's redirect / URL / TLS fields that differ from their defaults, as NetworkSettings
+// options (the request level's own), over what `n` already sets: how a request built from an
+// HttpRequest (a curl import) keeps them when it is saved.
+NetworkSettings with_http_options(NetworkSettings n, const HttpRequest& h);
+// The reverse: `n`'s set options applied to h.
+void apply_network_options(const NetworkSettings& n, HttpRequest& h);
 // With form parts: each one becomes -F / --form-string (with ;type= and ;filename=) and
 // r.body is not exported.
 std::string to_curl_command(const HttpRequest& r, const std::vector<FormPart>& form,

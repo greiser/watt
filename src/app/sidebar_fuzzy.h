@@ -18,14 +18,21 @@ class FuzzyQuery {
   // On a match returns true, *score (higher is better) and, if pos != null, the matched byte
   // offsets in ascending order (for highlighting).
   bool match(std::string_view target, size_t name_start, int* score, std::vector<uint16_t>* pos) const;
+  const std::vector<std::string>& words() const { return words_; }
 
  private:
   std::vector<std::string> words_;  // lower-case
 };
 
+// A number of two or more digits in query word w (lower-case) must appear unbroken in target.
+bool numbers_present(const std::string& w, std::string_view target);
 // Each query word must be a case-insensitive substring of target (the sidebar filter box).
 bool words_match(std::string_view query_lower, std::string_view target);
 std::string ascii_lower(std::string_view s);
+// A request URL as the filter searches it: a numeric host (127.0.0.1, [::1]) and any port are
+// left out, so typing "7" or "80" finds requests named or pathed so, not every request on
+// 127.0.0.1:8080. Named hosts and {{variables}} are kept ("api.github", "{{base}}").
+std::string url_search_text(std::string_view url);
 // Natural, case-insensitive order: digit runs compare by value ("endpoint 2" < "endpoint 10").
 bool natural_less(std::string_view a, std::string_view b);
 

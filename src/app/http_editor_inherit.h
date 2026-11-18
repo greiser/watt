@@ -21,6 +21,17 @@ namespace watt::app::http_editor {
 // first 6 and last 4 characters.
 std::string mask_secret(std::string_view v);
 
+// The redirect / URL / TLS options the levels above a request set (NetworkSettings' optional
+// ones) and where each comes from ("" = nobody sets it: HttpRequest's default applies).
+struct OptionsAbove {
+  NetworkSettings n;
+  std::string max_redirects_from, keep_method_from, keep_auth_from, encode_url_from, tls_min_from;
+  bool operator==(const OptionsAbove&) const = default;
+};
+OptionsAbove options_above(const EffectiveSettings& e);
+// What the request sends for each option: its own when set, else the one above, else the default.
+HttpRequest effective_options(const NetworkSettings& own, const OptionsAbove& above);
+
 struct InheritView {
   bool known = false;                  // filled from effective_settings (else: still loading)
   std::string source;                  // "Collection", "api/users"; "" when no level sets auth
@@ -36,6 +47,7 @@ struct InheritView {
   // Folder / collection variables, nearest level first (name, value as written), enabled only.
   std::vector<std::pair<std::string, std::string>> vars;
   std::string network;  // network_summary() of what the levels above set
+  OptionsAbove opts;    // redirect / URL / TLS options set above
   // One line for the Auth tab: "Bearer token from api/users: token abc123...f9e0".
   std::string summary() const;
 };

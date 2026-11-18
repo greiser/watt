@@ -14,6 +14,7 @@
 #include <wx/module.h>
 #include <wx/msgdlg.h>
 #include <wx/panel.h>
+#include <wx/scrolwin.h>
 #include <wx/settings.h>
 #include <wx/sizer.h>
 #include <wx/splitter.h>
@@ -25,6 +26,8 @@
 #include <wx/wupdlock.h>
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <ctime>
@@ -32,6 +35,7 @@
 #include <fstream>
 #include <map>
 #include <mutex>
+#include <set>
 #include <thread>
 
 #include <windows.h>
@@ -42,9 +46,15 @@
 #endif
 
 #include "app/panels.h"            // SidebarHost
+#include <rapidjson/document.h>    // Open request: a gRPC stream's kept messages
+#include <rapidjson/prettywriter.h>
+#include <rapidjson/stringbuffer.h>
+#include "app/request_tab.h"       // RequestTab::restore_response (Open request shows the run's response)
 #include "app/response_widgets.h"  // rv::Theme, ChipBar
+#include "app/http_editor_widgets.h"  // http_editor::Theme: Run uses the Send button's accent
 #include "app/runner_detail.h"
 #include "app/runner_engine.h"
+#include "app/ws_watch.h"          // WorkspaceWatcher: an open runner follows edits on disk
 #include "core/timing.h"
 
 namespace watt::app {
@@ -69,6 +79,42 @@ std::string u8(const std::filesystem::path& p) {
   return std::string(u.begin(), u.end());
 }
 const char* const kDot = "  \xC2\xB7  ";
+
+// A URL cut to w pixels without losing what tells runs apart: the scheme, host and port stay
+// whole, then as much of the end (the query with a data row's values) as fits, the middle of
+// the path giving way first: "http://127.0.0.1:18861/…/search?q=ann&n=1".
+wxString elide_url(wxDC& dc, const wxString& url, int w) {
+  if (w <= 0 || dc.GetTextExtent(url).x <= w) return url;
+  const wxString dots = wxString::FromUTF8("\xE2\x80\xA6");
+  size_t head_end = url.find("://");
+  head_end = head_end == wxString::npos ? 0 : head_end + 3;
+  const size_t slash = url.find_first_of("/?#", head_end);
+  if (slash == wxString::npos || slash == 0) return wxControl::Ellipsize(url, dc, wxELLIPSIZE_END, w);
+  const wxString head = url.substr(0, slash);
+  const int room = w - dc.GetTextExtent(head + dots).x;
+  if (room < dc.GetTextExtent("/a").x) return wxControl::Ellipsize(url, dc, wxELLIPSIZE_END, w);
+  // The longest end of the rest that fits (binary search on its length).
+  const wxString rest = url.substr(slash);
+  size_t lo = 0, hi = rest.size();
+  while (lo < hi) {
+    const size_t mid = (lo + hi + 1) / 2;
+    if (dc.GetTextExtent(rest.Right(mid)).x <= room) lo = mid;
+    else hi = mid - 1;
+  }
+  return head + dots + rest.Right(lo);
+}
+
+// Runs f on a later turn of the message loop (a one-shot timer), after the window messages
+// already queued: unlike CallAfter, whose events wx runs back to back in one go, two steps posted
+// this way are two UI-thread steps with input and paints answered in between.
+void next_turn(std::function<void()> f, int ms = 1) {
+  auto* t = new wxTimer();
+  t->Bind(wxEVT_TIMER, [t, f = std::move(f)](wxTimerEvent&) {
+    f();
+    wxTheApp->CallAfter([t] { delete t; });
+  });
+  t->StartOnce(ms);
+}
 
 // Characters (UTF-8 code points) in s: the width of a monospace cell, "über" is 4 wide.
 size_t u8_width(const std::string& s) {
@@ -113,6 +159,7 @@ class RunnerFrame;
 // the UI thread only, and only read there.
 struct Link {
   RunnerFrame* frame = nullptr;
+  std::atomic<int> saving{0};  // run-order.json writes in flight (a reload reads the file after them)
 };
 
 struct RunState {
@@ -131,11 +178,20 @@ struct RunRecord {
   RunSummary summary;  // with per_request
   std::shared_ptr<const std::vector<StepPtr>> steps;
   std::shared_ptr<const std::vector<RunItem>> items;
+  std::shared_ptr<const std::vector<size_t>> order;  // the run's order (indexes into items)
+  // What was run ("9 requests x 300 iterations, 8 parallel"): By request's change column
+  // compares only runs with the same plan.
+  std::string plan;
 };
 
 std::map<std::wstring, std::deque<std::shared_ptr<const RunRecord>>>& run_history() {
   static std::map<std::wstring, std::deque<std::shared_ptr<const RunRecord>>> m;
   return m;
+}
+// Runners whose results were cleared (Reset) since their last run: reopened, they show none.
+std::set<std::wstring>& cleared_runners() {
+  static std::set<std::wstring> s;
+  return s;
 }
 constexpr size_t kHistoryRuns = 12;
 constexpr size_t kAllChecksRun = 100;  // runs up to this many sends list passed checks too
@@ -180,7 +236,8 @@ class AccentButton : public wxWindow {
     const auto& th = rv::Theme::get();
     dc.SetBackground(wxBrush(GetParent()->GetBackgroundColour()));
     dc.Clear();
-    wxColour c = danger_ ? th.err : th.accent;
+    // The primary action's colour everywhere (the editors' Send / Connect), not the view accent.
+    wxColour c = danger_ ? th.err : http_editor::Theme::get().accent;
     if (!IsEnabled()) c = mix(c, th.bg, 0.55);
     else if (hover_) c = mix(c, *wxWHITE, 0.12);
     dc.SetPen(HasFocus() ? wxPen(mix(c, *wxWHITE, 0.6), FromDIP(2)) : *wxTRANSPARENT_PEN);
@@ -362,8 +419,9 @@ class SummaryStrip : public wxWindow {
     tiles.push_back({"RECEIVED", any ? fmt_bytes(s_.bytes_received) : "-", th.fg});
     dc.SetFont(GetFont().Bold());
     const wxSize sz = dc.GetTextExtent(U(state_));
-    const int limit = cs.x - pad - sz.x - FromDIP(16);
+    int limit = cs.x - pad - sz.x - FromDIP(16);
     const int y = FromDIP(8);
+    bool state_below = false;  // the state moved to the second line's right end (no room above)
     // Every tile fits: the gaps shrink first, then the values' font; only on a very narrow
     // window are the least read tiles (STD DEV, MIN, MAX) left out, never the last ones.
     wxFont vfont = big;
@@ -382,19 +440,34 @@ class SummaryStrip : public wxWindow {
       for (int v : w) n += v;
       return n;
     };
-    const int avail = limit - pad;
+    int avail = limit - pad;
     std::vector<int> w = widths(vfont);
     int gap = FromDIP(22);
-    const int min_gap = FromDIP(10);
+    const int min_gap = FromDIP(8);
     auto fits = [&] { return w.empty() || sum(w) + gap * static_cast<int>(w.size() - 1) <= avail; };
-    if (!fits() && w.size() > 1) gap = std::max(min_gap, (avail - sum(w)) / static_cast<int>(w.size() - 1));
-    for (float k : {1.3f, 1.15f, 1.0f}) {
-      if (fits()) break;
-      vfont = GetFont().Bold().Scaled(k);
-      w = widths(vfont);
+    auto regap = [&] {
       if (w.size() > 1) gap = std::clamp((avail - sum(w)) / static_cast<int>(w.size() - 1), min_gap, FromDIP(22));
+    };
+    regap();
+    // The same tiles in every run (a load run's "1500 / 1500" is wider than a 9-send run's
+    // "9 / 9"): the state moves under the tiles, "a / b" values lose their spaces and the values'
+    // font gets smaller before any tile is left out.
+    for (int step = 0; step < 6 && !fits(); ++step) {
+      if (step == 2 && !state_below) {
+        state_below = true;
+        limit = cs.x - pad;
+        avail = limit - pad;
+      } else if (step == 3) {
+        for (auto& t : tiles)
+          if (const size_t at = t.value.find(" / "); at != std::string::npos) t.value.replace(at, 3, "/");
+      } else {
+        static const float ks[] = {1.3f, 1.15f, 1.15f, 1.15f, 1.0f, 0.92f};
+        vfont = GetFont().Bold().Scaled(ks[step]);
+      }
+      w = widths(vfont);
+      regap();
     }
-    for (const char* drop : {"P90", "STD DEV", "MIN", "MAX", "AVG"}) {
+    for (const char* drop : {"STD DEV", "P90", "P99", "RECEIVED", "THROUGHPUT", "P95", "DURATION"}) {
       if (fits()) break;
       for (size_t i = 0; i < tiles.size(); ++i)
         if (tiles[i].label == drop) {
@@ -418,7 +491,8 @@ class SummaryStrip : public wxWindow {
     // State on the right ("Running Â· iteration 2 of 5", "Stopped", "Done").
     dc.SetFont(GetFont().Bold());
     dc.SetTextForeground(running_ ? th.accent : (s_.stopped ? th.warn : th.dim));
-    dc.DrawText(U(state_), cs.x - pad - sz.x, y + FromDIP(18));
+    dc.DrawText(U(state_), cs.x - pad - sz.x, y + FromDIP(state_below ? 47 : 18));
+    const int line_end = state_below ? cs.x - pad - sz.x - FromDIP(16) : cs.x - pad;  // the second line's room
     // Second line: where the time goes on average.
     if (any) {
       std::string l = "avg  TTFB " + fmt_ms(s_.avg_ttfb_ms);
@@ -442,7 +516,7 @@ class SummaryStrip : public wxWindow {
       if (s_.errors) l += kDot + std::to_string(s_.errors) + " not sent / transport error" + (s_.errors == 1 ? "" : "s");
       dc.SetFont(small);
       dc.SetTextForeground(th.dim);
-      dc.DrawText(U(l), pad, y + FromDIP(48));
+      dc.DrawText(wxControl::Ellipsize(U(l), dc, wxELLIPSIZE_END, std::max(FromDIP(60), line_end - pad)), pad, y + FromDIP(48));
       // Thresholds (Postman's performance pass / fail criteria), each green or red with its actual.
       if (!thr_.empty()) {
         int tx = pad + dc.GetTextExtent(U(l)).x + FromDIP(18);
@@ -456,7 +530,7 @@ class SummaryStrip : public wxWindow {
         for (const auto& t : thr_) all = all && t.pass;
         put(all ? "THRESHOLDS MET  " : "THRESHOLDS MISSED  ", all ? th.ok : th.err, small.Bold());
         for (const auto& t : thr_) {
-          if (tx > cs.x - pad - FromDIP(60)) break;
+          if (tx > line_end - FromDIP(60)) break;
           put((t.pass ? "\xE2\x9C\x93 " : "\xE2\x9C\x97 ") + t.t.text, t.pass ? th.ok : th.err, small);
           put(" (" + t.actual_text + ")   ", th.dim, small);
         }
@@ -498,22 +572,47 @@ constexpr bool kColRight[kCols] = {true, true, false, false, true, true, false};
 constexpr int kFlex = 2;
 
 struct ColModel {
-  int w[kCols] = {52, 44, 0, 170, 90, 86, 110};  // DIP; w[kFlex] unused
+  int w[kCols] = {52, 44, 0, 136, 90, 86, 110};  // DIP; w[kFlex] unused
   int sort = -1;                                 // column, -1: run order
   bool desc = false;
   struct X {
     int x[kCols + 1];
   };
+  // On a narrow pane the columns give way so Asserts (pass / fail counts) stays in view: Status
+  // narrows, then the request column, then Size is left out, then Time and the numbers narrow.
   X layout(const wxWindow* win, int width) const {
+    int ww[kCols];
     int sum = 0;
-    for (int i = 0; i < kCols; ++i)
-      if (i != kFlex) sum += win->FromDIP(w[i]);
-    const int flex = std::max(win->FromDIP(160), width - sum);
+    for (int i = 0; i < kCols; ++i) {
+      ww[i] = i == kFlex ? 0 : win->FromDIP(w[i]);
+      sum += ww[i];
+    }
+    int flex_min = win->FromDIP(160);
+    int over = sum + flex_min - width;
+    auto give = [&](int& v, int floor) {
+      if (over <= 0 || v <= floor) return;
+      const int cut = std::min(over, v - floor);
+      v -= cut;
+      over -= cut;
+    };
+    give(ww[3], win->FromDIP(96));
+    give(flex_min, win->FromDIP(120));
+    if (over > 0) {
+      over -= ww[5];
+      ww[5] = 0;
+    }
+    give(ww[4], win->FromDIP(64));
+    give(ww[0], win->FromDIP(36));
+    give(ww[1], win->FromDIP(32));
+    give(ww[6], win->FromDIP(76));
+    sum = 0;
+    for (int i = 0; i < kCols; ++i) sum += ww[i];
+    const int flex = std::max(flex_min, width - sum);
     X c;
     int x = 0;
     for (int i = 0; i < kCols; ++i) {
       c.x[i] = x;
-      x += i == kFlex ? flex : win->FromDIP(w[i]);
+      x += i == kFlex ? flex : ww[i];
     }
     c.x[kCols] = x;
     return c;
@@ -603,6 +702,7 @@ class GridHeader : public wxWindow {
     const wxFont f = GetFont().Scaled(0.85f).Bold();
     const int pad = FromDIP(8);
     for (int i = 0; i < kCols; ++i) {
+      if (c.x[i + 1] - c.x[i] < FromDIP(12)) continue;  // left out on a narrow pane
       wxString t = kColNames[i];
       const bool sorted = cols_->sort == i;
       if (sorted) t += wxString::FromUTF8(cols_->desc ? " \xE2\x96\xBC" : " \xE2\x96\xB2");
@@ -650,16 +750,16 @@ class ResultsList : public wxVListBox {
   }
   size_t hover_ = static_cast<size_t>(-1);
 
-  // Failed checks listed under a row (Bruno lists every one under its request): the first is
-  // on the row itself, the others on lines below, at most kMaxSub (then "+ n more"). With
-  // all_checks (a small run, where every check is quick to scan) the passed ones are listed
-  // too, in their order.
+  // Checks listed under a row (Bruno lists every failed assert with expected / actual): every
+  // failed one first, its full "expected ... got ..." line, then, with all_checks (a small run,
+  // where every check is quick to scan), the passed ones, in their order. At most kMaxSub lines
+  // (then "+ n more").
   static constexpr size_t kMaxSub = 6;
   size_t sub_lines(const StepResult& r) const {
     if (r.skipped || r.stopped() || r.errored()) return 0;
-    size_t more = 0;
-    if (all_checks_) more = r.asserts.size() - (r.asserts_failed > 0 ? 1 : 0);
-    else if (r.asserts_failed >= 2) more = static_cast<size_t>(r.asserts_failed) - 1;
+    size_t failed = 0;
+    for (const auto& a : r.asserts) failed += a.pass ? 0 : 1;
+    const size_t more = failed + (all_checks_ ? r.asserts.size() - failed : 0);
     return more > kMaxSub ? kMaxSub + 1 : more;
   }
   void set_all_checks(bool on) {
@@ -726,7 +826,9 @@ class ResultsList : public wxVListBox {
       dc.DrawText(s, rect.x + x0, rect.y + (rect.height - ns.y) / 2);
       const int ux = x0 + ns.x + FromDIP(14);
       const int uw = c.x[3] - ux - pad;
-      const std::string why = !faded && r.failed() ? r.reason() : std::string();
+      // Why it failed, unless its failed checks are listed in full below the row.
+      const bool listed = r.asserts_failed > 0 && sub_lines(r) > 0;
+      const std::string why = !faded && r.failed() && !listed ? r.reason() : std::string();
       if (uw > FromDIP(60) && !why.empty()) {
         // Why it failed, readable without a click (Bruno lists it under the request).
         dc.SetFont(small_);
@@ -743,12 +845,42 @@ class ResultsList : public wxVListBox {
         dc.SetTextForeground(th.warn);
         const wxString us = wxControl::Ellipsize(U(warn), dc, wxELLIPSIZE_END, uw);
         dc.DrawText(us, rect.x + ux, rect.y + (rect.height - dc.GetTextExtent(us).y) / 2);
-      } else if (uw > FromDIP(60) && !r.url.empty()) {
-        dc.SetFont(mono_);
-        dc.SetTextForeground(mix(th.bg, th.dim, 0.8));
-        const wxString us = wxControl::Ellipsize(U(r.url), dc, wxELLIPSIZE_MIDDLE, uw);
-        const wxSize uz = dc.GetTextExtent(us);
-        dc.DrawText(us, rect.x + ux, rect.y + (rect.height - uz.y) / 2);
+      } else if (uw > FromDIP(60)) {
+        int dx = ux;
+        if (r.data_row && !r.data_row->empty()) {
+          // The iteration's data row (Postman lists it per iteration): "id=1 q=c d", then the URL.
+          std::string d;
+          for (const auto& [k, v] : *r.data_row) {
+            if (d.size() > 400) break;
+            d += (d.empty() ? "" : "  ") + k + "=" + (v.size() > 120 ? v.substr(0, 120) + "\xE2\x80\xA6" : v);
+          }
+          // The room is shared by need: each gets its full width when both fit, else the shorter
+          // one keeps its own (up to half) and the other takes the rest.
+          dc.SetFont(mono_);
+          const int ufull = r.url.empty() ? 0 : dc.GetTextExtent(U(r.url)).x;
+          dc.SetFont(small_);
+          const int dfull = dc.GetTextExtent(U(d)).x;
+          const int gap = FromDIP(12);
+          int dw = uw;
+          if (!r.url.empty() && dfull + gap + ufull > uw) {
+            const int half = (uw - gap) / 2;
+            dw = ufull < half ? uw - gap - ufull : std::min(dfull, std::max(half, FromDIP(60)));
+          }
+          dw = std::max(std::min(dw, uw), FromDIP(40));
+          dc.SetTextForeground(faded ? th.dim : mix(th.bg, th.info, 0.85));
+          const wxString ds = wxControl::Ellipsize(U(d), dc, wxELLIPSIZE_END, dw);
+          const wxSize dz = dc.GetTextExtent(ds);
+          dc.DrawText(ds, rect.x + dx, rect.y + (rect.height - dz.y) / 2);
+          dx += dz.x + FromDIP(12);
+        }
+        const int rw = c.x[3] - dx - pad;
+        if (rw > FromDIP(40) && !r.url.empty()) {
+          dc.SetFont(mono_);
+          dc.SetTextForeground(mix(th.bg, th.dim, 0.8));
+          const wxString us = elide_url(dc, U(r.url), rw);
+          const wxSize uz = dc.GetTextExtent(us);
+          dc.DrawText(us, rect.x + dx, rect.y + (rect.height - uz.y) / 2);
+        }
       }
     }
     cell(3, U(status_label(r)), bold_, status_colour(r));
@@ -757,31 +889,47 @@ class ResultsList : public wxVListBox {
     if (r.skipped || r.stopped())
       cell(6, wxString::FromUTF8("\xE2\x80\x94"), bold_, th.dim);
     else if (r.asserts.empty())
-      cell(6, r.failed() ? wxString::FromUTF8("\xE2\x9C\x97 failed") : wxString::FromUTF8("\xE2\x80\x94"), bold_,
-           r.failed() ? th.err : th.dim);
+      // No checks: why it failed (a gRPC status other than OK, as the Failures view says).
+      cell(6,
+           !r.failed()                                              ? wxString::FromUTF8("\xE2\x80\x94")
+           : r.kind == RequestKind::Grpc && r.sent && r.status != 0 ? wxString::FromUTF8("\xE2\x9C\x97 status not OK")
+           : r.client_error                                         ? wxString::FromUTF8("\xE2\x9C\x97 error")
+           : !r.sent                                                ? wxString::FromUTF8("\xE2\x9C\x97 not sent")
+                                                                    : wxString::FromUTF8("\xE2\x9C\x97 failed"),
+           bold_, r.failed() ? th.err : th.dim);
+    else if (r.errored())
+      cell(6, wxString::FromUTF8(r.sent || r.client_error ? "\xE2\x9C\x97 error" : "\xE2\x9C\x97 not sent"), bold_,
+           th.err);
+    else if (!r.asserts_failed && r.status_failed())
+      // Every (inherited) check passed, but the status is an error the request does not expect.
+      cell(6,
+           wxString::Format(wxString::FromUTF8("\xE2\x9C\x97 status \xC2\xB7 %d / %zu"), r.asserts_passed,
+                            r.asserts.size()),
+           bold_, th.err);
     else
       cell(6,
            wxString::Format(wxString::FromUTF8(r.asserts_failed ? "\xE2\x9C\x97 %d / %zu" : "\xE2\x9C\x93 %d / %zu"),
                             r.asserts_passed, r.asserts.size()),
            bold_, r.asserts_failed ? th.err : th.ok);
     if (const size_t extra = sub_lines(r)) {
-      // The other failed checks, one per line under the request name, with expected / actual.
+      // The checks, one per line under the request name: failed ones first, with expected / actual.
       const int x0 = rect.x + c.x[2] + pad + FromDIP(50);
       const int w = std::max(FromDIP(80), rect.x + c.x[kCols] - pad - x0);
       dc.SetFont(small_);
       int y = rect.GetBottom() - FromDIP(3);
-      size_t shown = 0, skipped_first = 0, listable = 0;
-      for (const auto& a : r.asserts) {
-        if (a.pass && !all_checks_) continue;
-        if (!a.pass && !skipped_first++) continue;  // the first failed one is on the row itself
-        ++listable;
-        if (shown == kMaxSub) continue;
-        ++shown;
-        dc.SetTextForeground(a.pass ? mix(th.bg, th.ok, 0.85) : mix(th.bg, th.err, 0.9));
-        dc.DrawText(wxString::FromUTF8(a.pass ? "\xE2\x9C\x93" : "\xE2\x9C\x97"), x0 - FromDIP(14), y);
-        dc.SetTextForeground(a.pass ? mix(th.bg, th.fg, 0.75) : mix(th.bg, th.err, 0.9));
-        dc.DrawText(wxControl::Ellipsize(U(a.pass ? a.label() : a.text()), dc, wxELLIPSIZE_END, w), x0, y);
-        y += FromDIP(18);
+      size_t shown = 0, listable = 0;
+      for (int pass = 0; pass < 2; ++pass) {
+        for (const auto& a : r.asserts) {
+          if (a.pass != (pass == 1) || (a.pass && !all_checks_)) continue;
+          ++listable;
+          if (shown == kMaxSub) continue;
+          ++shown;
+          dc.SetTextForeground(a.pass ? mix(th.bg, th.ok, 0.85) : th.err);
+          dc.DrawText(wxString::FromUTF8(a.pass ? "\xE2\x9C\x93" : "\xE2\x9C\x97"), x0 - FromDIP(14), y);
+          dc.SetTextForeground(a.pass ? mix(th.bg, th.fg, 0.75) : mix(th.bg, th.err, 0.92));
+          dc.DrawText(wxControl::Ellipsize(U(a.pass ? a.label() : a.text()), dc, wxELLIPSIZE_END, w), x0, y);
+          y += FromDIP(18);
+        }
       }
       if (extra > kMaxSub) {
         dc.SetTextForeground(th.dim);
@@ -800,7 +948,7 @@ class ResultsList : public wxVListBox {
 
 class StatsList : public wxVListBox {
  public:
-  explicit StatsList(wxWindow* parent) : wxVListBox(parent, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxBORDER_NONE | wxWANTS_CHARS) {
+  explicit StatsList(wxWindow* parent) : wxVListBox(parent, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxBORDER_THEME | wxWANTS_CHARS) {
     SetBackgroundColour(rv::Theme::get().bg);
     bold_ = GetFont().Bold();
     small_ = GetFont().Scaled(0.85f).Bold();
@@ -853,7 +1001,8 @@ class StatsList : public wxVListBox {
       dc.SetTextForeground(th.dim);
       dc.DrawText("Request", rect.x + pad, rect.y + (rect.height - dc.GetCharHeight()) / 2);
       for (int i = 0; i < 7; ++i) right(i, heads[i], small_, th.dim);
-      if (delta) right(7, wxString::FromUTF8("\xCE\x94 P50"), small_, th.dim);
+      // Named: the run it is compared with (the latest earlier run with the same plan).
+      if (delta) right(7, wxString::FromUTF8("\xCE\x94 P50") + (base_label_.size() >= 5 ? U(" vs " + base_label_.substr(0, 5)) : wxString()), small_, th.dim);
       return;
     }
     const runner::RequestStats& q = rows_[n - 1];
@@ -934,7 +1083,7 @@ class StatsList : public wxVListBox {
 // and the first and last iteration. A click (or Enter) filters Results to exactly those steps.
 class FailList : public wxVListBox {
  public:
-  explicit FailList(wxWindow* parent) : wxVListBox(parent, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxBORDER_NONE | wxWANTS_CHARS) {
+  explicit FailList(wxWindow* parent) : wxVListBox(parent, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxBORDER_THEME | wxWANTS_CHARS) {
     SetBackgroundColour(rv::Theme::get().bg);
     bold_ = GetFont().Bold();
     small_ = GetFont().Scaled(0.85f).Bold();
@@ -1114,6 +1263,20 @@ class TimeChart : public wxWindow {
         b_[i].p50 = runner::percentile(t[i], 50);
         b_[i].p95 = runner::percentile(t[i], 95);
       }
+    // The p95 line is drawn over a window of neighbouring buckets (until it holds 100 sends,
+    // two buckets either side at most): with a slow request in the mix (one send in nine at
+    // 120 ms, the rest at 2 ms) a single bucket's p95 flips between the two on every bucket.
+    // A bucket whose own p95 is far off that line is marked as a dot of its own.
+    std::vector<double> win;
+    for (size_t i = 0; i < nb; ++i) {
+      if (t[i].empty()) continue;
+      win.assign(t[i].begin(), t[i].end());
+      for (size_t r = 1; r <= 2 && win.size() < 100; ++r) {
+        if (i >= r) win.insert(win.end(), t[i - r].begin(), t[i - r].end());
+        if (i + r < nb) win.insert(win.end(), t[i + r].begin(), t[i + r].end());
+      }
+      b_[i].p95s = runner::percentile(win, 95);
+    }
     // Active workers (k6's VUs, Postman's virtual users): the sends in flight, averaged over
     // each bucket (each send adds the share of the bucket it overlaps).
     max_active_ = 0;
@@ -1129,8 +1292,10 @@ class TimeChart : public wxWindow {
       }
     }
     for (size_t i = 0; i < nb; ++i) {
-      // The last bucket is partly past the end: average over the time it covers.
+      // The last bucket is partly past the end: rates and the average over the time it covers.
       const double span = std::min(bucket_ms_, end - bucket_ms_ * static_cast<double>(i));
+      b_[i].span_ms = std::max(span, 0.0);
+      b_[i].partial = span < bucket_ms_ * 0.999;
       b_[i].active = span > 0 ? b_[i].busy_ms / span : 0;
       max_active_ = std::max(max_active_, b_[i].active);
     }
@@ -1142,16 +1307,26 @@ class TimeChart : public wxWindow {
   struct B {
     size_t n = 0, failed = 0;
     double p50 = 0, p95 = 0;
+    double p95s = 0;  // p95 over the bucket and its neighbours (the drawn line)
     double busy_ms = 0, active = 0;  // send time in the bucket; active = busy_ms / bucket length
+    double span_ms = 0;              // the run time it covers (less than a bucket for the last one)
+    bool partial = false;            // the last bucket, cut by the run's end: few sends, drawn hatched,
+                                     // no p50 / p95 point (its tail would read as a latency collapse)
+    double rate(double bucket_ms) const { return span_ms > 0 ? static_cast<double>(n) * 1000.0 / std::max(span_ms, bucket_ms * 0.25) : 0; }
+    double fail_rate(double bucket_ms) const { return n ? rate(bucket_ms) * static_cast<double>(failed) / static_cast<double>(n) : 0; }
   };
+  static bool outlier(const B& b) { return b.p95s > 0 && (b.p95 > b.p95s * 2 || b.p95 < b.p95s / 2); }
   wxRect plot() const {
     const wxSize cs = GetClientSize();
     return wxRect(FromDIP(64), FromDIP(40), std::max(10, cs.x - FromDIP(64 + 64)), std::max(10, cs.y - FromDIP(40 + 30)));
   }
+  // Time runs left to right over the run (end_ms_), so the cut last bucket is drawn as narrow as
+  // the time it covers.
   int bucket_at(int x) const {
     const wxRect pr = plot();
-    if (b_.empty() || x < pr.x || x >= pr.GetRight()) return -1;
-    return std::min(static_cast<int>(b_.size()) - 1, (x - pr.x) * static_cast<int>(b_.size()) / std::max(1, pr.width));
+    if (b_.empty() || x < pr.x || x >= pr.GetRight() || end_ms_ <= 0) return -1;
+    const double t = end_ms_ * static_cast<double>(x - pr.x) / std::max(1, pr.width);
+    return std::min(static_cast<int>(b_.size()) - 1, static_cast<int>(t / bucket_ms_));
   }
   void paint() {
     wxAutoBufferedPaintDC dc(this);
@@ -1168,11 +1343,11 @@ class TimeChart : public wxWindow {
                   FromDIP(16), FromDIP(16));
       return;
     }
-    const double per_s = 1000.0 / bucket_ms_;
     double max_rps = 0, max_ms = 0;
     for (const auto& b : b_) {
-      max_rps = std::max(max_rps, static_cast<double>(b.n) * per_s);
-      max_ms = std::max(max_ms, b.p95);
+      if (b.partial && b.span_ms < bucket_ms_ * 0.5 && b_.size() > 1) continue;  // a sliver sets no scale
+      max_rps = std::max(max_rps, b.rate(bucket_ms_));
+      if (!b.partial || b_.size() == 1) max_ms = std::max({max_ms, b.p95, b.p95s});
     }
     max_rps = std::max(max_rps, 1.0) * 1.1;
     max_ms = std::max(max_ms, 0.01) * 1.1;
@@ -1180,7 +1355,7 @@ class TimeChart : public wxWindow {
     // the bars: the times then use a log axis, so both lines stay readable.
     double min_ms = max_ms;
     for (const auto& b : b_)
-      if (b.n && b.p50 > 0) min_ms = std::min(min_ms, b.p50);
+      if (b.n && b.p50 > 0 && (!b.partial || b_.size() == 1)) min_ms = std::min(min_ms, b.p50);
     const bool log_axis = max_ms / std::max(min_ms, 1e-6) > 20;
     const double lo_ms = log_axis ? std::max(min_ms / 1.5, 1e-3) : 0;
     auto y_of_ms = [&](double v) {
@@ -1217,7 +1392,7 @@ class TimeChart : public wxWindow {
       std::snprintf(at, sizeof at, "active workers (max %.1f)", max_active_);
       legend(at, cact, true);
     }
-    legend(log_axis ? "p95 ms (log axis)" : "p95 ms", c95, true);
+    legend(log_axis ? "p95 ms (smoothed, log axis)" : "p95 ms (smoothed)", c95, true);
     legend("p50 ms", c50, true);
     legend("failed / s", fail, false);
     legend("sends / s", bar, false);
@@ -1235,7 +1410,10 @@ class TimeChart : public wxWindow {
       dc.DrawText(r, pr.GetRight() + FromDIP(6), y - ls.y / 2);
     }
     const size_t nb = b_.size();
-    auto xat = [&](size_t i) { return pr.x + static_cast<int>(static_cast<double>(pr.width) * static_cast<double>(i) / static_cast<double>(nb)); };
+    auto xat = [&](size_t i) {
+      const double t = std::min(end_ms_, bucket_ms_ * static_cast<double>(i));
+      return pr.x + static_cast<int>(static_cast<double>(pr.width) * t / std::max(end_ms_, 1e-9));
+    };
     for (int g = 0; g <= 4; ++g) {
       // Every tick in the same unit ("0 s", "4.5 s", "9 s"; ms for a run under a second).
       const double v = end_ms_ * g / 4;
@@ -1254,14 +1432,17 @@ class TimeChart : public wxWindow {
       const auto& b = b_[i];
       if (!b.n) continue;
       const int x0 = xat(i) + 1, x1 = std::max(x0 + 1, xat(i + 1) - 1);
-      const int h = static_cast<int>(pr.height * (static_cast<double>(b.n) * per_s / max_rps));
-      const int hf = static_cast<int>(pr.height * (static_cast<double>(b.failed) * per_s / max_rps));
-      dc.SetBrush(wxBrush(static_cast<int>(i) == hover_ ? mix(bar, th.fg, 0.25) : bar));
+      const int h = std::min(pr.height, static_cast<int>(pr.height * (b.rate(bucket_ms_) / max_rps)));
+      const int hf = std::min(h, static_cast<int>(pr.height * (b.fail_rate(bucket_ms_) / max_rps)));
+      const wxColour bc = static_cast<int>(i) == hover_ ? mix(bar, th.fg, 0.25) : bar;
+      dc.SetBrush(b.partial && nb > 1 ? wxBrush(bc, wxBRUSHSTYLE_BDIAGONAL_HATCH) : wxBrush(bc));
+      if (b.partial && nb > 1) dc.SetPen(wxPen(bc));
       dc.DrawRectangle(x0, pr.GetBottom() - h, x1 - x0, h - hf);
       if (hf) {
         dc.SetBrush(wxBrush(fail));
         dc.DrawRectangle(x0, pr.GetBottom() - hf, x1 - x0, hf);
       }
+      dc.SetPen(*wxTRANSPARENT_PEN);
     }
     // Lines, each on a background-coloured halo so it reads over the bars.
     for (int pass = 0; pass < 4; ++pass) {
@@ -1271,16 +1452,25 @@ class TimeChart : public wxWindow {
       wxPoint prev(-1, -1);
       for (size_t i = 0; i < nb; ++i) {
         const auto& b = b_[i];
-        if (!b.n) {
+        if (!b.n || (b.partial && nb > 1)) {
           prev = wxPoint(-1, -1);
           continue;
         }
-        const double v = k ? b.p95 : b.p50;
+        const double v = k ? b.p95s : b.p50;
         const wxPoint pt((xat(i) + xat(i + 1)) / 2, pr.GetBottom() - y_of_ms(v));
         if (prev.x >= 0) dc.DrawLine(prev, pt);
         else dc.DrawCircle(pt, FromDIP(1));
         prev = pt;
       }
+    }
+    // Buckets whose own p95 is far from the line (a burst of slow sends, or none of them): a
+    // hollow dot at their own value.
+    dc.SetBrush(wxBrush(th.bg));
+    dc.SetPen(wxPen(c95, FromDIP(1)));
+    for (size_t i = 0; i < nb; ++i) {
+      const auto& b = b_[i];
+      if (!b.n || (b.partial && nb > 1) || !outlier(b)) continue;
+      dc.DrawCircle(wxPoint((xat(i) + xat(i + 1)) / 2, pr.GetBottom() - y_of_ms(b.p95)), FromDIP(3));
     }
     // Active workers: a stepped line (dashed) over the bars.
     {
@@ -1299,9 +1489,10 @@ class TimeChart : public wxWindow {
     if (hover_ >= 0 && static_cast<size_t>(hover_) < nb) {
       const auto& b = b_[static_cast<size_t>(hover_)];
       char t[256];
-      std::snprintf(t, sizeof t, "%s - %s:  %zu sends (%.1f / s), %zu failed, p50 %s, p95 %s, %.1f active workers",
-                    fmt_ms(bucket_ms_ * hover_).c_str(), fmt_ms(bucket_ms_ * (hover_ + 1)).c_str(), b.n,
-                    static_cast<double>(b.n) * per_s, b.failed, fmt_ms(b.p50).c_str(), fmt_ms(b.p95).c_str(), b.active);
+      std::snprintf(t, sizeof t, "%s - %s:  %zu sends (%.1f / s), %zu failed, p50 %s, p95 %s (window %s), %.1f active workers%s",
+                    fmt_ms(bucket_ms_ * hover_).c_str(), fmt_ms(bucket_ms_ * hover_ + b.span_ms).c_str(), b.n,
+                    b.rate(bucket_ms_), b.failed, fmt_ms(b.p50).c_str(), fmt_ms(b.p95).c_str(), fmt_ms(b.p95s).c_str(), b.active,
+                    b.partial && nb > 1 ? "  (partial bucket at the run's end: no p50 / p95 point)" : "");
       dc.SetTextForeground(th.fg);
       dc.DrawText(U(t), FromDIP(16), FromDIP(24));
     }
@@ -1323,7 +1514,7 @@ class RequestList : public wxVListBox {
     bool grpc = false;
     bool checked = true;
   };
-  explicit RequestList(wxWindow* parent) : wxVListBox(parent, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxBORDER_NONE | wxWANTS_CHARS) {
+  explicit RequestList(wxWindow* parent) : wxVListBox(parent, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxBORDER_THEME | wxWANTS_CHARS) {
     SetBackgroundColour(rv::Theme::get().bg);
     bold_ = GetFont().Bold().Scaled(0.9f);
     small_ = GetFont().Scaled(0.85f);
@@ -1499,10 +1690,10 @@ enum ChipId {
   // left
   kAll = 1, kNone, kUp, kDown, kDataPick, kDataClear, kDataPreview, kEnvPick,
   // load profile (Postman's performance runner): fixed, ramp up, peak, spike
-  kProfFixed = 12, kProfRamp, kProfPeak, kProfSpike,
+  kProfFixed = 12, kProfRamp, kProfPeak, kProfSpike, kOrderReset,
   // results bar
   kFAll = 20, kFPassed, kFFailed, kFSkipped, kVResults, kVRequests, kVTime, kVFail, kScope,
-  kRunAgain = 40, kRerunFailed, kHistory, kHtml, kJson, kJunit,
+  kRunAgain = 40, kRerunFailed, kHistory, kHtml, kJson, kJunit, kReset,
 };
 
 // A tab of the main window's notebook (as Postman's and Bruno's runners are), next to the
@@ -1529,19 +1720,28 @@ class RunnerFrame : public wxPanel {
     build_shell();
     // The window opens empty and fills in on the next timer ticks (the left side, then the
     // results side): each step stays short and the UI thread answers in between.
+    // Five steps of 10-25 ms each (the request list, the two halves of the settings, the results
+    // side without its detail pane, then the detail pane), never one of 50.
     stage_.Bind(wxEVT_TIMER, [this](wxTimerEvent&) {
-      if (!left_built_) {
-        left_built_ = true;
+      if (left_stage_ < kLeftBuilt) {
         wxWindowUpdateLocker lock(left_);  // children made on a visible window: draw once, at the end
-        build();
-        left_->Layout();
+        if (left_stage_ == 0) build();
+        else build_settings(left_stage_ - 1);
+        ++left_stage_;
+        relayout_left();
         stage_.StartOnce(1);
         return;
       }
       {
         wxWindowUpdateLocker lock(right_);
-        build_right();
-        Layout();
+        if (right_stage_ == 0) {
+          build_right();
+          right_->Layout();
+          right_stage_ = 1;
+          stage_.StartOnce(1);
+          return;
+        }
+        build_detail();
       }
       if (pending_items_) {
         auto items = std::move(pending_items_);
@@ -1550,16 +1750,25 @@ class RunnerFrame : public wxPanel {
     });
     stage_.StartOnce(1);
     tick_.Bind(wxEVT_TIMER, [this](wxTimerEvent&) { tick(); });
+    save_order_.Bind(wxEVT_TIMER, [this](wxTimerEvent&) { flush_order(); });
+    reload_timer_.Bind(wxEVT_TIMER, [this](wxTimerEvent&) { reload(0); });
+    restore_.Bind(wxEVT_TIMER, [this](wxTimerEvent&) { restore_step(); });
     Bind(wxEVT_CHAR_HOOK, [this](wxKeyEvent& e) { if (!on_key(e)) e.Skip(); });
     load(ws);
+    watch();
+    start_layout_check();
   }
   ~RunnerFrame() override {
+    watcher_.reset();  // joins the watcher thread before the window goes
+    flush_order();  // a reorder just before closing is still saved
+    save_settings();
     link_->frame = nullptr;
     if (run_) run_->ctl.stop();
   }
 
   // "Runner: api" for the tab.
   wxString tab_title() const { return U("Runner: " + name_s_); }
+  const fs::path& folder() const { return folder_; }
   // Ctrl+Enter / Ctrl+Shift+Enter from the main window's accelerators while this tab is shown.
   void run_from_shell(bool failed_only) { on_run(failed_only); }
 
@@ -1581,6 +1790,129 @@ class RunnerFrame : public wxPanel {
   }
 
  private:
+  // WATT_RUNNER_LAYOUT_CHECK=<file> (with WATT_RUN_FOLDER; tests/test_runner.cpp): drives the
+  // runner through everything that shows or hides the "Plan changed" note and checks after each
+  // step that Iterations, Parallel and Run are where they were before (as drawn, and after the
+  // layout the next keystroke would do): a run, a filter typed and cleared, a request unchecked
+  // and checked again, a request edited on disk (the test edits one once it sees
+  // {"check":"ran"}), and a second run that clears the note. Writes one JSON line per step and
+  // ends the process. Unset: one getenv per runner opened.
+  void start_layout_check() {
+    wxString out;
+    if (!wxGetEnv("WATT_RUNNER_LAYOUT_CHECK", &out) || out.empty()) return;
+    check_out_ = out.ToStdWstring();
+    check_started_ = Clock::now();
+    check_timer_.Bind(wxEVT_TIMER, [this](wxTimerEvent&) { layout_check_step(); });
+    check_timer_.Start(50);
+  }
+  void check_write(const std::string& line) {
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, check_out_.c_str(), L"ab") == 0 && f) {
+      std::fputs((line + "\n").c_str(), f);
+      std::fclose(f);
+    }
+  }
+  std::array<int, 3> check_ys() const {
+    return {iters_->GetPosition().y, par_->GetPosition().y, run_btn_->GetPosition().y};
+  }
+  // How far the fields moved from where they were first drawn: as drawn now, then after a layout.
+  void check_measure(const char* step) {
+    int moved = 0;
+    for (int pass = 0; pass < 2; ++pass) {
+      if (pass) relayout_left();
+      const auto ys = check_ys();
+      for (size_t i = 0; i < ys.size(); ++i) moved = std::max(moved, std::abs(ys[i] - check_base_[i]));
+    }
+    check_moved_ = std::max(check_moved_, moved);
+    check_write(std::string("{\"check\":\"step\",\"step\":\"") + step + "\",\"moved\":" + std::to_string(moved) +
+                ",\"note\":" + (changed_text_.empty() ? "false" : "true") + "}");
+  }
+  void layout_check_step() {
+    const bool idle = items_ && detail_ && !run_ && !preparing_ && left_stage_ >= kLeftBuilt;
+    const size_t runs = run_history()[key_].size();
+    if (std::chrono::duration<double>(Clock::now() - check_started_).count() > 60) {
+      check_write("{\"check\":\"timeout\",\"phase\":" + std::to_string(check_phase_) + "}");
+      TerminateProcess(GetCurrentProcess(), 3);
+    }
+    if (!idle) return;
+    switch (check_phase_) {
+      case 0:
+        if (items_->size() < 2) return;
+        relayout_left();
+        check_base_ = check_ys();
+        check_runs_ = runs;
+        on_run(false);
+        check_phase_ = 1;
+        break;
+      case 1:
+        if (runs <= check_runs_) return;
+        check_measure("run");
+        check_write("{\"check\":\"ran\"}");
+        check_phase_ = 2;
+        break;
+      case 2: {  // filter out the last request, as typed
+        const RunItem& last = (*items_)[order_.back()];
+        filter_->SetValue("-" + U(last.req.name));
+        check_phase_ = 3;
+        break;
+      }
+      case 3:
+        check_note_filter_ = !changed_text_.empty();
+        check_measure("filter");
+        filter_->SetValue("");
+        check_phase_ = 4;
+        break;
+      case 4:
+        check_measure("filter_cleared");
+        if (!list_->rows.empty()) {
+          list_->rows[0].checked = false;
+          list_->on_toggle(0);
+          list_->Refresh();
+        }
+        check_phase_ = 5;
+        break;
+      case 5:
+        check_note_uncheck_ = !changed_text_.empty();
+        check_measure("uncheck");
+        if (!list_->rows.empty()) {
+          list_->rows[0].checked = true;
+          list_->on_toggle(0);
+          list_->Refresh();
+        }
+        check_phase_ = 6;
+        break;
+      case 6:  // the test edits a request on disk: the note says so
+        if (changed_text_.Find("edited") == wxNOT_FOUND) return;
+        check_measure("disk_edit");
+        check_runs_ = runs;
+        on_run(false);
+        check_phase_ = 7;
+        break;
+      case 7: {
+        if (runs <= check_runs_) return;
+        check_timer_.Stop();
+        check_measure("run_again");
+        update_counts();  // what the first keystroke in a field does
+        check_measure("keystroke");
+        check_write(std::string("{\"check\":\"done\",\"moved\":") + std::to_string(check_moved_) +
+                    ",\"note_filter\":" + (check_note_filter_ ? "true" : "false") +
+                    ",\"note_uncheck\":" + (check_note_uncheck_ ? "true" : "false") +
+                    ",\"note_after\":" + (changed_text_.empty() ? "false" : "true") + "}");
+        TerminateProcess(GetCurrentProcess(), 0);
+        break;
+      }
+      default:
+        break;
+    }
+  }
+  wxTimer check_timer_;
+  std::wstring check_out_;
+  Clock::time_point check_started_;
+  int check_phase_ = 0, check_moved_ = 0;
+  std::array<int, 3> check_base_{};
+  bool check_note_filter_ = false, check_note_uncheck_ = false;
+  size_t check_runs_ = 0;
+
   // Window-wide keys (also called from the lists, whose wxWANTS_CHARS keeps some keys from the
   // frame's char hook). True when handled.
   bool on_key(wxKeyEvent& e) {
@@ -1623,10 +1955,23 @@ class RunnerFrame : public wxPanel {
   void build_shell() {
     const auto& th = rv::Theme::get();
     auto* root = new wxBoxSizer(wxHORIZONTAL);
-    left_ = new wxPanel(this);
+    // The settings scroll when the window is too short for them (1280 x 800), so the request
+    // list keeps a few rows instead of one.
+    auto* sc = new wxScrolled<wxPanel>(this);
+    sc->SetScrollRate(0, FromDIP(12));
+    sc->ShowScrollbars(wxSHOW_SB_NEVER, wxSHOW_SB_DEFAULT);
+    left_ = sc;
     left_->SetBackgroundColour(th.bg);
     left_->SetMinSize(FromDIP(wxSize(340, -1)));
     root->Add(left_, 0, wxEXPAND);
+    // Collapsed: a narrow rail with the button that opens the settings again.
+    rail_ = new rv::ChipBar(this, [this](int) { set_collapsed(false); });
+    rail_->SetBackgroundColour(th.bg);
+    rail_->add(1, "\xC2\xBB", "Show the run settings", -1);
+    rail_->SetMinSize(FromDIP(wxSize(44, 26)));
+    rail_->SetMaxSize(FromDIP(wxSize(44, 26)));
+    rail_->Hide();
+    root->Add(rail_, 0, wxTOP, FromDIP(8));
     auto* sep = new wxPanel(this, wxID_ANY, wxDefaultPosition, wxSize(1, -1));
     sep->SetBackgroundColour(th.grid);
     root->Add(sep, 0, wxEXPAND);
@@ -1634,13 +1979,46 @@ class RunnerFrame : public wxPanel {
     right_->SetBackgroundColour(th.bg);
     root->Add(right_, 1, wxEXPAND);
     SetSizer(root);
+    {
+      wxConfigBase* c = wxConfigBase::Get();
+      bool col = false;
+      if (c && c->Read("Runner/Collapsed", &col, false) && col) set_collapsed(true, false);
+    }
+    // A narrow window gives the settings less room (they keep at least 304 px).
+    Bind(wxEVT_SIZE, [this](wxSizeEvent& e) {
+      e.Skip();
+      const int w = GetClientSize().x;
+      const int want = w >= FromDIP(1150) ? FromDIP(340) : std::clamp(w * 31 / 100, FromDIP(304), FromDIP(340));
+      if (left_->GetMinSize().x != want) {
+        left_->SetMinSize(wxSize(want, -1));
+        if (order_hint_) order_hint_->Wrap(std::max(FromDIP(120), want - FromDIP(44)));
+      }
+    });
+  }
+
+  void set_collapsed(bool on, bool remember = true) {
+    collapsed_ = on;
+    left_->Show(!on);
+    rail_->Show(on);
+    Layout();
+    if (remember)
+      if (wxConfigBase* c = wxConfigBase::Get()) c->Write("Runner/Collapsed", on);
+    if (on && run_btn_ && FindFocus() && left_->IsDescendant(FindFocus()) && table_) table_->SetFocus();
+  }
+
+  void relayout_left() {
+    static_cast<wxScrolled<wxPanel>*>(left_)->FitInside();
+    left_->Layout();
   }
 
   // ---- left: what to run
+  // The left side in two steps (two timer ticks, each short): the title and the request list,
+  // then the run settings below it.
   void build() {
     const auto& th = rv::Theme::get();
     const wxColour lbg = th.bg;  // the chip bars and lists paint the theme background
     auto* ls = new wxBoxSizer(wxVERTICAL);
+    left_sizer_ = ls;
     const int pad = FromDIP(16);
     auto label = [&](const wxString& s, bool dim = true, float scale = 0.9f, bool bold = true) {
       auto* t = new wxStaticText(left_, wxID_ANY, s);
@@ -1650,7 +2028,17 @@ class RunnerFrame : public wxPanel {
       t->SetForegroundColour(dim ? th.dim : th.fg);
       return t;
     };
-    ls->Add(label("COLLECTION RUNNER", true, 0.85f), 0, wxLEFT | wxRIGHT | wxTOP, pad);
+    {
+      auto* top = new wxBoxSizer(wxHORIZONTAL);
+      top->Add(label("COLLECTION RUNNER", true, 0.85f), 1, wxALIGN_CENTER_VERTICAL);
+      auto* hide = new rv::ChipBar(left_, [this](int) { set_collapsed(true); });
+      hide->SetBackgroundColour(lbg);
+      hide->add(1, "\xC2\xAB", "Hide the run settings (more room for the results); Ctrl+Enter still runs", -1, true);
+      hide->SetMinSize(FromDIP(wxSize(44, 26)));
+      hide->SetMaxSize(FromDIP(wxSize(44, 26)));
+      top->Add(hide, 0, wxALIGN_CENTER_VERTICAL);
+      ls->Add(top, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, pad - FromDIP(4));
+    }
     ls->Add(label(U(name_s_), false, 1.35f), 0, wxLEFT | wxRIGHT | wxTOP, pad);
     ls->AddSpacer(FromDIP(4));
     // The environment of the run (Postman's runner dropdown, Bruno's selector on the runner tab):
@@ -1671,6 +2059,16 @@ class RunnerFrame : public wxPanel {
     left_chips_->add(kNone, "None", "Uncheck every request shown", -1, true);
     left_chips_->add(kUp, "\xE2\x96\xB2", "Move the selected request up (Alt+Up)", -1, true);
     left_chips_->add(kDown, "\xE2\x96\xBC", "Move the selected request down (Alt+Down)", -1, true);
+    left_chips_->add(kOrderReset, "\xE2\x86\xBA", "Run in the sidebar's order again (removes this folder's entries from run-order.json)",
+                     -1, true);
+    left_chips_->set_visible(kOrderReset, saved_order_);
+    // Quick clicks on the arrows arrive as a double click in place of the second press: each one
+    // still moves the request a step (four clicks, four places).
+    left_chips_->Bind(wxEVT_LEFT_DCLICK, [this](wxMouseEvent& e) {
+      wxMouseEvent down(e);
+      down.SetEventType(wxEVT_LEFT_DOWN);
+      left_chips_->GetEventHandler()->ProcessEvent(down);
+    });
     reqrow->Add(left_chips_, 1, wxEXPAND | wxLEFT, FromDIP(6));
     ls->Add(reqrow, 0, wxEXPAND | wxLEFT | wxRIGHT, pad);
     ls->AddSpacer(FromDIP(4));
@@ -1680,7 +2078,15 @@ class RunnerFrame : public wxPanel {
     filter_->Bind(wxEVT_TEXT, [this](wxCommandEvent&) { fill_list(); });
     ls->Add(filter_, 0, wxEXPAND | wxLEFT | wxRIGHT, pad);
     ls->AddSpacer(FromDIP(6));
+    // A request using {{var}} before the request that captures var (Postman / Bruno just send it
+    // unresolved): said before the run, not found afterwards in a failed row. Above the list, so
+    // showing or hiding it changes the list's height and nothing below it moves.
+    order_hint_ = label("", false, 0.9f, false);
+    order_hint_->SetForegroundColour(th.warn);
+    order_hint_->Hide();
+    ls->Add(order_hint_, 0, wxLEFT | wxRIGHT | wxBOTTOM, pad);
     list_ = new RequestList(left_);
+    list_->SetMinSize(wxSize(-1, FromDIP(24 * 5 + 4)));
     list_->on_toggle = [this](size_t n) {
       if (n < visible_.size()) checked_[visible_[n]] = list_->rows[n].checked;
       update_counts();
@@ -1693,16 +2099,71 @@ class RunnerFrame : public wxPanel {
         open_file((*items_)[order_[visible_[static_cast<size_t>(s)]]].req.file);
     });
     ls->Add(list_, 1, wxEXPAND | wxLEFT | wxRIGHT, pad);
+    // Said under the list when this folder has a saved run order, which the sidebar does not
+    // follow (Bruno shows one order in both places; here they can differ).
+    ls->AddSpacer(FromDIP(4));
+    // Always there, one line high (empty without a saved order): the note appearing after the
+    // first move must not move the settings below it under the cursor.
+    order_note_ = label("", true, 0.85f, false);
+    order_note_->SetMinSize(wxSize(-1, lines_height(order_note_, 1)));
+    ls->Add(order_note_, 0, wxEXPAND | wxLEFT | wxRIGHT, pad);
+    set_saved_order(saved_order_);
+    left_->SetSizer(ls);
+  }
 
-    ls->AddSpacer(FromDIP(14));
-    auto* grid = new wxFlexGridSizer(2, FromDIP(8), FromDIP(12));
-    grid->AddGrowableCol(1);
+  // Whether this runner's folder has entries in run-order.json (a worker reads it).
+  void set_saved_order(bool on) {
+    saved_order_ = on;
+    if (!order_note_) return;
+    if (left_chips_) left_chips_->set_visible(kOrderReset, on);
+    set_fixed_text(order_note_,
+                   on ? wxString::FromUTF8("Custom run order, not the sidebar's \xC2\xB7 \xE2\x86\xBA above goes back to it") : wxString(), 1,
+                   on ? wxString("Move a request with Alt+Up / Alt+Down, the arrows above or by dragging. The order is "
+                                 "kept for this runner and the command line runner (run-order.json); the sidebar keeps "
+                                 "its own. The circular arrow above removes it: the runner then runs in the sidebar's order.")
+                      : wxString());
+  }
+  static bool has_saved_order(const fs::path& root, const fs::path& folder) {
+    const runner::FolderOrder o = runner::load_run_order(root);
+    std::error_code ec;
+    const fs::path base = folder.empty() || fs::equivalent(folder, root, ec) ? root
+                          : fs::is_directory(folder, ec)                   ? folder
+                                                                            : folder.parent_path();
+    for (const auto& [dir, names] : o) {
+      if (names.empty()) continue;
+      const fs::path rel = dir.lexically_normal().lexically_relative(base.lexically_normal());
+      if (!rel.empty() && *rel.begin() != "..") return true;
+    }
+    return false;
+  }
+
+  // part 0: the fields grid; part 1: the data file, check boxes, Run and the plan lines.
+  void build_settings(int part) {
+    const auto& th = rv::Theme::get();
+    const wxColour lbg = th.bg;
+    wxBoxSizer* ls = left_sizer_;
+    const int pad = FromDIP(16);
+    auto label = [&](const wxString& s, bool dim = true, float scale = 0.9f, bool bold = true) {
+      auto* t = new wxStaticText(left_, wxID_ANY, s);
+      wxFont f = t->GetFont().Scaled(scale);
+      if (bold) f = f.Bold();
+      t->SetFont(f);
+      t->SetForegroundColour(dim ? th.dim : th.fg);
+      return t;
+    };
     auto field = [&](const wxString& s, const wxString& tip) {
       auto* t = new wxStaticText(left_, wxID_ANY, s);
       t->SetForegroundColour(th.fg);
       t->SetToolTip(tip);
       return t;
     };
+    if (part == 1) {
+      build_settings_rest(label, field, pad, lbg);
+      return;
+    }
+    ls->AddSpacer(FromDIP(14));
+    auto* grid = new wxFlexGridSizer(2, FromDIP(8), FromDIP(12));
+    grid->AddGrowableCol(1);
     iters_ = new NumberField(left_, 1, 1, 1000000, FromDIP(wxSize(110, -1)));
     delay_ = new NumberField(left_, 0, 0, 600000, FromDIP(wxSize(110, -1)));
     par_ = new NumberField(left_, 1, 1, static_cast<int>(runner::RunControl::kSlots), FromDIP(wxSize(110, -1)));
@@ -1730,7 +2191,7 @@ class RunnerFrame : public wxPanel {
     prof_chips_ = new rv::ChipBar(left_, [this](int id) { set_profile(id - kProfFixed, true); });
     prof_chips_->SetBackgroundColour(lbg);
     prof_chips_->add(kProfFixed, "Fixed", "Every worker from the start", 0);
-    prof_chips_->add(kProfRamp, "Ramp up", "The workers join one by one over Ramp (s)", 0);
+    prof_chips_->add(kProfRamp, "Ramp", "Ramp up: the workers join one by one over Ramp (s)", 0);
     prof_chips_->add(kProfPeak, "Peak", "Ramp up, hold, ramp down over the last Ramp (s) of the Duration", 0);
     prof_chips_->add(kProfSpike, "Spike", "Base load, then every worker at once in the middle fifth of the Duration", 0);
     prof_chips_->set_on(kProfFixed, true);
@@ -1752,6 +2213,12 @@ class RunnerFrame : public wxPanel {
     grid->Add(field("Thresholds", "Pass / fail criteria for the run, checked live and at the end"), 0, wxALIGN_CENTER_VERTICAL);
     grid->Add(thresh_, 0, wxALIGN_RIGHT);
     ls->Add(grid, 0, wxEXPAND | wxLEFT | wxRIGHT, pad);
+  }
+
+  template <class Label, class Field>
+  void build_settings_rest(Label& label, Field& field, int pad, const wxColour& lbg) {
+    const auto& th = rv::Theme::get();
+    wxBoxSizer* ls = left_sizer_;
     ls->AddSpacer(FromDIP(8));
     auto* drow = new wxBoxSizer(wxHORIZONTAL);
     auto* dl = field("Data file", "CSV with a header row, or a JSON array of objects: each row's columns become {{vars}} for one iteration");
@@ -1766,8 +2233,11 @@ class RunnerFrame : public wxPanel {
     drow->Add(data_chips_, 1, wxEXPAND | wxLEFT, FromDIP(6));
     ls->Add(drow, 0, wxEXPAND | wxLEFT | wxRIGHT, pad);
     data_label_ = label("", true, 0.85f, false);
-    ls->Add(data_label_, 0, wxLEFT | wxRIGHT, pad);
-    ls->AddSpacer(FromDIP(8));
+    // One line, always (empty without a data file): choosing a file moves nothing below.
+    data_label_->SetMinSize(wxSize(-1, lines_height(data_label_, 1)));
+    ls->AddSpacer(FromDIP(2));
+    ls->Add(data_label_, 0, wxEXPAND | wxLEFT | wxRIGHT, pad);
+    ls->AddSpacer(FromDIP(12));
     bail_ = new wxCheckBox(left_, wxID_ANY, "Stop on first failure");
     keep_ = new wxCheckBox(left_, wxID_ANY, "Keep variable values");
     keep_->SetValue(true);
@@ -1790,9 +2260,19 @@ class RunnerFrame : public wxPanel {
     run_btn_->SetToolTip("Run (Ctrl+Enter); Esc stops; Ctrl+Shift+Enter reruns the failed requests");
     ls->Add(run_btn_, 0, wxEXPAND | wxLEFT | wxRIGHT, pad);
     ls->AddSpacer(FromDIP(6));
+    // The plan line and the "Plan changed" note under it have fixed heights (two lines each, empty
+    // or not; longer text is cut, its whole in the tooltip): what they say changes with every
+    // keystroke in a field or the filter, a check box and a request edited on disk, and the list
+    // above takes what the panel has left, so any change in their height would move every field.
     plan_label_ = label("", true, 0.9f, false);
-    ls->Add(plan_label_, 0, wxLEFT | wxRIGHT | wxBOTTOM, pad);
-    left_->SetSizer(ls);
+    plan_label_->SetMinSize(wxSize(-1, lines_height(plan_label_, 2)));
+    ls->Add(plan_label_, 0, wxEXPAND | wxLEFT | wxRIGHT, pad);
+    ls->AddSpacer(FromDIP(4));
+    changed_label_ = label("", false, 0.9f, false);
+    changed_label_->SetForegroundColour(th.warn);
+    changed_label_->SetMinSize(wxSize(-1, lines_height(changed_label_, 2)));
+    ls->Add(changed_label_, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, pad);
+    restore_settings();
   }
 
   void build_right() {
@@ -1807,8 +2287,6 @@ class RunnerFrame : public wxPanel {
     bar_->add(kFPassed, "Passed", "Passed results", 0);
     bar_->add(kFFailed, "Failed", "Failed results", 0);
     bar_->add(kFSkipped, "Skipped", "Stopped, or not run because the run ended first", 0);
-    bar_->add(kScope, "", "Results are narrowed to this request or failure: click to show every result again", -1);
-    bar_->set_visible(kScope, false);
     bar_->add(kVResults, "Results", "Every step in run order", 1);
     bar_->add(kVRequests, "By request", "Per request across iterations: count, failures, avg, min, p50, p95, max, and the "
                                         "change against the previous run",
@@ -1820,18 +2298,38 @@ class RunnerFrame : public wxPanel {
     bar_->set_on(kFAll, true);
     bar_->set_on(kVResults, true);
     bar_->add(kRunAgain, "Run again", "Run the same requests again (Ctrl+Enter)", -1, true);
-    bar_->add(kRerunFailed, "Rerun failed", "Run only the requests that failed, once (Ctrl+Shift+Enter)", -1, true);
+    bar_->add(kRerunFailed, "Rerun failed", "Run the failed requests again: each iteration that had a failure, with its data row, plus the "
+                                          "requests whose captures they use (Ctrl+Shift+Enter)", -1, true);
     bar_->add(kHistory, "History \xE2\x96\xBE", "Earlier runs of this folder in this session", -1, true);
-    bar_->add(kHtml, "HTML report", "Save a self-contained HTML report", -1, true);
+    // One menu for the reports (HTML, JSON, JUnit): the bar keeps Rerun failed and History in
+    // view with a filter or cause chip shown.
+    bar_->add(kHtml, "Export \xE2\x96\xBE", "Save the results: an HTML report, JSON, or JUnit XML for CI", -1, true);
     bar_->add(kJson, "JSON", "Export every result as JSON", -1, true);
     bar_->add(kJunit, "JUnit", "Export JUnit XML for CI", -1, true);
-    for (int id : {kRunAgain, kRerunFailed, kHistory, kHtml, kJson, kJunit}) bar_->set_enabled(id, false);
+    bar_->add(kReset, "Reset", "Clear the results and show the run's plan again (the run stays in History)", -1, true);
+    for (int id : {kRunAgain, kRerunFailed, kHistory, kHtml, kJson, kJunit, kReset}) bar_->set_enabled(id, false);
+    bar_->set_visible(kJson, false);
+    bar_->set_visible(kJunit, false);
     bar->Add(bar_, 1, wxEXPAND);
     rs->Add(bar, 0, wxEXPAND | wxLEFT | wxRIGHT, FromDIP(8));
-    status_ = new wxStaticText(right, wxID_ANY, "");
+    // Always one line high (empty or not): a message never moves the rows under the cursor.
+    // The status line, with the scope chip ("x Fail lookup: gRPC status OK") at its start while
+    // results are narrowed to one request or failure: on its own row, so the bar above keeps
+    // every action in view. One height with or without the chip: nothing below moves.
+    scope_row_ = new wxBoxSizer(wxHORIZONTAL);
+    scope_row_->Add(0, FromDIP(24));
+    scope_bar_ = new rv::ChipBar(right, [this](int id) { on_chip(id); });
+    scope_bar_->SetBackgroundColour(th.bg);
+    scope_bar_->add(kScope, "", "Results are narrowed to this request or failure: click to show every result again", -1);
+    scope_bar_->Hide();
+    scope_row_->Add(scope_bar_, 0, wxALIGN_CENTER_VERTICAL);
+    scope_row_->AddSpacer(FromDIP(8));
+    status_ = new wxStaticText(right, wxID_ANY, " ", wxDefaultPosition, wxDefaultSize,
+                               wxST_NO_AUTORESIZE | wxST_ELLIPSIZE_END);
     status_->SetForegroundColour(th.dim);
-    rs->Add(status_, 0, wxLEFT | wxRIGHT | wxBOTTOM, FromDIP(16));
-    status_->Hide();
+    status_->SetMinSize(wxSize(-1, status_->GetCharHeight()));
+    scope_row_->Add(status_, 1, wxALIGN_CENTER_VERTICAL);
+    rs->Add(scope_row_, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, FromDIP(8));
 
     split_ = new wxSplitterWindow(right, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxSP_LIVE_UPDATE | wxSP_NOBORDER | wxSP_THIN_SASH);
     split_->SetBackgroundColour(th.grid);
@@ -1915,24 +2413,48 @@ class RunnerFrame : public wxPanel {
       if (on_key(e)) return;
       e.Skip();
     });
-    detail_ = new runner_ui::DetailPane(split_);
-    detail_->on_open = [this] { open_step(shown_); };
-    detail_->on_key = [this](wxKeyEvent& e) { return on_key(e); };
     run_btn_->on_key = [this](wxKeyEvent& e) { return on_key(e); };
-    split_->SplitHorizontally(tpanel_, detail_, 0);
+    split_->Initialize(tpanel_);  // the detail pane joins on the next step (build_detail)
     split_->SetSashGravity(0.6);
     split_->SetMinimumPaneSize(FromDIP(120));
     rs->Add(split_, 1, wxEXPAND | wxLEFT, FromDIP(1));
     right->SetSizer(rs);
     table_->Bind(wxEVT_LISTBOX, [this](wxCommandEvent&) {
       follow_ = false;
-      show_selected();
+      if (detail_) show_selected();
     });
-    CallAfter([this] {
+    split_->Bind(wxEVT_SPLITTER_SASH_POS_CHANGED, [this](wxSplitterEvent& e) {
+      e.Skip();
       const int h = split_->GetClientSize().y;
-      if (h > 0) split_->SetSashPosition(h * 58 / 100);  // ~22 result rows at 1600 x 1000
+      if (h > 0 && e.GetSashPosition() > 0)
+        if (wxConfigBase* c = wxConfigBase::Get())
+          c->Write("Runner/SplitPct", std::clamp(static_cast<long>(e.GetSashPosition()) * 100 / h, 15L, 85L));
+      CallAfter([this] {
+        const int sel = table_->GetSelection();
+        if (sel != wxNOT_FOUND) table_->ensure_visible(static_cast<size_t>(sel));
+      });
     });
     update_filter_chips();
+  }
+
+  // The results side's detail pane (Response / Headers / Request / Timing / Tests ...), one step
+  // after the rest of that side: the runner shows its list and summary first.
+  void build_detail() {
+    detail_ = new runner_ui::DetailPane(split_);
+    detail_->on_open = [this] { open_step(shown_); };
+    detail_->on_key = [this](wxKeyEvent& e) { return on_key(e); };
+    split_->SplitHorizontally(tpanel_, detail_, 0);
+    // The divider where the user last left it (a share of the height, for every runner), else
+    // ~22 result rows at 1600 x 1000. A drag keeps the selected row in view.
+    const int h = split_->GetClientSize().y;
+    long pct = 58;
+    if (wxConfigBase* c = wxConfigBase::Get()) c->Read("Runner/SplitPct", &pct, 58L);
+    pct = std::clamp(pct, 15L, 85L);
+    if (h > 0) split_->SetSashPosition(static_cast<int>(h * pct / 100));
+    else
+      CallAfter([this, pct] {
+        if (const int ch = split_->GetClientSize().y; ch > 0) split_->SetSashPosition(static_cast<int>(ch * pct / 100));
+      });
   }
 
   void update_env_label() {
@@ -1956,43 +2478,233 @@ class RunnerFrame : public wxPanel {
     else if (got > 1000 && static_cast<size_t>(got - 1001) < names.size()) env_ = names[static_cast<size_t>(got - 1001)];
     else return;
     update_env_label();
-    left_->Layout();
+    relayout_left();
   }
 
   // ---- loading the folder (worker)
-  // The order the user dragged items into in the sidebar (stored by the sidebar, per workspace,
-  // under Sidebar/Order/<hash of the root>): the runner runs what the tree lists, top to bottom.
-  static runner::FolderOrder sidebar_order(const fs::path& root) {
-    runner::FolderOrder out;
-    wxConfigBase* c = wxConfigBase::Get();
-    wxString s;
-    const wxString key = wxString::Format("%016llx", static_cast<unsigned long long>(std::hash<std::wstring>{}(root.wstring())));
-    if (!c || !c->Read("Sidebar/Order/" + key, &s)) return out;
-    wxStringTokenizer lines(s, "\n");
-    while (lines.HasMoreTokens()) {
-      wxStringTokenizer f(lines.GetNextToken(), "\t");
-      if (!f.HasMoreTokens()) continue;
-      const wxString rel = f.GetNextToken();
-      const fs::path dir = rel == "." ? root : (root / fs::path(rel.ToStdWstring())).lexically_normal();
-      std::vector<std::wstring> names;
-      while (f.HasMoreTokens()) names.push_back(f.GetNextToken().ToStdWstring());
-      out[dir] = std::move(names);
-    }
-    return out;
-  }
-
+  // The run order is run-order.json only (what `watt --run` follows), never the sidebar's
+  // per-user drag order: one order for the runner, its re-reads and the CLI.
   void load(const Workspace& ws) {
     auto wsc = std::make_shared<Workspace>(ws);
     auto link = link_;
     const fs::path folder = folder_;
-    auto order = std::make_shared<runner::FolderOrder>(sidebar_order(ws.root()));
-    std::thread([wsc, link, folder, order] {
+    std::thread([wsc, link, folder] {
       auto errs = std::make_shared<std::vector<std::string>>();
-      auto items = std::make_shared<std::vector<RunItem>>(runner::collect(*wsc, folder, errs.get(), order.get()));
-      wxTheApp->CallAfter([link, items, errs] {
-        if (link->frame) link->frame->loaded(items, *errs);
+      auto items = std::make_shared<std::vector<RunItem>>(runner::collect(*wsc, folder, errs.get()));
+      const bool saved_order = has_saved_order(wsc->root(), folder);
+      wxTheApp->CallAfter([link, items, errs, saved_order] {
+        if (!link->frame) return;
+        link->frame->set_saved_order(saved_order);
+        link->frame->loaded(items, *errs);
       });
     }).detach();
+  }
+
+  // Watches the workspace on disk (an editor save, a file added / deleted / renamed, git pull,
+  // run-order.json): a change under this runner's folder reloads its list.
+  void watch() {
+    auto link = link_;
+    try {
+      watcher_ = std::make_unique<WorkspaceWatcher>(root_, [link](WorkspaceWatcher::Batch b) {
+        auto batch = std::make_shared<WorkspaceWatcher::Batch>(std::move(b));
+        wxTheApp->CallAfter([link, batch] {
+          if (link->frame) link->frame->files_changed(*batch);
+        });
+      });
+    } catch (...) {
+      watcher_.reset();
+    }
+  }
+
+ public:
+  void files_changed(const WorkspaceWatcher::Batch& batch) {
+    const std::wstring base = run_base().lexically_relative(root_).generic_wstring();
+    const bool whole = base.empty() || base == L".";
+    bool hit = false;
+    for (const auto& p : batch) {
+      const std::wstring w = p.generic_wstring();
+      if (w.empty() || whole || w == L"run-order.json" || w.ends_with(L"folder.json")) {
+        hit = true;  // empty: too many changes to list
+        break;
+      }
+      // Under the folder, the folder itself, or one of its parents (renamed / deleted).
+      if ((w.size() > base.size() && w.compare(0, base.size(), base) == 0 && w[base.size()] == L'/') || w == base ||
+          (base.size() > w.size() && base.compare(0, w.size(), w) == 0 && base[w.size()] == L'/')) {
+        hit = true;
+        break;
+      }
+    }
+    if (!hit) return;
+    if (run_ || preparing_) {
+      reload_due_ = true;  // after the run: it sends what it started with
+      return;
+    }
+    reload_timer_.StartOnce(120);
+  }
+  // Raising an already open runner (Run folder again) re-reads its requests.
+  void refresh() {
+    if (!run_ && !preparing_ && items_) reload_timer_.StartOnce(1);
+  }
+
+ private:
+  // Re-reads the requests of the folder on a worker (a drag order not yet written is written
+  // first), then merges them into the list: checks are kept per file. then: 0 only refresh, 1
+  // start a run, 2 rerun the failed requests, from the fresh list.
+  void reload(int then) {
+    reload_timer_.Stop();
+    reload_due_ = false;
+    Workspace* ws = workspace_ ? workspace_() : nullptr;
+    if (!ws || runner_key(ws->root(), {}) != runner_key(root_, {})) {
+      if (then) {
+        preparing_ = false;
+        set_running(false);
+        summary_->set(summary_now(false), "Not run", false);
+        set_status_w("The workspace was closed or switched: open the runner again from the sidebar.");
+      }
+      return;
+    }
+    const uint64_t seq = ++reload_seq_;
+    if (then) reload_then_ = then;
+    auto wsc = std::make_shared<Workspace>(*ws);
+    auto link = link_;
+    const fs::path folder = folder_;
+    const fs::path root = root_;
+    std::shared_ptr<runner::FolderOrder> changed;
+    if (!order_dirty_.empty()) {
+      changed = std::make_shared<runner::FolderOrder>(std::move(order_dirty_));
+      order_dirty_.clear();
+      save_order_.Stop();
+    }
+    const uint64_t oseq = changed ? ++order_seq() : 0;
+    std::thread([wsc, link, folder, root, changed, oseq, seq] {
+      std::string oerr;
+      bool saved = true;
+      if (changed) saved = runner::save_run_order(root, *changed, oseq, &oerr);
+      // An order write started just before (the debounce timer) lands first.
+      for (int i = 0; i < 2000 && link->saving.load() > 0; ++i) Sleep(1);
+      auto errs = std::make_shared<std::vector<std::string>>();
+      auto items = std::make_shared<std::vector<RunItem>>(runner::collect(*wsc, folder, errs.get()));
+      const bool saved_order = has_saved_order(root, folder);
+      wxTheApp->CallAfter([link, items, errs, seq, saved, oerr, saved_order] {
+        if (!link->frame) return;
+        link->frame->set_saved_order(saved_order);
+        if (!saved) link->frame->set_status_w(U("Could not save the run order: " + oerr));
+        link->frame->reloaded(seq, items, *errs);
+      });
+    }).detach();
+  }
+
+  static std::atomic<uint64_t>& order_seq() {
+    static std::atomic<uint64_t> seq{0};
+    return seq;
+  }
+
+ public:
+  void reloaded(uint64_t seq, std::shared_ptr<std::vector<RunItem>> items, const std::vector<std::string>& errs) {
+    if (seq != reload_seq_) return;  // a newer reload is on its way
+    if (!detail_) {
+      pending_items_ = std::move(items);
+      pending_errs_ = errs;
+      return;
+    }
+    const int then = reload_then_;
+    reload_then_ = 0;
+    merge_items(std::move(items), errs);
+    if (then) {
+      preparing_ = false;
+      begin_run(then == 2);
+    }
+  }
+
+ private:
+  // The fresh list from disk replaces the shown one: checks (and the selected row) follow the
+  // file, a new request comes checked, a deleted one goes; the order is the saved run order.
+  void merge_items(std::shared_ptr<std::vector<RunItem>> fresh, const std::vector<std::string>& errs) {
+    std::map<fs::path, char> was;
+    fs::path sel_file;
+    if (items_) {
+      for (size_t k = 0; k < order_.size() && k < checked_.size(); ++k) was[(*items_)[order_[k]].req.file] = checked_[k];
+      const int sel = list_->GetSelection();
+      if (sel != wxNOT_FOUND && static_cast<size_t>(sel) < visible_.size())
+        sel_file = (*items_)[order_[visible_[static_cast<size_t>(sel)]]].req.file;
+    }
+    items_ = std::move(fresh);
+    order_.clear();
+    tags_.clear();
+    checked_.clear();
+    for (size_t i = 0; i < items_->size(); ++i) {
+      order_.push_back(i);
+      std::string t;
+      for (const auto& g : runner::tags_of((*items_)[i])) t += (t.empty() ? "#" : " #") + g;
+      tags_.push_back(std::move(t));
+      const auto it = was.find((*items_)[i].req.file);
+      checked_.push_back(it == was.end() ? 1 : it->second);
+    }
+    fill_list();
+    for (size_t n = 0; n < visible_.size() && !sel_file.empty(); ++n)
+      if ((*items_)[order_[visible_[n]]].req.file == sel_file) {
+        list_->SetSelection(static_cast<int>(n));
+        break;
+      }
+    if (!errs.empty()) set_status_w(U(std::to_string(errs.size()) + " file(s) could not be read: " + errs.front()));
+  }
+
+  // What changed between the plan of the run shown and what Run would send now ("" when
+  // nothing did): requests edited on disk, added, removed or reordered.
+  std::string plan_change() const {
+    if (!items_ || !run_items_ || !run_order_ || steps_.empty() || run_) return {};
+    const std::vector<size_t> now = chosen();
+    if (run_items_.get() == items_.get() && now == *run_order_) return {};
+    std::map<fs::path, const SavedRequest*> last;
+    std::vector<fs::path> last_seq, now_seq;
+    for (size_t i : *run_order_)
+      if (i < run_items_->size()) {
+        last[(*run_items_)[i].req.file] = &(*run_items_)[i].req;
+        last_seq.push_back((*run_items_)[i].req.file);
+      }
+    std::vector<std::string> edited, added;
+    size_t removed = 0;
+    std::map<fs::path, bool> seen;
+    for (size_t i : now) {
+      const SavedRequest& r = (*items_)[i].req;
+      now_seq.push_back(r.file);
+      seen[r.file] = true;
+      const auto it = last.find(r.file);
+      const std::string name = r.name.empty() ? (*items_)[i].rel : r.name;
+      if (it == last.end()) added.push_back(name);
+      else if (!same_request(*it->second, r)) edited.push_back(name);
+    }
+    for (const auto& [f, r] : last)
+      if (!seen.count(f)) ++removed;
+    auto names = [](const std::vector<std::string>& v) {
+      std::string o;
+      for (size_t i = 0; i < v.size() && i < 2; ++i) o += (i ? ", " : "") + v[i];
+      if (v.size() > 2) o += " +" + std::to_string(v.size() - 2);
+      return o;
+    };
+    std::string o;
+    auto add = [&](const std::string& t) { o += (o.empty() ? "" : "; ") + t; };
+    if (!edited.empty()) add("edited: " + names(edited));
+    if (!added.empty()) add("new: " + names(added));
+    if (removed) add(std::to_string(removed) + " no longer in the run");
+    if (o.empty() && now_seq != last_seq) add("new order");
+    return o.empty() ? o : "Plan changed since the last run (" + o + ")";
+  }
+
+  // Shows or hides the "Plan changed" note. Whenever its text or visibility changes the settings
+  // panel is laid out again (unless the caller does that next): a note that appears or goes away
+  // without a layout leaves Iterations / Delay / Parallel drawn where they no longer are, and the
+  // next keystroke's layout moves them under the cursor.
+  bool update_plan_change(bool layout = true) {
+    if (!changed_label_) return false;
+    const std::string t = plan_change();
+    if (U(t) == changed_text_) return false;
+    changed_text_ = U(t);
+    set_fixed_text(changed_label_, changed_text_, 2,
+                   t.empty() ? wxString()
+                             : wxString("Run sends the requests as saved now; the results shown are from the earlier plan."));
+    (void)layout;  // a fixed height: nothing to lay out again
+    return true;
   }
 
  public:
@@ -2002,29 +2714,40 @@ class RunnerFrame : public wxPanel {
       pending_errs_ = errs;
       return;
     }
-    items_ = std::move(items);
-    order_.clear();
-    tags_.clear();
-    for (size_t i = 0; i < items_->size(); ++i) {
-      order_.push_back(i);
-      std::string t;
-      for (const auto& g : runner::tags_of((*items_)[i])) t += (t.empty() ? "#" : " #") + g;
-      tags_.push_back(std::move(t));
-    }
-    checked_.assign(items_->size(), 1);
-    fill_list();
-    if (!errs.empty()) set_status_w(U(std::to_string(errs.size()) + " file(s) could not be read: " + errs.front()));
+    merge_items(std::move(items), errs);
     if (items_->empty()) {
       detail_->show(nullptr, errs.empty() ? "This folder has no requests." : errs.front());
     } else {
       detail_->show(nullptr, "Press Run (Ctrl+Enter) to send " + std::to_string(items_->size()) +
                                  " request(s) in order. Select a result to see its response, headers, request, timing and tests.");
     }
-    // The last run of this folder in this session, if the window was closed since.
+    // The last run of this folder in this session, if the window was closed since: shown in
+    // steps on the next timer ticks (the table, then the summary and views, then the detail),
+    // each short, so reopening a runner never holds the UI thread.
     auto& h = run_history()[key_];
-    if (!h.empty() && steps_.empty()) show_record(h.front(), false);
+    if (!h.empty() && steps_.empty() && !cleared_runners().count(key_)) {
+      restore_rec_ = h.front();
+      restore_phase_ = 0;
+      restore_.StartOnce(1);
+    }
     update_history_chips();
     run_btn_->SetFocus();
+  }
+
+  void restore_step() {
+    if (!restore_rec_ || run_) {
+      restore_rec_.reset();
+      return;
+    }
+    if (restore_phase_ == 0) {
+      show_record(restore_rec_, true, 1);
+      restore_phase_ = 1;
+      restore_.StartOnce(1);
+      return;
+    }
+    auto rec = std::move(restore_rec_);
+    restore_rec_.reset();
+    show_record(rec, true, 2);
   }
 
   void drain(const std::shared_ptr<RunState>& st) {
@@ -2152,6 +2875,7 @@ class RunnerFrame : public wxPanel {
     drain(st);
     run_.reset();
     tick_.Stop();
+    if (reload_due_) reload_timer_.StartOnce(50);
     // Planned steps that never ran (Stop, Esc, stop on failure) are listed as Skipped.
     if (s.stopped && run_order_ && steps_.size() < planned_ && run_label_ != "rerun failed") {
       std::vector<bool> done(planned_);
@@ -2168,35 +2892,27 @@ class RunnerFrame : public wxPanel {
       table_->refresh_rows();
     }
     if (run_parallel_) {
-      // Parallel workers finish out of order: once the run is done the results read in plan
-      // order (iteration, then the request's place), as a sequential run lists them; the
-      // finishing order stays one click away (the # column).
+      // Parallel workers finish out of order. The list keeps the order the results arrived in
+      // (the # column; the Iter column sorts into plan order), so nothing jumps at the end;
+      // steps_ (exports, history) is put in plan order.
       std::stable_sort(steps_.begin(), steps_.end(), [](const StepPtr& a, const StepPtr& b) {
         if (a->iteration != b->iteration) return a->iteration < b->iteration;
         if (a->pos != b->pos) return a->pos < b->pos;
         return a->seq < b->seq;
       });
-      view_.clear();
-      for (const auto& x : steps_)
-        if (matches(*x)) view_.push_back(x);
-      if (cols_.sort >= 0) apply_sort(false);
-      table_->refresh_rows();
-      // A row the user picked stays picked; the automatic choice (the first failure, or the
-      // latest row while following) becomes the first failure in plan order, else the top row.
-      const bool auto_pick = follow_ || !shown_ || shown_ == pinned_step_;
-      int sel = view_.empty() ? wxNOT_FOUND : 0;
+    }
+    // The row shown stays shown, picked by the user or not; with none yet, the first failure.
+    if (!shown_ && !view_.empty()) {
+      int sel = 0;
       for (size_t i = 0; i < view_.size(); ++i)
-        if (auto_pick ? view_[i]->failed() : view_[i] == shown_) {
+        if (view_[i]->failed()) {
           sel = static_cast<int>(i);
           break;
         }
       follow_ = false;
       table_->SetSelection(sel);
-      if (sel != wxNOT_FOUND) {
-        if (sel == 0) table_->ScrollToRow(0);
-        else table_->ensure_visible(static_cast<size_t>(sel));
-        if (view_[static_cast<size_t>(sel)] != shown_) show_selected();
-      }
+      table_->ensure_visible(static_cast<size_t>(sel));
+      show_selected(false);
     }
     final_ = runner::summarize(steps_, planned_, s.wall_ms, s.stopped, true);
     have_final_ = true;
@@ -2210,6 +2926,8 @@ class RunnerFrame : public wxPanel {
     rec->summary = final_;
     rec->steps = std::make_shared<const std::vector<StepPtr>>(steps_);
     rec->items = run_items_;
+    rec->order = run_order_;
+    rec->plan = run_plan_;
     auto& h = run_history()[key_];
     h.push_front(rec);
     while (h.size() > kHistoryRuns) h.pop_back();
@@ -2229,6 +2947,10 @@ class RunnerFrame : public wxPanel {
 
   void data_loaded(uint64_t gen, std::shared_ptr<std::vector<runner::DataRow>> rows, std::string name, std::string err) {
     if (gen != data_gen_) return;
+    struct Reset {
+      int& r;
+      ~Reset() { r = -1; }
+    } reset{restore_iters_};
     if (!err.empty()) {
       data_label_->SetLabel(U(name + ": " + err));
       data_label_->SetForegroundColour(rv::Theme::get().err);
@@ -2243,7 +2965,7 @@ class RunnerFrame : public wxPanel {
       data_label_->SetLabel(U(name + kDot + std::to_string(data_->size()) + " row" + (data_->size() == 1 ? "" : "s") +
                               kDot + "{{" + cols + "}}"));
       data_label_->SetForegroundColour(rv::Theme::get().dim);
-      iters_->set_value(static_cast<int>(std::min<size_t>(data_->size(), 1000000)));
+      iters_->set_value(restore_iters_ > 0 ? restore_iters_ : static_cast<int>(std::min<size_t>(data_->size(), 1000000)));
       data_chips_->set_visible(kDataClear, true);
       data_chips_->set_visible(kDataPreview, true);
     }
@@ -2252,11 +2974,55 @@ class RunnerFrame : public wxPanel {
 
   void set_status(const std::string& s) { set_status_w(U(s)); }
 
+  // ---- the run's settings, remembered per runner (folder) for this user
+  wxString settings_key() const {
+    return wxString::Format("Runner/Settings/%016llx", static_cast<unsigned long long>(std::hash<std::wstring>{}(key_)));
+  }
+  void save_settings() {
+    wxConfigBase* c = wxConfigBase::Get();
+    if (!c || left_stage_ < kLeftBuilt || !iters_) return;
+    wxString th = thresh_->GetValue();
+    th.Replace("\t", " ");
+    th.Replace("\n", " ");
+    const wxString v = wxString::Format("v1\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t", iters_->value(), delay_->value(),
+                                        par_->value(), dur_->value(), ramp_->value(), profile_, bail_->GetValue() ? 1 : 0,
+                                        cookies_->GetValue() ? 1 : 0, keep_->GetValue() ? 1 : 0) +
+                       th + "\t" + wxString(data_path_.wstring());
+    c->Write(settings_key(), v);
+  }
+  void restore_settings() {
+    wxConfigBase* c = wxConfigBase::Get();
+    wxString v;
+    if (!c || !c->Read(settings_key(), &v)) return;
+    wxArrayString f = wxSplit(v, '\t', 0);
+    if (f.size() < 12 || f[0] != "v1") return;
+    auto num = [&](size_t i) {
+      long n = 0;
+      return f[i].ToLong(&n) ? static_cast<int>(n) : 0;
+    };
+    iters_->set_value(num(1));
+    delay_->set_value(num(2));
+    par_->set_value(num(3));
+    dur_->set_value(num(4));
+    ramp_->set_value(num(5));
+    bail_->SetValue(num(7) != 0);
+    cookies_->SetValue(num(8) != 0);
+    keep_->SetValue(num(9) != 0);
+    thresh_->ChangeValue(f[10]);
+    set_profile(std::clamp(num(6), 0, 3), false);
+    if (!f[11].empty()) {
+      // The data file picked last time (the user's own pick, kept per user): read again on a worker.
+      restore_iters_ = num(1);
+      data_picked(fs::path(f[11].ToStdWstring()));
+    }
+  }
+
  private:
   void set_status_w(const wxString& s) {
-    status_->SetLabel(s);
-    status_->Show(!s.empty());
-    status_->GetParent()->Layout();
+    wxString one = s;
+    one.Replace("\n", "  ");
+    status_->SetLabel(one);
+    status_->SetToolTip(s.empty() ? wxString() : s);
   }
 
   std::string state_text(const RunSummary& s) const {
@@ -2294,8 +3060,7 @@ class RunnerFrame : public wxPanel {
     scope_item_ = item;
     scope_key_ = std::move(key);
     const bool on = scope_item_ != kNoScope || !scope_key_.empty();
-    bar_->set_visible(kScope, on);
-    bar_->set_label(kScope, on ? "\xC3\x97  " + label : std::string());
+    show_scope_chip(on, label);
     n_passed_ = n_failed_ = n_skipped_ = 0;
     for (const auto& s : steps_) count(*s);
     if (mode >= 0) {
@@ -2315,13 +3080,88 @@ class RunnerFrame : public wxPanel {
     table_->SetFocus();
     bar_->Refresh();
     if (on)
-      set_status_w(U(std::to_string(view_.size()) + " result" + (view_.size() == 1 ? "" : "s") + " of " + label +
-                     kDot + "click the \xC3\x97 chip (or Esc) to show every result"));
+      set_status_w(U(std::to_string(view_.size()) + " result" + (view_.size() == 1 ? "" : "s") + " shown" + kDot +
+                     "click the \xC3\x97 chip (or Esc) to show every result"));
     else
       set_status_w("");
   }
   void clear_scope() {
     if (scope_item_ != kNoScope || !scope_key_.empty()) set_scope(kNoScope, {}, "", -1);
+  }
+  void show_scope_chip(bool on, const std::string& label) {
+    if (!scope_bar_) return;
+    if (!on && !scope_bar_->IsShown()) return;
+    std::string chip;
+    if (on) {
+      chip = "\xC3\x97  " + (u8_width(label) > 34 ? u8_head(label, 33) + "\xE2\x80\xA6" : label);
+      wxClientDC dc(scope_bar_);
+      dc.SetFont(scope_bar_->GetFont());
+      scope_bar_->SetMinSize(wxSize(dc.GetTextExtent(U(chip)).x + FromDIP(8 + 16 + 4), FromDIP(26)));
+    }
+    scope_bar_->set_label(kScope, chip);
+    scope_bar_->Show(on);
+    scope_row_->Layout();
+  }
+
+  // Reset (Bruno's): the results go, the plan shows again. The run stays in History, and a
+  // reopened runner shows no results either until the next run.
+  void reset_results() {
+    if (run_ || preparing_ || !detail_) return;
+    steps_.clear();
+    view_.clear();
+    scope_item_ = kNoScope;
+    scope_key_.clear();
+    show_scope_chip(false, {});
+    n_fail_groups_ = 0;
+    pinned_fail_ = false;
+    pinned_step_.reset();
+    n_passed_ = n_failed_ = n_skipped_ = 0;
+    shown_.reset();
+    shown_record_.reset();
+    have_final_ = false;
+    final_ = RunSummary{};
+    restore_rec_.reset();
+    table_->refresh_rows();
+    refresh_fails();
+    if (view_mode_ != 0) show_mode(0);
+    summary_->set_thresholds({});
+    summary_->set(RunSummary{}, "Ready", false);
+    detail_->show(nullptr, items_ && !items_->empty()
+                               ? "Press Run (Ctrl+Enter) to send " + std::to_string(items_->size()) +
+                                     " request(s) in order. Select a result to see its response, headers, request, timing and tests."
+                               : std::string());
+    update_filter_chips();
+    update_plan_change();
+    cleared_runners().insert(key_);
+    set_status_w("Results cleared. The run is still in History.");
+    if (run_btn_) run_btn_->SetFocus();
+  }
+
+  // Back to the sidebar's order: this folder's entries (and its subfolders') leave run-order.json.
+  void reset_order() {
+    if (run_ || !saved_order_) return;
+    save_order_.Stop();
+    order_dirty_.clear();
+    const uint64_t s = ++order_seq();
+    const fs::path root = root_, base = run_base();
+    auto link = link_;
+    ++link->saving;
+    std::thread([root, base, s, link] {
+      runner::FolderOrder changed;
+      for (const auto& [dir, names] : runner::load_run_order(root)) {
+        const fs::path rel = dir.lexically_normal().lexically_relative(base.lexically_normal());
+        if (!rel.empty() && *rel.begin() != "..") changed[dir] = {};
+      }
+      std::string err;
+      const bool ok = changed.empty() || runner::save_run_order(root, changed, s, &err);
+      --link->saving;
+      wxTheApp->CallAfter([link, ok, err] {
+        if (!link->frame) return;
+        link->frame->set_status_w(ok ? U(std::string("Runs in the sidebar's order again (removed from ") + runner::kRunOrderFile + ")")
+                                     : U("Could not save the run order: " + err));
+        if (ok) link->frame->reload(0);
+      });
+    }).detach();
   }
   std::string request_label(size_t item) const {
     if (run_items_ && item < run_items_->size()) {
@@ -2387,7 +3227,7 @@ class RunnerFrame : public wxPanel {
     const bool any = !steps_.empty();
     bar_->set_enabled(kRunAgain, idle && items_ && !chosen().empty());
     bar_->set_enabled(kRerunFailed, idle && n_failed_ > 0 && shown_is_latest());
-    for (int id : {kHtml, kJson, kJunit}) bar_->set_enabled(id, idle && any);
+    for (int id : {kHtml, kJson, kJunit, kReset}) bar_->set_enabled(id, idle && any);
     update_history_chips();
   }
   void update_history_chips() {
@@ -2417,10 +3257,124 @@ class RunnerFrame : public wxPanel {
     return {};
   }
 
+  // Opens the step's saved request with the response this run got in its response view (Postman's
+  // runner opens a result the same way), not an empty one: the HTTP response (a spilled large body
+  // is read back), the HTTP transport error, or the gRPC call's status, google.rpc.Status details,
+  // messages and trailers. Put together on a worker.
   void open_step(const StepPtr& s) {
     if (!s) return;
-    open_file(file_of(*s));
+    const fs::path f = file_of(*s);
+    if (f.empty()) return;
+    if (!s->sent || s->skipped || s->stopped()) {
+      open_file(f);
+      return;
+    }
+    auto link = link_;
+    const std::string when = started_iso_;
+    std::thread([s, link, f, when] {
+      LastResponse last;
+      last.when_iso = when;
+      if (s->kind == RequestKind::Grpc) last.grpc = grpc_response_of(*s);
+      else last.http = http_response_of(*s);
+      wxTheApp->CallAfter([link, f, last = std::move(last)]() mutable {
+        if (link->frame) link->frame->open_with_response(f, std::move(last));
+      });
+    }).detach();
   }
+
+  static std::shared_ptr<HttpResponse> http_response_of(const StepResult& s) {
+    auto r = std::make_shared<HttpResponse>();
+    r->ok = s.transport_ok;
+    r->effective_url = s.url;
+    r->timing = s.timing;
+    r->sizes.request_body = s.req_body_size;
+    if (!s.transport_ok) {
+      r->error = s.error.empty() ? "No response" : s.error;
+      return r;
+    }
+    r->status = s.status;
+    r->status_text = s.status_text;
+    r->http_version = s.http_version;
+    for (const auto& [k, v] : s.resp_headers) r->headers.add(k, v);
+    std::string full;
+    if (s.body_truncated && s.body_file && s.body_file->read(&full)) r->body = std::move(full);
+    else r->body = s.body_preview;
+    r->sizes.response_body = s.size;
+    r->sizes.response_body_wire = s.size;
+    if (s.bytes_received > s.size) r->sizes.response_headers = s.bytes_received - s.size;
+    return r;
+  }
+
+  // The run keeps a stream's messages as one JSON array (a single message is an object): split
+  // back into its messages when it was kept whole.
+  static std::shared_ptr<GrpcResponse> grpc_response_of(const StepResult& s) {
+    auto g = std::make_shared<GrpcResponse>();
+    g->ok = s.transport_ok;
+    g->status_code = static_cast<int>(s.status);
+    g->status_name = s.status_text;
+    if (!s.transport_ok) g->status_message = s.error;
+    g->error_details = s.grpc_details;
+    g->headers.assign(s.resp_headers.begin(), s.resp_headers.end());
+    g->trailers.assign(s.resp_trailers.begin(), s.resp_trailers.end());
+    g->timing = s.timing;
+    const std::string& b = s.body_preview;
+    const size_t at = b.find_first_not_of(" \t\r\n");
+    bool split = false;
+    if (at != std::string::npos && b[at] == '[' && !s.body_truncated) {
+      rapidjson::Document d;
+      d.Parse(b.data(), b.size());
+      if (!d.HasParseError() && d.IsArray() && d.Size() > 0) {
+        split = true;
+        const size_t each = static_cast<size_t>(s.size / d.Size());
+        for (const auto& v : d.GetArray()) {
+          rapidjson::StringBuffer sb;
+          rapidjson::PrettyWriter<rapidjson::StringBuffer> w(sb);
+          w.SetIndent(' ', 2);
+          v.Accept(w);
+          GrpcMessageEvent m;
+          m.json.assign(sb.GetString(), sb.GetSize());
+          m.wire_bytes = each;
+          g->messages.push_back(std::move(m));
+        }
+      }
+    }
+    if (!split && at != std::string::npos) {
+      GrpcMessageEvent m;
+      m.json = b;
+      m.wire_bytes = static_cast<size_t>(s.size);
+      g->messages.push_back(std::move(m));
+    }
+    return g;
+  }
+
+ public:
+  void open_with_response(const fs::path& f, LastResponse last) {
+    open_file(f);
+    wxWindow* w = GetParent();
+    while (w && !dynamic_cast<wxAuiNotebook*>(w)) w = w->GetParent();
+    auto* nb = dynamic_cast<wxAuiNotebook*>(w);
+    if (!nb || nb->GetSelection() == wxNOT_FOUND) return;
+    auto* tab = dynamic_cast<RequestTab*>(nb->GetPage(static_cast<size_t>(nb->GetSelection())));
+    if (!tab) return;
+    // Three short UI steps, each on its own turn of the message loop (the tab shows, with its
+    // editor, first): build the tab's response view when it has none yet, then fill it.
+    wxWeakRef<RequestTab> weak(tab);
+    auto held = std::make_shared<LastResponse>(std::move(last));
+    auto fill = [weak, held] {
+      if (weak) weak->restore_response(std::move(*held));
+    };
+    if (tab->has_response_view()) {
+      next_turn(fill);
+      return;
+    }
+    next_turn([weak, fill] {
+      if (!weak) return;
+      if (!weak->has_response_view()) weak->build_response_view();
+      next_turn(fill);
+    });
+  }
+
+ private:
 
   void open_file(const fs::path& file) {
     if (file.empty()) return;
@@ -2464,34 +3418,94 @@ class RunnerFrame : public wxPanel {
     update_counts();
   }
 
-  void move_sel(size_t n, int d) {
-    if (n >= visible_.size()) return;
-    const long t = static_cast<long>(n) + d;
-    if (t < 0 || t >= static_cast<long>(visible_.size())) return;
-    const size_t a = visible_[n], b = visible_[static_cast<size_t>(t)];
-    std::swap(order_[a], order_[b]);
-    std::swap(checked_[a], checked_[b]);
+  // Reordering: the list is the folder tree flattened, so a step moves a whole block (a request
+  // within its folder, or a subfolder with its requests; at the edge of its folder the folder
+  // moves). The new order is saved to <ws>/run-order.json on a worker (debounced), which the
+  // next open of this runner and `watt --run` follow.
+  fs::path run_base() const {
+    std::error_code ec;
+    if (folder_.empty() || key_ == runner_key(root_, {})) return root_;
+    return fs::is_directory(folder_, ec) ? folder_ : folder_.parent_path();
+  }
+
+  // Applies a reorder of order_ (old position -> item) to checked_, refreshes, selects item.
+  void reordered(const std::vector<size_t>& before, size_t item, const runner::FolderOrder& changed) {
+    std::vector<char> chk(items_->size(), 1);
+    for (size_t k = 0; k < before.size(); ++k) chk[before[k]] = checked_[k];
+    for (size_t k = 0; k < order_.size(); ++k) checked_[k] = chk[order_[k]];
+    for (const auto& [dir, names] : changed) order_dirty_[dir] = names;
+    set_saved_order(true);
     fill_list();
-    list_->SetSelection(static_cast<int>(t));
+    for (size_t n = 0; n < visible_.size(); ++n)
+      if (order_[visible_[n]] == item) {
+        list_->SetSelection(static_cast<int>(n));
+        break;
+      }
+    save_order_.StartOnce(250);
+  }
+
+  void flush_order() {
+    if (order_dirty_.empty()) return;
+    auto changed = std::make_shared<runner::FolderOrder>(std::move(order_dirty_));
+    order_dirty_.clear();
+    const uint64_t s = ++order_seq();
+    const fs::path root = root_;
+    auto link = link_;
+    ++link->saving;
+    std::thread([root, changed, s, link] {
+      std::string err;
+      const bool ok = runner::save_run_order(root, *changed, s, &err);
+      --link->saving;
+      wxTheApp->CallAfter([link, ok, err] {
+        if (!link->frame) return;
+        link->frame->set_status_w(ok ? U(std::string("Run order saved to ") + runner::kRunOrderFile +
+                                         " (watt --run follows it)")
+                                     : U("Could not save the run order: " + err));
+      });
+    }).detach();
+  }
+
+  void move_sel(size_t n, int d) {
+    if (n >= visible_.size() || !items_) return;
+    const std::vector<size_t> before = order_;
+    const size_t item = order_[visible_[n]];
+    runner::FolderOrder changed;
+    // With a filter, keep stepping until the shown order changes (or it cannot move).
+    const std::vector<size_t> vis0 = visible_order(order_);
+    for (int guard = 0; guard < 4096; ++guard) {
+      const size_t pos = static_cast<size_t>(std::find(order_.begin(), order_.end(), item) - order_.begin());
+      if (!runner::move_block(*items_, order_, run_base(), pos, d, &changed)) break;
+      if (visible_order(order_) != vis0) break;
+    }
+    if (order_ == before) {
+      set_status_w("A request stays in its folder: it is already at the edge of the run.");
+      return;
+    }
+    reordered(before, item, changed);
   }
 
   // Drag and drop in the list: the request at visible row `from` moves before visible row
-  // `before` (visible_.size(): after the last one shown); hidden (filtered) rows keep their place.
+  // `before` (visible_.size(): after the last one shown), block by block.
   void drop_row(size_t from, size_t before) {
-    if (from >= visible_.size() || before > visible_.size() || before == from || before == from + 1) return;
+    if (!items_ || from >= visible_.size() || before > visible_.size() || before == from || before == from + 1) return;
+    const std::vector<size_t> prev = order_;
     const size_t a = visible_[from];
     const size_t at = before == visible_.size() ? visible_.back() + 1 : visible_[before];
     const size_t item = order_[a];
-    const char chk = checked_[a];
-    order_.erase(order_.begin() + static_cast<long>(a));
-    checked_.erase(checked_.begin() + static_cast<long>(a));
-    const size_t ins = at > a ? at - 1 : at;
-    order_.insert(order_.begin() + static_cast<long>(ins), item);
-    checked_.insert(checked_.begin() + static_cast<long>(ins), chk);
-    fill_list();
-    for (size_t n = 0; n < visible_.size(); ++n)
-      if (visible_[n] == ins) list_->SetSelection(static_cast<int>(n));
+    runner::FolderOrder changed;
+    if (!runner::drop_block(*items_, order_, run_base(), a, at, &changed)) return;
+    reordered(prev, item, changed);
   }
+
+  // The visible (filtered) items in order, for an order.
+  std::vector<size_t> visible_order(const std::vector<size_t>& order) const {
+    const std::string f = filter_->GetValue().ToStdString(wxConvUTF8);
+    std::vector<size_t> v;
+    for (size_t i : order)
+      if (f.empty() || runner::tag_filter_match((*items_)[i], f)) v.push_back(i);
+    return v;
+  }
+  std::vector<size_t> visible_items() const { return visible_order(order_); }
 
   // What Run sends: checked requests that pass the filter, in list order.
   std::vector<size_t> chosen() const {
@@ -2515,8 +3529,12 @@ class RunnerFrame : public wxPanel {
       plan = wxString::Format("%zu request%s, repeated for %d s", n, n == 1 ? "" : "s", d);
       if (it > 1) plan += wxString::Format(" (at most %d iterations)", it);
       if (par > 1) plan += wxString::Format(", %d at a time", par);
+    } else if (n && par > 1 && it < par) {
+      // Parallel workers each run whole iterations (requests in one iteration stay in order).
+      plan += it == 1 ? wxString::Format(", sequential: Parallel %d applies across iterations", par)
+                      : wxString::Format(", %d at a time (Parallel %d applies across iterations)", it, par);
     } else if (n && par > 1) {
-      plan += wxString::Format(", %d at a time", std::min(par, it));
+      plan += wxString::Format(", %d at a time", par);
     }
     if (n && par > 1) {
       const int d = dur_->value(), r = ramp_->value();
@@ -2526,10 +3544,98 @@ class RunnerFrame : public wxPanel {
       else if (profile_ == 3) plan += d > 0 ? wxString::Format(", spike %d to %d", spike_base(par), par)
                                             : wxString(" (spike needs a Duration)");
     }
-    plan_label_->SetLabel(plan);
+    set_plan_text(plan);
+    update_order_hint(false);
+    update_plan_change(false);
     if (!run_) run_btn_->Enable(n > 0);
     if (!run_ && bar_) bar_->set_enabled(kRunAgain, n > 0 && !steps_.empty());
-    left_->Layout();
+    relayout_left();
+  }
+
+  // The plan line under Run, wrapped to the panel once it has its width; at least two lines
+  // high, so a plan that wraps while a field is typed into does not move the fields above.
+  void set_plan_text(const wxString& t) { set_fixed_text(plan_label_, t, 2, wxString()); }
+
+  // The height of `lines` lines in a label's font.
+  static int lines_height(wxStaticText* l, int lines) {
+    int w = 0, h = 0;
+    l->GetTextExtent("Ag", &w, &h);
+    return h * lines;
+  }
+
+  // A label of a fixed height: `t` wrapped to the panel and cut to `lines` lines (an ellipsis
+  // ends the last one, and the tooltip has the whole text; else the tooltip is `tip`). The
+  // label's size never changes, so nothing around it moves and no layout is needed.
+  void set_fixed_text(wxStaticText* l, const wxString& t, int lines, const wxString& tip) {
+    const int width = std::max(FromDIP(120), l->GetSize().x > FromDIP(60) ? l->GetSize().x - FromDIP(4)
+                                                                          : left_->GetClientSize().x - FromDIP(36));
+    wxString out;
+    bool cut = false;
+    if (!t.empty()) {
+      wxClientDC dc(l);
+      dc.SetFont(l->GetFont());
+      std::vector<wxString> rows;
+      for (const wxString& para : wxSplit(t, '\n', 0)) {
+        wxString cur;
+        for (const wxString& word : wxSplit(para, ' ', 0)) {
+          const wxString next = cur.empty() ? word : cur + " " + word;
+          if (!cur.empty() && dc.GetTextExtent(next).x > width) {
+            rows.push_back(cur);
+            cur = word;
+          } else {
+            cur = next;
+          }
+        }
+        rows.push_back(cur);
+      }
+      if (rows.size() > static_cast<size_t>(lines)) {
+        cut = true;
+        rows.resize(static_cast<size_t>(lines));
+        wxString& last = rows.back();
+        const wxString ell = wxString::FromUTF8("\xE2\x80\xA6");
+        while (!last.empty() && dc.GetTextExtent(last + ell).x > width) last.RemoveLast();
+        last += ell;
+      }
+      for (size_t i = 0; i < rows.size(); ++i) out += (i ? "\n" : "") + rows[i];
+    }
+    if (l->GetLabel() != out) {
+      const wxSize keep = l->GetSize();
+      l->SetLabel(out);
+      if (keep.y > 0) l->SetSize(keep);  // the sizer's size, not the text's
+      l->Refresh();
+    }
+    const wxString want = cut ? t : tip;
+    if (l->GetToolTipText() != want) {
+      if (want.empty()) l->UnsetToolTip();
+      else l->SetToolTip(want);
+    }
+  }
+
+  // The order hint for the chosen requests; recomputed only when the choice or order changes.
+  // Like update_plan_change(), lays the panel out again when the hint changes (unless told not to).
+  bool update_order_hint(bool layout = true) {
+    if (!order_hint_ || !items_) return false;
+    std::vector<size_t> o = chosen();
+    if (o == hint_for_ && hint_items_ == items_.get()) return false;
+    hint_items_ = items_.get();
+    hint_for_ = o;
+    const auto hints = runner::capture_order_hints(*items_, o, 3);
+    wxString text;
+    for (const auto& h : hints) {
+      if (!text.empty()) text += "\n";
+      text += wxString::FromUTF8((*items_)[o[h.user]].req.name + " uses {{" + h.var + "}} before " +
+                                 (*items_)[o[h.capture]].req.name + " captures it");
+    }
+    if (!hints.empty())
+      text += wxString::FromUTF8("\nMove " + (*items_)[o[hints.front().capture]].req.name +
+                                 " up (drag or the arrows; the order is saved for the next run and --run).");
+    order_hint_->SetLabel(text);
+    order_hint_->Wrap(std::max(FromDIP(120), left_->GetClientSize().x - FromDIP(44)));
+    order_hint_->InvalidateBestSize();
+    const bool was = order_hint_->IsShown(), changed = was != !text.empty() || was;
+    order_hint_->Show(!text.empty());
+    if (changed && layout) relayout_left();
+    return changed;
   }
 
   void set_running(bool on) {
@@ -2595,12 +3701,34 @@ class RunnerFrame : public wxPanel {
     run_btn_->Disable();
   }
 
+  // Run, Run again and Rerun failed send the requests as saved now: the folder is read again on
+  // a worker first (an edit, a new or deleted file, a new order), then the run starts from that.
   void on_run(bool failed_only) {
     if (run_) {
       stop_run();
       return;
     }
-    if (!items_) return;
+    if (!items_ || preparing_) return;
+    if (failed_only && !has_failed_to_rerun()) return;
+    if (!failed_only && chosen().empty()) return;
+    preparing_ = true;
+    run_btn_->set("Reading...", true);
+    run_btn_->Disable();
+    reload(failed_only ? 2 : 1);
+  }
+
+  bool has_failed_to_rerun() const {
+    if (!shown_is_latest() || !run_items_ || !run_order_) return false;
+    for (const auto& s : steps_)
+      if (s->failed() && s->pos < run_order_->size()) return true;
+    return false;
+  }
+
+  void begin_run(bool failed_only) {
+    run_btn_->set("Run", false);
+    run_btn_->Enable(!chosen().empty());
+    if (!items_ || run_) return;
+    save_settings();
     Workspace* ws = workspace_ ? workspace_() : nullptr;
     if (!ws || runner_key(ws->root(), {}) != runner_key(root_, {})) {
       set_status_w("The workspace was closed or switched: open the runner again from the sidebar.");
@@ -2610,22 +3738,64 @@ class RunnerFrame : public wxPanel {
     int iterations = std::max(1, iters_->value());
     std::shared_ptr<const std::vector<RunItem>> items = items_;
     run_label_.clear();
+    std::string rerun_note;
     if (failed_only) {
       // Every failed step of the run shown, once: per failed iteration, with that iteration's
-      // data row and number, only the requests that failed in it (Postman's "Run failed").
+      // data row and number, only the requests that failed in it (Postman's "Run failed"),
+      // plus the requests before them whose captures they read (Login for its token), so a
+      // rerun does not reuse values left from the last run. Matched to the fresh list by file.
       if (!shown_is_latest() || !run_items_ || !run_order_) return;
+      std::map<fs::path, size_t> idx;
+      for (size_t i = 0; i < items_->size(); ++i) idx.emplace((*items_)[i].req.file, i);
+      std::vector<size_t> new_pos(run_order_->size(), kNoScope);
+      for (size_t k = 0; k < run_order_->size(); ++k) {
+        const size_t old = (*run_order_)[k];
+        if (old >= run_items_->size()) continue;
+        const auto it = idx.find((*run_items_)[old].req.file);
+        if (it == idx.end()) continue;
+        new_pos[k] = pick.size();
+        pick.push_back(it->second);
+      }
       std::map<int, std::vector<size_t>> per;
+      size_t gone = 0;
       for (const auto& s : steps_)
-        if (s->failed() && s->pos < run_order_->size()) per[s->iteration].push_back(s->pos);
-      if (per.empty()) return;
+        if (s->failed() && s->pos < run_order_->size()) {
+          if (new_pos[s->pos] == kNoScope) ++gone;
+          else per[s->iteration].push_back(new_pos[s->pos]);
+        }
+      if (per.empty()) {
+        set_status_w(gone ? "The failed requests are no longer in this folder." : "");
+        return;
+      }
       retry_.clear();
+      std::set<size_t> deps;
+      size_t n_failed = 0;
       for (auto& [it, pos] : per) {
         std::sort(pos.begin(), pos.end());
         pos.erase(std::unique(pos.begin(), pos.end()), pos.end());
-        retry_.push_back({it, std::move(pos)});
+        n_failed += pos.size();
+        std::vector<size_t> all = runner::with_capture_sources(*items_, pick, pos);
+        for (size_t q : all)
+          if (!std::binary_search(pos.begin(), pos.end(), q)) deps.insert(pick[q]);
+        retry_.push_back({it, std::move(all)});
       }
-      pick = *run_order_;
-      items = run_items_;
+      if (!deps.empty()) {
+        std::string names;
+        size_t shown = 0;
+        for (size_t i : deps) {
+          if (shown++ == 3) {
+            names += " +" + std::to_string(deps.size() - 3);
+            break;
+          }
+          const RunItem& r = (*items_)[i];
+          names += (names.empty() ? "" : ", ") + (r.req.name.empty() ? r.rel : r.req.name);
+        }
+        rerun_note = ", with " + names + " first (their captures feed the failed ones)";
+      } else {
+        rerun_note = ", no other request first (variables from earlier runs are used as they are)";
+      }
+      if (gone) rerun_note += "; " + std::to_string(gone) + " failed no longer in the folder";
+      items = items_;
       iterations = static_cast<int>(retry_.size());
       run_label_ = "rerun failed";
     } else {
@@ -2661,7 +3831,7 @@ class RunnerFrame : public wxPanel {
     view_.clear();
     scope_item_ = kNoScope;
     scope_key_.clear();
-    bar_->set_visible(kScope, false);
+    show_scope_chip(false, {});
     n_fail_groups_ = 0;
     pinned_fail_ = false;
     pinned_step_.reset();
@@ -2683,14 +3853,22 @@ class RunnerFrame : public wxPanel {
       for (const auto& r : retry_) planned_ += r.positions.size();
     }
     started_iso_ = runner::now_iso();
+    cleared_runners().erase(key_);
     started_ = Clock::now();
     follow_ = true;
-    set_status_w("");
     set_running(true);
-    if (failed_only)
-      plan_label_->SetLabel(wxString::Format("Rerun failed: %zu send%s in %zu iteration%s, each with its own data row",
-                                             planned_, planned_ == 1 ? "" : "s", retry_.size(),
-                                             retry_.size() == 1 ? "" : "s"));
+    if (failed_only) {
+      // Said where it stays after the run (the status line), not only while it runs.
+      const wxString what = wxString::Format("Rerun failed: %zu send%s in %zu iteration%s", planned_,
+                                             planned_ == 1 ? "" : "s", retry_.size(), retry_.size() == 1 ? "" : "s") +
+                            U(rerun_note);
+      set_status_w(what);
+      set_plan_text(what);
+      relayout_left();
+    } else {
+      set_status_w("");
+    }
+    update_plan_change();
     summary_->set(RunSummary{0, planned_}, "Preparing", true);
     // Consent is judged on a worker (it resolves paths and reads the allowlists), then asked
     // here once for the whole run.
@@ -2714,6 +3892,17 @@ class RunnerFrame : public wxPanel {
     o.stop_on_failure = bail_->GetValue();
     o.concurrency = std::max(1, par_->value());
     run_parallel_ = o.concurrency > 1;
+    {
+      // The plan as By request names it when it compares this run with an earlier one.
+      std::string p = std::to_string(order->size()) + " request" + (order->size() == 1 ? "" : "s");
+      if (duration_ms_ > 0) p += " for " + std::to_string(duration_ms_ / 1000) + " s";
+      else p += " x " + std::to_string(o.iterations) + " iteration" + (o.iterations == 1 ? "" : "s");
+      if (o.concurrency > 1) p += ", " + std::to_string(o.concurrency) + " parallel";
+      if (o.delay_ms > 0) p += ", delay " + std::to_string(o.delay_ms) + " ms";
+      if (o.ramp_up_ms > 0 || o.spike_base > 0) p += profile_ == 3 ? ", spike" : profile_ == 2 ? ", peak" : ", ramp";
+      if (!run_label_.empty()) p += ", " + run_label_;
+      run_plan_ = std::move(p);
+    }
     o.duration_ms = duration_ms_;
     o.cookies = cookies_->GetValue();
     o.spill_bodies = true;  // the full response of every step stays viewable (a temp file per big body)
@@ -2784,7 +3973,7 @@ class RunnerFrame : public wxPanel {
   }
 
   // ---- results view
-  void rebuild_view() {
+  void rebuild_view(bool detail = true) {
     view_.clear();
     for (const auto& s : steps_)
       if (matches(*s)) view_.push_back(s);
@@ -2794,7 +3983,7 @@ class RunnerFrame : public wxPanel {
     if (!view_.empty()) {
       table_->SetSelection(0);
       table_->ScrollToRow(0);
-      show_selected();
+      if (detail) show_selected();
     } else {
       table_->SetSelection(wxNOT_FOUND);
       shown_.reset();
@@ -2814,7 +4003,20 @@ class RunnerFrame : public wxPanel {
       }
     };
     const StepPtr keep = user ? shown_ : nullptr;
-    if (cols_.sort == 2) {
+    if (cols_.sort < 0) {
+      // No column picked: the # order (when each result arrived; plan order for a sequential
+      // run), during the run and after it, so rows never jump when a parallel run ends.
+      // steps_ is in plan order once a parallel run is done (exports, history).
+      const auto by_seq = [](const StepPtr& a, const StepPtr& b) { return a->seq < b->seq; };
+      if (!std::is_sorted(view_.begin(), view_.end(), by_seq)) std::stable_sort(view_.begin(), view_.end(), by_seq);
+    } else if (cols_.sort == 1) {
+      // Iteration, then the request's place in it: plan order.
+      std::stable_sort(view_.begin(), view_.end(), [this](const StepPtr& a, const StepPtr& b) {
+        if (a->iteration != b->iteration) return cols_.desc ? a->iteration > b->iteration : a->iteration < b->iteration;
+        if (a->pos != b->pos) return a->pos < b->pos;
+        return a->seq < b->seq;
+      });
+    } else if (cols_.sort == 2) {
       std::stable_sort(view_.begin(), view_.end(), [this](const StepPtr& a, const StepPtr& b) {
         const int c = a->rel.compare(b->rel);
         return cols_.desc ? c > 0 : c < 0 || (c == 0 && a->seq < b->seq);
@@ -2862,26 +4064,53 @@ class RunnerFrame : public wxPanel {
   }
 
   void refresh_stats(const RunSummary* live = nullptr) {
-    RunSummary s = live ? *live : have_final_ ? final_ : runner::summarize(steps_, planned_, 0, false, true);
-    if (s.per_request.empty() && !steps_.empty()) s = runner::summarize(steps_, planned_, 0, false, true);
-    // Compared with the run before the one shown (same folder, this session).
+    // A cause chip, a request scope or a Passed / Failed filter narrows this view as it narrows
+    // Results: the counts and times are of the results that match.
+    const bool narrowed = scope_item_ != kNoScope || !scope_key_.empty() || filter_mode_ != 0;
+    std::vector<StepPtr> picked;
+    if (narrowed) {
+      picked.reserve(steps_.size());
+      for (const auto& st : steps_)
+        if (matches(*st)) picked.push_back(st);
+    }
+    const std::vector<StepPtr>& src = narrowed ? picked : steps_;
+    RunSummary s = narrowed ? runner::summarize(src, 0, 0, false, true)
+                   : live ? *live : have_final_ ? final_ : runner::summarize(steps_, planned_, 0, false, true);
+    if (s.per_request.empty() && !src.empty()) s = runner::summarize(src, narrowed ? 0 : planned_, 0, false, true);
+    // Compared with the latest run before the one shown that had the same plan (same folder,
+    // this session): a 300 x 8 load run is never set against a single sequential pass.
     std::map<std::string, double> base;
     const auto& h = run_history()[key_];
     std::shared_ptr<const RunRecord> prev;
-    bool after = !shown_record_;  // a live run: the newest record is the previous one
+    const std::string plan = shown_record_ ? shown_record_->plan : run_plan_;
+    bool after = !shown_record_;  // a live run: every record is an earlier one
+    bool other_plans = false;
     for (const auto& r : h) {
       if (after) {
-        prev = r;
-        break;
+        if (r->plan == plan) {
+          prev = r;
+          break;
+        }
+        other_plans = true;
       }
       if (r == shown_record_) after = true;
     }
     if (prev)
       for (const auto& q : prev->summary.per_request) base[q.rel] = q.p50_ms;
+    std::string base_tip;
+    if (prev)
+      base_tip = "\xCE\x94 P50: the change against the run of " + iso_local(prev->started_iso, false) +
+                 ", the latest earlier run with the same plan (" + plan + ")";
+    else if (other_plans)
+      base_tip = "No \xCE\x94 P50 column: no earlier run in this session had the same plan (" + plan + ")";
+    if (stats_->GetToolTipText() != U(base_tip)) {
+      if (base_tip.empty()) stats_->UnsetToolTip();
+      else stats_->SetToolTip(U(base_tip));
+    }
     // Why each request failed: its most frequent cause (groups are sorted most frequent first).
     std::map<size_t, StatsList::Top> top;
     if (s.failed || n_failed_)
-      for (const auto& g : runner::group_failures(steps_)) {
+      for (const auto& g : runner::group_failures(src)) {
         auto [it, fresh] = top.try_emplace(g.item);
         if (fresh) {
           it->second.message = g.message;
@@ -2889,7 +4118,7 @@ class RunnerFrame : public wxPanel {
         }
         ++it->second.causes;
       }
-    stats_->set(s.per_request, std::move(base), prev ? prev->started_iso : std::string(), std::move(top));
+    stats_->set(s.per_request, std::move(base), prev ? iso_local(prev->started_iso, false) : std::string(), std::move(top));
   }
 
   void refresh_fails() {
@@ -2917,11 +4146,20 @@ class RunnerFrame : public wxPanel {
     summary_->set_thresholds(std::move(r));
   }
 
-  void show_record(const std::shared_ptr<const RunRecord>& rec, bool announce) {
+  // part: 0 all at once; 1 the results table only, 2 the rest (summary, views, the detail of
+  // the first row) of a record part 1 put up: a restore spread over two timer ticks.
+  void show_record(const std::shared_ptr<const RunRecord>& rec, bool announce, int part = 0) {
     if (run_ || !rec) return;
+    if (part == 2) {
+      if (shown_record_ != rec) return;
+      finish_record(rec, announce);
+      if (!view_.empty() && table_->GetSelection() == 0) show_selected();
+      return;
+    }
     shown_record_ = rec;
     steps_ = *rec->steps;
     run_items_ = rec->items;
+    if (rec->order) run_order_ = rec->order;
     planned_ = rec->planned;
     iterations_ = rec->iterations;
     table_->set_all_checks(planned_ > 0 && planned_ <= kAllChecksRun);
@@ -2930,13 +4168,21 @@ class RunnerFrame : public wxPanel {
     started_iso_ = rec->started_iso;
     scope_item_ = kNoScope;
     scope_key_.clear();
-    bar_->set_visible(kScope, false);
+    show_scope_chip(false, {});
     n_passed_ = n_failed_ = n_skipped_ = 0;
     for (const auto& s : steps_) count(*s);
+    shown_.reset();
+    rebuild_view(part != 1);
+    if (part == 1) {
+      update_plan_change();
+      return;
+    }
+    finish_record(rec, announce);
+  }
+
+  void finish_record(const std::shared_ptr<const RunRecord>& rec, bool announce) {
     refresh_fails();
     eval_thresholds(final_);
-    shown_.reset();
-    rebuild_view();
     summary_->set(final_, state_text(final_), false);
     update_filter_chips();
     if (view_mode_ == 1) refresh_stats();
@@ -2945,8 +4191,11 @@ class RunnerFrame : public wxPanel {
       const auto& h = run_history()[key_];
       size_t idx = 0;
       while (idx < h.size() && h[idx] != rec) ++idx;
+      // Its own plan, not the settings on the left (a rerun of 64 failed sends is not "9 x 1").
       set_status_w(U("Showing the run of " + iso_local(rec->started_iso) + (idx == 0 ? " (latest)" : " (" + std::to_string(idx) + " before the latest)") +
-                     (rec->label.empty() ? "" : kDot + rec->label)));
+                     (rec->label.empty() ? "" : kDot + rec->label) + kDot + std::to_string(rec->planned) + " send" +
+                     (rec->planned == 1 ? "" : "s") + ", " + std::to_string(rec->iterations) + " iteration" +
+                     (rec->iterations == 1 ? "" : "s") + (rec->environment.empty() ? "" : std::string(kDot) + "env " + rec->environment)));
     }
   }
 
@@ -2964,10 +4213,13 @@ class RunnerFrame : public wxPanel {
       it->Check(h[i] == shown_record_);
     }
     m.AppendSeparator();
-    m.Append(999, "Compare: By request shows the change against the run before");
+    m.Append(999, "Compare: By request shows the change against the last run with the same plan");
     m.Enable(999, false);
     const int id = GetPopupMenuSelectionFromUser(m);
-    if (id >= 1000 && static_cast<size_t>(id - 1000) < h.size()) show_record(h[static_cast<size_t>(id - 1000)], true);
+    if (id >= 1000 && static_cast<size_t>(id - 1000) < h.size()) {
+      cleared_runners().erase(key_);
+      show_record(h[static_cast<size_t>(id - 1000)], true);
+    }
   }
 
   // The OS file dialog runs on its own thread (owned by this window, which it disables while it
@@ -3012,10 +4264,11 @@ class RunnerFrame : public wxPanel {
   void data_picked(const fs::path& p) {
     picking_ = false;
     if (p.empty() || run_) return;
+    data_path_ = p;
     const uint64_t gen = ++data_gen_;
     data_label_->SetLabel("Reading " + wxString(p.filename().wstring()) + "...");
     data_label_->SetForegroundColour(rv::Theme::get().dim);
-    left_->Layout();
+    relayout_left();
     auto link = link_;
     std::thread([link, p, gen] {
       auto rows = std::make_shared<std::vector<runner::DataRow>>();
@@ -3098,12 +4351,13 @@ class RunnerFrame : public wxPanel {
       case kEnvPick: return env_menu();
       case kDataClear:
         ++data_gen_;
+        data_path_.clear();
         data_.reset();
         data_name_.clear();
         data_label_->SetLabel("");
         data_chips_->set_visible(kDataClear, false);
         data_chips_->set_visible(kDataPreview, false);
-        left_->Layout();
+        relayout_left();
         return;
       case kFAll:
       case kFPassed:
@@ -3137,10 +4391,22 @@ class RunnerFrame : public wxPanel {
         else if (id == kVFail) fails_->SetFocus();
         return;
       case kScope: return clear_scope();
+      case kReset: return reset_results();
+      case kOrderReset: return reset_order();
       case kRunAgain: return on_run(false);
       case kRerunFailed: return on_run(true);
       case kHistory: return history_menu();
-      case kHtml: return export_as(2);
+      case kHtml: {
+        wxMenu m;
+        m.Append(1, "HTML report...");
+        m.Append(2, "JSON...");
+        m.Append(3, "JUnit XML (CI)...");
+        const int got = GetPopupMenuSelectionFromUser(m);
+        if (got == 1) export_as(2);
+        else if (got == 2) export_as(0);
+        else if (got == 3) export_as(1);
+        return;
+      }
       case kJson: return export_as(0);
       case kJunit: return export_as(1);
       default: return;
@@ -3199,6 +4465,7 @@ class RunnerFrame : public wxPanel {
   std::shared_ptr<const std::vector<size_t>> run_order_;
   std::shared_ptr<const std::vector<RunItem>> run_items_;  // items of the run shown
   std::string run_label_;
+  std::string run_plan_;  // the running / latest run's plan (RunRecord::plan)
   std::vector<StepPtr> steps_;  // every step of the run shown
   std::vector<StepPtr> view_;   // what the table shows (filtered, sorted)
   size_t n_passed_ = 0, n_failed_ = 0, n_skipped_ = 0;
@@ -3236,15 +4503,40 @@ class RunnerFrame : public wxPanel {
   uint64_t data_gen_ = 0;
   wxTimer tick_;
 
-  wxPanel* left_ = nullptr;
+  wxPanel* left_ = nullptr;   // a wxScrolled<wxPanel>
+  rv::ChipBar* rail_ = nullptr;
+  bool collapsed_ = false;
   wxPanel* right_ = nullptr;
   wxTimer stage_;
-  bool left_built_ = false;
+  fs::path data_path_;   // the data file picked (remembered with the settings)
+  int restore_iters_ = -1;  // iterations restored with a data file (its load keeps them)
+  wxTimer save_order_;                 // debounces writing run-order.json after a reorder
+  wxTimer reload_timer_;               // debounces re-reading the folder after a change on disk
+  wxTimer restore_;                    // shows a restored last run in steps
+  std::shared_ptr<const RunRecord> restore_rec_;
+  int restore_phase_ = 0;
+  std::unique_ptr<WorkspaceWatcher> watcher_;
+  uint64_t reload_seq_ = 0;
+  int reload_then_ = 0;   // what the pending reload starts: 0 nothing, 1 a run, 2 rerun failed
+  bool preparing_ = false;  // Run pressed: the folder is being read again
+  bool reload_due_ = false; // the folder changed during a run: read it again after it
+  wxStaticText* changed_label_ = nullptr;
+  runner::FolderOrder order_dirty_;    // folders reordered since the last write
+  wxStaticText* order_note_ = nullptr; // "Run order: run-order.json ... the sidebar keeps its own"
+  bool saved_order_ = false;           // this folder has a saved run order
+  static constexpr int kLeftBuilt = 3;
+  int left_stage_ = 0;   // 0 nothing built, 1 the list, 2 the first settings, 3 (kLeftBuilt) all of them
+  int right_stage_ = 0;  // 0 nothing, 1 everything but the detail pane (detail_ set: all of it)
+  wxBoxSizer* left_sizer_ = nullptr;
   std::shared_ptr<std::vector<RunItem>> pending_items_;
   std::vector<std::string> pending_errs_;
   rv::ChipBar* env_chips_ = nullptr;
   wxStaticText* req_title_ = nullptr;
   wxStaticText* plan_label_ = nullptr;
+  wxString changed_text_;  // the "Plan changed" note's whole text (empty: none)
+  wxStaticText* order_hint_ = nullptr;
+  std::vector<size_t> hint_for_;
+  const void* hint_items_ = nullptr;
   wxStaticText* status_ = nullptr;
   wxStaticText* data_label_ = nullptr;
   wxTextCtrl* filter_ = nullptr;
@@ -3270,6 +4562,8 @@ class RunnerFrame : public wxPanel {
   wxCheckBox* cookies_ = nullptr;
   AccentButton* run_btn_ = nullptr;
   rv::ChipBar* left_chips_ = nullptr;
+  rv::ChipBar* scope_bar_ = nullptr;  // the scope chip, at the status line's start
+  wxBoxSizer* scope_row_ = nullptr;
   rv::ChipBar* data_chips_ = nullptr;
   rv::ChipBar* bar_ = nullptr;
   SummaryStrip* summary_ = nullptr;
@@ -3290,7 +4584,7 @@ class RunnerFrame : public wxPanel {
 }  // namespace
 
 void open_runner(wxWindow* parent, std::function<Workspace*()> workspace, const fs::path& folder,
-                 std::function<std::shared_ptr<GrpcClient>()> grpc) {
+                 std::function<std::shared_ptr<GrpcClient>()> grpc, bool select) {
   Workspace* ws = workspace ? workspace() : nullptr;
   if (!ws) return;
   const std::wstring key = runner_key(ws->root(), folder);
@@ -3307,7 +4601,9 @@ void open_runner(wxWindow* parent, std::function<Workspace*()> workspace, const 
   if (auto it = open.find(key); it != open.end()) {
     if (wxWindow* f = it->second.get()) {
       if (const int i = nb->GetPageIndex(f); i != wxNOT_FOUND) {
+        if (!select) return;
         nb->SetSelection(static_cast<size_t>(i));
+        if (auto* r = dynamic_cast<RunnerFrame*>(f)) r->refresh();
         return;
       }
     }
@@ -3315,7 +4611,23 @@ void open_runner(wxWindow* parent, std::function<Workspace*()> workspace, const 
   }
   auto* f = new RunnerFrame(nb, std::move(workspace), *ws, folder, std::move(grpc));
   open[key] = f;
-  nb->AddPage(f, f->tab_title(), true);
+  // Added, then selected on the next turn of the message loop: with many tabs open, the tab
+  // strip's layout and the page switch are 15-40 ms each, two steps rather than one.
+  nb->AddPage(f, f->tab_title(), false);
+  if (!select) return;
+  wxWeakRef<wxAuiNotebook> book(nb);
+  wxWeakRef<wxWindow> page(f);
+  next_turn([book, page] {
+    if (!book || !page) return;
+    if (const int i = book->GetPageIndex(page.get()); i != wxNOT_FOUND) book->SetSelection(static_cast<size_t>(i));
+  });
+}
+
+bool runner_folder(wxWindow* page, fs::path* folder) {
+  auto* r = dynamic_cast<RunnerFrame*>(page);
+  if (!r) return false;
+  if (folder) *folder = r->folder();
+  return true;
 }
 
 bool runner_shortcut(wxWindow* page, bool failed_only) {

@@ -22,6 +22,7 @@
 #include "app/response_tests.h"
 #include "core/grpc_client.h"
 #include "core/http_client.h"
+#include "core/script.h"
 
 class wxStyledTextCtrl;
 class wxStyledTextEvent;
@@ -45,6 +46,21 @@ class BodyView : public wxPanel {
   void show_message(const std::string& text);
   // HTTP response body (kept alive by r, never copied for Raw).
   void set_http(std::shared_ptr<const HttpResponse> r);
+  // Where the next set_http body came from when it is not the bytes as received ("history copy:
+  // first 64 KB of 10 MB, indented when kept"): said in the note of Raw and Hex. "" = as received.
+  void set_origin_note(std::string note) { origin_note_ = std::move(note); }
+  // The run's post-response script result: when it called pm.visualizer.set(), the Visualize chip
+  // shows its template rendered with its data (response_visualize.h), on the worker, in the
+  // WebView2 page with scripts off and nothing fetched. Call before set_http (null: none).
+  void set_visualizer(std::shared_ptr<const ScriptRun> post);
+  // Visualize is the view to open the next body in (the response view keeps it per request).
+  bool visualize_chosen() const { return vis_chosen_; }
+  void set_visualize_chosen(bool on) { vis_chosen_ = on; }
+  // The user picked Visualize (true) or another view (false) for a body that has a template.
+  std::function<void(bool)> on_visualize_chosen;
+  // An event stream's body: an "Events" chip before Pretty / Raw goes back to the event list
+  // (the response view's SSE page). Empty: no such chip.
+  void set_events_chip(std::function<void()> on_events);
   // gRPC: messages are appended live; each gets a "// #i  +offset  size" header line.
   void begin_stream();
   void append_messages(const GrpcMessageEvent* m, size_t n, size_t first_index);
@@ -89,8 +105,9 @@ class BodyView : public wxPanel {
   // Wrap on and a line wider than the pane: its lines broken at the pane width on the worker,
   // rebuilt after a width change. Heavy documents never get Scintilla's own wrap (it lays out
   // every line up to the target on the UI thread: 170-330 ms for Ctrl+End on 1.3M lines).
+  // Visualize: the post-response script's pm.visualizer template, rendered (no document of its own).
   enum Mode { Pretty = 0, Raw = 1, Hex = 2, Preview = 3, RawWrap = 4, Outline = 5, Filter = 6, Table = 7, Wrapped = 8,
-              kModes = 9 };
+              Visualize = 9, kModes = 10 };
   struct Doc {
     void* doc = nullptr;                // Scintilla document (our reference)
     std::shared_ptr<const void> owner;  // keeps `text` alive
@@ -121,9 +138,12 @@ class BodyView : public wxPanel {
   void apply_styles(int lexer);
   void release_docs();
   void request_mode(int mode);
+  void choose_mode(int mode);  // a mode chip: remembered for this kind of body (chosen_mode_)
   void build(int k);  // starts building docs_[k] (inline for small bodies, else on the worker)
   void apply_built(uint64_t gen, int mode, Built& b);
   void show_doc(int mode);
+  // Every document change on the visible control goes through here (wrap / annotations off first).
+  void swap_doc(void* doc);
   void set_mode_chips();
   void update_note();
   void on_chip(int id);
@@ -180,6 +200,19 @@ class BodyView : public wxPanel {
   void start_styling();
   void style_slice();
 
+  // visualize
+  void show_visualize();
+  void show_vis_page();
+  std::function<void()> on_events_;
+  std::shared_ptr<const ScriptRun> vis_;  // post-response run with a template (null: none)
+  bool vis_chosen_ = false;
+  uint64_t vis_seq_ = 0;        // bumps with every new template / data: older renders drop out
+  uint64_t vis_built_ = ~0ull;  // the vis_seq_ vis_page_ was rendered for
+  bool vis_rendering_ = false;
+  std::string vis_page_;        // the sandboxed page (visualize_page) or "" with vis_note_ saying why
+  std::string vis_note_;
+  Tone vis_tone_{};
+
   // table (created on first use; the model is built on the worker)
   void show_table();
   JsonTable* table_ = nullptr;
@@ -203,6 +236,8 @@ class BodyView : public wxPanel {
   std::pair<std::shared_ptr<const void>, std::string_view> search_text();
   void schedule_count();
   void highlight_visible();
+  void make_findbar();  // the find row, created on the first Ctrl+F
+  bool find_shown() const { return findbar_ && findbar_->IsShown(); }
   void close_find();
   // Hides the find bar and drops its count / note (the query stays for the next Ctrl+F): a new
   // response, a message page or the Table view has nothing the old count was about.
@@ -233,6 +268,9 @@ class BodyView : public wxPanel {
   fmt::BodyKind kind_ = fmt::BodyKind::Empty;
   Doc docs_[kModes];
   int mode_ = Pretty;
+  // By size class (0: up to kBigChoice, 1: larger) and fmt::BodyKind; -1: the default. Raw picked
+  // for a 10 MB one-line body is not the view for the next 3 KB one (and the other way round).
+  signed char chosen_mode_[2][6] = {{-1, -1, -1, -1, -1, -1}, {-1, -1, -1, -1, -1, -1}};
   int cur_lexer_ = -1;
   bool grpc_ = false;
   bool wrap_ = false;
@@ -251,6 +289,10 @@ class BodyView : public wxPanel {
   bool holding_ = false;
   void fade_styles();
   bool show_web_preview(const std::string& page);
+  bool create_web();    // the WebView2 control, hidden (false: no Edge runtime)
+  void prewarm_web();   // creates it ahead of the first Preview click (after an HTML response)
+  bool web_prewarm_ = false;
+  std::string origin_note_;
   void web_load(const std::string& page);
   bool wrap_chosen_ = false;  // the user toggled Wrap for this body (no more automatic choice)
   int wrap_cols_ = 0;         // RawWrap: columns the document was built for

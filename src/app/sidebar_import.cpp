@@ -275,6 +275,22 @@ void apply_auth(SavedRequest& r, const AuthSpec& a, ImportResult& res) {
   }
 }
 
+// A folder's (or the collection's) own auth as that folder's settings, so its requests inherit
+// it instead of each getting a copy. False when it cannot be a folder setting (an API key in the
+// query string): the requests get it themselves then.
+bool folder_auth(const AuthSpec& a, ImportFolder& f, ImportResult& res) {
+  const std::string t = lower_ascii(a.type);
+  if (t.empty() || t == "inherit") return false;
+  SavedRequest x;
+  x.name = f.name;
+  apply_auth(x, a, res);
+  if (!x.http.url.empty()) return false;
+  for (const auto& [k, v] : x.http.headers) f.headers.push_back(SettingsRow{k, v, {}, true});
+  f.auth = x.auth;  // None unless digest / NTLM / AWS / OAuth 2.0: "no scheme here" stops the walk up
+  f.basic_auth = x.basic_auth;
+  return true;
+}
+
 // ---------------------------------------------------------------- result building
 
 // Adds r to f unless it cannot be sent (bad method, non-http(s) URL), then records why.
@@ -519,6 +535,22 @@ void pm_body(const Value* b, SavedRequest& r) {
   }
 }
 
+// Something under this item ("item" list) sets its own auth. Then a folder's auth stays a copy
+// on each request: as a folder header it would also reach a request that says "no auth" or uses
+// another scheme (watt's folder headers are inherited whatever the request's auth).
+bool pm_descendant_auth(const Value& it, int depth = 0) {
+  const Value* items = arr(it, "item");
+  if (!items || depth > kMaxDepth) return false;
+  auto own = [](const Value* a) { return a && a->IsObject() && str(*a, "type") != "inherit"; };
+  for (const auto& c : items->GetArray()) {
+    if (!c.IsObject()) continue;
+    if (own(mem(c, "auth"))) return true;
+    if (const Value* rq = mem(c, "request"); rq && rq->IsObject() && own(mem(rq, "auth"))) return true;
+    if (pm_descendant_auth(c, depth + 1)) return true;
+  }
+  return false;
+}
+
 void pm_item(const Value& it, ImportFolder& out, const AuthSpec& auth, const std::string& pre, const std::string& post,
              PmCtx& c, int depth) {
   const std::string name = str(it, "name");
@@ -530,7 +562,10 @@ void pm_item(const Value& it, ImportFolder& out, const AuthSpec& auth, const std
     ImportFolder f;
     f.name = name.empty() ? "Folder" : name;
     AuthSpec a = auth;
-    if (const Value* fa = mem(it, "auth")) a = pm_auth(fa);
+    if (const Value* fa = mem(it, "auth")) {
+      a = pm_auth(fa);
+      if (!pm_descendant_auth(it) && folder_auth(a, f, c.res)) a = AuthSpec{"inherit", {}};  // its requests inherit it
+    }
     std::string fpre = pre, fpost = post;
     pm_events(it, fpre, fpost);
     pm_variables(it, f);
@@ -576,7 +611,8 @@ void pm_item(const Value& it, ImportFolder& out, const AuthSpec& auth, const std
       AuthSpec own = pm_auth(ra);
       if (own.type != "inherit") a = own;
     }
-    apply_auth(r, a, c.res);
+    if (a.type == "inherit") r.auth.type = HttpAuth::Type::Inherit;  // a folder's / the collection's
+    else apply_auth(r, a, c.res);
   }
   if (r.docs.empty()) r.docs = pm_description(mem(it, "description"));
   std::string rpre = pre, rpost = post;
@@ -595,7 +631,8 @@ std::optional<ImportResult> parse_postman(const Document& d, std::string* err) {
   if (res.root.name.empty()) res.root.name = "Postman collection";
   PmCtx c{res};
   pm_variables(d, res.root);
-  const AuthSpec auth = pm_auth(mem(d, "auth"));
+  AuthSpec auth = pm_auth(mem(d, "auth"));
+  if (!pm_descendant_auth(d) && folder_auth(auth, res.root, res)) auth = AuthSpec{"inherit", {}};  // the collection folder's
   std::string pre, post;
   pm_events(d, pre, post);
   const Value* items = arr(d, "item");
@@ -2049,7 +2086,7 @@ void plan_folder(const fs::path& dir, ImportFolder& f, ImportWritten& w, std::ve
     return;
   }
   ++w.folders;
-  if (!f.vars.empty()) vars.emplace_back(dir, &f);
+  if (f.has_settings()) vars.emplace_back(dir, &f);
   std::vector<std::wstring>& order = w.order[dir];
   std::set<std::string> used;  // lower-case names in dir (Windows names are case-insensitive)
   for (auto& sub : f.folders) {
@@ -2257,9 +2294,12 @@ ImportWritten write_import(Workspace& ws, const fs::path& dest_in, ImportResult&
   for (const auto& [dir, f] : vars) {
     FolderSettings fs_;
     fs_.vars = f->vars;
+    fs_.headers = f->headers;
+    fs_.auth = f->auth;
+    fs_.basic_auth = f->basic_auth;
     std::string err;
     if (ws.save_folder_settings(dir, fs_, &err)) w.vars += f->vars.size();
-    else w.skipped.push_back(f->name + " variables: " + (err.empty() ? std::string("folder.json could not be written") : err));
+    else w.skipped.push_back(f->name + " settings: " + (err.empty() ? std::string("folder.json could not be written") : err));
   }
   for (auto& j : jobs) {
     if (!j.ok) {
@@ -2293,6 +2333,55 @@ size_t merge_import_envs(std::vector<Environment>& envs, const std::vector<Envir
     changed += any;
   }
   return changed;
+}
+
+namespace {
+
+// {{name}} uses in s (trimmed names; dynamic {{$guid}}-style names and anything with a space or
+// a brace are not variables a user defines).
+void var_uses(const std::string& s, std::vector<std::string>& out) {
+  for (size_t i = s.find("{{"); i != std::string::npos; i = s.find("{{", i)) {
+    const size_t e = s.find("}}", i + 2);
+    if (e == std::string::npos) break;
+    std::string n = s.substr(i + 2, e - i - 2);
+    const size_t a = n.find_first_not_of(" \t"), b = n.find_last_not_of(" \t");
+    n = a == std::string::npos ? std::string() : n.substr(a, b - a + 1);
+    i = e + 2;
+    if (n.empty() || n[0] == '$' || n.rfind("process.env.", 0) == 0 || n.find_first_of(" {}\t\r\n") != std::string::npos) continue;
+    out.push_back(std::move(n));
+  }
+}
+
+void undefined_in(const ImportFolder& f, std::set<std::string> defined, std::vector<std::string>& out) {
+  for (const auto& v : f.vars)
+    if (v.enabled) defined.insert(v.name);
+  for (const auto& r : f.requests) {
+    std::vector<std::string> uses;
+    var_uses(r.http.url, uses);
+    for (size_t i = 0; i < r.http.headers.size(); ++i)
+      if (!r.disabled_headers.count(i)) {
+        var_uses(r.http.headers[i].first, uses);
+        var_uses(r.http.headers[i].second, uses);
+      }
+    var_uses(r.http.body, uses);
+    var_uses(r.basic_auth.user, uses);
+    var_uses(r.basic_auth.password, uses);
+    for (const auto& [k, v] : r.path_params) var_uses(v, uses);
+    for (auto& n : uses)
+      if (!defined.count(n) && std::find(out.begin(), out.end(), n) == out.end()) out.push_back(std::move(n));
+  }
+  for (const auto& sub : f.folders) undefined_in(sub, defined, out);
+}
+
+}  // namespace
+
+std::vector<std::string> undefined_import_vars(const ImportResult& r, const std::set<std::string>& defined) {
+  std::set<std::string> d = defined;
+  for (const auto& e : r.envs)
+    for (const auto& [k, v] : e.vars) d.insert(k);
+  std::vector<std::string> out;
+  undefined_in(r.root, std::move(d), out);
+  return out;
 }
 
 std::string import_summary(const ImportResult& r, const ImportWritten& w) {

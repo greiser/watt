@@ -11,12 +11,15 @@
 #include "app/http_editor_util.cpp"
 #include "app/http_editor_codegen.cpp"
 #include "app/http_editor_jshelp.cpp"
+#include "app/http_editor_cookies.cpp"
 #include "core/model.h"
 
 #include <filesystem>
 #include <fstream>
 
 using namespace watt::app::http_editor;
+using watt::Cookie;
+using watt::SameSite;
 
 namespace {
 
@@ -811,4 +814,248 @@ TEST_CASE("case-insensitive find stays linear when one case never occurs", "[htt
   CHECK(m.total == 1);
   const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
   CHECK(ms < 2000);
+}
+
+TEST_CASE("counting many case-insensitive matches is one pass", "[http_editor]") {
+  // ~1 MB with ~40k "name" hits and no capital N: the count used to restart a memchr for 'N'
+  // from every hit to the end of the text (O(matches x size)).
+  std::string hay;
+  hay.reserve(1u << 20);
+  size_t want = 0;
+  while (hay.size() < (1u << 20)) {
+    hay += "{\"id\": 1, \"name\": \"x\"},\n";
+    ++want;
+  }
+  size_t want_before = 0;
+  for (size_t p = hay.find("name"); p != std::string::npos && p < hay.size() / 2; p = hay.find("name", p + 4))
+    ++want_before;
+  const auto t0 = std::chrono::steady_clock::now();
+  for (int r = 0; r < 10; ++r) {
+    const MatchCount m = count_matches(hay, "name", false, hay.size() / 2);
+    CHECK(m.total == want);
+    CHECK(m.before == want_before);
+  }
+  CHECK(find_match(hay, "name", false, hay.size(), false) == hay.rfind("name"));
+  CHECK(find_match(hay, "NAME", false, 30, false) == hay.find("name"));
+  const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+  CHECK(ms < 300);
+  // Mixed case: both cases' next hits kept in step.
+  CHECK(count_matches("Name name NAME nAmE na", "name", false, 0).total == 4);
+  CHECK(count_matches("Name name NAME nAmE na", "name", true, 0).total == 1);
+  // A set stop flag ends the walk.
+  std::atomic<bool> stop{true};
+  CHECK(count_matches(hay, "name", false, 0, 1000000, &stop).cancelled);
+  CHECK(find_match(hay, "name", false, hay.size(), false, &stop) == std::string::npos);
+}
+
+TEST_CASE("header names must be RFC 9110 tokens", "[http_editor]") {
+  CHECK(header_name_problem("Authorization").empty());
+  CHECK(header_name_problem("X-Custom_1.v2!").empty());
+  CHECK(header_name_problem("").empty());
+  CHECK(header_name_problem("  Accept  ").empty());           // surrounding blanks are trimmed
+  CHECK(header_name_problem("X-{{tenant}} -Id").find("spaces") != std::string::npos);
+  CHECK(header_name_problem("X-{{tenant}}-Id").empty());       // a {{variable}} is not checked
+  // A name of several words is not "a name and its value".
+  const std::string words = header_name_problem("X Bad/Name");
+  CHECK(words.find("Value column") == std::string::npos);
+  CHECK(words.find("\"X-Bad-Name\"") != std::string::npos);
+  CHECK(header_name_problem("Authorization Bearer tok").find("Value column") != std::string::npos);
+  const std::string sp = header_name_problem("Authorization Bearer tok");
+  CHECK(sp.find("spaces") != std::string::npos);
+  CHECK(sp.find("AuthorizationBearertok") != std::string::npos);
+  CHECK(header_name_problem("Content-Type: text/plain").find("':'") != std::string::npos);
+  CHECK(header_name_problem("Content-Dispositiontext/plain").find("'/'") != std::string::npos);
+  CHECK(!header_name_problem("X-\xC3\xA4").empty());
+}
+
+TEST_CASE("jar cookies for a URL follow the RFC 6265 match rules", "[http_editor][cookies]") {
+  const int64_t now = 1'800'000'000;
+  auto mk = [](std::string n, std::string d, std::string p, bool host_only, bool secure, int64_t exp, int64_t created) {
+    Cookie c;
+    c.name = std::move(n);
+    c.value = "v";
+    c.domain = std::move(d);
+    c.path = std::move(p);
+    c.host_only = host_only;
+    c.secure = secure;
+    c.expires = exp;
+    c.created = created;
+    return c;
+  };
+  const std::vector<Cookie> all = {
+      mk("root", "example.com", "/", false, false, 0, 1),
+      mk("api", "example.com", "/api", true, false, now + 60, 2),
+      mk("sec", "example.com", "/", true, true, 0, 3),
+      mk("old", "example.com", "/", true, false, now - 1, 4),
+      mk("other", "other.com", "/", true, false, 0, 5),
+      mk("host", "api.example.com", "/", true, false, 0, 6),
+  };
+  auto names = [](const std::vector<Cookie>& v) {
+    std::string s;
+    for (const auto& c : v) s += c.name + ",";
+    return s;
+  };
+  CHECK(names(jar_cookies_for(all, "http://example.com/api/users?x=1", now)) == "api,root,");
+  CHECK(names(jar_cookies_for(all, "https://EXAMPLE.com:8443/", now)) == "root,sec,");
+  CHECK(names(jar_cookies_for(all, "https://api.example.com/api", now)) == "root,host,");  // root: Domain=
+  CHECK(names(jar_cookies_for(all, "http://example.com/apiary", now)) == "root,");          // path boundary
+  CHECK(jar_cookies_for(all, "ftp://example.com/", now).empty());
+  CHECK(jar_cookies_for(all, "{{base}}/x", now).empty());
+  CHECK(names(jar_cookies_for(all, "example.com/api", now)) == "api,root,");  // sent as http://
+  CHECK(url_host("https://user:pw@Api.Example.com:443/x") == "api.example.com");
+  CHECK(url_host("http://[::1]:8080/") == "::1");
+}
+
+TEST_CASE("cookie expiry and attribute text", "[http_editor][cookies]") {
+  const int64_t now = 1'800'000'000;
+  CHECK(expiry_text(0, now) == "Session");
+  CHECK(expiry_text(now - 5, now) == "expired");
+  CHECK(expiry_text(now + 300, now) == "in 5 min");
+  CHECK(expiry_text(now + 3 * 3600, now) == "in 3 h");
+  CHECK(expiry_text(now + 10 * 86400, now) == "in 10 days");
+  CHECK(expiry_text(1800000000 + 400 * 86400, now) == "2028-02-19");
+  Cookie c;
+  c.secure = true;
+  c.same_site = SameSite::Lax;
+  c.host_only = false;
+  CHECK(cookie_flags(c) == "Secure Lax +subdomains");
+}
+TEST_CASE("json_block_end finds the matching bracket past strings and comments", "[http_editor]") {
+  CHECK(json_block_end("{}", 0) == 1);
+  CHECK(json_block_end("[1, [2], {\"a\": \"]}\"}]", 0) == 20);
+  CHECK(json_block_end("{\"k\\\"}\": 1}", 0) == 10);  // escaped quote inside a key
+  CHECK(json_block_end("{ // }\n /* } */ }", 0) == 16);
+  CHECK(json_block_end("{ [ }", 0) == std::string::npos);  // not closed
+  CHECK(json_block_end("x{}", 0) == std::string::npos);    // not an opener
+  // Long input: candidates on both sides of the 16-byte steps.
+  std::string big = "{\"items\": [";
+  for (int i = 0; i < 20000; ++i) big += "{\"id\": " + std::to_string(i) + ", \"name\": \"it\\em {[\"},\n";
+  big.pop_back();
+  big.pop_back();
+  big += "]}";
+  CHECK(json_block_end(big, 0) == big.size() - 1);
+  CHECK(json_block_end(big, big.find('[')) == big.size() - 2);
+  CHECK(json_block_end(big, 11) == big.find('}', 11));
+}
+
+TEST_CASE("lex_json styles keys after an unquoted {{var}} as keys", "[http_editor]") {
+  const std::string t = "{\"id\": {{userId}}, \"name\": \"ada\", \"tags\": [1, true]}";
+  JsonLexState st;
+  std::string sty;
+  std::vector<JsonLexLine> lines;
+  lex_json(t, st, &sty, &lines);
+  REQUIRE(sty.size() == t.size());
+  auto at = [&](std::string_view what, size_t from = 0) { return static_cast<int>(sty[t.find(what, from)]); };
+  CHECK(at("\"id\"") == kJsProperty);
+  CHECK(at("{{userId}}") == kJsDefault);
+  CHECK(at("\"name\"") == kJsProperty);
+  CHECK(at("\"ada\"") == kJsString);
+  CHECK(at("\"tags\"") == kJsProperty);
+  CHECK(at(", \"name\"") == kJsOperator);
+  CHECK(at("1,") == kJsNumber);
+  CHECK(at("true") == kJsKeyword);
+  CHECK(lines.size() == 1);
+  CHECK(st.depth == 0);
+  // Folding: depth at each line start, headers where a block opens; a comment spans lines.
+  const std::string m = "{\n  \"a\": [\n    1 /* x\n y */, bogus\n  ]\n}\n";
+  JsonLexState s2;
+  lines.clear();
+  lex_json(m, s2, &sty, &lines);
+  REQUIRE(lines.size() == 6);
+  CHECK(lines[0].depth == 0);
+  CHECK(lines[0].header);
+  CHECK(lines[1].depth == 1);
+  CHECK(lines[1].header);
+  CHECK(lines[2].depth == 2);
+  CHECK_FALSE(lines[2].header);
+  CHECK(lines[3].in_comment);
+  CHECK(static_cast<int>(sty[m.find("y */")]) == kJsBlockComment);
+  CHECK(static_cast<int>(sty[m.find("bogus")]) == kJsError);
+  CHECK(static_cast<int>(sty[m.find("bogus") + 5]) != kJsError);  // only the word
+  CHECK(lines[4].depth == 2);
+  CHECK(lines[5].depth == 1);
+  CHECK(s2.depth == 0);
+  CHECK_FALSE(s2.in_comment);
+  // A string with an escape stays one string; an unclosed one is string-EOL.
+  const std::string e = "[\"a\\\"b\", \"open\n";
+  JsonLexState s3;
+  lex_json(e, s3, &sty, nullptr);
+  CHECK(static_cast<int>(sty[e.find("b\"")]) == kJsString);
+  CHECK(static_cast<int>(sty[e.find("\\")]) == kJsEscape);
+  CHECK(static_cast<int>(sty[e.find("\"open")]) == kJsStringEol);
+}
+
+TEST_CASE("json_block_end walks a dense 8 MB body quickly", "[http_editor]") {
+  std::string big = "{\"items\": [\n";
+  while (big.size() < (8u << 20)) big += "  {\"id\": 1, \"name\": \"item 1\", \"tags\": [\"a\", \"b\"], \"ok\": true},\n";
+  big += "  {}\n]}";
+  const auto t0 = std::chrono::steady_clock::now();
+  CHECK(json_block_end(big, big.find('[')) == big.size() - 2);
+  const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+  CHECK(ms < 60);
+}
+
+TEST_CASE("json_big_blocks lists the long blocks by opener line, outermost per line", "[http_editor]") {
+  // line 0: {   line 1: "items": [   lines 2..6: values   line 7: ]   line 8: }
+  std::string t = "{\n  \"items\": [\n";
+  for (int i = 0; i < 5; ++i) t += "    \"a]\\\"b\",\n";
+  t += "  ]\n}\n";
+  auto b = json_big_blocks(t, 3);
+  REQUIRE(b.size() == 2);
+  CHECK(b[0] == std::pair<int, int>{0, 8});
+  CHECK(b[1] == std::pair<int, int>{1, 7});
+  CHECK(json_big_blocks(t, 9).empty());
+  // Two openers on one line: the outer one's end; comments are skipped.
+  const std::string two = "[{ // ] }\n1,\n2,\n/* ]\n} */ 3\n}]\n";
+  b = json_big_blocks(two, 2);
+  REQUIRE(b.size() == 1);
+  CHECK(b[0] == std::pair<int, int>{0, 5});
+  // 1M lines in well under a second.
+  std::string big = "{\"items\": [\n";
+  for (int i = 0; i < 1000000; ++i) big += "{\"id\": 1, \"s\": \"x\"},\n";
+  big += "{}]}\n";
+  const auto t0 = std::chrono::steady_clock::now();
+  b = json_big_blocks(big, 20000);
+  const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+  REQUIRE(b.size() == 1);
+  CHECK(b[0] == std::pair<int, int>{0, 1000001});
+  CHECK(ms < 400);
+}
+
+TEST_CASE("Encode URL off: the path and query go out as typed", "[http_editor][options]") {
+  // Only what no request line can carry is encoded.
+  CHECK(minimal_url("http://h/a b?q=\"x\"|{y}&e=\xC3\xA9&p=%zz#f g") == "http://h/a%20b?q=\"x\"|{y}&e=\xC3\xA9&p=%zz#f%20g");
+  CHECK(minimal_url("http://h/a/../b?x=1") == "http://h/a/../b?x=1");
+  CHECK(minimal_url("{{base}}/x y") == "{{base}}/x%20y");
+  // Variable values are not query_encode()d either.
+  auto exp = [](const std::string& s) { return s == "{{v}}" ? std::string("a&b=c|d") : s; };
+  CHECK(expand_url("http://h/?q={{v}}", exp, false) == "http://h/?q=a&b=c|d");
+  CHECK(expand_url("http://h/?q={{v}}", exp, true) == "http://h/?q=a%26b%3Dc%7Cd");
+  CHECK(with_path_values("http://h/:id", [](const std::string&) { return std::string("a/b"); }, false) == "http://h/a/b");
+  CHECK(with_path_values("http://h/:id", [](const std::string&) { return std::string("a/b"); }) == "http://h/a%2Fb");
+}
+
+TEST_CASE("Options: what applies is the request's own, else the levels above, else the default", "[http_editor][options]") {
+  watt::EffectiveSettings e;
+  e.network.max_redirects = 5;
+  e.max_redirects_from = {watt::SettingsOrigin::Level::Folder, {}, "api"};
+  e.network.encode_url = false;
+  e.encode_url_from = {watt::SettingsOrigin::Level::Collection, {}, "Collection"};
+  const OptionsAbove above = options_above(e);
+  CHECK(above.max_redirects_from == "api");
+  CHECK(above.encode_url_from == "Collection");
+  CHECK(above.keep_auth_from.empty());
+  watt::NetworkSettings own;
+  watt::HttpRequest h = effective_options(own, above);
+  CHECK(h.max_redirects == 5);
+  CHECK_FALSE(h.encode_url);
+  CHECK_FALSE(h.keep_auth_on_redirect);
+  CHECK(h.tls_min_version == watt::TlsVersion::Default);
+  own.max_redirects = 0;
+  own.encode_url = true;
+  own.tls_min = watt::TlsVersion::Tls1_3;
+  h = effective_options(own, above);
+  CHECK(h.max_redirects == 0);
+  CHECK(h.encode_url);
+  CHECK(h.tls_min_version == watt::TlsVersion::Tls1_3);
 }

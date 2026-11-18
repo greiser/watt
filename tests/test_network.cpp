@@ -215,3 +215,75 @@ TEST_CASE("engine: proxy modes", "[network][http]") {
   CHECK_FALSE(r.ok);
   CHECK(r.conn.proxy.empty());
 }
+
+TEST_CASE("network settings: redirect / URL / TLS options inherit per option and reach the engine", "[network]") {
+  TestConfigDir cfg;
+  TempWs t;
+  FolderSettings coll;
+  coll.network.max_redirects = 5;
+  coll.network.tls_min = TlsVersion::Tls1_2;
+  REQUIRE(t.ws.save_collection_settings(coll));
+  FolderSettings api;
+  api.network.keep_method = true;
+  api.network.encode_url = false;
+  REQUIRE(t.ws.save_folder_settings(t.root / "api", api));
+  CHECK_THAT(slurp(t.root / "folder.json"), ContainsSubstring("\"tls_min_version\": \"1.2\""));
+  const auto back = t.ws.folder_settings(t.root / "api");
+  REQUIRE(back);
+  CHECK(back->network == api.network);
+
+  SavedRequest r = t.ws.new_request(RequestKind::Http, "r", t.root / "api");
+  r.http.url = "http://example.test/";
+  r.network.max_redirects = 0;  // the request's own wins
+  const EffectiveSettings e = t.ws.effective_settings(r);
+  CHECK(e.network.max_redirects == 0L);
+  CHECK(e.max_redirects_from.level == SettingsOrigin::Level::Request);
+  CHECK(e.network.keep_method == true);
+  CHECK(e.keep_method_from.label == "api");
+  CHECK(e.network.tls_min == TlsVersion::Tls1_2);
+  CHECK(e.tls_min_from.level == SettingsOrigin::Level::Collection);
+  CHECK_FALSE(e.network.keep_auth);  // nobody sets it: the default (off)
+  const auto h = t.ws.http_to_send(r);
+  REQUIRE(h);
+  CHECK(h->max_redirects == 0);
+  CHECK(h->keep_method_on_redirect);
+  CHECK_FALSE(h->keep_auth_on_redirect);
+  CHECK_FALSE(h->encode_url);
+  CHECK(h->tls_min_version == TlsVersion::Tls1_2);
+
+  // Saved with the request; a request built from an HttpRequest (a curl import) keeps its fields.
+  REQUIRE(t.ws.save_request(r));
+  auto loaded = t.ws.load_request(r.file);
+  REQUIRE(loaded);
+  CHECK(loaded->network == r.network);
+  SavedRequest imp = t.ws.new_request(RequestKind::Http, "imp", t.root);
+  imp.http.url = "http://example.test/";
+  imp.http.keep_auth_on_redirect = true;
+  imp.http.max_redirects = 7;
+  REQUIRE(t.ws.save_request(imp));
+  loaded = t.ws.load_request(imp.file);
+  REQUIRE(loaded);
+  CHECK(loaded->network.keep_auth == true);
+  CHECK(loaded->network.max_redirects == 7L);
+  CHECK_THAT(to_curl_command(*loaded), ContainsSubstring("--location-trusted --max-redirs 7"));
+}
+
+TEST_CASE("curl: redirect / URL / TLS flags round trip", "[network][curl]") {
+  auto r = parse_curl_command("curl --location-trusted --max-redirs 4 --post301 --post302 --post303 --path-as-is "
+                              "--tlsv1.2 https://h.test/a/../b");
+  REQUIRE(r);
+  CHECK(r->follow_redirects);
+  CHECK(r->keep_auth_on_redirect);
+  CHECK(r->max_redirects == 4);
+  CHECK(r->keep_method_on_redirect);
+  CHECK_FALSE(r->encode_url);
+  CHECK(r->tls_min_version == TlsVersion::Tls1_2);
+  CHECK(to_curl_command(*r) ==
+        "curl https://h.test/a/../b \\\n  --location-trusted --max-redirs 4 --post301 --post302 --post303 --path-as-is "
+        "--tlsv1.2 --compressed");
+  auto plain = parse_curl_command("curl -L --post302 https://h.test/");
+  REQUIRE(plain);
+  CHECK(plain->keep_method_on_redirect);
+  CHECK_FALSE(plain->keep_auth_on_redirect);
+  CHECK(plain->max_redirects == HttpRequest{}.max_redirects);
+}

@@ -10,6 +10,7 @@
 #include <cctype>
 #include <fstream>
 #include <map>
+#include <mutex>
 #include <set>
 #include <thread>
 
@@ -19,6 +20,7 @@
 
 #include "app/http_editor_pre.h"   // evaluate_pre_vars (the Scripts tab's pre-request variables)
 #include "app/http_editor_util.h"  // with_path_values, split_row_docs
+#include "core/model_json.h"  // read_file / write_file_atomic / json_pretty (run-order.json)
 #include "core/oauth2.h"
 #include "core/timing.h"
 
@@ -27,6 +29,16 @@ namespace watt::app::runner {
 namespace fs = std::filesystem;
 
 namespace {
+
+// protobuf's JSON parse errors pad their parts with runs of spaces ("invalid JSON  in  x,   near
+// 1:6"): one space each, as the rest of the UI writes them.
+std::string one_space(const std::string& s) {
+  std::string o;
+  o.reserve(s.size());
+  for (const char c : s)
+    if (!(c == ' ' && !o.empty() && o.back() == ' ')) o += c;
+  return o;
+}
 
 std::string generic_utf8(const fs::path& p) {
   const auto u = p.generic_u8string();
@@ -82,32 +94,43 @@ bool natural_less(std::string_view a, std::string_view b) {
   return a < b;
 }
 
-// Depth first in the sidebar's order: a folder's subfolders first, then its requests, each by
+// Depth first. `saved`: path_key(folder) -> the runner's saved order (run-order.json): its
+// names first, folders and requests interleaved. The rest (and folders without a saved list) as
+// the sidebar sorts: subfolders first, then the dragged order (`order`, see FolderOrder), then
 // natural name order (so "Run folder" runs what the sidebar lists, top to bottom).
-// `order`: path_key(folder) -> dragged file names (see FolderOrder), as the sidebar sorts.
-void flatten(const CollectionNode& n, std::vector<const CollectionNode*>& out,
-             const std::map<std::wstring, std::vector<std::wstring>>* order = nullptr) {
-  const std::vector<std::wstring>* ord = nullptr;
-  if (order)
-    if (auto it = order->find(path_key(n.path)); it != order->end()) ord = &it->second;
-  auto rank = [ord](const CollectionNode* c) -> size_t {
-    if (!ord) return SIZE_MAX;
+using KeyedOrder = std::map<std::wstring, std::vector<std::wstring>>;
+void flatten(const CollectionNode& n, std::vector<const CollectionNode*>& out, const KeyedOrder* order = nullptr,
+             const KeyedOrder* saved = nullptr) {
+  auto find = [&n](const KeyedOrder* m) -> const std::vector<std::wstring>* {
+    if (!m) return nullptr;
+    auto it = m->find(path_key(n.path));
+    return it == m->end() ? nullptr : &it->second;
+  };
+  const std::vector<std::wstring>* ord = find(order);
+  const std::vector<std::wstring>* sav = find(saved);
+  auto rank_in = [](const std::vector<std::wstring>* list, const CollectionNode* c) -> size_t {
+    if (!list) return SIZE_MAX;
     const std::wstring f = c->path.filename().wstring();
-    for (size_t i = 0; i < ord->size(); ++i)
-      if ((*ord)[i] == f) return i;
+    for (size_t i = 0; i < list->size(); ++i)
+      if (_wcsicmp((*list)[i].c_str(), f.c_str()) == 0) return i;
     return SIZE_MAX;
   };
-  std::vector<std::pair<size_t, const CollectionNode*>> kids;
+  struct Kid {
+    size_t saved, rank;
+    const CollectionNode* c;
+  };
+  std::vector<Kid> kids;
   kids.reserve(n.children.size());
-  for (const auto& c : n.children) kids.emplace_back(rank(&c), &c);
-  std::stable_sort(kids.begin(), kids.end(), [](const auto& a, const auto& b) {
-    if (a.second->is_folder != b.second->is_folder) return a.second->is_folder;
-    if (a.first != b.first) return a.first < b.first;
-    return natural_less(a.second->name, b.second->name);
+  for (const auto& c : n.children) kids.push_back({rank_in(sav, &c), rank_in(ord, &c), &c});
+  std::stable_sort(kids.begin(), kids.end(), [](const Kid& a, const Kid& b) {
+    if (a.saved != b.saved) return a.saved < b.saved;
+    if (a.c->is_folder != b.c->is_folder) return a.c->is_folder;
+    if (a.rank != b.rank) return a.rank < b.rank;
+    return natural_less(a.c->name, b.c->name);
   });
-  for (const auto& [r, c] : kids) {
-    if (c->is_folder) flatten(*c, out, order);
-    else out.push_back(c);
+  for (const Kid& k : kids) {
+    if (k.c->is_folder) flatten(*k.c, out, order, saved);
+    else out.push_back(k.c);
   }
 }
 
@@ -141,6 +164,35 @@ std::string join(const std::vector<std::string>& v) {
   return s;
 }
 
+// A response-time check failed in the standard form ("expected res.responseTime to be < 100, got
+// 135.4425"): said in ms with the runner's precision ("expected response time to be < 100 ms,
+// got 135 ms"), as Bruno says "expected 134 to be below 100". Anything else is kept.
+void time_message(StepResult::Check& c) {
+  std::string t = c.target;
+  while (!t.empty() && std::isspace(static_cast<unsigned char>(t.back()))) t.pop_back();
+  while (!t.empty() && std::isspace(static_cast<unsigned char>(t.front()))) t.erase(0, 1);
+  std::string low;
+  for (char ch : t) low += static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+  if (low != "res.responsetime" && low != "responsetime" && low != "time" && low != "res.time") return;
+  char* end = nullptr;
+  const double v = std::strtod(c.actual.c_str(), &end);
+  if (c.actual.empty() || !end || *end != 0 || !std::isfinite(v)) return;
+  const std::string head = "expected " + t + " ";
+  const std::string tail = ", got " + c.actual;
+  if (c.message.size() < head.size() + tail.size() || c.message.compare(0, head.size(), head) != 0 ||
+      c.message.compare(c.message.size() - tail.size(), tail.size(), tail) != 0)
+    return;
+  std::string mid = c.message.substr(head.size(), c.message.size() - head.size() - tail.size());
+  if (!mid.empty() && std::isdigit(static_cast<unsigned char>(mid.back()))) mid += " ms";
+  char b[32];
+  const double ms = v < 0 ? 0 : v;
+  if (ms < 1) std::snprintf(b, sizeof b, "%.2f ms", ms);
+  else if (ms < 100) std::snprintf(b, sizeof b, "%.1f ms", ms);
+  else std::snprintf(b, sizeof b, "%.0f ms", ms);
+  c.actual = b;
+  c.message = "expected response time " + mid + ", got " + b;
+}
+
 void fill_checks(StepResult& s, const std::vector<AssertResult>& ar, const std::vector<CaptureResult>& cr) {
   s.asserts.reserve(ar.size());
   for (const auto& a : ar) {
@@ -153,6 +205,7 @@ void fill_checks(StepResult& s, const std::vector<AssertResult>& ar, const std::
     c.expected = tidy_numbers(a.expected);
     c.actual = tidy_numbers(a.actual);
     c.message = tidy_numbers(a.message);
+    if (!a.pass) time_message(c);
     (a.pass ? s.asserts_passed : s.asserts_failed)++;
     s.asserts.push_back(std::move(c));
   }
@@ -356,9 +409,10 @@ std::string strip_ext(std::string s) {
 
 std::vector<RunItem> collect(const Workspace& ws, const fs::path& folder, std::vector<std::string>* errors,
                              const FolderOrder* order) {
-  std::map<std::wstring, std::vector<std::wstring>> keyed;
+  KeyedOrder keyed, saved;
   if (order)
     for (const auto& [dir, names] : *order) keyed[path_key(dir)] = names;
+  for (auto& [dir, names] : load_run_order(ws.root())) saved[path_key(dir)] = std::move(names);
   std::vector<RunItem> out;
   const CollectionNode tree = ws.tree(-1);
   const CollectionNode* base = &tree;
@@ -372,7 +426,7 @@ std::vector<RunItem> collect(const Workspace& ws, const fs::path& folder, std::v
   }
   std::vector<const CollectionNode*> files;
   if (base->is_folder || base == &tree)
-    flatten(*base, files, order ? &keyed : nullptr);
+    flatten(*base, files, order ? &keyed : nullptr, saved.empty() ? nullptr : &saved);
   else
     files.push_back(base);
   const fs::path rel_base = base->is_folder || base == &tree ? base->path : base->path.parent_path();
@@ -387,6 +441,9 @@ std::vector<RunItem> collect(const Workspace& ws, const fs::path& folder, std::v
       if (errors) errors->push_back(strip_ext(generic_utf8(rel)) + ": " + (err.empty() ? "cannot read" : err));
       continue;
     }
+    // A WebSocket request is a connection, not a request / response the runner can time and
+    // assert (Postman's and Bruno's runners leave them out too).
+    if (r->kind == RequestKind::WebSocket) continue;
     RunItem it;
     it.req = std::move(*r);
     it.rel = strip_ext(generic_utf8(rel));
@@ -394,6 +451,302 @@ std::vector<RunItem> collect(const Workspace& ws, const fs::path& folder, std::v
     out.push_back(std::move(it));
   }
   return out;
+}
+
+// ------------------------------------------------------------------ saved run order
+
+namespace {
+bool plain_name(const std::wstring& n) {
+  return !n.empty() && n != L"." && n != L".." && n.find_first_of(L"/\\:") == std::wstring::npos;
+}
+// "." for the root, "a/b" below it; "" when folder is not inside root.
+std::string order_key(const fs::path& root, const fs::path& folder) {
+  if (path_key(folder) == path_key(root)) return ".";
+  const fs::path rel = folder.lexically_normal().lexically_relative(root.lexically_normal());
+  if (rel.empty() || rel.is_absolute()) return "";
+  for (const auto& c : rel)
+    if (c == L".." || c == L".") return "";
+  return generic_utf8(rel);
+}
+std::mutex& order_file_mutex() {
+  static std::mutex m;
+  return m;
+}
+}  // namespace
+
+FolderOrder load_run_order(const fs::path& root, std::string* err) {
+  FolderOrder out;
+  const fs::path file = root / kRunOrderFile;
+  detail::PathStat st;
+  if (!detail::stat_path(file, st) || !st.exists) return out;
+  if (st.is_link || st.is_dir || st.size > (1u << 20)) {
+    if (err) *err = std::string(kRunOrderFile) + ": ignored (a link, a folder or over 1 MB)";
+    return out;
+  }
+  std::string text;
+  if (!detail::read_file(file, text)) {
+    if (err) *err = std::string(kRunOrderFile) + ": cannot read";
+    return out;
+  }
+  rapidjson::Document d;
+  d.Parse(text.data(), text.size());
+  if (d.HasParseError() || !d.IsObject() || !d.HasMember("order") || !d["order"].IsObject()) {
+    if (err) *err = std::string(kRunOrderFile) + ": not a run order (expected {\"order\": {...}})";
+    return out;
+  }
+  const rapidjson::Value& obj = d["order"];
+  for (auto m = obj.MemberBegin(); m != obj.MemberEnd(); ++m) {
+    if (!m->value.IsArray()) continue;
+    const std::string key(m->name.GetString(), m->name.GetStringLength());
+    fs::path dir;
+    if (key == "." || key.empty()) {
+      dir = root;
+    } else {
+      const fs::path rel = detail::from_utf8(key);
+      if (rel.is_absolute() || rel.has_root_name() || rel.has_root_directory()) continue;
+      bool ok = true;
+      for (const auto& c : rel) ok = ok && c != L"..";
+      if (!ok) continue;
+      dir = (root / rel).lexically_normal();
+    }
+    std::vector<std::wstring> names;
+    for (auto v = m->value.Begin(); v != m->value.End(); ++v) {
+      if (!v->IsString()) continue;
+      std::wstring n = detail::from_utf8(std::string(v->GetString(), v->GetStringLength())).wstring();
+      if (plain_name(n)) names.push_back(std::move(n));
+    }
+    out[dir] = std::move(names);
+  }
+  return out;
+}
+
+bool save_run_order(const fs::path& root, const FolderOrder& changed, uint64_t seq, std::string* err) {
+  std::lock_guard lk(order_file_mutex());
+  static std::map<std::wstring, uint64_t> last;
+  uint64_t& done = last[path_key(root)];
+  if (seq && seq < done) return true;  // a newer order is already on disk
+  if (seq) done = seq;
+  // What is there now (other folders' entries are kept).
+  std::vector<std::pair<std::string, std::vector<std::string>>> entries;
+  for (const auto& [dir, names] : load_run_order(root)) {
+    const std::string k = order_key(root, dir);
+    if (k.empty()) continue;
+    std::vector<std::string> v;
+    for (const auto& n : names) v.push_back(detail::to_utf8(fs::path(n)));
+    entries.emplace_back(k, std::move(v));
+  }
+  for (const auto& [dir, names] : changed) {
+    const std::string k = order_key(root, dir);
+    if (k.empty()) continue;
+    auto it = std::find_if(entries.begin(), entries.end(), [&](const auto& e) { return e.first == k; });
+    std::vector<std::string> v;
+    for (const auto& n : names)
+      if (plain_name(n)) v.push_back(detail::to_utf8(fs::path(n)));
+    if (v.empty()) {
+      if (it != entries.end()) entries.erase(it);
+    } else if (it != entries.end()) {
+      it->second = std::move(v);
+    } else {
+      entries.emplace_back(k, std::move(v));
+    }
+  }
+  std::sort(entries.begin(), entries.end(), [](const auto& a, const auto& b) {
+    if ((a.first == ".") != (b.first == ".")) return a.first == ".";
+    return a.first < b.first;
+  });
+  return detail::write_file_atomic(root / kRunOrderFile, run_order_json(entries), err);
+}
+
+// One name per line, commas at the line ends, two-space indents: a file meant to be committed
+// diffs line by line when one item moves.
+std::string run_order_json(const std::vector<std::pair<std::string, std::vector<std::string>>>& entries) {
+  auto str = [](const std::string& v) {
+    rapidjson::StringBuffer b;
+    rapidjson::Writer<rapidjson::StringBuffer> w(b);
+    w.String(v.c_str(), static_cast<rapidjson::SizeType>(v.size()));
+    return std::string(b.GetString(), b.GetSize());
+  };
+  std::string o = "{\n  \"version\": 1,\n  \"order\": {";
+  for (size_t e = 0; e < entries.size(); ++e) {
+    o += e ? ",\n    " : "\n    ";
+    o += str(entries[e].first) + ": [";
+    const auto& v = entries[e].second;
+    for (size_t i = 0; i < v.size(); ++i) o += (i ? ",\n      " : "\n      ") + str(v[i]);
+    o += v.empty() ? "]" : "\n    ]";
+  }
+  o += entries.empty() ? "}\n}\n" : "\n  }\n}\n";
+  return o;
+}
+
+namespace {
+// An item's place below the run's folder: its folder names, then its file name.
+std::vector<std::wstring> tree_path(const RunItem& it) {
+  std::vector<std::wstring> v;
+  const fs::path rel = detail::from_utf8(it.rel);
+  for (const auto& c : rel.parent_path()) {
+    std::wstring w = c.wstring();
+    if (!w.empty() && w != L"." && w != L"/" && w != L"\\") v.push_back(std::move(w));
+  }
+  v.push_back(it.req.file.empty() ? rel.filename().wstring() + L".req.json" : it.req.file.filename().wstring());
+  return v;
+}
+bool same_prefix(const std::vector<std::wstring>& a, const std::vector<std::wstring>& b, size_t n) {
+  if (a.size() < n || b.size() < n) return false;
+  for (size_t i = 0; i < n; ++i)
+    if (a[i] != b[i]) return false;
+  return true;
+}
+}  // namespace
+
+bool move_block(const std::vector<RunItem>& items, std::vector<size_t>& order, const fs::path& base, size_t pos,
+                int d, FolderOrder* changed) {
+  if (pos >= order.size() || d == 0) return false;
+  std::vector<std::vector<std::wstring>> p(order.size());
+  for (size_t k = 0; k < order.size(); ++k)
+    if (order[k] < items.size()) p[k] = tree_path(items[order[k]]);
+  const std::vector<std::wstring> me = p[pos];
+  for (size_t L = me.size(); L-- > 0;) {
+    // The block: the items sharing me[0..L] (the request itself, or its folder at depth L).
+    size_t bs = pos, be = pos + 1;
+    while (bs > 0 && same_prefix(p[bs - 1], me, L + 1)) --bs;
+    while (be < order.size() && same_prefix(p[be], me, L + 1)) ++be;
+    if (d < 0) {
+      if (bs == 0 || p[bs - 1].size() <= L || !same_prefix(p[bs - 1], me, L)) continue;  // first in its folder
+      const std::vector<std::wstring> nb = p[bs - 1];
+      size_t ns = bs - 1;
+      while (ns > 0 && same_prefix(p[ns - 1], nb, L + 1)) --ns;
+      std::rotate(order.begin() + static_cast<std::ptrdiff_t>(ns), order.begin() + static_cast<std::ptrdiff_t>(bs),
+                  order.begin() + static_cast<std::ptrdiff_t>(be));
+    } else {
+      if (be >= order.size() || p[be].size() <= L || !same_prefix(p[be], me, L)) continue;  // last in its folder
+      const std::vector<std::wstring> nb = p[be];
+      size_t ne = be + 1;
+      while (ne < order.size() && same_prefix(p[ne], nb, L + 1)) ++ne;
+      std::rotate(order.begin() + static_cast<std::ptrdiff_t>(bs), order.begin() + static_cast<std::ptrdiff_t>(be),
+                  order.begin() + static_cast<std::ptrdiff_t>(ne));
+    }
+    if (changed) {
+      // The folder's new child list, in run order.
+      fs::path dir = base;
+      for (size_t i = 0; i < L; ++i) dir /= me[i];
+      std::vector<std::wstring> names;
+      for (size_t k = 0; k < order.size(); ++k) {
+        if (order[k] >= items.size()) continue;
+        const auto q = tree_path(items[order[k]]);
+        if (q.size() <= L || !same_prefix(q, me, L)) continue;
+        if (names.empty() || names.back() != q[L]) names.push_back(q[L]);
+      }
+      (*changed)[dir.lexically_normal()] = std::move(names);
+    }
+    return true;
+  }
+  return false;
+}
+
+bool drop_block(const std::vector<RunItem>& items, std::vector<size_t>& order, const fs::path& base, size_t pos,
+                size_t before, FolderOrder* changed) {
+  if (pos >= order.size() || before > order.size() || before == pos || before == pos + 1) return false;
+  const size_t item = order[pos];
+  auto where = [&] { return static_cast<size_t>(std::find(order.begin(), order.end(), item) - order.begin()); };
+  bool moved = false;
+  if (before < pos) {
+    for (size_t cur = pos; cur > before;) {
+      if (!move_block(items, order, base, cur, -1, changed)) break;
+      const size_t now = where();
+      moved = true;
+      if (now >= cur) break;
+      cur = now;
+    }
+  } else {
+    for (size_t cur = pos; cur + 1 < before;) {
+      if (!move_block(items, order, base, cur, 1, changed)) break;
+      const size_t now = where();
+      moved = true;
+      if (now <= cur) break;
+      cur = now;
+    }
+  }
+  return moved;
+}
+
+namespace {
+// Adds every {{name}} in text (first 256 KB) to out.
+void vars_in(std::string_view text, std::vector<std::string>& out) {
+  if (text.size() > (256u << 10)) text = text.substr(0, 256u << 10);
+  for (size_t at = text.find("{{"); at != std::string_view::npos; at = text.find("{{", at + 2)) {
+    const size_t end = text.find("}}", at + 2);
+    if (end == std::string_view::npos) break;
+    const std::string_view name = trim_ws(text.substr(at + 2, end - at - 2));
+    if (name.empty() || name.size() > 64 || name.front() == '$') continue;  // {{$guid}}: dynamic
+    if (std::find(out.begin(), out.end(), name) == out.end()) out.emplace_back(name);
+  }
+}
+// Every {{var}} a request reads where captures matter (URL, headers, path params, body; gRPC:
+// address, body, metadata).
+void vars_used(const SavedRequest& r, std::vector<std::string>& used) {
+  if (r.kind == RequestKind::Grpc) {
+    vars_in(r.grpc_target.address, used);
+    vars_in(r.grpc_body, used);
+    for (const auto& m : r.grpc_opts.metadata) vars_in(m.second, used);
+    for (const auto& m : r.grpc_opts.rpc_metadata) vars_in(m.second, used);
+  } else {
+    vars_in(r.http.url, used);
+    for (const auto& h : r.http.headers) vars_in(h.second, used);
+    for (const auto& p : r.path_params) vars_in(p.second, used);
+    vars_in(r.http.body, used);
+  }
+}
+}  // namespace
+
+std::vector<OrderHint> capture_order_hints(const std::vector<RunItem>& items, const std::vector<size_t>& order,
+                                           size_t max) {
+  std::vector<OrderHint> out;
+  // var -> first position that captures it.
+  std::map<std::string, size_t, std::less<>> first_capture;
+  for (size_t k = 0; k < order.size(); ++k) {
+    if (order[k] >= items.size()) continue;
+    for (const auto& c : items[order[k]].req.captures)
+      if (c.enabled && !c.var.empty()) first_capture.emplace(c.var, k);
+  }
+  if (first_capture.empty()) return out;
+  std::vector<std::string> used;
+  for (size_t k = 0; k < order.size() && out.size() < max; ++k) {
+    if (order[k] >= items.size()) continue;
+    used.clear();
+    vars_used(items[order[k]].req, used);
+    for (const auto& v : used) {
+      const auto it = first_capture.find(v);
+      if (it == first_capture.end() || it->second <= k) continue;
+      out.push_back({k, it->second, v});
+      if (out.size() >= max) break;
+    }
+  }
+  return out;
+}
+
+std::vector<size_t> with_capture_sources(const std::vector<RunItem>& items, const std::vector<size_t>& order,
+                                         const std::vector<size_t>& positions) {
+  std::set<size_t> want(positions.begin(), positions.end());
+  std::vector<size_t> todo(positions.begin(), positions.end());
+  std::vector<std::string> used;
+  while (!todo.empty()) {
+    const size_t k = todo.back();
+    todo.pop_back();
+    if (k >= order.size() || order[k] >= items.size()) continue;
+    used.clear();
+    vars_used(items[order[k]].req, used);
+    for (const auto& v : used) {
+      // The last request before k that captures v sets what k reads.
+      for (size_t q = k; q-- > 0;) {
+        if (order[q] >= items.size()) continue;
+        const auto& caps = items[order[q]].req.captures;
+        if (std::none_of(caps.begin(), caps.end(), [&](const Capture& c) { return c.enabled && c.var == v; })) continue;
+        if (want.insert(q).second) todo.push_back(q);
+        break;
+      }
+    }
+  }
+  return {want.begin(), want.end()};
 }
 
 std::string tidy_numbers(const std::string& in) {
@@ -462,8 +815,11 @@ std::string StepResult::reason() const {
   if (!error.empty()) return error;
   for (const auto& a : asserts)
     if (!a.pass) return a.text();
-  if (kind == RequestKind::Grpc) return "gRPC status " + (status_text.empty() ? std::to_string(status) : status_text);
-  return "HTTP " + std::to_string(status) + (status_text.empty() ? "" : " " + status_text) + " (no asserts: a status of 400 or more fails)";
+  if (kind == RequestKind::Grpc)
+    return "gRPC status " + (status_text.empty() ? std::to_string(status) : status_text) +
+           " (fails unless the request asserts on res.status)";
+  return "HTTP " + std::to_string(status) + (status_text.empty() ? "" : " " + status_text) +
+         " (a status of 400 or more fails unless the request asserts on res.status)";
 }
 
 bool has_scripts(const SavedRequest& r) { return !r.pre_script.empty() || !r.post_script.empty(); }
@@ -534,12 +890,21 @@ std::string StepResult::content_type() const {
   return {};
 }
 
+bool StepResult::status_failed() const {
+  if (!sent || client_error) return false;
+  if (kind == RequestKind::Grpc ? transport_ok : status < 400) return false;
+  for (const auto& a : asserts)
+    if (!a.script && a.from.empty() && (a.target == "res.status" || a.target == "res.statusText")) return false;
+  return true;
+}
+
 bool StepResult::failed() const {
   if (skipped || stopped()) return false;
   if (errored()) return true;
-  if (!asserts.empty()) return asserts_failed > 0;
-  if (kind == RequestKind::Grpc) return !transport_ok;
-  return status >= 400;
+  // An error status fails the step even when every (inherited) assert passed, unless the
+  // request itself asserts on its status (an expected 404, NOT_FOUND).
+  if (status_failed()) return true;
+  return asserts_failed > 0;
 }
 
 // ------------------------------------------------------------------ control
@@ -1039,10 +1404,12 @@ void run_grpc(const SavedRequest& original, Workspace& ws, Engines& eng, const G
     Workspace::SchemaPlan plan = ws.schema_plan(saved);
     if (!plan.invalid.empty()) {
       s.error = "Schema not loaded: " + plan.invalid.front();
+      s.client_error = true;
       return;
     }
     if (!plan.blocked.empty()) {
       s.error = "Schema not loaded: " + generic_utf8(plan.blocked.front()) + " is outside the workspace and was not allowed";
+      s.client_error = true;
       return;
     }
     std::string key;
@@ -1053,6 +1420,7 @@ void run_grpc(const SavedRequest& original, Workspace& ws, Engines& eng, const G
       GrpcSchema sc = eng.grpc->load_proto_files(plan.proto_files, plan.import_dirs);
       if (!sc.ok) {
         s.error = "Schema not loaded: " + sc.error;
+        s.client_error = true;
         return;
       }
       eng.schemas_loaded.insert(key);
@@ -1066,13 +1434,15 @@ void run_grpc(const SavedRequest& original, Workspace& ws, Engines& eng, const G
   const double setup = ms_between(begin, start);
   std::shared_ptr<GrpcCall> call(eng.grpc->start_call(r.grpc_target, r.grpc_method, r.grpc_opts));
   if (!ctl.attach(call, slot)) call->cancel();
+  bool encode_failed = false;
   if (!call->done()) {
     for (const auto& m : split_messages(r.grpc_body)) {
       std::string err;
       if (!call->send(m, &err)) {
         if (!call->done()) {
           call->cancel();
-          s.error = "Request message: " + err;
+          s.error = "Request message: " + one_space(err);
+          encode_failed = true;
         }
         break;
       }
@@ -1081,6 +1451,11 @@ void run_grpc(const SavedRequest& original, Workspace& ws, Engines& eng, const G
   }
   GrpcResponse resp = call->wait();
   ctl.attach(std::shared_ptr<GrpcCall>(), slot);
+  if (encode_failed && !ctl.stopped()) {
+    // Nothing usable went out: an error, never a CANCELLED response that inherited asserts pass.
+    s.client_error = true;
+    return;
+  }
   s.sent = true;
   resp.timing.queue_ms += setup;
   resp.timing.total_ms += setup;

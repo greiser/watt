@@ -67,6 +67,8 @@
 #include "app/grpc_editor_tree.h"
 #include "app/grpc_editor_util.h"
 #include "app/grpc_editor_widgets.h"
+#include "app/http_editor_util.h"     // find_vars: the address's {{var}} colours
+#include "app/http_editor_widgets.h"  // http_editor::Theme var colours (as the HTTP URL)
 #include "app/panels.h"
 #include "core/timing.h"
 
@@ -342,7 +344,8 @@ class GrpcEditor : public wxPanel, public GrpcEditorPanel {
         load_timer_(this, wxWindow::NewControlId()),
         json_timer_(this, wxWindow::NewControlId()),
         pump_timer_(this, wxWindow::NewControlId()),
-        flash_timer_(this, wxWindow::NewControlId()) {
+        flash_timer_(this, wxWindow::NewControlId()),
+        addr_timer_(this, wxWindow::NewControlId()) {
     jobs_->target = this;
     const auto t0 = Clock::now();
     Hide();  // children are created in a hidden window: no size / paint traffic per child
@@ -370,6 +373,10 @@ class GrpcEditor : public wxPanel, public GrpcEditorPanel {
     Bind(wxEVT_TIMER, [this](wxTimerEvent&) { check_json(); }, json_timer_.GetId());
     Bind(wxEVT_TIMER, [this](wxTimerEvent&) { pump_sends(); }, pump_timer_.GetId());
     Bind(wxEVT_TIMER, [this](wxTimerEvent&) { grpcurl_->SetLabel("grpcurl"); }, flash_timer_.GetId());
+    Bind(wxEVT_TIMER, [this](wxTimerEvent&) {
+      addr_wait_ = false;
+      maybe_load_schema(false);
+    }, addr_timer_.GetId());
     Bind(wxEVT_CHAR_HOOK, &GrpcEditor::on_char_hook, this);
 
     update_header();
@@ -415,6 +422,8 @@ class GrpcEditor : public wxPanel, public GrpcEditorPanel {
     const bool fresh = r.grpc_target.address.empty() && r.proto_files.empty() && r.grpc_method.empty() &&
                        trim_empty(r.grpc_body) && lt.set;
     addr_->ChangeValue(wxString::FromUTF8(fresh ? lt.address : r.grpc_target.address));
+    addr_text_ = addr_->GetValue();
+    colour_addr_vars();
     tls_->set_checked(fresh ? lt.tls : r.grpc_target.tls);
     update_tls_label();
     opt_t_ = fresh ? lt.target : r.grpc_target;
@@ -610,7 +619,8 @@ class GrpcEditor : public wxPanel, public GrpcEditorPanel {
     web_ = new FlatButton(top_, "gRPC-Web", FlatButton::Style::Outline);
     web_->SetToolTip("Call a gRPC-Web endpoint (Envoy, grpcwebproxy, Connect, tonic-web) over HTTP instead of a gRPC "
                      "channel. Unary and server streaming only; the address may carry a scheme and path prefix.");
-    addr_ = new wxTextCtrl(top_, wxID_ANY, "", wxDefaultPosition, wxDefaultSize, wxTE_PROCESS_ENTER);
+    // Rich: {{variables}} are coloured like the HTTP URL's (defined green, missing red).
+    addr_ = new wxTextCtrl(top_, wxID_ANY, "", wxDefaultPosition, wxDefaultSize, wxTE_PROCESS_ENTER | wxTE_RICH2);
     addr_->SetHint("host:port  or a grpcurl command  (Ctrl+L)");
     wxFont af = addr_->GetFont();
     af.SetFractionalPointSize(af.GetFractionalPointSize() * 1.1);
@@ -647,12 +657,30 @@ class GrpcEditor : public wxPanel, public GrpcEditorPanel {
       update_web_ui();
       update_options_tab();
       changed();
-      maybe_load_schema(false);
+      // A gRPC-Web endpoint is usually another address (a proxy, the port next to the native
+      // one): reflecting the old address at once only fills the schema pane with errors. The
+      // address field takes the focus instead; reflection follows when the user leaves it,
+      // presses Enter, or stops typing a new address (or, untouched, after a short pause).
+      if (source_->GetSelection() == kSourceReflection && !addr_->GetValue().IsEmpty()) {
+        addr_->SetFocus();
+        addr_->SelectAll();
+        addr_wait_ = true;
+        addr_timer_.StartOnce(kAddrIdleMs * 3);
+      } else {
+        maybe_load_schema(false);
+      }
     };
     addr_->Bind(wxEVT_TEXT, [this](wxCommandEvent& e) {
       e.Skip();
-      if (loading_) return;
-      std::string a = addr_->GetValue().utf8_string();
+      // A rich edit control can report a restyle (the {{var}} colours) as a text change, even
+      // after the load is over: only a different value is an edit.
+      const wxString now = addr_->GetValue();
+      if (loading_ || now == addr_text_) {
+        addr_text_ = now;
+        return;
+      }
+      addr_text_ = now;
+      std::string a = now.utf8_string();
       if (looks_like_grpcurl(a)) {
         import_grpcurl(a);
         return;
@@ -663,13 +691,50 @@ class GrpcEditor : public wxPanel, public GrpcEditorPanel {
         if (strip_scheme(a, &tls)) {
           loading_ = true;
           addr_->ChangeValue(wxString::FromUTF8(a));
+          addr_text_ = addr_->GetValue();
           addr_->SetInsertionPointEnd();
           tls_->set_checked(tls);
           update_tls_label();
           loading_ = false;
         }
       }
+      colour_addr_vars();
       changed();
+      // An address typed after the gRPC-Web toggle, or after a failed load: reflect once the
+      // typing pauses, without a click on refresh.
+      if (addr_wait_ || status_err_) {
+        addr_wait_ = true;
+        addr_timer_.StartOnce(kAddrIdleMs);
+      }
+    });
+    // "{{" closes itself with "}}", and typing the "}}" it added steps over them, as in the URL
+    // bar and the auth fields.
+    addr_->Bind(wxEVT_CHAR, [this](wxKeyEvent& e) {
+      const int k = static_cast<int>(e.GetUnicodeKey());
+      long from = 0, to = 0;
+      addr_->GetSelection(&from, &to);
+      if (k == '}' && addr_closed_ > 0 && from == to) {
+        const wxString v = addr_->GetValue();
+        if (from < static_cast<long>(v.length()) && v[static_cast<size_t>(from)] == '}') {
+          --addr_closed_;
+          addr_->SetInsertionPoint(from + 1);
+          return;
+        }
+      }
+      e.Skip();
+      if (k != '{') return;
+      CallAfter([this] {
+        const long p = addr_->GetInsertionPoint();
+        const wxString v = addr_->GetValue();
+        if (p < 0 || p > static_cast<long>(v.length())) return;
+        const std::string before = v.Left(static_cast<size_t>(p)).utf8_string();
+        const std::string after = v.Mid(static_cast<size_t>(p)).utf8_string();
+        const std::string close = http_editor::var_closer(before, after);
+        if (close.empty()) return;
+        addr_->WriteText(wxString::FromUTF8(close));
+        addr_->SetInsertionPoint(p);
+        addr_closed_ = static_cast<int>(close.size());
+      });
     });
     // A multi-line grpcurl command would lose its continuation lines in a single-line field.
     addr_->Bind(wxEVT_KEY_DOWN, [this](wxKeyEvent& e) {
@@ -694,6 +759,8 @@ class GrpcEditor : public wxPanel, public GrpcEditorPanel {
       bool tls = tls_->checked();
       if (strip_scheme(a, &tls)) {
         addr_->ChangeValue(wxString::FromUTF8(a));
+        addr_text_ = addr_->GetValue();
+        colour_addr_vars();
         tls_->set_checked(tls);
         update_tls_label();
         changed();
@@ -1499,6 +1566,42 @@ class GrpcEditor : public wxPanel, public GrpcEditorPanel {
     if (!loading_) host_->changed();
   }
 
+  // The workspace opened or the environment changed: {{var}} colours of the address follow.
+  void vars_changed() override { colour_addr_vars(); }
+
+  // {{name}} spans of the address in the var colours (resolved with the request's folders, as
+  // the send does), the resolved address as the tooltip. A few SetStyle calls on a short string.
+  void colour_addr_vars() {
+    if (!addr_) return;
+    const std::string t = addr_->GetValue().utf8_string();
+    const auto spans = http_editor::find_vars(t);
+    if (spans.empty() && !addr_coloured_) return;
+    const auto& th = http_editor::Theme::get();
+    // SetStyle on the rich edit control can raise wxEVT_TEXT: that is not an edit.
+    const bool was = loading_;
+    loading_ = true;
+    struct Restore {
+      bool& f;
+      bool v;
+      ~Restore() { f = v; }
+    } restore{loading_, was};
+    addr_->SetStyle(0, addr_->GetLastPosition(), wxTextAttr(addr_->GetForegroundColour()));
+    addr_coloured_ = !spans.empty();
+    const Workspace* ws = host_->workspace();
+    SavedRequest probe;
+    probe.kind = RequestKind::Grpc;
+    probe.file = host_->inherit_file();
+    for (const auto& s : spans) {
+      const std::string span = t.substr(s.begin, s.end - s.begin);
+      const bool ok = ws && ws->expand(span, probe) != span;
+      const long a = static_cast<long>(wxString::FromUTF8(t.substr(0, s.begin)).length());
+      const long b = a + static_cast<long>(wxString::FromUTF8(span).length());
+      addr_->SetStyle(a, b, wxTextAttr(ok ? th.var_ok : th.var_bad));
+    }
+    addr_->SetToolTip(spans.empty() || !ws ? wxString()
+                                           : wxString::FromUTF8("Connects to " + ws->expand(t, probe)));
+  }
+
   // Everything but the body.
   void store_fields(SavedRequest& r) const {
     store_head(r);
@@ -2257,9 +2360,13 @@ class GrpcEditor : public wxPanel, public GrpcEditorPanel {
       for (const GrpcMethodInfo* m : list) {
         const int id = 1000 + static_cast<int>(ids.size());
         ids.push_back(m);
-        auto* item = target->AppendCheckItem(id, wxString::FromUTF8("    " + m->method + "    " +
-                                                                    std::string(kind_long(m->kind))));
+        // gRPC-Web carries no client or bidi streams: those methods are listed but not pickable.
+        const bool off = web_->checked() && client_streams(m->kind);
+        auto* item = target->AppendCheckItem(
+            id, wxString::FromUTF8("    " + m->method + "    " + std::string(kind_long(m->kind)) +
+                                   (off ? "  (not over gRPC-Web)" : "")));
         item->Check(m->full_path == method_);
+        if (off) item->Enable(false);
       }
     }
     const wxPoint at = method_btn_->GetPosition() + wxPoint(0, method_btn_->GetSize().y);
@@ -2434,6 +2541,8 @@ class GrpcEditor : public wxPanel, public GrpcEditorPanel {
   }
 
   void maybe_load_schema(bool force) {
+    addr_timer_.Stop();
+    addr_wait_ = false;
     const std::string key = schema_key();
     if (!force && key == schema_key_) return;
     const bool reflect = source_->GetSelection() == kSourceReflection;
@@ -3003,6 +3112,7 @@ class GrpcEditor : public wxPanel, public GrpcEditorPanel {
     bool tls = g.tls;
     strip_scheme(a, &tls);
     addr_->ChangeValue(wxString::FromUTF8(a));
+    addr_text_ = addr_->GetValue();
     addr_->SetInsertionPointEnd();
     tls_->set_checked(tls);
     update_tls_label();
@@ -3338,6 +3448,7 @@ class GrpcEditor : public wxPanel, public GrpcEditorPanel {
   FlatButton* tls_ = nullptr;
   FlatButton* web_ = nullptr;
   wxTextCtrl* addr_ = nullptr;
+  bool addr_coloured_ = false;  // some of addr_ carries a {{var}} colour
   FlatButton* send_ = nullptr;
   FlatButton* grpcurl_ = nullptr;
   wxSplitterWindow* split_ = nullptr;
@@ -3448,6 +3559,7 @@ class GrpcEditor : public wxPanel, public GrpcEditorPanel {
   Clock::time_point pump_started_;
   bool in_flight_ = false;
   bool loading_ = false;
+  wxString addr_text_;  // the address the last wxEVT_TEXT saw
   UndoDoc undo_doc_, redo_doc_;  // see swap_history()
   size_t checked_len_ = 0;       // body length at the last check_json()
   std::wstring st_out_;
@@ -3456,6 +3568,10 @@ class GrpcEditor : public wxPanel, public GrpcEditorPanel {
   std::string ctor_times_, load_times_;  // construction / load() cost (self test INFO lines)
 
   wxTimer load_timer_, json_timer_, pump_timer_, flash_timer_;
+  wxTimer addr_timer_;  // reflection after the address stops changing (gRPC-Web toggle, failed load)
+  bool addr_wait_ = false;
+  int addr_closed_ = 0;  // closing braces {{ added after the caret in the address
+  static constexpr int kAddrIdleMs = 700;
   wxTimer tt_timer_;  // typing test (WATT_GRPCED_TYPETEST)
   int tt_run_ = -1, tt_pos_ = -1, tt_wait_ = 0;
   bool tt_popup_ = false;

@@ -8,6 +8,7 @@
 //     \", so in that mode a backslash escapes the next character.
 // and the curl options engineers actually use. Options that make no sense for an API tester
 // (-o, -w, -s, -v, ...) are accepted and ignored so a pasted command never fails on them.
+#include <algorithm>
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
@@ -1459,6 +1460,26 @@ std::optional<CurlImport> parse_curl(const std::string& cmd_in, std::string* err
       r.verify_tls = false;
     } else if (opt == "--location" || opt == "--location-trusted") {
       r.follow_redirects = true;
+      if (opt == "--location-trusted") r.keep_auth_on_redirect = true;
+    } else if (opt == "--max-redirs") {
+      if (!arg()) return false;
+      try {
+        const long n = std::stol(val);
+        r.max_redirects = std::clamp<long>(n < 0 ? 100L : n, 0L, 100L);  // -1: curl's "unlimited"
+      } catch (...) {
+      }
+    } else if (opt == "--post301" || opt == "--post302" || opt == "--post303") {
+      r.keep_method_on_redirect = true;
+    } else if (opt == "--path-as-is") {
+      r.encode_url = false;
+    } else if (opt == "--tlsv1" || opt == "--tlsv1.0") {
+      r.tls_min_version = TlsVersion::Tls1_0;
+    } else if (opt == "--tlsv1.1") {
+      r.tls_min_version = TlsVersion::Tls1_1;
+    } else if (opt == "--tlsv1.2") {
+      r.tls_min_version = TlsVersion::Tls1_2;
+    } else if (opt == "--tlsv1.3") {
+      r.tls_min_version = TlsVersion::Tls1_3;
     } else if (opt == "--head") {
       head = true;
     } else if (opt == "--get") {
@@ -1502,7 +1523,6 @@ std::optional<CurlImport> parse_curl(const std::string& cmd_in, std::string* err
           {"--interface", "the default interface is used"},
           {"--limit-rate", "the transfer is not rate-limited"},
           {"--aws-sigv4", "the request is not signed"},
-          {"--max-redirs", "curl's default redirect limit applies"},
           {"--noproxy", "no proxy is used"},
       };
       for (const auto& [name, why] : noted)
@@ -1697,8 +1717,9 @@ std::optional<CurlImport> parse_curl(const std::string& cmd_in, std::string* err
       !has_header(r.headers, "Content-Length"))
     r.headers.emplace_back("Content-Length", "0");
   // Accept-Encoding is kept exactly as given (browsers list br and zstd): it is part of the
-  // request the server sees. --compressed alone adds what curl offers: deflate, gzip.
-  if (compressed && !has_header(r.headers, "Accept-Encoding")) r.headers.emplace_back("Accept-Encoding", "deflate, gzip");
+  // request the server sees. --compressed alone is what the engine always does (it asks for
+  // deflate, gzip and decodes them: an automatic header), so it adds no header row.
+  (void)compressed;
 
   r.url = url;
   r.body = std::move(body);
@@ -1788,11 +1809,13 @@ std::string to_curl_impl(const HttpRequest& r, const std::vector<FormPart>& form
   if (r.url.find_first_of("[]{}") != std::string::npos) out += " -g";
   out += " " + q(r.url);
   const char* sep = shell == CurlShell::Cmd ? " ^\n  " : shell == CurlShell::PowerShell ? " `\n  " : " \\\n  ";
-  bool compressed = false;
+  // The engine always asks for deflate, gzip and decodes the body (curl does with --compressed),
+  // unless a header removes Accept-Encoding.
+  bool compressed = true;
   for (const auto& [k, v] : r.headers) {
     const std::string lk = lower(k);
     if (empty_body && lk == "content-length") continue;
-    if (lk == "accept-encoding" && !is_remove_marker(v)) compressed = true;
+    if (lk == "accept-encoding" && is_remove_marker(v)) compressed = false;
     out += sep;
     out += "-H " + q(v.empty() ? k + ";" : is_remove_marker(v) ? k + ":" : k + ": " + v);
   }
@@ -1848,7 +1871,19 @@ std::string to_curl_impl(const HttpRequest& r, const std::vector<FormPart>& form
   }
   std::string flags;
   if (!r.verify_tls) flags += " -k";
-  if (r.follow_redirects) flags += " -L";
+  if (r.follow_redirects) {
+    flags += r.keep_auth_on_redirect ? " --location-trusted" : " -L";
+    if (r.max_redirects != HttpRequest{}.max_redirects) flags += " --max-redirs " + std::to_string(r.max_redirects);
+    if (r.keep_method_on_redirect) flags += " --post301 --post302 --post303";
+  }
+  if (!r.encode_url) flags += " --path-as-is";
+  switch (r.tls_min_version) {
+    case TlsVersion::Tls1_0: flags += " --tlsv1.0"; break;
+    case TlsVersion::Tls1_1: flags += " --tlsv1.1"; break;
+    case TlsVersion::Tls1_2: flags += " --tlsv1.2"; break;
+    case TlsVersion::Tls1_3: flags += " --tlsv1.3"; break;
+    default: break;
+  }
   // Only a timeout the user chose: every request starts with the default, and curl has none.
   if (r.timeout_ms > 0 && r.timeout_ms != HttpRequest{}.timeout_ms) flags += " --max-time " + seconds(r.timeout_ms);
   switch (r.version) {
@@ -1880,8 +1915,9 @@ std::string to_curl_command(const SavedRequest& r, CurlShell shell) {
   bool has_form = false;
   for (const auto& p : r.form) has_form = has_form || p.enabled;
   const std::string* file = r.body_file.empty() || has_form ? nullptr : &r.body_file;
-  if (r.disabled_headers.empty()) return to_curl_impl(r.http, r.form, r.basic_auth, shell, file, &r);
   HttpRequest h = r.http;  // disabled headers are not sent, so not exported
+  apply_network_options(r.network, h);  // the request's own redirect / URL / TLS options
+  if (r.disabled_headers.empty()) return to_curl_impl(h, r.form, r.basic_auth, shell, file, &r);
   h.headers.clear();
   for (size_t k = 0; k < r.http.headers.size(); ++k)
     if (!r.disabled_headers.count(k)) h.headers.push_back(r.http.headers[k]);

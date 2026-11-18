@@ -60,6 +60,7 @@ enum TreeImage {
   kImgGrpcClient,  // client streaming: up arrow
   kImgGrpcBidi,    // bidirectional: up-down arrow
   kImgFolderEmpty,  // a folder with nothing in it: no expand chevron
+  kImgWs,           // WebSocket request: "WS"
   kImgCount
 };
 int tree_image(RequestKind kind, std::string_view method);

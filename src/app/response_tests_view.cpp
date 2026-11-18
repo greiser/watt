@@ -89,29 +89,57 @@ class TestList : public wxListCtrl {
     fail_.SetFont(GetFont().Bold());
     Bind(wxEVT_SIZE, [this](wxSizeEvent& e) {
       e.Skip();
-      if (fit_pending_) return;
-      fit_pending_ = true;
-      CallAfter([this] {
-        fit_pending_ = false;
-        // Result fixed; the rest shares the width: target 24%, check 17%, actual 21%, and the note
-        // (why a check failed) the most, 38%.
-        const int r = FromDIP(64);
-        const int w = std::max(FromDIP(300), GetClientSize().x - r - 2);
-        const int widths[] = {r, w * 24 / 100, w * 17 / 100, w * 21 / 100, w - w * 24 / 100 - w * 17 / 100 - w * 21 / 100};
-        // Frozen: every SetColumnWidth repaints the list at once otherwise (~50 ms each).
-        Freeze();
-        for (int c = 0; c < 5; ++c)
-          if (GetColumnWidth(c) != widths[c]) SetColumnWidth(c, widths[c]);
-        Thaw();
-      });
+      schedule_fit();
     });
   }
   void refresh_rows() {
     SetItemCount(static_cast<long>(v_->asserts_.size()));
     Refresh();
+    schedule_fit();  // the columns follow what the rows hold
   }
 
  private:
+  void schedule_fit() {
+    if (fit_pending_) return;
+    fit_pending_ = true;
+    CallAfter([this] {
+      fit_pending_ = false;
+      fit();
+    });
+  }
+  // Result fixed. Target, Check and Actual get what their text needs (measured over the first
+  // rows), as long as the Note keeps at least a quarter of the width; when they need more, the
+  // room is shared in proportion to the need. The Note (why a check failed) gets the rest.
+  void fit() {
+    const int r = FromDIP(64);
+    const int w = std::max(FromDIP(300), GetClientSize().x - r - 2);
+    const int pad = FromDIP(16);
+    static const char* const kHead[] = {"", "Target", "Check", "Actual"};
+    int need[4] = {0, 0, 0, 0};
+    for (int c = 1; c <= 3; ++c) need[c] = GetTextExtent(kHead[c]).x + pad;
+    const long n = std::min<long>(GetItemCount(), 200);
+    for (long i = 0; i < n; ++i)
+      for (int c = 1; c <= 3; ++c) {
+        const wxString t = OnGetItemText(i, c);
+        if (t.empty()) continue;
+        // Long values are cut anyway: no need to measure more than ~120 characters.
+        need[c] = std::max(need[c], GetTextExtent(t.length() > 120 ? t.Left(120) : t).x + pad);
+      }
+    const int lo = w * 10 / 100;  // never narrower than this
+    for (int c = 1; c <= 3; ++c) need[c] = std::max(need[c], lo);
+    const int avail = w - w * 25 / 100;
+    const int sum = need[1] + need[2] + need[3];
+    int cols[4] = {r, need[1], need[2], need[3]};
+    if (sum > avail)
+      for (int c = 1; c <= 3; ++c) cols[c] = std::max(lo, static_cast<int>(static_cast<long long>(need[c]) * avail / sum));
+    const int note = std::max(w * 20 / 100, w - cols[1] - cols[2] - cols[3]);
+    const int widths[] = {cols[0], cols[1], cols[2], cols[3], note};
+    // Frozen: every SetColumnWidth repaints the list at once otherwise (~50 ms each).
+    Freeze();
+    for (int c = 0; c < 5; ++c)
+      if (GetColumnWidth(c) != widths[c]) SetColumnWidth(c, widths[c]);
+    Thaw();
+  }
   const TestRow* row(long i) const {
     return static_cast<size_t>(i) < v_->rows_.size() ? &v_->rows_[static_cast<size_t>(i)] : nullptr;
   }
@@ -491,15 +519,7 @@ void TestsView::apply_script() {
       script_fit_pending_ = true;
       CallAfter([this] {
         script_fit_pending_ = false;
-        const int r = FromDIP(64);
-        const int w = std::max(FromDIP(300), script_list_->GetClientSize().x - r - 2);
-        const int ph = FromDIP(104);  // "post-response"
-        const int rest = std::max(FromDIP(200), w - ph);
-        const int widths[] = {r, rest * 40 / 100, ph, rest - rest * 40 / 100};
-        script_list_->Freeze();  // (each width change would repaint the list at once)
-        for (int i = 0; i < 4; ++i)
-          if (script_list_->GetColumnWidth(i) != widths[i]) script_list_->SetColumnWidth(i, widths[i]);
-        script_list_->Thaw();
+        fit_script_columns();
       });
     });
     // The full message of the row under the mouse (the column cuts it); Ctrl+C copies it.
@@ -529,8 +549,40 @@ void TestsView::apply_script() {
     size_t at = sz->GetItemCount();
     for (size_t i = 0; i < sz->GetItemCount(); ++i)
       if (sz->GetItem(i)->GetWindow() == caps_title_) at = i;
+    script_err_ = new wxStaticText(this, wxID_ANY, "", wxDefaultPosition, wxDefaultSize, wxST_NO_AUTORESIZE);
+    script_err_->SetForegroundColour(th.err);
+    script_err_->Hide();
+    sz->Insert(at, script_err_, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, FromDIP(8));
     sz->Insert(at, script_list_, 0, wxEXPAND);
     sz->Insert(at, script_title_, 0, wxLEFT | wxTOP | wxBOTTOM, FromDIP(8));
+    // Re-wrapped when the pane width changes (after the layout, once per burst of size events).
+    Bind(wxEVT_SIZE, [this](wxSizeEvent& e) {
+      e.Skip();
+      if (script_err_ && script_err_->IsShown()) CallAfter([this] { wrap_script_err(); });
+    });
+  }
+  {
+    // A script error or failed test message too long for the list's Message column (or on several
+    // lines) in full under the list, one per line ("post-response: line 3:1: ReferenceError: ...").
+    // One that fits is said once, in its row.
+    std::string t;
+    size_t shown = 0;
+    for (const ScriptTestRow& r : sr.rows) {
+      if (r.state == ScriptTestRow::Pass || r.message.empty()) continue;
+      if (r.message.size() <= 90 && r.message.find('\n') == std::string::npos) continue;
+      if (++shown > 5) {
+        t += "\xE2\x80\xA6";
+        break;
+      }
+      std::string msg = r.message.size() > 600 ? r.message.substr(0, 600) + "\xE2\x80\xA6" : r.message;
+      for (char& c : msg)
+        if (c == '\r' || c == '\t') c = ' ';
+      if (!t.empty()) t += '\n';
+      t += "\xE2\x9C\x97 " + (r.state == ScriptTestRow::Error ? r.phase + " script" : r.name) + ": " + msg;
+    }
+    script_err_text_ = std::move(t);
+    script_err_->Show(!script_err_text_.empty());
+    if (!script_err_text_.empty()) wrap_script_err();
   }
   script_list_->Freeze();
   script_list_->DeleteAllItems();
@@ -565,8 +617,17 @@ void TestsView::apply_script() {
     if (script_fail_) title += ", " + std::to_string(script_fail_) + " failed";
     colour = script_fail_ ? th.err : th.ok;
   }
+  if (!sr.rows.empty()) {
+    bool one_phase = true;
+    for (const ScriptTestRow& r : sr.rows)
+      if (r.phase != sr.rows.front().phase) one_phase = false;
+    // (The note names the script with its time already when it ran.)
+    if (one_phase && sr.note.find(sr.rows.front().phase) == std::string::npos)
+      title += "  \xC2\xB7  " + sr.rows.front().phase + " script";
+  }
   if (!sr.note.empty()) title += "  \xC2\xB7  " + sr.note;
   script_title_->SetLabel(U(title));
+  fit_script_columns();
   script_title_->SetForegroundColour(colour);
   const int rh = FromDIP(22);
   const int visible = std::clamp<int>(static_cast<int>(n), 1, 10);
@@ -574,6 +635,37 @@ void TestsView::apply_script() {
   script_title_->Show(show);
   script_list_->Show(show && n > 0);
   update_summary();
+}
+
+// Result | Test | Script | Message. The Script column only when the rows come from both scripts
+// (the title names the one script otherwise: "post-response" on every row says nothing).
+void TestsView::fit_script_columns() {
+  if (!script_list_) return;
+  bool one_phase = true;
+  for (const ScriptTestRow& r : script_.rows)
+    if (r.phase != script_.rows.front().phase) one_phase = false;
+  const int r = FromDIP(64);
+  const int w = std::max(FromDIP(300), script_list_->GetClientSize().x - r - 2);
+  const int ph = one_phase ? 0 : FromDIP(104);  // "post-response"
+  const int rest = std::max(FromDIP(200), w - ph);
+  const int widths[] = {r, rest * 40 / 100, ph, rest - rest * 40 / 100};
+  script_list_->Freeze();  // (each width change would repaint the list at once)
+  for (int i = 0; i < 4; ++i)
+    if (script_list_->GetColumnWidth(i) != widths[i]) script_list_->SetColumnWidth(i, widths[i]);
+  script_list_->Thaw();
+}
+
+void TestsView::wrap_script_err() {
+  if (!script_err_ || script_err_text_.empty()) return;
+  const int w = std::max(FromDIP(200), GetClientSize().x - FromDIP(16));
+  if (w == script_err_w_ && script_err_text_ == script_err_shown_) return;
+  script_err_w_ = w;
+  script_err_shown_ = script_err_text_;
+  script_err_->SetLabel(U(script_err_text_));
+  script_err_->Wrap(w);
+  const int lines = static_cast<int>(script_err_->GetLabel().Freq('\n')) + 1;
+  script_err_->SetMinSize(wxSize(w, lines * script_err_->GetCharHeight() + FromDIP(2)));
+  Layout();
 }
 
 // The inherited group: the folders' / collection's checks, read-only, with their origin. Created
@@ -879,9 +971,15 @@ void TestsView::update_summary() {
   } else if (!have_response_ || rows_.empty()) {
     note = std::to_string(on) + (on == 1 ? " check" : " checks") + " \xC2\xB7 run on the next response";
   } else {
-    note = std::to_string(passed_) + " of " + std::to_string(on) + " passed";
+    // One total first (the same as the tab's badge and the status line: assertions, folder checks
+    // and script tests together), then the split.
+    const int all_pass = passed_ + inh_pass_ + script_pass_;
+    const int all = passed_ + failed_ + inh_pass_ + inh_fail_ + script_pass_ + script_fail_;
+    const bool split = inh_pass_ + inh_fail_ + script_pass_ + script_fail_ > 0;
+    note = std::to_string(all_pass) + " of " + std::to_string(all) + " passed";
     if (rechecked_) note = "checked now against the restored run: " + note;
-    if (failed_) note += " \xC2\xB7 " + std::to_string(failed_) + " failed";
+    if (split) note += " \xC2\xB7 assertions " + std::to_string(passed_) + "/" + std::to_string(passed_ + failed_);
+    else if (failed_) note += " \xC2\xB7 " + std::to_string(failed_) + " failed";
     if (off) note += " \xC2\xB7 " + std::to_string(off) + " off";
     if (inh_pass_ + inh_fail_ > 0)
       note += " \xC2\xB7 folders " + std::to_string(inh_pass_) + "/" + std::to_string(inh_pass_ + inh_fail_);

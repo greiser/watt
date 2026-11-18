@@ -121,11 +121,27 @@ FuzzyQuery::FuzzyQuery(std::string_view query) {
   }
 }
 
+// A number in a query word is an id ("svc150", "v2"): its digits must stand together in the
+// target. Scattered digits matched "svc150" in "service-152/delete resource 0 of svc152".
+bool numbers_present(const std::string& w, std::string_view t) {
+  for (size_t i = 0; i < w.size();) {
+    if (w[i] < '0' || w[i] > '9') {
+      ++i;
+      continue;
+    }
+    size_t e = i;
+    while (e < w.size() && w[e] >= '0' && w[e] <= '9') ++e;
+    if (e - i > 1 && t.find(std::string_view(w).substr(i, e - i)) == std::string_view::npos) return false;
+    i = e;
+  }
+  return true;
+}
+
 bool FuzzyQuery::match(std::string_view target, size_t name_start, int* score, std::vector<uint16_t>* pos) const {
   int s = 0;
   if (pos) pos->clear();
   for (const auto& w : words_)
-    if (!match_word(w, target, name_start, &s, pos)) return false;
+    if (!numbers_present(w, target) || !match_word(w, target, name_start, &s, pos)) return false;
   if (pos) {
     std::sort(pos->begin(), pos->end());
     pos->erase(std::unique(pos->begin(), pos->end()), pos->end());
@@ -133,6 +149,32 @@ bool FuzzyQuery::match(std::string_view target, size_t name_start, int* score, s
   // Shorter targets win ties (a tighter match).
   *score = s * 4 - static_cast<int>(std::min<size_t>(target.size(), 200)) / 8;
   return true;
+}
+
+std::string url_search_text(std::string_view url) {
+  const size_t sch = url.find("://");
+  const size_t a = sch == std::string_view::npos ? 0 : sch + 3;
+  // Without a scheme only a leading host:port / IP is an authority ("127.0.0.1:8080/x").
+  size_t e = url.find_first_of("/?#", a);
+  if (e == std::string_view::npos) e = url.size();
+  std::string_view auth = url.substr(a, e - a);
+  if (auth.empty() || auth.find("{{") != std::string_view::npos) return std::string(url);
+  if (sch == std::string_view::npos &&
+      (auth.find_first_not_of("0123456789.:[]") != std::string_view::npos || auth.find_first_of(".:") == std::string_view::npos))
+    return std::string(url);  // "users/42" or "42/items": a path, not a host
+  if (const size_t at = auth.rfind('@'); at != std::string_view::npos) auth = auth.substr(at + 1);
+  std::string_view host = auth;
+  if (!host.empty() && host[0] == '[') {
+    const size_t rb = host.find(']');
+    host = host.substr(0, rb == std::string_view::npos ? host.size() : rb + 1);
+  } else if (const size_t c = host.rfind(':'); c != std::string_view::npos) {
+    host = host.substr(0, c);
+  }
+  const bool numeric = host.find_first_not_of("0123456789.:[]") == std::string_view::npos;
+  std::string out(url.substr(0, a));
+  if (!numeric) out += host;
+  out += url.substr(e);
+  return out;
 }
 
 bool words_match(std::string_view q, std::string_view target) {

@@ -952,11 +952,17 @@ struct TransferCtx {
   // has not seen yet and kept across sends; a reused connection costs one CONN_ID lookup.
   ConnCache conns;
   VerifyMode verify_mode;
+  // Head hook (HeadFn): fired once per final header block; t0 / t_io as in send().
+  const HeadFn* on_head = nullptr;
+  bool head_sent = false;
+  bool client_cert = false;
+  Clock::time_point t0{}, t_io{};
 
   void begin(HttpResponse* r, const BodyChunkFn* chunk, const HttpRequest& req) {
     resp = r;
     on_chunk = chunk;
     has_chunk = chunk && *chunk;
+    head_sent = false;
     keep_body = req.keep_body;
     follow = req.follow_redirects;
     hop_open = false;
@@ -993,6 +999,8 @@ const char* version_name(std::string_view v) {
 
 bool is_redirect_code(long s) { return s == 301 || s == 302 || s == 303 || s == 307 || s == 308; }
 
+void fire_head(TransferCtx* ctx);  // below split_hop
+
 size_t on_header(char* buf, size_t size, size_t nitems, void* userdata) {
   auto* ctx = static_cast<TransferCtx*>(userdata);
   const size_t n = size * nitems;
@@ -1008,6 +1016,7 @@ size_t on_header(char* buf, size_t size, size_t nitems, void* userdata) {
     r.status_text.clear();
     ctx->hop_status = 0;
     ctx->have_location = false;
+    ctx->head_sent = false;
     std::string_view rest = trim(line);
     size_t sp = rest.find(' ');
     if (sp != std::string_view::npos) {
@@ -1038,6 +1047,10 @@ size_t on_header(char* buf, size_t size, size_t nitems, void* userdata) {
       if (curl_easy_getinfo(ctx->easy, CURLINFO_PRIMARY_IP, &s) == CURLE_OK && s) h.ip = s;
       curl_easy_getinfo(ctx->easy, CURLINFO_PRIMARY_PORT, &h.port);
       ctx->hop_open = true;
+    } else if (ctx->hop_status >= 200 && !ctx->head_sent && ctx->on_head && *ctx->on_head) {
+      // The final response's head (trailers after the body end with a blank line too: once).
+      ctx->head_sent = true;
+      fire_head(ctx);
     }
     return n;
   }
@@ -1222,6 +1235,84 @@ curl_off_t us_between(Clock::time_point a, Clock::time_point b) {
   return static_cast<curl_off_t>(std::chrono::duration<double, std::micro>(b - a).count());
 }
 
+// The final response's head as HeadFn hands it over (see http_client.h): what the header
+// callback has parsed, the connection as read at pre-request time, and the phases up to the
+// first response byte, split like send() splits them (download and process are still running).
+void fire_head(TransferCtx* ctx) {
+  const auto now = Clock::now();
+  CURL* e = ctx->easy;
+  const HttpResponse& r = *ctx->resp;
+  HttpResponse h;
+  h.ok = true;
+  h.status = ctx->hop_status;
+  h.status_text = r.status_text;
+  h.http_version = ctx->hop_version;
+  h.headers = r.headers;
+  char* s = nullptr;
+  if (curl_easy_getinfo(e, CURLINFO_EFFECTIVE_URL, &s) == CURLE_OK && s) h.effective_url = s;
+  s = nullptr;
+  if (curl_easy_getinfo(e, CURLINFO_PRIMARY_IP, &s) == CURLE_OK && s) h.remote_ip = s;
+  curl_easy_getinfo(e, CURLINFO_PRIMARY_PORT, &h.remote_port);
+  curl_off_t cid = -1;
+  curl_easy_getinfo(e, CURLINFO_CONN_ID, &cid);
+  if (const ConnEntry* ce = ctx->conns.find(cid)) {
+    h.conn = ce->info;
+    h.local_ip = ce->info.local_ip;
+    h.local_port = ce->info.local_port;
+    if (const TlsInfo* t = ce->info.tls_info.get()) {
+      h.tls_version = t->version;
+      h.tls_cipher = t->cipher;
+      h.cert_subject = t->leaf.subject;
+      h.cert_san = ce->cert_san;
+      h.cert_issuer = t->leaf.issuer;
+      h.cert_not_after = ce->cert_not_after;
+      h.cert_chain = t->chain;
+      h.verify_result = t->verify_result;
+    }
+  }
+  h.conn.client_cert = ctx->client_cert;
+  h.redirect_count = static_cast<long>(ctx->hops.size());
+  h.sizes.response_headers = ctx->hop_header_bytes;
+  // Every earlier hop is closed (its successor's status line closed it): R is where this one
+  // started on curl's clock.
+  Marks base;
+  curl_off_t R = 0;
+  if (!ctx->hops.empty()) {
+    base = ctx->hops.back().at_end;
+    R = std::max<curl_off_t>(ctx->hops.back().redirect_end, 0);
+  }
+  Marks f = Marks::read(e).minus(base);
+  const auto final_start = ctx->t_io + std::chrono::microseconds(R);
+  bool opened = false;
+  for (size_t i = 0; i < ctx->n_opens && !opened; ++i) opened = ctx->opens[i].at >= final_start;
+  const bool reused = f.conns == 0 && !opened;
+  // The first byte is here: a first-byte mark curl has not stamped yet is now.
+  const curl_off_t so_far = std::max<curl_off_t>(us_between(final_start, now), 0);
+  if (f.st <= 0) f.st = so_far;
+  const curl_off_t st = std::max({f.q, f.n, f.c, f.a, f.p, f.pt, f.st});
+  const Phases ph = split_hop(f, st, reused, final_start, *ctx, h.remote_ip);
+  Timing& tm = h.timing;
+  tm.connection_reused = reused;
+  h.conn.reused = reused;
+  tm.queue_ms = us_ms(ph.queue);
+  tm.dns_ms = us_ms(ph.dns);
+  h.socket_ms = us_ms(ph.socket);
+  tm.connect_ms = us_ms(ph.connect);
+  tm.tls_ms = us_ms(ph.tls);
+  tm.send_ms = us_ms(ph.send);
+  tm.ttfb_ms = us_ms(ph.ttfb);
+  tm.download_ms = 0;
+  h.redirect_ms = us_ms(R);
+  h.prepare_ms = ms_between(ctx->t0, ctx->t_io);
+  tm.bytes_sent = static_cast<uint64_t>(Marks::read(e).req);
+  tm.bytes_received = ctx->hop_header_bytes;
+  tm.total_ms = h.prepare_ms + h.redirect_ms + us_ms(ph.queue + ph.dns + ph.socket + ph.connect + ph.tls + ph.send + ph.ttfb);
+  try {
+    (*ctx->on_head)(h);
+  } catch (...) {  // never let an exception unwind through libcurl's C frames
+  }
+}
+
 constexpr const char* kUserAgent = "watt/0.1";
 
 }  // namespace
@@ -1327,6 +1418,7 @@ struct HttpClient::Impl {
     bool valid = false;
     std::string url;
     long timeout = 0, version = 0, follow = 0;
+    long max_redirs = 30, post_redir = 0, unrestricted = 0, as_is = 0, tls_min = CURL_SSLVERSION_DEFAULT;
     bool verify = false, fresh = false;
     std::string ca_pem;
     int kind = 0;  // 0 GET-like, 1 HEAD, 2 with body
@@ -1425,6 +1517,35 @@ struct HttpClient::Impl {
     last.aws_sigv4 = req.aws_sigv4;
   }
 
+  // Redirect limit / method / credentials, URL as written, lowest TLS version: set when changed.
+  void apply_redirect_url_tls(const HttpRequest& req, bool all) {
+    CURL* h = easy;
+    const long redirs = std::clamp<long>(req.max_redirects, 0L, 100L);
+    if (all ? redirs != 30L : redirs != last.max_redirs) curl_easy_setopt(h, CURLOPT_MAXREDIRS, redirs);
+    last.max_redirs = redirs;
+    const long post = req.keep_method_on_redirect ? CURL_REDIR_POST_ALL : 0L;
+    if (all ? post != 0 : post != last.post_redir) curl_easy_setopt(h, CURLOPT_POSTREDIR, post);
+    last.post_redir = post;
+    // Windows SSO (NTLM / Negotiate, SSPI: possibly the current logon) never goes to another host.
+    const bool sspi = req.auth == HttpRequest::Auth::Ntlm || req.auth == HttpRequest::Auth::Negotiate;
+    const long unres = req.keep_auth_on_redirect && !sspi ? 1L : 0L;
+    if (all ? unres != 0 : unres != last.unrestricted) curl_easy_setopt(h, CURLOPT_UNRESTRICTED_AUTH, unres);
+    last.unrestricted = unres;
+    const long as_is = req.encode_url ? 0L : 1L;
+    if (all ? as_is != 0 : as_is != last.as_is) curl_easy_setopt(h, CURLOPT_PATH_AS_IS, as_is);
+    last.as_is = as_is;
+    long tls = CURL_SSLVERSION_DEFAULT;
+    switch (req.tls_min_version) {
+      case TlsVersion::Default: tls = CURL_SSLVERSION_DEFAULT; break;
+      case TlsVersion::Tls1_0: tls = CURL_SSLVERSION_TLSv1_0; break;
+      case TlsVersion::Tls1_1: tls = CURL_SSLVERSION_TLSv1_1; break;
+      case TlsVersion::Tls1_2: tls = CURL_SSLVERSION_TLSv1_2; break;
+      case TlsVersion::Tls1_3: tls = CURL_SSLVERSION_TLSv1_3; break;
+    }
+    if (all ? tls != CURL_SSLVERSION_DEFAULT : tls != last.tls_min) curl_easy_setopt(h, CURLOPT_SSLVERSION, tls);
+    last.tls_min = tls;
+  }
+
   void apply(const HttpRequest& req) {
     CURL* h = easy;
     const bool all = !last.valid;
@@ -1492,11 +1613,13 @@ struct HttpClient::Impl {
       last.custom = want_custom;
     }
     // OBEYCODE: a custom method is still switched to GET on 301/302/303 like a browser would.
-    const long follow = !req.follow_redirects    ? 0L
-                        : custom || send_body ? CURLFOLLOW_OBEYCODE
-                                              : CURLFOLLOW_ALL;
+    // keep_method_on_redirect: the method (custom or POST) and body go to every hop.
+    const long follow = !req.follow_redirects                                   ? 0L
+                        : (custom || send_body) && !req.keep_method_on_redirect ? CURLFOLLOW_OBEYCODE
+                                                                                : CURLFOLLOW_ALL;
     if (all || follow != last.follow) curl_easy_setopt(h, CURLOPT_FOLLOWLOCATION, follow);
     last.follow = follow;
+    apply_redirect_url_tls(req, all);
     apply_auth(req, all);
     apply_cert(req, all);
     apply_proxy(req, all);
@@ -1638,6 +1761,10 @@ void HttpClient::cancel() {
 }
 
 HttpResponse HttpClient::send(const HttpRequest& req, const BodyChunkFn& on_chunk) {
+  return send(req, on_chunk, HeadFn{});
+}
+
+HttpResponse HttpClient::send(const HttpRequest& req, const BodyChunkFn& on_chunk, const HeadFn& on_head) {
   const auto t0 = Clock::now();
   HttpResponse resp;
   Impl& im = *impl_;
@@ -1661,6 +1788,9 @@ HttpResponse HttpClient::send(const HttpRequest& req, const BodyChunkFn& on_chun
   im.errbuf[0] = '\0';
   TransferCtx& ctx = im.ctx;
   ctx.begin(&resp, &on_chunk, req);
+  ctx.on_head = on_head ? &on_head : nullptr;
+  ctx.client_cert = !req.client_cert.empty() && is_https_url(req.url);
+  ctx.t0 = t0;
 
   // While a client is in use the process asks for 1 ms timer resolution (as Chromium-based
   // tools do). With Windows' default 15.6 ms tick the CPU drops into deep idle during every
@@ -1691,6 +1821,7 @@ HttpResponse HttpClient::send(const HttpRequest& req, const BodyChunkFn& on_chun
   CURLMcode mc = curl_multi_add_handle(im.multi, h);
   const bool added = mc == CURLM_OK;
   const auto t_io = Clock::now();
+  ctx.t_io = t_io;
   auto t_curl = t_io;
   // See HttpRequest::busy_poll_ms: for the first busy_poll_ms of the transfer this thread
   // stays on the CPU and re-polls curl instead of sleeping until the network wakes it.

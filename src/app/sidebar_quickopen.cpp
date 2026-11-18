@@ -1,5 +1,7 @@
 #include "app/sidebar_quickopen.h"
 
+#include <chrono>
+
 #include <wx/dc.h>
 #include <wx/dialog.h>
 #include <wx/sizer.h>
@@ -239,6 +241,10 @@ class QuickOpenDialog : public wxDialog {
       }
       rows_.push_back(std::move(r));
     }
+    // Nothing matches every word: the closest, where a word may match only by its start ("svc150"
+    // as "svc15": a number typed one digit off), fewest characters dropped first.
+    near_ = false;
+    if (rows_.empty() && !fq.empty()) near_fill(fq.words(), have_kind, want_kind, want_method);
     if (fq.empty()) {
       // Recently used first, then by path.
       std::stable_sort(rows_.begin(), rows_.end(), [this](const Row& a, const Row& b) {
@@ -247,7 +253,7 @@ class QuickOpenDialog : public wxDialog {
         if (ra >= 0) return ra < rb;
         return targets_[a.item] < targets_[b.item];
       });
-    } else {
+    } else if (!near_) {  // near_fill() ordered its rows
       std::stable_sort(rows_.begin(), rows_.end(), [this](const Row& a, const Row& b) {
         if (a.score != b.score) return a.score > b.score;
         const int ra = items_[a.item].recent, rb = items_[b.item].recent;
@@ -259,8 +265,57 @@ class QuickOpenDialog : public wxDialog {
     if (!rows_.empty()) list_->SetSelection(0);
     list_->Refresh();
     if (items_.empty()) count_->SetLabel("No saved requests in this workspace yet (Ctrl+S saves the current tab)");
+    else if (near_) count_->SetLabel(wxString::Format("No exact match: %zu close", rows_.size()) +
+                                     wxString::FromUTF8("   ↑↓ move   Enter open   Esc close"));
     else count_->SetLabel(wxString::Format("%zu of %zu requests", rows_.size(), items_.size()) +
                           wxString::FromUTF8("   ↑↓ move   Enter open   Esc close"));
+  }
+
+  void near_fill(const std::vector<std::string>& words, bool have_kind, RequestKind want_kind,
+                 const std::string& want_method) {
+    // Per word, its prefixes from the longest down to 60% of it (at least 2 characters).
+    std::vector<std::vector<std::pair<FuzzyQuery, size_t>>> pre(words.size());
+    for (size_t w = 0; w < words.size(); ++w)
+      for (size_t len = words[w].size(); len >= 2 && len * 5 >= words[w].size() * 3; --len)
+        pre[w].emplace_back(FuzzyQuery(words[w].substr(0, len)), words[w].size() - len);
+    struct Near {
+      Row row;
+      size_t dropped;
+    };
+    std::vector<Near> found;
+    for (size_t i = 0; i < items_.size(); ++i) {
+      const QuickItem& it = items_[i];
+      if (have_kind) {
+        if (it.kind != want_kind) continue;
+        if (want_kind == RequestKind::Http && (!it.badge || ascii_lower(it.method) != want_method)) continue;
+      }
+      const size_t ns = it.folder.empty() ? 0 : it.folder.size() + 1;
+      Near n{Row{i, 0, {}}, 0};
+      bool ok = true;
+      for (size_t w = 0; w < pre.size() && ok; ++w) {
+        ok = false;
+        for (const auto& [q, dropped] : pre[w]) {
+          int s = 0;
+          std::vector<uint16_t> pos;
+          if (!q.match(targets_[i], ns, &s, &pos)) continue;
+          n.row.score += s;
+          n.row.pos.insert(n.row.pos.end(), pos.begin(), pos.end());
+          n.dropped += dropped;
+          ok = true;
+          break;
+        }
+      }
+      if (!ok) continue;
+      std::sort(n.row.pos.begin(), n.row.pos.end());
+      n.row.pos.erase(std::unique(n.row.pos.begin(), n.row.pos.end()), n.row.pos.end());
+      found.push_back(std::move(n));
+    }
+    std::stable_sort(found.begin(), found.end(), [](const Near& a, const Near& b) {
+      if (a.dropped != b.dropped) return a.dropped < b.dropped;
+      return a.row.score > b.row.score;
+    });
+    for (auto& n : found) rows_.push_back(std::move(n.row));
+    near_ = !rows_.empty();
   }
 
   void accept() {
@@ -279,16 +334,36 @@ class QuickOpenDialog : public wxDialog {
   ResultList* list_;
   wxStaticText* count_;
   bool ready_ = false;
+  bool near_ = false;  // the rows are near matches (near_fill())
   bool accepted_ = false;  // accept() ran: ignore the deactivation that EndModal itself causes
 };
 
 }  // namespace
+
+namespace {
+struct QuickPick {
+  std::filesystem::path file;
+  std::chrono::steady_clock::time_point at{};
+};
+QuickPick& quick_pick() {
+  static QuickPick p;  // UI thread only
+  return p;
+}
+}  // namespace
+
+bool take_quick_pick(const std::filesystem::path& file) {
+  QuickPick& p = quick_pick();
+  if (p.file.empty() || p.file != file || std::chrono::steady_clock::now() - p.at > std::chrono::seconds(5)) return false;
+  p.file.clear();
+  return true;
+}
 
 std::filesystem::path quick_open(wxWindow* parent, std::vector<QuickItem> items) {
   QuickOpenDialog dlg(parent, std::move(items));
   // The chosen file wins over the return code: hiding the dialog deactivates it, and a queued
   // "click outside" cancel must never discard a choice the user already made.
   dlg.ShowModal();
+  quick_pick() = {dlg.chosen, std::chrono::steady_clock::now()};
   return dlg.chosen;
 }
 

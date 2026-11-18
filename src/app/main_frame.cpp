@@ -50,6 +50,7 @@ enum {
   ID_NEXT_TAB,
   ID_PREV_TAB,
   ID_FOCUS_FILTER,
+  ID_NEW_WS_TAB,
 };
 
 // The frame, for background threads that finish after it is gone (cleared in ~MainFrame).
@@ -361,6 +362,7 @@ MainFrame::MainFrame(std::filesystem::path workspace_dir)
       {wxACCEL_CTRL, WXK_NUMPAD_ENTER, ID_SEND},
       {wxACCEL_CTRL, 'T', ID_NEW_TAB},
       {wxACCEL_CTRL | wxACCEL_SHIFT, 'T', ID_NEW_GRPC_TAB},
+      {wxACCEL_CTRL | wxACCEL_ALT, 'T', ID_NEW_WS_TAB},
       {wxACCEL_CTRL, 'W', ID_CLOSE_TAB},
       {wxACCEL_CTRL, WXK_F4, ID_CLOSE_TAB},
       {wxACCEL_CTRL, 'L', ID_FOCUS_URL},
@@ -378,6 +380,7 @@ MainFrame::MainFrame(std::filesystem::path workspace_dir)
   }, ID_SEND);
   Bind(wxEVT_MENU, [this](wxCommandEvent&) { new_request(RequestKind::Http, {}); }, ID_NEW_TAB);
   Bind(wxEVT_MENU, [this](wxCommandEvent&) { new_request(RequestKind::Grpc, {}); }, ID_NEW_GRPC_TAB);
+  Bind(wxEVT_MENU, [this](wxCommandEvent&) { new_request(RequestKind::WebSocket, {}); }, ID_NEW_WS_TAB);
   Bind(wxEVT_MENU, [this](wxCommandEvent&) { if (nb_->GetSelection() >= 0) close_tab(nb_->GetSelection()); }, ID_CLOSE_TAB);
   Bind(wxEVT_MENU, [this](wxCommandEvent&) { if (auto* t = current_tab()) t->focus_url(); }, ID_FOCUS_URL);
   Bind(wxEVT_MENU, [this](wxCommandEvent&) { save_current(); }, ID_SAVE);
@@ -676,6 +679,7 @@ struct MainFrame::SessionSnapshot {
     bool dirty = false, preview = false;
     LastResponse resp;
     std::shared_ptr<const GrpcSchema> schema;  // a gRPC tab's schema (RequestTab::session_schema)
+    std::optional<std::filesystem::path> runner;  // a runner tab: its folder, relative to the root
   };
   uint64_t seq = 0;
   std::shared_ptr<Workspace> ws;  // a copy (the drafts are written through it)
@@ -724,6 +728,13 @@ bool write_session(const MainFrame::SessionSnapshot& s) {
   int n = 0;
   for (const auto& t : s.tabs) {
     w.StartObject();
+    if (t.runner) {
+      w.Key("runner");
+      w.String(detail::to_utf8(*t.runner).c_str());
+      w.EndObject();
+      ++n;
+      continue;
+    }
     w.Key("file");
     w.String(detail::to_utf8(t.file).c_str());
     if (t.draft) {
@@ -793,8 +804,20 @@ std::shared_ptr<MainFrame::SessionSnapshot> MainFrame::snapshot_session() {
   s->ws = std::make_shared<Workspace>(*ws_);
   const int sel = nb_->GetSelection();
   for (size_t i = 0; i < nb_->GetPageCount(); ++i) {
+    std::filesystem::path folder;
+    if (runner_folder(nb_->GetPage(i), &folder)) {
+      // A runner tab: reopened (not rerun) after a restart, for its folder.
+      std::filesystem::path rel = folder.empty() ? std::filesystem::path() : folder.lexically_relative(ws_->root());
+      if (!folder.empty() && (rel.empty() || *rel.begin() == "..")) continue;
+      if (rel == ".") rel.clear();
+      SessionSnapshot::Tab st;
+      st.runner = rel;
+      if (static_cast<int>(i) == sel) s->active = static_cast<int>(s->tabs.size());
+      s->tabs.push_back(std::move(st));
+      continue;
+    }
     auto* t = dynamic_cast<RequestTab*>(nb_->GetPage(i));
-    if (!t || t->pristine()) continue;  // a runner tab is not part of the session
+    if (!t || t->pristine()) continue;
     SessionSnapshot::Tab st;
     st.file = t->file();
     st.dirty = t->dirty();
@@ -849,6 +872,7 @@ struct MainFrame::Session {
   std::filesystem::path root;
   std::vector<SessionTab> tabs;
   int active = 0;
+  std::vector<std::filesystem::path> runners;  // runner tabs' folders (absolute, inside the root)
 };
 
 namespace {
@@ -870,6 +894,17 @@ std::shared_ptr<MainFrame::Session> read_session(const Workspace& ws) {
     if (!v.IsObject()) continue;
     auto str = [&](const char* k) { return v.HasMember(k) && v[k].IsString() ? std::string(v[k].GetString()) : std::string(); };
     auto flag = [&](const char* k) { return v.HasMember(k) && v[k].IsBool() && v[k].GetBool(); };
+    if (v.HasMember("runner") && v["runner"].IsString()) {
+      // Only a relative path below the root, without "..": the session must not open a runner
+      // on a folder outside the workspace.
+      const fs::path rel = detail::from_utf8(str("runner"));
+      bool ok = !rel.is_absolute() && !rel.has_root_name() && !rel.has_root_directory();
+      for (const auto& part : rel) ok = ok && part != "..";
+      std::error_code ec;
+      const fs::path p = rel.empty() ? fs::path() : ws.root() / rel;
+      if (ok && (p.empty() || fs::exists(p, ec))) out->runners.push_back(p);
+      continue;
+    }
     const fs::path file = detail::from_utf8(str("file"));
     const std::string draft = str("draft");
     SessionTab t;
@@ -940,7 +975,17 @@ void MainFrame::restore_session() {
 // selected. gRPC tabs are parked (RequestTab::park_grpc): no engine, reflection or connection
 // until the user works in them.
 void MainFrame::apply_session(Session& s) {
-  if (!restored_roots_.insert(s.root).second || s.tabs.empty()) return;
+  if (!restored_roots_.insert(s.root).second) return;
+  // Runner tabs come back behind the request tabs, one per turn of the message loop after the
+  // window shows (each builds its whole panel), and never start a run.
+  for (const auto& folder : s.runners)
+    CallAfter([this, folder] {
+      auto open = [this, folder] {
+        if (ws_) open_runner(this, [this] { return ws_.get(); }, folder, &MainFrame::grpc, /*select=*/false);
+      };
+      if (!when_workspace(open)) open();  // before the workspace has opened: when it has
+    });
+  if (s.tabs.empty()) return;
   RequestTab* start = current_tab();
   const bool early = !start;
   const bool reuse = start && nb_->GetPageCount() == 1 && start->pristine() && !start->in_flight();
@@ -996,7 +1041,7 @@ RequestTab* MainFrame::add_tab(SavedRequest r, bool preview, bool lazy, int at, 
   // its kind when there is one: its editor and response view are built already, so opening the
   // first gRPC request is a load into a finished editor, not a 60-85 ms build on the UI thread.
   if (!lazy && !park && at < 0)
-    if (RequestTab*& spare = spare_[r.kind == RequestKind::Http ? 0 : 1]) {
+    if (RequestTab*& spare = spare_[spare_slot(r.kind)]) {
       RequestTab* t = std::exchange(spare, nullptr);
       t->set_request(std::move(r), preview);
       t->wake_grpc();
@@ -1162,10 +1207,14 @@ void MainFrame::open_request(const std::filesystem::path& file, bool preview) {
     wxMessageBox(wxString::FromUTF8("Could not open: " + err), "watt", wxOK | wxICON_ERROR, this);
     return;
   }
+  // The preview tab, or a pristine start tab, is reused only for a request of its own kind: a
+  // tab of another kind would build that kind's editor and response view on the spot (58-169 ms
+  // on the UI thread). The prebuilt spare of the request's kind takes its place instead.
   if (preview) {
     for (size_t i = 0; i < nb_->GetPageCount(); ++i) {
       auto* t = dynamic_cast<RequestTab*>(nb_->GetPage(i));
       if (t && t->preview() && !t->dirty() && !t->in_flight()) {
+        if (t->request_kind() != r->kind && replace_with_spare(i, *r, true)) return;
         t->set_request(std::move(*r), true);
         nb_->SetSelection(i);
         return;
@@ -1174,11 +1223,47 @@ void MainFrame::open_request(const std::filesystem::path& file, bool preview) {
   }
   // Replace a pristine empty start tab instead of piling up "Untitled" tabs.
   if (RequestTab* cur = current_tab(); cur && cur->pristine() && !cur->in_flight()) {
+    if (cur->request_kind() != r->kind && replace_with_spare(static_cast<size_t>(nb_->GetSelection()), *r, preview))
+      return;
     cur->set_request(std::move(*r), preview);
     sidebar_->select_file(cur->file());  // no page change event when the start tab is reused
     return;
   }
   add_tab(std::move(*r), preview);
+}
+
+// The page at idx (a preview or start tab of another kind) gives its place to the spare of r's
+// kind, loaded with r. The old tab is parked hidden and destroyed in a later quiet moment (a
+// response view holding 10 MB is not torn down inside the click). False: no spare to take.
+RequestTab* MainFrame::replace_with_spare(size_t idx, SavedRequest& r, bool preview) {
+  if (idx >= nb_->GetPageCount()) return nullptr;
+  RequestTab*& spare = spare_[spare_slot(r.kind)];
+  RequestTab* t = std::exchange(spare, nullptr);
+  if (!t)  // a tab of this kind replaced moments ago (not recycled yet): its editor is built
+    for (auto it = retired_.begin(); it != retired_.end(); ++it)
+      if (auto* rt = dynamic_cast<RequestTab*>(*it); rt && rt->realized() && rt->request_kind() == r.kind) {
+        t = rt;
+        retired_.erase(it);
+        break;
+      }
+  if (!t) return nullptr;
+  wxWindow* old = nb_->GetPage(idx);
+  {
+    wxWindowUpdateLocker lock(nb_);
+    t->set_request(std::move(r), preview);
+    t->wake_grpc();
+    t->Reparent(nb_);
+    nb_->InsertPage(idx, t, t->title(), true);  // selects it: the page-changed handler syncs the sidebar
+    t->Show();
+    nb_->RemovePage(idx + 1);
+    old->Hide();
+    old->Reparent(spare_park_);
+  }
+  retired_.push_back(old);
+  if (preview) update_title(t);  // a preview keeps the focus where the click was (tree, history)
+  else t->focus_url();
+  prebuild_later(kQuietMs);
+  return t;
 }
 
 void MainFrame::open_history(const HistoryEntry& entry) {
@@ -1199,7 +1284,11 @@ void MainFrame::open_history(const HistoryEntry& entry) {
 void MainFrame::new_request(RequestKind kind, const std::filesystem::path& folder) {
   SavedRequest r;
   r.kind = kind;
-  RequestTab*& spare = spare_[kind == RequestKind::Http ? 0 : 1];
+  if (kind == RequestKind::WebSocket) {
+    r.auth.type = HttpAuth::Type::Inherit;
+    r.http.body = "{\n  \"hello\": \"world\"\n}";
+  }
+  RequestTab*& spare = spare_[spare_slot(kind)];
   RequestTab* t;
   if (spare) {
     // Built in a quiet moment (prebuild_step): only the page is added now, so Ctrl+T shows a
@@ -1244,6 +1333,26 @@ void MainFrame::prebuild_step() {
   }
   // Between slices: let paints, timers and the tabs' own deferred events run first.
   constexpr int kNext = 30;
+  if (!retired_.empty()) {
+    // A tab replaced by a spare: it becomes the spare of its kind when that slot is empty (its
+    // editor and response view are built, so no new tab needs building), else it is torn down.
+    // One per slice.
+    wxWindow* w = retired_.back();
+    retired_.pop_back();
+    auto* t = dynamic_cast<RequestTab*>(w);
+    if (t && t->realized() && !t->in_flight() && !spare_[spare_slot(t->request_kind())]) {
+      const RequestKind kind = t->request_kind();
+      SavedRequest r;
+      r.kind = kind;
+      t->set_request(std::move(r), false);
+      t->set_save_folder({});
+      spare_[spare_slot(kind)] = t;
+    } else {
+      delete w;
+    }
+    prebuild_later(kNext);
+    return;
+  }
   for (size_t i = 0; i < nb_->GetPageCount(); ++i) {
     auto* t = dynamic_cast<RequestTab*>(nb_->GetPage(i));
     if (!t) continue;
@@ -1258,11 +1367,13 @@ void MainFrame::prebuild_step() {
       return;
     }
   }
-  for (int k = 0; k < 2; ++k) {
+  // A WebSocket spare last: opening a WebSocket request or history entry, or Ctrl+Alt+T, used to
+  // build its editor and log on the spot (48-175 ms on the UI thread).
+  for (int k = 0; k < 3; ++k) {
     if (k == 1 && !want_grpc_spare_) continue;
     if (!spare_[k]) {
       SavedRequest r;
-      r.kind = k == 0 ? RequestKind::Http : RequestKind::Grpc;
+      r.kind = k == 0 ? RequestKind::Http : k == 1 ? RequestKind::Grpc : RequestKind::WebSocket;
       // Parked outside the notebook (see spare_park_): sized and shown when new_request adds it.
       auto* t = new RequestTab(spare_park_, tab_context(), std::move(r), false, /*lazy=*/true);
       t->Hide();

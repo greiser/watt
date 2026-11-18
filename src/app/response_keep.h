@@ -17,6 +17,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <vector>
 
 #include "core/http_client.h"
 #include "core/model.h"
@@ -31,7 +32,21 @@ struct RunExtras {
   // The response as received, body left out (body_size says how large it was).
   std::shared_ptr<const HttpResponse> head;
   uint64_t body_size = 0;
+  bool visualize = false;  // the body was shown as Visualize (pm.visualizer): reopened that way
+  // A text/event-stream body: when each event arrived (ms after the send, in stream order), so a
+  // restored stream lists its events with their offsets as it did live. At most kKeptSseTimes.
+  std::vector<double> sse_at;
+  std::string key;  // the run key it was found under (set by find_extras*, not stored)
 };
+
+// The whole body of a run, kept next to its extras (<ws>/.watt/response-bodies/<key>.body) when
+// it is at most kKeptBodyMax: the history keeps only its first kHistoryResponseCap, and a reopened
+// request's Find / Filter / Table / Copy / Save must work on the body as received. The newest
+// kKeptBodyFiles files, at most kKeptBodyBytes together, are kept.
+inline constexpr size_t kKeptSseTimes = 20000;
+inline constexpr uint64_t kKeptBodyMax = 16u << 20;
+inline constexpr size_t kKeptBodyFiles = 64;
+inline constexpr uint64_t kKeptBodyBytes = 256ull << 20;
 
 // "GET https://x/{{id}}" (the request as saved, before {{var}} expansion), the status and the
 // shell's total (whole microseconds).
@@ -49,7 +64,13 @@ std::optional<RunExtras> extras_from_json(const std::string& json);
 std::shared_ptr<HttpResponse> restore_response(const HttpResponse* kept, const RunExtras& x);
 
 // UI thread or worker: remembered for this process and written to disk on a worker thread.
-void keep_extras(const std::filesystem::path& root, const std::string& key, RunExtras x);
+// full: the response (its body is written too when it is not over kKeptBodyMax; never copied).
+void keep_extras(const std::filesystem::path& root, const std::string& key, RunExtras x,
+                 std::shared_ptr<const HttpResponse> full = nullptr);
+// Worker thread: the body kept by keep_extras for this run, when it is there and exactly
+// expect_size bytes (null otherwise).
+std::shared_ptr<std::string> load_kept_body(const std::filesystem::path& root, const std::string& key,
+                                            uint64_t expect_size);
 // Any thread (reads the disk when not in memory: call it off the UI thread).
 std::optional<RunExtras> find_extras(const std::filesystem::path& root, const std::string& key);
 // Memory only (UI thread safe).

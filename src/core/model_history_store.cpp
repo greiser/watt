@@ -203,4 +203,82 @@ void filter_hidden_history(const HistoryHidden& h, std::vector<HistoryEntry>& en
                 entries.end());
 }
 
+namespace {
+fs::path origins_file(const fs::path& root) { return root / ".watt" / "snapshots" / "origins.json"; }
+std::mutex& origins_mutex() {
+  static std::mutex m;
+  return m;
+}
+bool safe_snapshot_name(std::string_view n) {
+  if (n.empty() || n.size() > 64) return false;
+  for (char c : n)
+    if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || c == '.' || c == '-' || c == '_')) return false;
+  return n.find("..") == std::string_view::npos;
+}
+}  // namespace
+
+bool safe_relative_origin(std::string_view rel) {
+  if (rel.empty() || rel.size() > 1024) return false;
+  if (rel.front() == '/' || rel.front() == '\\') return false;
+  if (rel.find(':') != std::string_view::npos) return false;  // C:..., \\?\..., streams
+  size_t start = 0;
+  bool first = true;
+  while (start <= rel.size()) {
+    size_t end = rel.find_first_of("/\\", start);
+    if (end == std::string_view::npos) end = rel.size();
+    const std::string_view part = rel.substr(start, end - start);
+    if (part.empty() || part == "." || part == "..") return false;
+    if (first && (part == ".watt" || part == ".git")) return false;
+    for (unsigned char c : part)
+      if (c < 0x20) return false;
+    first = false;
+    start = end + 1;
+  }
+  return true;
+}
+
+std::map<std::string, std::string> load_snapshot_origins(const fs::path& root) {
+  std::map<std::string, std::string> out;
+  std::string text;
+  {
+    std::lock_guard lk(origins_mutex());
+    if (!detail::read_file(origins_file(root), text)) return out;
+  }
+  rapidjson::Document d;
+  d.Parse(text.data(), text.size());
+  if (d.HasParseError() || !d.IsObject() || !d.HasMember("origins") || !d["origins"].IsObject()) return out;
+  for (const auto& m : d["origins"].GetObject()) {
+    if (out.size() >= kSnapshotOriginsMax) break;
+    if (!m.value.IsString()) continue;
+    std::string k(m.name.GetString(), m.name.GetStringLength());
+    std::string v(m.value.GetString(), m.value.GetStringLength());
+    if (safe_snapshot_name(k) && safe_relative_origin(v)) out.emplace(std::move(k), std::move(v));
+  }
+  return out;
+}
+
+bool save_snapshot_origins(const fs::path& root, const std::map<std::string, std::string>& origins) {
+  rapidjson::StringBuffer sb;
+  rapidjson::Writer<rapidjson::StringBuffer> w(sb);
+  w.StartObject();
+  w.Key("version");
+  w.Int(1);
+  w.Key("origins");
+  w.StartObject();
+  size_t n = 0;
+  for (const auto& [k, v] : origins) {
+    if (n >= kSnapshotOriginsMax) break;
+    if (!safe_snapshot_name(k) || !safe_relative_origin(v)) continue;
+    w.Key(k.data(), static_cast<rapidjson::SizeType>(k.size()));
+    w.String(v.data(), static_cast<rapidjson::SizeType>(v.size()));
+    ++n;
+  }
+  w.EndObject();
+  w.EndObject();
+  std::lock_guard lk(origins_mutex());
+  detail::ensure_dir(root / ".watt");
+  detail::ensure_dir(root / ".watt" / "snapshots");
+  return detail::write_file_atomic(origins_file(root), std::string(sb.GetString(), sb.GetSize()), nullptr, true);
+}
+
 }  // namespace watt

@@ -8,6 +8,7 @@
 #include <wx/textctrl.h>
 #include <wx/timer.h>
 
+#include <algorithm>
 #include <atomic>
 #include <memory>
 #include <mutex>
@@ -23,6 +24,21 @@ namespace {
 
 class FindBar;
 
+// Cancel tokens of the running workers (UI thread only; each worker reads its own flag). A newer
+// search, closing the bar or an edit of the document stops the older walks.
+struct Stops {
+  std::shared_ptr<std::atomic<bool>> find, count;
+  static std::shared_ptr<std::atomic<bool>> renew(std::shared_ptr<std::atomic<bool>>& slot) {
+    if (slot) slot->store(true);
+    slot = std::make_shared<std::atomic<bool>>(false);
+    return slot;
+  }
+  void all() {
+    if (find) find->store(true);
+    if (count) count->store(true);
+  }
+};
+
 // Lifetime token for the counting worker (the bar may go away while it runs).
 struct BarAlive {
   std::mutex m;
@@ -31,7 +47,8 @@ struct BarAlive {
 
 class FindBar : public wxPanel {
  public:
-  explicit FindBar(wxStyledTextCtrl* stc) : wxPanel(stc->GetParent()), stc_(stc), count_timer_(this) {
+  FindBar(wxStyledTextCtrl* stc, std::function<void(int, int)> reveal)
+      : wxPanel(stc->GetParent()), stc_(stc), reveal_(std::move(reveal)), count_timer_(this) {
     const Theme& t = Theme::get();
     alive_->bar = this;
     SetBackgroundColour(t.bg);
@@ -106,14 +123,18 @@ class FindBar : public wxPanel {
     count_timer_.Bind(wxEVT_TIMER, [this](wxTimerEvent&) { start_count(); });
     // Edits of the document invalidate the snapshot the workers search (no `this`: the editor
     // may outlive the bar).
-    stc_->Bind(wxEVT_STC_MODIFIED, [edits = edits_](wxStyledTextEvent& e) {
+    stc_->Bind(wxEVT_STC_MODIFIED, [edits = edits_, stops = stops_](wxStyledTextEvent& e) {
       e.Skip();
-      if (e.GetModificationType() & (wxSTC_MOD_INSERTTEXT | wxSTC_MOD_DELETETEXT)) ++*edits;
+      if (e.GetModificationType() & (wxSTC_MOD_INSERTTEXT | wxSTC_MOD_DELETETEXT)) {
+        ++*edits;
+        stops->all();
+      }
     });
     Hide();
   }
 
   ~FindBar() override {
+    stops_->all();
     std::lock_guard lk(alive_->m);
     alive_->bar = nullptr;
   }
@@ -194,13 +215,33 @@ class FindBar : public wxPanel {
     const int at = stc_->SearchInTarget(wxString::FromUTF8(term));
     if (at < 0) return false;
     const int end = stc_->GetTargetEnd();
+    reveal(at, end);
     stc_->SetSelection(at, end);
-    stc_->EnsureCaretVisible();
-    stc_->ScrollRange(end, at);
+    scroll_to_match(stc_, at, end);
     return true;
   }
 
+  // Unfolds the lines of [s, e) so a match inside a folded region is shown, not selected hidden.
+  void reveal(int s, int e) {
+    const int l0 = stc_->LineFromPosition(s), l1 = stc_->LineFromPosition(e);
+    bool hidden = false;
+    for (int l = l0; l <= l1 && !hidden; ++l) hidden = !stc_->GetLineVisible(l);
+    if (!hidden) return;
+    if (reveal_) {
+      reveal_(l0, l1);
+      return;
+    }
+    for (int l = l0; l <= l1; ++l)
+      if (!stc_->GetLineVisible(l)) stc_->EnsureVisible(l);
+  }
+
   void not_found() {
+    // The last prefix match ("item 9599" for "item 95999") must not stay selected: it is not a
+    // match of what is typed now. The caret goes back to where the search started.
+    if (stc_->GetSelectionStart() != stc_->GetSelectionEnd()) {
+      const int a = std::clamp(anchor_, 0, stc_->GetLength());
+      stc_->SetSelection(a, a);
+    }
     count_->SetLabel("No results");
     count_->SetForegroundColour(Theme::get().js_error);
   }
@@ -245,10 +286,13 @@ class FindBar : public wxPanel {
     ++count_gen_;  // this search brings its own count
     count_timer_.Stop();
     finding_ = true;
-    std::thread([alive = alive_, text, term, mc, from, forward, stepping, gen, edits = snap_edits_] {
-      const size_t at = find_match(*text, term, mc, from, forward);
+    if (stops_->count) stops_->count->store(true);
+    auto stop = Stops::renew(stops_->find);
+    std::thread([alive = alive_, text, term, mc, from, forward, stepping, gen, edits = snap_edits_, stop] {
+      size_t at = find_match(*text, term, mc, from, forward, stop.get());
       MatchCount m;
-      if (at != std::string_view::npos) m = count_matches(*text, term, mc, at + 1);
+      if (at != std::string_view::npos) m = count_matches(*text, term, mc, at + 1, 1000000, stop.get());
+      if (stop->load()) at = std::string_view::npos;  // superseded: found() drops it
       std::lock_guard lk(alive->m);
       if (FindBar* b = alive->bar)
         b->CallAfter([b, at, n = term.size(), m, stepping, gen, edits] { b->found(gen, edits, at, n, m, stepping); });
@@ -259,20 +303,20 @@ class FindBar : public wxPanel {
     if (gen != find_gen_) return;  // a newer search is on its way
     finding_ = false;
     if (!IsShown()) return;
+    const int len = stc_->GetLength();
+    if (edits != *edits_ || (at != std::string_view::npos && at + n > static_cast<size_t>(len))) {
+      if (!stepping) term_changed();  // edited meanwhile: search again
+      return;
+    }
     if (at == std::string_view::npos) {
       queued_ = 0;
       not_found();
       return;
     }
-    const int len = stc_->GetLength();
-    if (edits != *edits_ || at + n > static_cast<size_t>(len)) {  // edited meanwhile: search again
-      if (!stepping) term_changed();
-      return;
-    }
     const int s = static_cast<int>(at), e = static_cast<int>(at + n);
+    reveal(s, e);
     stc_->SetSelection(s, e);
-    stc_->EnsureCaretVisible();
-    stc_->ScrollRange(e, s);
+    scroll_to_match(stc_, s, e);
     if (stepping) anchor_ = s;
     show_count(m);
     if (queued_ > 0) {
@@ -302,8 +346,10 @@ class FindBar : public wxPanel {
     }
     // A snapshot so the worker never reads the live buffer.
     auto text = snapshot();
-    std::thread([alive = alive_, text, term, mc, at, gen] {
-      const MatchCount m = count_matches(*text, term, mc, at + 1);
+    auto stop = Stops::renew(stops_->count);
+    std::thread([alive = alive_, text, term, mc, at, gen, stop] {
+      const MatchCount m = count_matches(*text, term, mc, at + 1, 1000000, stop.get());
+      if (m.cancelled || stop->load()) return;
       std::lock_guard lk(alive->m);
       if (FindBar* b = alive->bar)
         b->CallAfter([b, m, gen] {
@@ -374,6 +420,7 @@ class FindBar : public wxPanel {
   }
 
   void hide_bar() {
+    stops_->all();
     ++count_gen_;
     ++find_gen_;
     finding_ = false;
@@ -386,7 +433,9 @@ class FindBar : public wxPanel {
   }
 
   wxStyledTextCtrl* stc_;
+  std::function<void(int, int)> reveal_;
   std::shared_ptr<BarAlive> alive_ = std::make_shared<BarAlive>();
+  std::shared_ptr<Stops> stops_ = std::make_shared<Stops>();
   wxTextCtrl* find_ = nullptr;
   wxTextCtrl* repl_ = nullptr;
   CheckButton* case_ = nullptr;
@@ -409,12 +458,21 @@ class FindBar : public wxPanel {
 
 }  // namespace
 
-void attach_find(wxStyledTextCtrl* stc) {
+void scroll_to_match(wxStyledTextCtrl* stc, int from, int to) {
+  const int line = stc->LineFromPosition(from);
+  const int vis = stc->VisibleFromDocLine(line);
+  const int first = stc->GetFirstVisibleLine(), n = std::max(stc->LinesOnScreen(), 1);
+  const int margin = std::min(3, n / 4);
+  if (vis < first + margin || vis > first + n - 1 - margin) stc->SetFirstVisibleLine(std::max(0, vis - n / 2));
+  stc->ScrollRange(to, from);  // horizontally
+}
+
+void attach_find(wxStyledTextCtrl* stc, std::function<void(int first, int last)> reveal) {
   // Scintilla's own Ctrl+F / Ctrl+H do nothing useful here (Ctrl+H would type a backspace).
   stc->CmdKeyClear('F', wxSTC_KEYMOD_CTRL);
   stc->CmdKeyClear('H', wxSTC_KEYMOD_CTRL);
   auto bar = std::make_shared<FindBar*>(nullptr);
-  stc->Bind(wxEVT_CHAR_HOOK, [stc, bar](wxKeyEvent& e) {
+  stc->Bind(wxEVT_CHAR_HOOK, [stc, bar, reveal = std::move(reveal)](wxKeyEvent& e) {
     const int k = e.GetKeyCode();
     const int m = e.GetModifiers();
     const bool find = m == wxMOD_CONTROL && (k == 'F' || k == 'f');
@@ -424,7 +482,7 @@ void attach_find(wxStyledTextCtrl* stc) {
       e.Skip();
       return;
     }
-    if (!*bar) *bar = new FindBar(stc);
+    if (!*bar) *bar = new FindBar(stc, reveal);
     if (f3 && (*bar)->IsShown()) (*bar)->step(m == 0);
     else (*bar)->open(repl);
   });

@@ -80,6 +80,8 @@ const V* arr(const V& o, const char* k) {
 
 // ------------------------------------------------------------------ scripts
 
+constexpr size_t kKeptVisualizerData = 8u << 20;
+
 void put_script(W& w, const char* k, const ScriptRun& r) {
   key(w, k);
   w.StartObject();
@@ -128,6 +130,21 @@ void put_script(W& w, const char* k, const ScriptRun& r) {
   put(w, "elapsed_us", r.elapsed_us);
   put(w, "setup_us", r.setup_us);
   put(w, "wait_us", r.wait_us);
+  // pm.visualizer.set(): the template and its data, so a restored run keeps its Visualize view
+  // (data over kKeptVisualizerData is left out and said so).
+  if (r.visualizer) {
+    key(w, "visualizer");
+    w.StartObject();
+    put(w, "template", r.visualizer_template);
+    if (r.visualizer_data.size() <= kKeptVisualizerData) {
+      put(w, "data", r.visualizer_data);
+      put(w, "error", r.visualizer_error);
+    } else {
+      put(w, "error", "the visualizer data (" + std::to_string(r.visualizer_data.size() >> 20) +
+                          " MB) is not kept with the run: send the request again to see it");
+    }
+    w.EndObject();
+  }
   w.EndObject();
 }
 
@@ -168,6 +185,13 @@ std::shared_ptr<const ScriptRun> get_script(const V& o) {
   r->elapsed_us = num(o, "elapsed_us");
   r->setup_us = num(o, "setup_us");
   r->wait_us = num(o, "wait_us");
+  if (const V* v = obj(o, "visualizer")) {
+    r->visualizer = true;
+    r->visualizer_template = str(*v, "template");
+    r->visualizer_data = str(*v, "data");
+    r->visualizer_error = str(*v, "error");
+    if (r->visualizer_template.size() > kMaxVisualizerTemplate) r->visualizer_template.clear();
+  }
   return r;
 }
 
@@ -415,6 +439,28 @@ Cache& cache() {
 }
 
 fs::path runs_dir(const fs::path& root) { return root / ".watt" / "response-runs"; }
+fs::path bodies_dir(const fs::path& root) { return root / ".watt" / "response-bodies"; }
+
+// The newest kKeptBodyFiles bodies, at most kKeptBodyBytes together.
+void prune_bodies(const fs::path& dir) {
+  std::error_code ec;
+  struct F {
+    fs::file_time_type t;
+    uint64_t size;
+    fs::path p;
+  };
+  std::vector<F> files;
+  for (fs::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
+    if (!it->is_regular_file(ec)) continue;
+    files.push_back({it->last_write_time(ec), it->file_size(ec), it->path()});
+  }
+  std::sort(files.begin(), files.end(), [](const F& a, const F& b) { return a.t > b.t; });
+  uint64_t total = 0;
+  for (size_t i = 0; i < files.size(); ++i) {
+    total += files[i].size;
+    if (i >= kKeptBodyFiles || (i > 0 && total > kKeptBodyBytes)) fs::remove(files[i].p, ec);
+  }
+}
 
 // Only hex keys reach the file system (run_key's output).
 bool safe_key(const std::string& k) {
@@ -500,6 +546,14 @@ std::string extras_to_json(const RunExtras& x) {
   put(w, "prompt_ms", x.prompt_ms);
   put_b(w, "untrusted", x.scripts_skipped_untrusted);
   put_u(w, "body_size", x.body_size);
+  if (x.visualize) put(w, "view", std::string_view("visualize"));
+  if (!x.sse_at.empty()) {
+    key(w, "sse_at");
+    w.StartArray();
+    const size_t n = std::min(x.sse_at.size(), kKeptSseTimes);
+    for (size_t i = 0; i < n; ++i) w.Double(std::round(x.sse_at[i] * 100.0) / 100.0);
+    w.EndArray();
+  }
   if (x.pre) put_script(w, "pre", *x.pre);
   if (x.post) put_script(w, "post", *x.post);
   if (x.head) put_head(w, *x.head);
@@ -515,6 +569,15 @@ std::optional<RunExtras> extras_from_json(const std::string& json) {
   x.prompt_ms = std::max(0.0, num(d, "prompt_ms"));
   x.scripts_skipped_untrusted = flag(d, "untrusted");
   x.body_size = u64(d, "body_size");
+  x.visualize = str(d, "view") == "visualize";
+  if (const auto it = d.FindMember("sse_at"); it != d.MemberEnd() && it->value.IsArray()) {
+    const auto arr = it->value.GetArray();
+    x.sse_at.reserve(std::min<size_t>(arr.Size(), kKeptSseTimes));
+    for (const V& v : arr) {
+      if (x.sse_at.size() >= kKeptSseTimes) break;
+      x.sse_at.push_back(v.IsNumber() ? v.GetDouble() : -1.0);
+    }
+  }
   if (const V* p = obj(d, "pre")) x.pre = get_script(*p);
   if (const V* p = obj(d, "post")) x.post = get_script(*p);
   if (const V* h = obj(d, "head")) x.head = get_head(*h);
@@ -562,8 +625,9 @@ std::shared_ptr<HttpResponse> restore_response(const HttpResponse* kept, const R
   return r;
 }
 
-void keep_extras(const fs::path& root, const std::string& key, RunExtras x) {
+void keep_extras(const fs::path& root, const std::string& key, RunExtras x, std::shared_ptr<const HttpResponse> full) {
   if (!safe_key(key)) return;
+  x.key = key;
   {
     Cache& c = cache();
     std::lock_guard lock(c.mu);
@@ -573,13 +637,30 @@ void keep_extras(const fs::path& root, const std::string& key, RunExtras x) {
   if (root.empty()) return;
   static std::atomic<unsigned> writes{0};
   const bool do_prune = (writes++ % 64) == 0;
-  std::thread([root, key, x = std::move(x), do_prune] {
+  if (full && (full->body.empty() || full->body.size() > kKeptBodyMax)) full.reset();
+  std::thread([root, key, x = std::move(x), do_prune, full = std::move(full)] {
     const std::string json = extras_to_json(x);
     const fs::path dir = runs_dir(root);
     detail::ensure_dir(dir);
     detail::write_file_atomic(dir / (key + ".json"), json, nullptr, true);
     if (do_prune) prune(dir);
+    if (full) {
+      const fs::path bdir = bodies_dir(root);
+      detail::ensure_dir(bdir);
+      detail::write_file_atomic(bdir / (key + ".body"), full->body, nullptr, true);
+      prune_bodies(bdir);
+    }
   }).detach();
+}
+
+std::shared_ptr<std::string> load_kept_body(const fs::path& root, const std::string& key, uint64_t expect_size) {
+  if (root.empty() || !safe_key(key) || expect_size == 0 || expect_size > kKeptBodyMax) return nullptr;
+  const fs::path p = bodies_dir(root) / (key + ".body");
+  std::error_code ec;
+  if (fs::file_size(p, ec) != expect_size || ec) return nullptr;
+  auto b = std::make_shared<std::string>();
+  if (!detail::read_file(p, *b) || b->size() != expect_size) return nullptr;
+  return b;
 }
 
 std::optional<RunExtras> find_extras_cached(const std::string& key) {
@@ -587,7 +668,9 @@ std::optional<RunExtras> find_extras_cached(const std::string& key) {
   std::lock_guard lock(c.mu);
   const auto it = c.m.find(key);
   if (it == c.m.end()) return std::nullopt;
-  return it->second;
+  RunExtras x = it->second;
+  x.key = key;
+  return x;
 }
 
 void keep_runs_of(const Workspace& ws, const SavedRequest& q, const std::string& summary,
@@ -612,6 +695,7 @@ std::optional<RunExtras> find_extras(const fs::path& root, const std::string& ke
   if (!detail::read_file(runs_dir(root) / (key + ".json"), json) || json.empty()) return std::nullopt;
   auto x = extras_from_json(json);
   if (x) {
+    x->key = key;
     Cache& c = cache();
     std::lock_guard lock(c.mu);
     c.m.emplace(key, *x);

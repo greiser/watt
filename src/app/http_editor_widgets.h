@@ -44,6 +44,9 @@ class FlatButton : public wxControl {
   FlatButton(wxWindow* parent, const wxString& label, Style style, bool dropdown = false);
   void SetLabel(const wxString& label) override;
   void set_text_colour(const wxColour& c);
+  // Drawn like a text field (its fill and border, the label left-aligned): a dropdown in a
+  // settings column of fields lines up with them.
+  void set_field_look(bool on);
   std::function<void()> on_click;
 
  protected:
@@ -56,6 +59,7 @@ class FlatButton : public wxControl {
   wxString label_;
   Style style_;
   bool dropdown_;
+  bool field_look_ = false;
   bool hover_ = false;
   bool down_ = false;
   wxColour text_;
@@ -71,6 +75,8 @@ class ChoiceButton : public FlatButton {
   ChoiceButton(wxWindow* parent, std::vector<wxString> items);
   int selection() const { return sel_; }
   void set_selection(int index);  // no on_select
+  // Relabels one choice (e.g. "Inherit (on, from api)"); grows the button when it is wider.
+  void set_item(int index, const wxString& text);
   std::function<void(int)> on_select;  // a user pick only
 
  private:

@@ -67,15 +67,67 @@ bool tag_filter_match(const RunItem& it, const std::string& filter);
 // rest follow in natural name order).
 using FolderOrder = std::map<std::filesystem::path, std::vector<std::wstring>>;
 
-// Every request under folder (the workspace root when folder is empty or the root), in the
-// sidebar's order (`order`, else natural name order), subfolders depth-first; a .req.json file
-// runs alone. Reads the disk: worker thread only. Files that cannot be read are listed in
+// The run order saved by the runner (its arrows / drag), shared in git so `watt --run` in CI
+// runs what the runner shows: <ws>/run-order.json
+//   { "version": 1, "order": { ".": ["List items.req.json", "orders"], "orders": [...] } }
+// Per folder (relative to the workspace root, "/"-separated, "." = the root) the file names of
+// its requests and subfolders, interleaved: a root request listed before a subfolder runs before
+// it. Items a list does not name follow it in the default order. Keys are only matched against
+// the workspace tree (never opened); a link or a file over 1 MB is ignored.
+inline constexpr const char* kRunOrderFile = "run-order.json";
+// Absolute folder -> names, as read from <root>/run-order.json (empty when there is none).
+FolderOrder load_run_order(const std::filesystem::path& root, std::string* err = nullptr);
+// Sets the lists of the folders in `changed` (absolute folder -> names; an empty list removes
+// the folder's entry) and writes the file atomically; other folders' entries are kept. Disk:
+// worker thread only. Calls are serialized; a call whose seq is lower than one already written
+// is dropped (a slow older write never undoes a newer order).
+bool save_run_order(const std::filesystem::path& root, const FolderOrder& changed, uint64_t seq = 0,
+                    std::string* err = nullptr);
+// The text of run-order.json for (folder key, names) entries: one name per line, commas at line
+// ends (clean git diffs).
+std::string run_order_json(const std::vector<std::pair<std::string, std::vector<std::string>>>& entries);
+
+// Every request under folder (the workspace root when folder is empty or the root), depth-first
+// in the saved run order (run-order.json, folders and requests interleaved), else the sidebar's
+// order (`order`: folders first, then the dragged order), else natural name order; a .req.json
+// file runs alone. Reads the disk: worker thread only. Files that cannot be read are listed in
 // *errors ("rel: why").
 std::vector<RunItem> collect(const Workspace& ws, const std::filesystem::path& folder,
                              std::vector<std::string>* errors = nullptr, const FolderOrder* order = nullptr);
 
+// Reordering the runner's list as a tree: requests stay in their folders, so a step moves a
+// whole block (a request, or a subfolder with all its requests). `order` is item indexes in run
+// order, each folder's items contiguous (as collect() returns them). base: the run's folder.
+// Moves the request at order position pos one sibling up (d < 0) or down (d > 0) in its folder;
+// at the edge of its folder the folder itself moves (and so on up). True when something moved;
+// *changed gets the moved folder's new child list (absolute folder -> file names) to save.
+bool move_block(const std::vector<RunItem>& items, std::vector<size_t>& order, const std::filesystem::path& base,
+                size_t pos, int d, FolderOrder* changed);
+// Drag and drop: moves the request at pos (block by block, as move_block) until it stands at or
+// just past position `before` (order.size(): the end). True when something moved.
+bool drop_block(const std::vector<RunItem>& items, std::vector<size_t>& order, const std::filesystem::path& base,
+                size_t pos, size_t before, FolderOrder* changed);
+
 // "a/b.req.json" -> "a/b".
 std::string strip_ext(std::string s);
+
+// A request of the run that uses {{var}} before the request that captures var has run: the
+// first iteration sends it with the variable's old value (or unresolved). order positions.
+struct OrderHint {
+  size_t user = 0;     // position (in order) of the request that uses {{var}}
+  size_t capture = 0;  // position of the first later request that captures it
+  std::string var;
+};
+// Every such pair in the run's order (a {{var}} captured by an earlier request, or by the same
+// request, is fine), at most max. Scans URL, headers, path params, body (first 256 KB), gRPC
+// address, body and metadata. Cheap enough for the UI thread for typical folders.
+std::vector<OrderHint> capture_order_hints(const std::vector<RunItem>& items, const std::vector<size_t>& order,
+                                           size_t max = 8);
+// positions (indexes into order) plus, transitively, every earlier position whose capture sets a
+// {{var}} one of them reads (the last capture of it before the reader), sorted: what "Rerun
+// failed" sends so a failed request gets fresh values instead of ones left from the last run.
+std::vector<size_t> with_capture_sources(const std::vector<RunItem>& items, const std::vector<size_t>& order,
+                                         const std::vector<size_t>& positions);
 
 // The URL with its "/:name" path variables replaced by the request's path_params values
 // ({{vars}} in a value expanded first, then path-encoded), as the HTTP editor sends it.
@@ -124,6 +176,9 @@ struct StepResult {
   std::string method;   // HTTP method, or the gRPC method path
   std::string url;      // as sent: expanded URL / gRPC address
   bool sent = false;    // reached the engine
+  // Failed on the client before anything usable went out: the request message did not encode,
+  // the schema / reflection had no such method. Counted as an error (sent stays false).
+  bool client_error = false;
   bool transport_ok = false;  // HTTP: a response arrived; gRPC: status OK
   long status = 0;            // HTTP status / gRPC status code
   std::string status_text;    // reason phrase / gRPC status name
@@ -194,7 +249,12 @@ struct StepResult {
 
   // Stopped by Stop / Esc while in flight or before it was sent: neither passed nor failed.
   bool stopped() const { return error == "Stopped"; }
-  bool errored() const { return !skipped && !stopped() && (!sent || (kind == RequestKind::Http && !transport_ok)); }
+  bool errored() const {
+    return !skipped && !stopped() && (client_error || !sent || (kind == RequestKind::Http && !transport_ok));
+  }
+  // The status is an error (HTTP 400+, a gRPC status other than OK) and the request has no
+  // res.status / res.statusText assert of its own (an inherited folder assert does not count).
+  bool status_failed() const;
   bool failed() const;
   bool passed() const { return !skipped && !stopped() && !failed(); }
   // One line saying why the step failed: the error, the first failed check ("status eq 200:

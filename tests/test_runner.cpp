@@ -251,6 +251,29 @@ TEST_CASE("delay and stop-on-failure", "[runner]") {
   CHECK(names == std::vector<std::string>{"c", "a"});
 }
 
+TEST_CASE("a failed response time check reads in ms, not as a raw float", "[runner]") {
+  TempWs t;
+  SavedRequest a = http("slow", "GET", base() + "/delay/120");
+  a.asserts.push_back(as("res.responseTime", "lt", "1"));
+  t.add(a, "f");
+  auto items = collect(t.ws, t.dir / "f");
+  REQUIRE(items.size() == 1);
+  RunControl ctl;
+  Workspace w = t.ws;
+  std::shared_ptr<const StepResult> got;
+  run_plan(items, {0}, {}, w, {}, ctl, [&](auto r) { got = r; });
+  REQUIRE(got);
+  REQUIRE(got->asserts.size() == 1);
+  const auto& c = got->asserts[0];
+  INFO(c.message);
+  CHECK_FALSE(c.pass);
+  CHECK(c.message.rfind("expected response time to be < 1 ms, got ", 0) == 0);
+  CHECK(c.message.size() > 3);
+  CHECK(c.message.substr(c.message.size() - 3) == " ms");
+  CHECK(c.actual.find('.') == std::string::npos);  // >= 100 ms: whole ms (watt's precision)
+  CHECK(c.expected == "1");                        // the check's label stays as written
+}
+
 TEST_CASE("path params are substituted and encoded", "[runner]") {
   TempWs t;
   SavedRequest a = http("p", "GET", base() + "/echo/:id/x");
@@ -494,6 +517,37 @@ TEST_CASE("data files: CSV and JSON rows become variables per iteration", "[runn
   CHECK(urls[2].find("id=30") != std::string::npos);
   CHECK(urls[3].find("id=30") != std::string::npos);
   CHECK(s.passed == 4);
+}
+
+TEST_CASE("capture order hints: a {{var}} used before its capture", "[runner]") {
+  std::vector<RunItem> items(3);
+  items[0].req.name = "Get order";
+  items[0].req.http.url = "http://h/orders/{{ firstId }}?u={{user}}&g={{$guid}}";
+  items[1].req.name = "List items";
+  items[1].req.http.url = "http://h/items";
+  Capture c;
+  c.var = "firstId";
+  c.target = "res.body[0].id";
+  items[1].req.captures.push_back(c);
+  items[2].req.name = "Item";
+  items[2].req.http.headers.push_back({"X-Id", "{{firstId}}"});
+  // Get order, List items, Item: Get order runs before the capture.
+  auto h = capture_order_hints(items, {0, 1, 2});
+  REQUIRE(h.size() == 1);
+  CHECK(h[0].user == 0);
+  CHECK(h[0].capture == 1);
+  CHECK(h[0].var == "firstId");
+  // Capture first: nothing to say.
+  CHECK(capture_order_hints(items, {1, 0, 2}).empty());
+  // A disabled capture captures nothing.
+  items[1].req.captures[0].enabled = false;
+  CHECK(capture_order_hints(items, {0, 1, 2}).empty());
+  // gRPC metadata counts too; max caps the list.
+  items[1].req.captures[0].enabled = true;
+  items[2].req.kind = RequestKind::Grpc;
+  items[2].req.grpc_opts.metadata.push_back({"x-id", "{{firstId}}"});
+  CHECK(capture_order_hints(items, {2, 0, 1}).size() == 2);
+  CHECK(capture_order_hints(items, {2, 0, 1}, 1).size() == 1);
 }
 
 TEST_CASE("tag filter includes and excludes", "[runner]") {
@@ -1437,4 +1491,455 @@ TEST_CASE("collect orders requests by file name, as the sidebar lists them", "[r
   CHECK(items[0].req.name == "Protected");
   CHECK(items[1].req.name == "List items");
   CHECK(items[2].req.name == "Echo uses capture");
+}
+
+TEST_CASE("a saved run order interleaves folders and requests, for the runner and --run", "[runner][order]") {
+  // The common layout: a root request captures a value that requests in a subfolder use. The
+  // sidebar lists subfolders first, so by default the subfolder runs before the capture.
+  TempWs t;
+  SavedRequest l = http("List items", "POST", base() + "/echo");
+  Capture c;
+  c.var = "firstId";
+  c.target = "res.body.method";
+  l.captures.push_back(c);
+  t.add(l, "");
+  SavedRequest g = http("Get order", "GET", base() + "/echo?m={{firstId}}");
+  g.asserts.push_back(as("res.body.query", "contains", "m=POST"));
+  t.add(g, "orders");
+  SavedRequest h = http("Create order", "GET", base() + "/echo");
+  t.add(h, "orders");
+  const auto u = [](const fs::path& p) {
+    const auto s = p.u8string();
+    return std::string(s.begin(), s.end());
+  };
+  auto items = collect(t.ws, {});
+  REQUIRE(items.size() == 3);
+  CHECK(items[0].rel == "orders/Create order");
+  CHECK(items[1].rel == "orders/Get order");
+  CHECK(items[2].rel == "List items");
+  std::string out;
+  CHECK(run_cli({"--run", u(t.dir), "--workspace", u(t.dir), "--quiet"}, {}, &out) == 1);
+
+  // The runner's arrow: List items trades places with the whole orders folder (one step).
+  std::vector<size_t> order = all(items.size());
+  FolderOrder changed;
+  REQUIRE(move_block(items, order, t.dir, 2, -1, &changed));
+  CHECK(order == std::vector<size_t>{2, 0, 1});
+  REQUIRE(changed.size() == 1);
+  REQUIRE(changed.begin()->second == std::vector<std::wstring>{L"List items.req.json", L"orders"});
+  // Already first: nothing moves.
+  CHECK_FALSE(move_block(items, order, t.dir, 0, -1, nullptr));
+  // Get order up: stays in orders/, swaps with Create order.
+  std::vector<size_t> o2 = order;
+  FolderOrder ch2;
+  REQUIRE(move_block(items, o2, t.dir, 2, -1, &ch2));
+  CHECK(o2 == std::vector<size_t>{2, 1, 0});
+  CHECK(ch2.begin()->first == (t.dir / "orders").lexically_normal());
+  // Create order (first in orders/) up: the orders folder moves above List items again.
+  std::vector<size_t> o3 = order;
+  REQUIRE(move_block(items, o3, t.dir, 1, -1, nullptr));
+  CHECK(o3 == std::vector<size_t>{0, 1, 2});
+  // Drag List items to the end: past the orders block.
+  std::vector<size_t> o4 = order;
+  REQUIRE(drop_block(items, o4, t.dir, 0, 3, nullptr));
+  CHECK(o4 == std::vector<size_t>{0, 1, 2});
+
+  std::string err;
+  REQUIRE(save_run_order(t.dir, changed, 1, &err));
+  REQUIRE(fs::exists(t.dir / kRunOrderFile));
+  // An older write arriving late never undoes the newer order.
+  FolderOrder stale{{t.dir, {L"orders", L"List items.req.json"}}};
+  REQUIRE(save_run_order(t.dir, stale, 0, &err));  // seq 0: always written
+  REQUIRE(save_run_order(t.dir, changed, 3, &err));
+  REQUIRE(save_run_order(t.dir, stale, 2, &err));  // dropped: 2 < 3
+  const FolderOrder back = load_run_order(t.dir);
+  REQUIRE(back.count(t.dir) == 1);
+  CHECK(back.at(t.dir) == std::vector<std::wstring>{L"List items.req.json", L"orders"});
+
+  // Reopened (a fresh collect) and in CI (--run): the root capture runs first and feeds orders/.
+  items = collect(t.ws, {});
+  REQUIRE(items.size() == 3);
+  CHECK(items[0].rel == "List items");
+  CHECK(items[1].rel == "orders/Create order");
+  out.clear();
+  CHECK(run_cli({"--run", u(t.dir), "--workspace", u(t.dir), "--quiet"}, {}, &out) == 0);
+  // Running only the subfolder keeps its own order.
+  const auto sub = collect(t.ws, t.dir / "orders");
+  REQUIRE(sub.size() == 2);
+  CHECK(sub[0].rel == "Create order");
+
+  // Keys outside the workspace, absolute keys and names with separators are ignored.
+  {
+    std::ofstream f(t.dir / kRunOrderFile, std::ios::binary | std::ios::trunc);
+    f << R"({"version":1,"order":{"..":["x"],"C:/abs":["y"],"orders/../..":["z"],".":["a/b","..","orders"]}})";
+  }
+  const FolderOrder bad = load_run_order(t.dir);
+  REQUIRE(bad.size() == 1);
+  CHECK(bad.at(t.dir) == std::vector<std::wstring>{L"orders"});
+  // A file that is not a run order is reported, not fatal.
+  { std::ofstream(t.dir / kRunOrderFile, std::ios::binary | std::ios::trunc) << "[1,2]"; }
+  std::string why;
+  CHECK(load_run_order(t.dir, &why).empty());
+  CHECK_FALSE(why.empty());
+  CHECK(collect(t.ws, {}).size() == 3);
+}
+
+TEST_CASE("the runner's reset drops a folder's run order: the sidebar's order again", "[runner][order]") {
+  // What the runner's circular arrow writes: an empty list for the folder and each folder below
+  // it; other folders' entries stay.
+  TempWs t;
+  SavedRequest r1 = http("Login", "GET", base() + "/echo"), r2 = http("List items", "GET", base() + "/echo"),
+               r3 = http("Get order", "GET", base() + "/echo"), r4 = http("Big", "GET", base() + "/echo");
+  t.add(r1, "Shop");
+  t.add(r2, "Shop");
+  t.add(r3, "Shop/orders");
+  t.add(r4, "Other");
+  const fs::path shop = t.dir / "Shop";
+  std::string err;
+  FolderOrder custom{{shop, {L"List items.req.json", L"orders", L"Login.req.json"}},
+                     {shop / "orders", {L"Get order.req.json"}},
+                     {t.dir, {L"Shop", L"Other"}}};
+  REQUIRE(save_run_order(t.dir, custom, 0, &err));
+  auto items = collect(t.ws, shop);
+  REQUIRE(items.size() == 3);
+  CHECK(items[0].rel == "List items");
+
+  FolderOrder reset;
+  for (const auto& [dir, names] : load_run_order(t.dir)) {
+    const fs::path rel = dir.lexically_normal().lexically_relative(shop.lexically_normal());
+    if (!rel.empty() && *rel.begin() != "..") reset[dir] = {};
+  }
+  CHECK(reset.size() == 2);  // Shop and Shop/orders, not the root
+  REQUIRE(save_run_order(t.dir, reset, 0, &err));
+  const FolderOrder back = load_run_order(t.dir);
+  CHECK(back.size() == 1);
+  CHECK(back.count(t.dir) == 1);
+  items = collect(t.ws, shop);
+  REQUIRE(items.size() == 3);
+  CHECK(items[0].rel == "orders/Get order");  // folders first, then natural names, as the sidebar
+  CHECK(items[1].rel == "List items");
+  CHECK(items[2].rel == "Login");
+}
+
+TEST_CASE("run-order.json puts commas at line ends, one name per line", "[runner][order]") {
+  CHECK(run_order_json({}) == "{\n  \"version\": 1,\n  \"order\": {}\n}\n");
+  const std::string j = run_order_json({{".", {"List items.req.json", "orders"}}, {"orders", {"Get \"x\".req.json"}}});
+  CHECK(j ==
+        "{\n  \"version\": 1,\n  \"order\": {\n"
+        "    \".\": [\n      \"List items.req.json\",\n      \"orders\"\n    ],\n"
+        "    \"orders\": [\n      \"Get \\\"x\\\".req.json\"\n    ]\n  }\n}\n");
+  for (size_t at = j.find('\n'); at != std::string::npos; at = j.find('\n', at + 1)) {
+    size_t k = at + 1;
+    while (k < j.size() && j[k] == ' ') ++k;
+    CHECK((k >= j.size() || j[k] != ','));
+  }
+  // What it writes reads back.
+  TempWs t;
+  fs::create_directories(t.dir / "orders");
+  std::string err;
+  REQUIRE(save_run_order(t.dir, {{t.dir, {L"orders", L"a.req.json"}}, {t.dir / "orders", {L"b.req.json"}}}, 0, &err));
+  const FolderOrder back = load_run_order(t.dir);
+  REQUIRE(back.size() == 2);
+  CHECK(back.at(t.dir) == std::vector<std::wstring>{L"orders", L"a.req.json"});
+}
+
+TEST_CASE("rerun failed adds the requests whose captures the failed ones read", "[runner]") {
+  std::vector<RunItem> items(4);
+  Capture tok;
+  tok.var = "token";
+  tok.target = "res.body.token";
+  items[0].req.name = "Login";
+  items[0].req.captures.push_back(tok);
+  Capture id;
+  id.var = "firstId";
+  id.target = "res.body[0].id";
+  items[1].req.name = "List items";
+  items[1].req.http.headers.push_back({"Authorization", "Bearer {{token}}"});
+  items[1].req.captures.push_back(id);
+  items[2].req.name = "Get order";
+  items[2].req.http.url = "http://h/orders/{{firstId}}";
+  items[3].req.name = "Health";
+  items[3].req.http.url = "http://h/health";
+  const std::vector<size_t> order{0, 1, 2, 3};
+  // Get order failed: List items (firstId), and Login (List items reads token) run first.
+  CHECK(with_capture_sources(items, order, {2}) == std::vector<size_t>{0, 1, 2});
+  // Health reads nothing captured.
+  CHECK(with_capture_sources(items, order, {3}) == std::vector<size_t>{3});
+  // A capture after the reader does not feed it; a disabled one captures nothing.
+  CHECK(with_capture_sources(items, {2, 0, 1, 3}, {0}) == std::vector<size_t>{0});
+  items[1].req.captures[0].enabled = false;
+  CHECK(with_capture_sources(items, order, {2}) == std::vector<size_t>{2});
+}
+
+TEST_CASE("collect again reads the requests as saved now", "[runner]") {
+  // The runner re-collects on every Run: an edit, a new file and a deleted one show at once.
+  TempWs t;
+  SavedRequest a = http("A", "GET", "http://h/json/50");
+  t.add(a, "");
+  SavedRequest b = http("B", "GET", "http://h/b");
+  t.add(b, "");
+  REQUIRE(collect(t.ws, {}).size() == 2);
+  a.http.url = "http://h/json/9";
+  t.add(a, "");
+  SavedRequest c = http("C", "GET", "http://h/c");
+  t.add(c, "");
+  fs::remove(b.file);
+  const auto items = collect(t.ws, {});
+  REQUIRE(items.size() == 2);
+  CHECK(items[0].req.http.url == "http://h/json/9");
+  CHECK(items[1].req.name == "C");
+}
+
+namespace {
+
+// HKCU\Software\watt\Workspace values, put back after the app run below (it records the
+// workspace it opened as the last one).
+constexpr const wchar_t* kWsKey = L"Software\\watt\\Workspace";
+
+struct KeepRegValue {
+  std::wstring name;
+  std::wstring value;
+  bool had = false;
+  explicit KeepRegValue(const wchar_t* n) : name(n) {
+    DWORD size = 0;
+    if (RegGetValueW(HKEY_CURRENT_USER, kWsKey, n, RRF_RT_REG_SZ, nullptr, nullptr, &size) == ERROR_SUCCESS) {
+      value.resize(size / sizeof(wchar_t));
+      had = RegGetValueW(HKEY_CURRENT_USER, kWsKey, n, RRF_RT_REG_SZ, nullptr, value.data(), &size) == ERROR_SUCCESS;
+      value.resize(wcsnlen(value.c_str(), value.size()));
+    }
+  }
+  ~KeepRegValue() {
+    if (had)
+      RegSetKeyValueW(HKEY_CURRENT_USER, kWsKey, name.c_str(), REG_SZ, value.c_str(),
+                      static_cast<DWORD>((value.size() + 1) * sizeof(wchar_t)));
+    else
+      RegDeleteKeyValueW(HKEY_CURRENT_USER, kWsKey, name.c_str());
+  }
+};
+
+std::string read_all(const fs::path& p) {
+  std::ifstream f(p, std::ios::binary);
+  return std::string(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+}
+
+int json_int(const std::string& line, const std::string& key) {
+  const size_t at = line.find("\"" + key + "\":");
+  return at == std::string::npos ? -1 : std::stoi(line.substr(at + key.size() + 3));
+}
+
+}  // namespace
+
+// The runner window itself (watt.exe next to this test, WATT_RUNNER_LAYOUT_CHECK): nothing
+// that shows or hides the "Plan changed" note (a run, typing a filter, unchecking a request, a
+// request edited on disk, the next run) may move Iterations, Parallel or Run, or a click aimed at
+// Iterations lands in Delay.
+TEST_CASE("runner settings never move when the Plan changed note shows or hides", "[runner][app]") {
+  wchar_t self[MAX_PATH] = {};
+  GetModuleFileNameW(nullptr, self, MAX_PATH);
+  const fs::path exe = fs::path(self).parent_path() / "watt.exe";
+  if (!fs::exists(exe)) SKIP("watt.exe is not built next to this test");
+  KeepRegValue last(L"Last"), recent(L"Recent");
+  TempWs t;
+  SavedRequest a = http("A", "GET", base() + "/json/3");
+  a.asserts.push_back(as("res.status", "eq", "200"));
+  t.add(a, "Shop");
+  SavedRequest b = http("B", "GET", base() + "/json/2");
+  t.add(b, "Shop");
+  const fs::path out = t.cfg / "layout.jsonl";
+  SetEnvironmentVariableW(L"WATT_RUN_FOLDER", (t.dir / "Shop").wstring().c_str());
+  SetEnvironmentVariableW(L"WATT_RUNNER_LAYOUT_CHECK", out.wstring().c_str());
+  std::wstring cmd = L"\"" + exe.wstring() + L"\" --new-instance \"" + t.dir.wstring() + L"\"";
+  STARTUPINFOW si{};
+  si.cb = sizeof si;
+  PROCESS_INFORMATION pi{};
+  const BOOL started = CreateProcessW(exe.wstring().c_str(), cmd.data(), nullptr, nullptr, FALSE, 0, nullptr,
+                                      nullptr, &si, &pi);
+  SetEnvironmentVariableW(L"WATT_RUN_FOLDER", nullptr);
+  SetEnvironmentVariableW(L"WATT_RUNNER_LAYOUT_CHECK", nullptr);
+  REQUIRE(started);
+  bool edited = false;
+  std::string got;
+  const auto t0 = std::chrono::steady_clock::now();
+  while (std::chrono::steady_clock::now() - t0 < std::chrono::seconds(70)) {
+    got = read_all(out);
+    if (!edited && got.find("\"ran\"") != std::string::npos) {
+      // Edited on disk while the runner is open: the note appears; the next run clears it.
+      a.http.url = base() + "/json/4";
+      t.add(a, "Shop");
+      edited = true;
+    }
+    if (got.find("\"done\"") != std::string::npos || got.find("\"timeout\"") != std::string::npos) break;
+    if (WaitForSingleObject(pi.hProcess, 100) == WAIT_OBJECT_0 && read_all(out) == got) break;
+  }
+  if (WaitForSingleObject(pi.hProcess, 5000) != WAIT_OBJECT_0) TerminateProcess(pi.hProcess, 9);
+  CloseHandle(pi.hThread);
+  CloseHandle(pi.hProcess);
+  INFO(got);
+  REQUIRE(got.find("\"done\"") != std::string::npos);
+  const size_t at = got.find("{\"check\":\"done\"");
+  const std::string line = got.substr(at);
+  for (const char* step : {"run", "filter", "filter_cleared", "uncheck", "disk_edit", "run_again", "keystroke"})
+    CHECK(got.find(std::string("\"step\":\"") + step + "\"") != std::string::npos);
+  CHECK(json_int(line, "moved") == 0);                            // no step moved a field
+  CHECK(line.find("\"note_filter\":true") != std::string::npos);   // the note did show
+  CHECK(line.find("\"note_uncheck\":true") != std::string::npos);
+  CHECK(line.find("\"note_after\":false") != std::string::npos);   // and the run cleared it
+}
+
+namespace {
+
+// watt_testserver.exe from the same build dir, on a free port; killed with this process.
+struct GrpcServer {
+  PROCESS_INFORMATION pi{};
+  HANDLE job = nullptr;
+  int port = 0;
+  GrpcServer() {
+    wchar_t buf[MAX_PATH];
+    GetModuleFileNameW(nullptr, buf, MAX_PATH);
+    const fs::path exe = fs::path(buf).parent_path() / "watt_testserver.exe";
+    if (!fs::exists(exe)) return;
+    job = CreateJobObjectW(nullptr, nullptr);
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION li{};
+    li.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    SetInformationJobObject(job, JobObjectExtendedLimitInformation, &li, sizeof(li));
+    SECURITY_ATTRIBUTES sa{sizeof(sa), nullptr, TRUE};
+    HANDLE rd = nullptr, wr = nullptr;
+    CreatePipe(&rd, &wr, &sa, 0);
+    SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdOutput = wr;
+    si.hStdError = GetStdHandle(STD_ERROR_HANDLE);
+    si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+    std::wstring cmd = L"\"" + exe.wstring() + L"\" 0";
+    if (!CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+      CloseHandle(rd);
+      CloseHandle(wr);
+      return;
+    }
+    AssignProcessToJobObject(job, pi.hProcess);
+    CloseHandle(wr);
+    const auto line = [&] {
+      std::string l;
+      char c;
+      DWORD n;
+      while (ReadFile(rd, &c, 1, &n, nullptr) && n == 1 && c != '\n') l += c;
+      return l;
+    };
+    const std::string grpc = line();
+    line();  // the gRPC-Web banner
+    CloseHandle(rd);
+    if (const auto colon = grpc.rfind(':'); colon != std::string::npos) port = std::atoi(grpc.c_str() + colon + 1);
+  }
+  ~GrpcServer() {
+    if (pi.hProcess) {
+      TerminateProcess(pi.hProcess, 0);
+      CloseHandle(pi.hThread);
+      CloseHandle(pi.hProcess);
+    }
+    if (job) CloseHandle(job);
+  }
+};
+
+StepResult::Check check(const std::string& target, bool pass, const std::string& from) {
+  StepResult::Check c;
+  c.target = target;
+  c.op = "eq";
+  c.pass = pass;
+  c.from = from;
+  return c;
+}
+
+}  // namespace
+
+TEST_CASE("a client-side error or an error status is a failure even when inherited asserts pass", "[runner][grpc]") {
+  // The rule itself, without a server.
+  StepResult s;
+  s.kind = RequestKind::Grpc;
+  s.client_error = true;
+  s.error = "Request message: invalid JSON in watt.test.CountRequest";
+  s.asserts.push_back(check("res.responseTime", true, "Collection"));
+  s.asserts_passed = 1;
+  CHECK(s.errored());
+  CHECK(s.failed());
+  // Sent, NOT_FOUND, only the collection's passing time assert: failed.
+  StepResult g = s;
+  g.client_error = false;
+  g.error.clear();
+  g.sent = true;
+  g.transport_ok = false;
+  g.status = 5;
+  g.status_text = "NOT_FOUND";
+  CHECK_FALSE(g.errored());
+  CHECK(g.failed());
+  CHECK(g.reason().find("NOT_FOUND") != std::string::npos);
+  // An inherited status assert does not excuse it; the request's own does.
+  g.asserts.push_back(check("res.status", true, "api"));
+  g.asserts_passed = 2;
+  CHECK(g.failed());
+  g.asserts.back().from.clear();
+  CHECK_FALSE(g.failed());
+  // HTTP 404 with an inherited passing assert fails; with its own status assert it passes.
+  StepResult h;
+  h.kind = RequestKind::Http;
+  h.sent = h.transport_ok = true;
+  h.status = 404;
+  h.asserts.push_back(check("res.responseTime", true, "Collection"));
+  h.asserts_passed = 1;
+  CHECK(h.failed());
+  h.asserts.push_back(check("res.status", true, ""));
+  h.asserts_passed = 2;
+  CHECK_FALSE(h.failed());
+  h.status = 200;
+  h.asserts.pop_back();
+  h.asserts_passed = 1;
+  CHECK(h.passed());
+
+  // The real thing: Count with a field CountRequest does not have, under a collection assert.
+  GrpcServer srv;
+  if (!srv.port) {
+    WARN("watt_testserver.exe not next to the test exe: the live part is skipped");
+    return;
+  }
+  TempWs t;
+  FolderSettings coll;
+  coll.asserts.push_back(as("res.responseTime", "lt", "5000"));
+  std::string err;
+  REQUIRE(t.ws.save_collection_settings(coll, &err));
+  SavedRequest bad;
+  bad.name = "Count";
+  bad.kind = RequestKind::Grpc;
+  bad.grpc_target.address = "127.0.0.1:" + std::to_string(srv.port);
+  bad.grpc_method = "/watt.test.Echo/Count";
+  bad.grpc_body = R"({"n": 3})";
+  t.add(bad, "grpc");
+  SavedRequest good = bad;
+  good.name = "Say";
+  good.grpc_method = "/watt.test.Echo/Say";
+  good.grpc_body = R"({"message": "hi"})";
+  t.add(good, "grpc");
+  const auto items = collect(t.ws, t.dir / "grpc");
+  REQUIRE(items.size() == 2);
+  Workspace w = t.ws;
+  RunControl ctl;
+  RunOptions o;
+  std::vector<std::shared_ptr<const StepResult>> seen;
+  const GrpcFactory f = [] { return std::make_shared<GrpcClient>(); };
+  const auto sum = run_plan(items, all(items.size()), o, w, f, ctl, [&](auto r) { seen.push_back(r); });
+  REQUIRE(seen.size() == 2);
+  for (const auto& r : seen) {
+    INFO(r->name << ": " << r->error);
+    if (r->name == "Count") {
+      CHECK(r->client_error);
+      CHECK_FALSE(r->sent);
+      CHECK(r->failed());
+      CHECK(r->error.find("Request message") != std::string::npos);
+    } else {
+      CHECK(r->passed());
+    }
+  }
+  CHECK(sum.passed == 1);
+  CHECK(sum.failed == 1);
+  CHECK(sum.errors == 1);
 }

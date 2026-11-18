@@ -25,6 +25,7 @@
 #include <cmath>
 #include <cstring>
 #include <map>
+#include <set>
 #include <memory>
 #include <thread>
 
@@ -38,9 +39,13 @@
 #include "app/request_tab.h"
 #include "app/response_body.h"
 #include "app/response_conn.h"
+#include "app/response_cookies.h"
+#include "app/http_editor_cookies.h"
 #include "app/response_examples.h"
 #include "app/response_format.h"
 #include "app/response_keep.h"
+#include "app/response_sse.h"
+#include "app/response_sse_view.h"
 #include "app/response_tests.h"
 #include "app/response_tests_view.h"
 #include "app/response_widgets.h"
@@ -62,6 +67,20 @@ FILE* trace_file() {
   }();
   return f;
 }
+// Lap timer for one step split in parts: "what.part ms" lines (only when tracing is on).
+struct TraceLaps {
+  const char* what;
+  Clock::time_point t = Clock::now();
+  explicit TraceLaps(const char* w) : what(w) {}
+  void lap(const char* part) {
+    if (FILE* f = trace_file()) {
+      const auto now = Clock::now();
+      std::fprintf(f, "%s.%s %.2f\n", what, part, std::chrono::duration<double, std::milli>(now - t).count());
+      std::fflush(f);
+      t = now;
+    }
+  }
+};
 struct TraceScope {
   const char* what;
   Clock::time_point t0 = Clock::now();
@@ -208,6 +227,215 @@ class KvPage : public LazyPage {
   const char* c2_;
   KvData d_;
   KvList* list_ = nullptr;
+};
+
+// The Cookies page: every Set-Cookie of the response as Postman / Insomnia show them (name,
+// value, domain, path, expiry, flags) plus what the workspace jar did with it, under a line
+// that says where they went and opens the jar ("Manage cookies").
+class CookieList : public wxListCtrl {
+ public:
+  enum Col { kName, kValue, kDomain, kPath, kExpires, kFlags, kJar, kCols };
+  CookieList(wxWindow* parent, const std::vector<rv::SetCookieRow>* rows)
+      : wxListCtrl(parent, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxLC_REPORT | wxLC_VIRTUAL | wxBORDER_NONE),
+        rows_(rows) {
+    const char* names[kCols] = {"Name", "Value", "Domain", "Path", "Expires", "Flags", "Jar"};
+    const int widths[kCols] = {140, 240, 150, 70, 100, 140, 180};
+    for (int c = 0; c < kCols; ++c) AppendColumn(names[c], wxLIST_FORMAT_LEFT, FromDIP(widths[c]));
+    // Refit after a resize, deferred (a width change inside the size event can re-enter it).
+    Bind(wxEVT_SIZE, [this](wxSizeEvent& e) {
+      e.Skip();
+      if (fit_pending_) return;
+      fit_pending_ = true;
+      CallAfter([this] {
+        fit_pending_ = false;
+        fit_columns();
+      });
+    });
+    Bind(wxEVT_KEY_DOWN, [this](wxKeyEvent& e) {
+      if (e.GetModifiers() == wxMOD_CONTROL && e.GetKeyCode() == 'C') return copy(false, false);
+      if (e.GetModifiers() == wxMOD_CONTROL && e.GetKeyCode() == 'A') {
+        for (long i = 0; i < GetItemCount(); ++i) SetItemState(i, wxLIST_STATE_SELECTED, wxLIST_STATE_SELECTED);
+        return;
+      }
+      e.Skip();
+    });
+    // The whole cell under the pointer as a tooltip (a long value, the jar's full reason).
+    Bind(wxEVT_MOTION, [this](wxMouseEvent& e) {
+      e.Skip();
+      int flags = 0;
+      long col = -1;
+      const long item = HitTest(e.GetPosition(), flags, &col);
+      if (item == tip_item_ && col == tip_col_) return;
+      tip_item_ = item;
+      tip_col_ = col;
+      wxString t;
+      if (item >= 0 && (col == kJar || col == kValue)) {
+        t = OnGetItemText(item, col);
+        wxClientDC dc(this);
+        dc.SetFont(GetFont());
+        if (dc.GetTextExtent(t).x + FromDIP(12) <= GetColumnWidth(static_cast<int>(col))) t.clear();
+      }
+      if (t.empty()) UnsetToolTip();
+      else SetToolTip(t);
+    });
+    Bind(wxEVT_CONTEXT_MENU, [this](wxContextMenuEvent&) {
+      wxMenu m;
+      m.Append(1, "Copy value\tCtrl+C");
+      m.Append(2, "Copy name=value");
+      m.Append(3, "Copy Set-Cookie header");
+      m.Append(4, "Copy all as Set-Cookie headers");
+      const int id = GetPopupMenuSelectionFromUser(m);
+      if (id == 1) copy(false, false);
+      else if (id == 2) copy(false, true);
+      else if (id == 3) copy_raw(false);
+      else if (id == 4) copy_raw(true);
+    });
+    sync();
+  }
+  void sync() {
+    SetItemCount(static_cast<long>(rows_->size()));
+    fit_columns();
+    Refresh();
+  }
+
+ private:
+  // Each column as wide as its widest cell (the first 200 rows, capped), so the seven columns
+  // fit a narrow response pane; Value may grow to the right edge.
+  void fit_columns() {
+    if (GetClientSize().x <= 0) return;
+    static const int caps[kCols] = {200, 320, 200, 140, 120, 170, 520};
+    wxClientDC dc(this);
+    dc.SetFont(GetFont());
+    int w[kCols];
+    for (int c = 0; c < kCols; ++c) {
+      wxListItem it;
+      it.SetMask(wxLIST_MASK_TEXT);
+      GetColumn(c, it);
+      w[c] = dc.GetTextExtent(it.GetText()).x;
+    }
+    const size_t n = std::min<size_t>(rows_->size(), 200);
+    for (size_t i = 0; i < n; ++i)
+      for (int c = 0; c < kCols; ++c)
+        w[c] = std::max(w[c], dc.GetTextExtent(OnGetItemText(static_cast<long>(i), c)).x);
+    int cw[kCols];
+    int used = 0;
+    for (int c = 0; c < kCols; ++c) {
+      cw[c] = std::min(w[c] + FromDIP(18), FromDIP(caps[c]));
+      used += cw[c];
+    }
+    // No horizontal scrolling at the pane width: Value gives way first, then the Jar reason (its
+    // full text is the row's tooltip), down to a readable minimum each.
+    const int room = GetClientSize().x - 4;
+    if (room > 0 && used > room) {
+      const int v = std::max(FromDIP(80), cw[kValue] - (used - room));
+      used -= cw[kValue] - v;
+      cw[kValue] = v;
+    }
+    if (room > 0 && used > room) {
+      const int j = std::max(FromDIP(110), cw[kJar] - (used - room));
+      used -= cw[kJar] - j;
+      cw[kJar] = j;
+    }
+    if (room > 0 && used > room) {  // a very narrow pane: every column in proportion
+      int sum = 0;
+      for (int c = 0; c < kCols; ++c) sum += (cw[c] = std::max(FromDIP(36), cw[c] * room / used));
+      used = sum;
+    }
+    Freeze();
+    for (int c = 0; c < kCols; ++c) SetColumnWidth(c, cw[c]);
+    const int spare = room - used;
+    if (spare > 0) SetColumnWidth(kValue, cw[kValue] + spare);
+    Thaw();
+  }
+  wxString OnGetItemText(long item, long col) const override {
+    if (item < 0 || static_cast<size_t>(item) >= rows_->size()) return {};
+    const rv::SetCookieRow& r = (*rows_)[static_cast<size_t>(item)];
+    switch (col) {
+      case kName: return U(r.name.empty() ? std::string("(no name)") : r.name);
+      case kValue: return U(r.value.size() > 512 ? r.value.substr(0, 512) + "\xE2\x80\xA6" : r.value);
+      case kDomain: return U(r.host_only ? r.domain : "." + r.domain);
+      case kPath: return U(r.path);
+      case kExpires: return U(r.expires);
+      case kFlags: return U(rv::cookie_flags_text(r));
+      case kJar: return U(rv::cookie_fate_text(r));
+      default: return {};
+    }
+  }
+  wxItemAttr* OnGetItemAttr(long item) const override {
+    if (item < 0 || static_cast<size_t>(item) >= rows_->size()) return nullptr;
+    switch ((*rows_)[static_cast<size_t>(item)].fate) {
+      case rv::SetCookieRow::Fate::Ignored: return &warn_attr_;
+      case rv::SetCookieRow::Fate::Deletes: return &dim_attr_;
+      default: return nullptr;
+    }
+  }
+  void copy(bool all, bool pair) {
+    std::string s;
+    for (size_t i = 0; i < rows_->size(); ++i)
+      if (all || GetItemState(static_cast<long>(i), wxLIST_STATE_SELECTED)) {
+        const rv::SetCookieRow& r = (*rows_)[i];
+        s += pair ? r.name + "=" + r.value : r.value;
+        s += '\n';
+      }
+    if (!s.empty()) s.pop_back();
+    if (!s.empty()) to_clipboard(U(s));
+  }
+  void copy_raw(bool all) {
+    std::string s;
+    for (size_t i = 0; i < rows_->size(); ++i)
+      if (all || GetItemState(static_cast<long>(i), wxLIST_STATE_SELECTED)) s += "Set-Cookie: " + (*rows_)[i].raw + "\n";
+    if (!s.empty()) to_clipboard(U(s));
+  }
+  const std::vector<rv::SetCookieRow>* rows_;
+  bool fit_pending_ = false;
+  long tip_item_ = -2, tip_col_ = -2;
+  mutable wxItemAttr warn_attr_{Theme::get().warn, wxNullColour, wxNullFont};
+  mutable wxItemAttr dim_attr_{Theme::get().dim, wxNullColour, wxNullFont};
+};
+
+class CookiePage : public LazyPage {
+ public:
+  // on_manage: opens the workspace cookie jar on the given host's cookies.
+  CookiePage(wxWindow* parent, std::function<void(const std::string&)> on_manage)
+      : LazyPage(parent), on_manage_(std::move(on_manage)) {}
+  void set(std::vector<rv::SetCookieRow> rows, std::string note = {}, Tone tone = Tone::Dim) {
+    rows_ = std::move(rows);
+    note_ = std::move(note);
+    tone_ = tone;
+    if (list_) {
+      list_->sync();
+      bar_->set_note(note_, tone_);
+      bar_->set_enabled(1, !rows_.empty());
+    }
+  }
+  size_t count() const { return rows_.size(); }
+
+ private:
+  wxWindow* make() override {
+    auto* p = new wxPanel(this);
+    p->SetBackgroundColour(Theme::get().bg);
+    bar_ = new ChipBar(p, [this](int id) {
+      if (id == 1 && on_manage_) on_manage_(rows_.empty() ? std::string() : rows_.front().domain);
+    });
+    bar_->add(1, "Manage cookies\xE2\x80\xA6",
+              "Open the workspace cookie jar on this host's cookies: every cookie later requests send, "
+              "to edit, delete or clear.",
+              -1, true);
+    bar_->set_note(note_, tone_);
+    bar_->set_enabled(1, !rows_.empty());
+    list_ = new CookieList(p, &rows_);
+    auto* s = new wxBoxSizer(wxVERTICAL);
+    s->Add(bar_, 0, wxEXPAND);
+    s->Add(list_, 1, wxEXPAND);
+    p->SetSizer(s);
+    return p;
+  }
+  std::function<void(const std::string&)> on_manage_;
+  std::vector<rv::SetCookieRow> rows_;
+  std::string note_;
+  Tone tone_ = Tone::Dim;
+  ChipBar* bar_ = nullptr;
+  CookieList* list_ = nullptr;
 };
 
 struct MsgRow {
@@ -464,6 +692,13 @@ class LogPage : public LazyPage {
   explicit LogPage(wxWindow* parent) : LazyPage(parent) {}
   void set(std::string text) {
     text_ = std::move(text);
+    tail_.clear();
+    if (stc_) fill();
+  }
+  // Lines known only after the checks ran (the captures' variable writes), after the transcript.
+  void set_tail(std::string tail) {
+    if (tail == tail_) return;
+    tail_ = std::move(tail);
     if (stc_) fill();
   }
 
@@ -505,15 +740,17 @@ class LogPage : public LazyPage {
     // Scintilla wraps on the UI thread: only a transcript of a usual size (a huge script log
     // keeps its horizontal scroll bar).
     stc_->SetWrapMode(text_.size() < (512u << 10) ? wxSTC_WRAP_WORD : wxSTC_WRAP_NONE);
-    stc_->AddTextRaw(text_.data(), static_cast<int>(text_.size()));
+    const std::string all = tail_.empty() ? std::string() : text_ + tail_;
+    const std::string& text = tail_.empty() ? text_ : all;
+    stc_->AddTextRaw(text.data(), static_cast<int>(text.size()));
     // One style per line, from its first character: "*" info dim, ">" sent, "<" received,
     // "|" script console output, "!" a warning / error.
     stc_->StartStyling(0);
     size_t at = 0;
-    while (at < text_.size()) {
-      size_t e = text_.find('\n', at);
-      e = e == std::string::npos ? text_.size() : e + 1;
-      const char p = text_[at];
+    while (at < text.size()) {
+      size_t e = text.find('\n', at);
+      e = e == std::string::npos ? text.size() : e + 1;
+      const char p = text[at];
       stc_->SetStyling(static_cast<int>(e - at), p == '>'   ? kSent
                                                  : p == '<' ? kRecv
                                                  : p == '|' ? kConsole
@@ -525,6 +762,7 @@ class LogPage : public LazyPage {
     stc_->GotoPos(0);
   }
   std::string text_;
+  std::string tail_;
   wxStyledTextCtrl* stc_ = nullptr;
 };
 
@@ -683,6 +921,10 @@ TimingModel http_model(const HttpResponse& r, bool plain_http, const ScriptRun* 
     if (pre->wait_us > 0) tip += ", waiting in sendRequest / sleep " + fmt::ms(pre->wait_us / 1000.0);
     tip += ". Its console output and tests are in the Log and Tests tabs.";
     m.phases.insert(m.phases.begin(), Phase{"Pre-script", pre_ms, tip, wxColour(170, 110, 190)});
+    // Not part of the response time (as the post-response script is not): Total is the request's
+    // own time and the script is named next to it, as Postman and Bruno leave both out.
+    m.before = pre_ms;
+    m.total = t.total_ms - pre_ms;
   }
   if (token) {
     if (m.phases.size() > 1 && m.phases[1].name == "Queue") {  // keep the reserved row count
@@ -722,12 +964,12 @@ TimingModel http_model(const HttpResponse& r, bool plain_http, const ScriptRun* 
     m.phases.push_back(Phase{"Post-script", post_ms, tip, wxColour(170, 110, 190)});
     m.after = post_ms;
   }
-  m.client = r.prepare_ms + t.queue_ms + r.process_ms;
-  m.network = std::max(0.0, t.total_ms - m.server_wait - m.client);
+  m.client = r.prepare_ms + (t.queue_ms - pre_ms) + r.process_ms;
+  m.network = std::max(0.0, m.total - m.server_wait - m.client);
   m.client_tip = "watt's own time: Prepare (request setup) + Queue (UI-to-worker hand-off, libcurl's queue) + "
                  "Process (result collection) = " + fmt::ms(r.prepare_ms) + " + " + fmt::ms(queue_ms) + " + " +
                  fmt::ms(r.process_ms) + ".";
-  if (pre_ms > 0) m.client_tip += " Plus the pre-request script, " + fmt::ms(pre_ms) + ".";
+  if (pre_ms > 0) m.client_tip += " Before the request: the pre-request script, " + fmt::ms(pre_ms) + " (not in the total).";
   if (token) m.client_tip += " Plus the OAuth 2.0 token step, " + fmt::ms(tok_ms) + ".";
   if (m.after > 0)
     m.client_tip += " After the response: the post-response script, " + fmt::ms(m.after) + " (not in the total).";
@@ -1085,9 +1327,30 @@ void mark_failure(TimingModel& m, const HttpResponse& r) {
   for (const Phase& ph : m.phases)
     for (const char* name : kNet)
       if (ph.has_value && ph.name == name && ph.name != "Wait (TTFB)") net += ph.ms;
+  // Failed before the request was sent (DNS, connect, TLS): no server time at all, "n/a" (not
+  // "server wait 0.000 ms", which reads as an instant answer).
+  if (f.at == FailAt::Url || f.at == FailAt::Dns || f.at == FailAt::Connect || f.at == FailAt::Tls) {
+    m.server_wait = 0;
+    m.server_na = true;
+    m.server_tip = "The request failed before it was sent: no server was reached, so there is no server time.";
+  }
   m.network = net;
   m.client = std::max(0.0, m.total - m.server_wait - net);
   m.client_tip = "watt's own time, including the time before the request failed that no phase above covers.";
+}
+
+// curl's message counts whole milliseconds from its own start ("Failed to connect to 127.0.0.1
+// port 9 after 0 ms: ..."), next to a total of 1.17 ms: the view says the total it shows.
+std::string shown_error(const HttpResponse& r) {
+  std::string e = r.error;
+  const size_t a = e.find(" after ");
+  if (a == std::string::npos) return e;
+  size_t k = a + 7;
+  const size_t digits = k;
+  while (k < e.size() && e[k] >= '0' && e[k] <= '9') ++k;
+  if (k == digits || e.compare(k, 3, " ms") != 0) return e;
+  e.replace(a, k + 3 - a, " after " + fmt::ms(r.timing.total_ms));
+  return e;
 }
 
 // Cheap identity of a request body: its size plus a hash of the first and last 64 KB.
@@ -1218,11 +1481,16 @@ std::string http_transcript(const HttpResponse& r, const SentHttp* sent, const s
     line('*', b + ", headers " + fmt::human_bytes(z.response_headers));
   }
   const Timing& t = r.timing;
-  std::string tm = "Timing: queue " + fmt::ms(t.queue_ms) + ", DNS " + fmt::ms(t.dns_ms) + ", connect " +
+  // The pre-request script ran inside Queue: split out as in the status line and the waterfall
+  // (Total is the request's own time, the script is named next to it).
+  const ScriptRun* pre = sent && sent->pre_script && sent->pre_script->ran ? sent->pre_script.get() : nullptr;
+  const double pre_ms = pre ? std::min(t.queue_ms, pre->elapsed_us / 1000.0) : 0.0;
+  std::string tm = "Timing: queue " + fmt::ms(t.queue_ms - pre_ms) + ", DNS " + fmt::ms(t.dns_ms) + ", connect " +
                    fmt::ms(t.connect_ms) + ", TLS " + fmt::ms(t.tls_ms) + ", send " + fmt::ms(t.send_ms) + ", wait " +
                    fmt::ms(t.ttfb_ms) + ", download " + fmt::ms(t.download_ms);
   if (r.redirect_ms > 0) tm += ", redirects " + fmt::ms(r.redirect_ms);
-  line('*', tm + ", total " + fmt::ms(t.total_ms));
+  line('*', tm + ", total " + fmt::ms(t.total_ms - pre_ms) +
+                (pre_ms > 0 ? " (+ pre-request script " + fmt::ms(pre_ms) + ")" : std::string()));
   line('*', "Bytes on the wire: " + std::to_string(t.bytes_sent) + " sent, " + std::to_string(t.bytes_received) + " received");
   return o;
 }
@@ -1230,6 +1498,8 @@ std::string http_transcript(const HttpResponse& r, const SentHttp* sent, const s
 // ------------------------------------------------------------------ view
 
 enum Tab { kBody, kHeaders, kCookies, kTrailers, kMessages, kRequest, kTests, kLog };
+// Book page of an event stream's Body tab (no tab of its own: the Body tab shows it).
+constexpr int kSsePage = 8;
 
 // The body pane before the first response: what the view will show, so its features are found.
 const char* const kEmptyHelp =
@@ -1247,15 +1517,38 @@ class ResponseView : public wxPanel, public ResponsePanel {
  public:
   explicit ResponseView(wxWindow* parent) : wxPanel(parent, wxID_ANY) {
     SetBackgroundColour(Theme::get().bg);
+    TraceLaps tl("build");
     status_ = new StatusStrip(this);
     wf_ = new Waterfall(this);
     tabs_ = new TabStrip(this, [this](int i) { show_page(i); });
     book_ = new wxSimplebook(this, wxID_ANY);
     book_->SetBackgroundColour(Theme::get().bg);
+    tl.lap("strips");
     body_ = new BodyView(book_);
+    body_->on_visualize_chosen = [this](bool on) {
+      const std::string k = vis_key();
+      if (k.empty()) return;
+      auto& m = vis_chosen_by_request();
+      if (!on) m.erase(k);
+      else if (m.size() < 4096) m.insert(k);
+      // Kept with the run shown, so the request reopens (after a restart too) in this view.
+      if (showing_grpc_ || shown_run_ >= runs_.size()) return;
+      const Run& run = runs_[shown_run_];
+      const RequestTab* t = tab();
+      if (!t || t->request().kind != RequestKind::Http) return;
+      const SavedRequest& q = t->request();
+      const std::string key =
+          rv::run_key(q.http.method + " " + q.http.url, run.resp->status, run.resp->timing.total_ms + run.prompt_ms);
+      if (auto x = rv::find_extras_cached(key); x && x->visualize != on) {
+        x->visualize = on;
+        const Workspace* ws = t->workspace();
+        rv::keep_extras(ws ? ws->root() : std::filesystem::path(), key, std::move(*x));
+      }
+    };
+    tl.lap("body");
     // The other pages are cheap panels until first shown (see LazyPage).
     headers_ = new KvPage(book_, "Header", "Value");
-    cookies_ = new KvPage(book_, "Cookie", "Value; attributes");
+    cookies_ = new CookiePage(book_, [this](const std::string& host) { manage_cookies(host); });
     trailers_ = new KvPage(book_, "Trailer", "Value");
     msgs_ = new MsgPage(book_, [this](size_t i) {
       select_tab(kBody);
@@ -1276,6 +1569,11 @@ class ResponseView : public wxPanel, public ResponsePanel {
       });
     };
     log_ = new LogPage(book_);
+    sse_ = new SsePage(book_);
+    sse_->on_raw = [this] {
+      sse_raw_ = true;
+      show_raw_stream();
+    };
     book_->AddPage(body_, "Body");
     book_->AddPage(headers_, "Headers");
     book_->AddPage(cookies_, "Cookies");
@@ -1284,6 +1582,7 @@ class ResponseView : public wxPanel, public ResponsePanel {
     book_->AddPage(request_, "Request");
     book_->AddPage(tests_, "Tests");
     book_->AddPage(log_, "Log");
+    book_->AddPage(sse_, "Events");
     tabs_->add("Body");
     tabs_->add("Headers");
     tabs_->add("Cookies");
@@ -1292,6 +1591,7 @@ class ResponseView : public wxPanel, public ResponsePanel {
     tabs_->add("Request");
     tabs_->add("Tests");
     tabs_->add("Log");
+    tl.lap("pages");
 
     hist_ = new ChipBar(this, [this](int id) { id == 2 ? examples_menu() : history_menu(); });
     hist_->add(2, "Examples \xE2\x96\xBE",
@@ -1314,6 +1614,7 @@ class ResponseView : public wxPanel, public ResponsePanel {
     sz->Add(tabrow, 0, wxEXPAND | wxTOP, FromDIP(2));
     sz->Add(book_, 1, wxEXPAND);
     SetSizer(sz);
+    tl.lap("sizer");
     wf_->set_on_conn_click([this](const wxRect& r) { open_conn(r); });
     status_->set_on_click([this](int id, const wxRect& r) {
       if (id == kClickTests) return select_tab(kTests);
@@ -1371,6 +1672,13 @@ class ResponseView : public wxPanel, public ResponsePanel {
 
   void clear() override {
     TraceScope ts("clear");
+    stop_live_head();
+    tap_.reset();
+    ++tap_seq_;
+    tap_armed_ = false;
+    sse_timer_.Stop();
+    sse_live_ = false;
+    sse_off();
     status_->set("", Tone::Plain, {{"Send a request to see the response here  (Ctrl+Enter)", "", Tone::Dim}});
     wf_->clear(false);
     switch_filter({});
@@ -1506,6 +1814,307 @@ class ResponseView : public wxPanel, public ResponsePanel {
     }).detach();
   }
 
+  // ------------------------------------------------------------------ event streams
+ private:
+  struct Run;
+
+ public:
+  //
+  // The shell's worker feeds every body chunk of an HTTP send to the tap. A text/event-stream
+  // body (sniffed from its first bytes: no headers reach the tap) turns the Body tab into the
+  // event list as soon as the first event is complete; batches reach the UI thread at most every
+  // kSseBatchMs, so a fast stream never floods it.
+  std::shared_ptr<HttpBodyTap> body_tap() override {
+    const uint64_t seq = ++tap_seq_;
+    tap_armed_ = true;
+    std::weak_ptr<bool> alive = alive_;
+    tap_t0_ = Clock::now();
+    tap_ = std::make_shared<SseTap>(
+        tap_t0_,
+        [alive, this, seq] {
+          // Worker thread: one post per drain (the tap does not call again until drain() ran).
+          if (!wxTheApp) return;
+          wxTheApp->CallAfter([alive, this, seq] {
+            if (auto a = alive.lock(); a && *a && seq == tap_seq_) sse_kick();
+          });
+        },
+        [alive, this, seq] {
+          // Worker thread: the response head is in (status, headers, phases to the first byte).
+          if (!wxTheApp) return;
+          wxTheApp->CallAfter([alive, this, seq] {
+            if (auto a = alive.lock(); a && *a && seq == tap_seq_) on_tap_head();
+          });
+        });
+    return tap_;
+  }
+
+  void sse_kick() {
+    if (!tap_ || sse_timer_.IsRunning()) return;
+    const double since = sse_drained_at_ == Clock::time_point{} ? 1e9 : ms_between(sse_drained_at_, Clock::now());
+    if (since >= kSseBatchMs) return sse_drain();
+    if (sse_timer_.GetOwner() != this) {
+      sse_timer_.SetOwner(this, wxWindow::NewControlId());
+      Bind(wxEVT_TIMER, [this](wxTimerEvent&) { sse_drain(); }, sse_timer_.GetId());
+    }
+    sse_timer_.StartOnce(std::max(1, static_cast<int>(kSseBatchMs - since)));
+  }
+
+  // UI thread: the events and bytes since the last drain onto the list.
+  void sse_drain() {
+    TraceScope ts("sse_drain");
+    sse_drained_at_ = Clock::now();
+    if (!tap_ || !tap_->is_sse()) return;
+    SseTap::Batch b = tap_->drain();
+    if (!awaiting_) return;  // the result (or a cancel) already took the stream over
+    if (!sse_live_) sse_begin_live();
+    sse_comments_ = b.comments;
+    if (sse_raw_bytes_.size() < kSseRawMax) sse_raw_bytes_.append(b.raw, 0, kSseRawMax - sse_raw_bytes_.size());
+    sse_->append(std::move(b.events));
+    sse_live_caption(false);
+    if (first_ms_ < 0) first_ms_ = tap_->first_ms();
+    status_->set_busy_label(live_label());
+    wf_->set_live(first_ms_, tap_->bytes(), 0);
+    if (head_shown_) live_tick();
+  }
+
+  // ------------------------------------------------------------------ live head
+  //
+  // The engine hands the final response's head over as soon as its header block ends (HeadFn):
+  // status, headers, connection and the phases up to the first byte. A response that is still
+  // arriving after kHeadDelayMs (an event stream, a slow download) shows them then, with only
+  // Download running; a fast one goes straight to show_http (no extra repaint).
+  static constexpr int kHeadDelayMs = 40;
+  static constexpr int kLiveTickMs = 250;
+
+  void on_tap_head() {
+    if (!awaiting_ || kind_ != RequestKind::Http || !tap_ || head_shown_) return;
+    if (head_timer_.GetOwner() != this) {
+      head_timer_.SetOwner(this, wxWindow::NewControlId());
+      Bind(wxEVT_TIMER, [this](wxTimerEvent&) { show_live_head(); }, head_timer_.GetId());
+    }
+    if (!head_timer_.IsRunning()) head_timer_.StartOnce(kHeadDelayMs);
+  }
+
+  // Body bytes and events per second since the first body byte ("" until there is half a second).
+  std::string live_rate() const {
+    if (!tap_ || tap_->first_ms() < 0) return {};
+    const double span = (ms_between(tap_t0_, Clock::now()) - tap_->first_ms()) / 1000.0;
+    if (span < 0.5) return {};
+    std::string t = fmt::human_bytes(static_cast<uint64_t>(static_cast<double>(tap_->bytes()) / span)) + "/s";
+    if (sse_live_ && sse_) {
+      char b[32];
+      std::snprintf(b, sizeof b, "%.1f events/s", static_cast<double>(sse_->count()) / span);
+      t += std::string(" \xC2\xB7 ") + b;
+    }
+    return t;
+  }
+
+  // The busy status line while a response arrives: protocol, what arrived, throughput.
+  std::string live_label() const {
+    std::string t;
+    if (head_shown_) {
+      t = head_shown_->http_version.empty() ? std::string("HTTP") : head_shown_->http_version;
+      if (!head_shown_->tls_version.empty()) t += " \xC2\xB7 " + head_shown_->tls_version;
+      t += "  \xC2\xB7  ";
+    }
+    const uint64_t got = std::max<uint64_t>(tap_ ? tap_->bytes() : 0, live_bytes_);
+    if (sse_live_ && sse_) {
+      t += "Streaming \xC2\xB7 " + std::to_string(sse_->count()) + (sse_->count() == 1 ? " event" : " events") +
+           " \xC2\xB7 " + fmt::human_bytes(got);
+    } else {
+      t += "Receiving " + fmt::human_bytes(got);
+    }
+    if (const std::string rate = live_rate(); !rate.empty()) t += " \xC2\xB7 " + rate;
+    return t;
+  }
+
+  std::string live_wf_head() const {
+    const uint64_t got = std::max<uint64_t>(tap_ ? tap_->bytes() : 0, live_bytes_);
+    std::string t = std::string(sse_live_ ? "streaming \xC2\xB7 " : "receiving \xC2\xB7 ") + fmt::human_bytes(got);
+    if (const std::string rate = live_rate(); !rate.empty()) t += " \xC2\xB7 " + rate;
+    return t;
+  }
+
+  static KV header_rows(const HttpResponse& r) {
+    KV h;
+    h.reserve(r.headers.size());
+    for (const auto& [k, v] : r.headers) h.emplace_back(std::string(k), std::string(v));
+    return h;
+  }
+
+  // The head of the response in flight: status pill, Headers, protocol, and the waterfall with
+  // every phase up to Wait (TTFB) as measured; Download runs (live_tick).
+  void show_live_head() {
+    if (!awaiting_ || kind_ != RequestKind::Http || !tap_) return;
+    std::shared_ptr<const HttpResponse> h = tap_->head_response();
+    if (!h || h == head_shown_) return;
+    TraceScope ts("live_head");
+    head_shown_ = h;
+    head_at_ms_ = tap_->head_ms();
+    const bool plain = h->effective_url.rfind("http:", 0) == 0;
+    TimingModel m = http_model(*h, plain);
+    for (size_t i = 0; i < m.phases.size(); ++i)
+      if (m.phases[i].name == "Download") {
+        m.live_row = static_cast<int>(i);
+        m.phases[i].tip = "First response byte -> now: the body is still arriving. Every phase before it is final "
+                          "(the engine reported them with the response head).";
+      }
+    for (Phase& ph : m.phases)
+      if (ph.name == "Process") ph.has_value = false;  // runs once the body is complete
+    m.total_tip = "So far: Send click -> now. Process and the final total come with the complete response.";
+    m.live_head = live_wf_head();
+    wf_->set(m, nullptr);
+    std::string badge = std::to_string(h->status);
+    if (!h->status_text.empty()) badge += " " + h->status_text;
+    else if (h->status == 200) badge += " OK";
+    status_->set_busy_badge(badge, http_tone(h->status));
+    headers_->set(header_rows(*h));
+    tabs_->set_label(kHeaders, "Headers", std::to_string(h->headers.size()));
+    live_tick();
+    if (live_timer_.GetOwner() != this) {
+      live_timer_.SetOwner(this, wxWindow::NewControlId());
+      Bind(wxEVT_TIMER, [this](wxTimerEvent&) {
+        if (!awaiting_ || !head_shown_) return live_timer_.Stop();
+        live_tick();
+      }, live_timer_.GetId());
+    }
+    live_timer_.Start(kLiveTickMs);
+  }
+
+  void live_tick() {
+    if (!head_shown_ || !tap_) return;
+    const double dl = std::max(0.0, ms_between(tap_t0_, Clock::now()) - head_at_ms_);
+    wf_->live_tick(dl, head_shown_->timing.total_ms + dl, live_wf_head());
+    status_->set_busy_label(live_label());
+  }
+
+  void stop_live_head() {
+    head_timer_.Stop();
+    live_timer_.Stop();
+    head_shown_.reset();
+    head_at_ms_ = -1;
+  }
+
+  // The first event of a send arrived: the Body tab becomes the event list.
+  void sse_begin_live() {
+    sse_live_ = true;
+    sse_raw_bytes_.clear();
+    sse_comments_ = 0;
+    sse_resp_.reset();
+    stale_timer_.Stop();
+    body_->set_stale(false);
+    waiting_msg_ = true;
+    sse_->reset();
+    sse_show(true);
+  }
+
+  // The Body tab shows the event list (true) or the plain body (false).
+  void sse_show(bool on) {
+    if (on == sse_on_) return;
+    sse_on_ = on;
+    sse_raw_ = false;
+    if (on) {
+      sse_->ensure();
+      body_->set_events_chip([this] {
+        sse_raw_ = false;
+        if (tabs_->selection() == kBody) show_page(kBody);
+      });
+    } else {
+      body_->set_events_chip({});
+    }
+    tabs_->set_label(kBody, on ? "Events" : "Body", on && sse_->count() ? std::to_string(sse_->count()) : std::string());
+    if (tabs_->selection() == kBody) show_page(kBody);
+  }
+
+  void sse_live_caption(bool final_batch) {
+    const size_t n = sse_->count();
+    std::string c = std::string(final_batch ? "" : "live \xC2\xB7 ") + std::to_string(n) + (n == 1 ? " event" : " events");
+    if (sse_comments_) c += " \xC2\xB7 " + std::to_string(sse_comments_) + (sse_comments_ == 1 ? " comment" : " comments");
+    if (tap_) c += " \xC2\xB7 " + fmt::human_bytes(tap_->bytes());
+    const auto& ev = sse_->events();
+    if (!ev.empty() && ev.back().at_ms >= 0) c += " \xC2\xB7 last at +" + fmt::ms(ev.back().at_ms);
+    sse_->set_caption(c, final_batch ? Tone::Dim : Tone::Accent);
+    tabs_->set_label(kBody, "Events", std::to_string(n));
+  }
+
+  // Raw chip of the event list: the stream as received in the body view (the stream so far
+  // while it runs).
+  void show_raw_stream() {
+    if (sse_live_ && awaiting_) {
+      auto r = std::make_shared<HttpResponse>();
+      r->ok = true;
+      r->body = sse_raw_bytes_;
+      r->headers.add("Content-Type", "text/event-stream");
+      body_->set_origin_note("stream so far (" + fmt::human_bytes(r->body.size()) + "), as of +" +
+                             fmt::ms(ms_between(send_t0_, Clock::now())));
+      body_->set_http(std::move(r));
+      body_->set_events_chip([this] {
+        sse_raw_ = false;
+        if (tabs_->selection() == kBody) show_page(kBody);
+      });
+    }
+    if (tabs_->selection() == kBody) show_page(kBody);
+  }
+
+  // The run's body is an event stream: the list for it (the live one when this run streamed
+  // here, else parsed from the body, with the offsets kept for the run when there are any).
+  void sse_for_run(const Run& run) {
+    const std::shared_ptr<const HttpResponse>& r = run.resp;
+    if (sse_resp_ == r) return sse_show(true);
+    sse_resp_ = r;
+    if (run.sse_live) {
+      // The rest of the stream (events after the last batch) is on the list already: show_http
+      // drained it before this run was made.
+      sse_show(true);
+      std::string c = std::to_string(sse_->count()) + (sse_->count() == 1 ? " event" : " events");
+      if (sse_comments_) c += " \xC2\xB7 " + std::to_string(sse_comments_) + " comments";
+      if (run.cancelled_ms >= 0) {
+        c += " \xC2\xB7 cancelled by you after " + fmt::ms(run.cancelled_ms);
+        sse_->set_caption(c, Tone::Warn);
+      } else {
+        c += " \xC2\xB7 stream closed after " + fmt::ms(r->timing.total_ms);
+        sse_->set_caption(c, Tone::Dim);
+      }
+      tabs_->set_label(kBody, "Events", std::to_string(sse_->count()));
+      return;
+    }
+    sse_->reset();
+    sse_show(true);
+    auto at = run.sse_at;
+    auto fill = [this, at](std::vector<SseEvent> evs) {
+      if (at)
+        for (size_t i = 0; i < evs.size() && i < at->size(); ++i) evs[i].at_ms = (*at)[i];
+      sse_comments_ = 0;
+      sse_->append(std::move(evs));
+      const size_t n = sse_->count();
+      std::string c = std::to_string(n) + (n == 1 ? " event" : " events");
+      c += at && !at->empty() ? " \xC2\xB7 offsets as received" : " \xC2\xB7 parsed from the body (no offsets kept)";
+      sse_->set_caption(c, Tone::Dim);
+      tabs_->set_label(kBody, "Events", std::to_string(n));
+    };
+    if (r->body.size() <= kSseSyncParse) return fill(parse_sse(r->body));
+    sse_->set_caption("reading events\xE2\x80\xA6", Tone::Accent);
+    std::thread([r, fill, alive = alive_, this] {
+      auto evs = std::make_shared<std::vector<SseEvent>>(parse_sse(r->body));
+      if (!wxTheApp) return;
+      wxTheApp->CallAfter([alive, this, r, evs, fill] {
+        if (*alive && sse_resp_ == r) fill(std::move(*evs));
+      });
+    }).detach();
+  }
+
+  // The run on screen is not an event stream.
+  void sse_off() {
+    sse_resp_.reset();
+    sse_show(false);
+  }
+
+  static bool is_sse_response(const HttpResponse& r) {
+    const std::string_view ct = r.headers.get("content-type");
+    if (is_event_stream(ct)) return true;
+    return ct.empty() && sniff_sse(std::string_view(r.body).substr(0, 256)) == 1;
+  }
+
   void set_history_when(const std::string& when_iso) override {
     history_when_ = when_iso;
     if (!when_iso.empty()) grpc_history_when_ = when_iso;
@@ -1517,6 +2126,18 @@ class ResponseView : public wxPanel, public ResponsePanel {
     grpc_history_when_.clear();
     kind_ = kind;
     live_ = false;
+    // The tap handed out right before this send is its own; any other one is of an earlier send.
+    if (kind != RequestKind::Http || !tap_armed_) {
+      tap_.reset();
+      ++tap_seq_;
+    }
+    tap_armed_ = false;
+    sse_timer_.Stop();
+    stop_live_head();
+    sse_drained_at_ = {};
+    sse_live_ = false;
+    // The previous run's event list leaves the Body tab (its body stays, faded, as for any run).
+    sse_off();
     send_t0_ = Clock::now();
     sent_here_ = true;
     awaiting_ = true;
@@ -1561,8 +2182,21 @@ class ResponseView : public wxPanel, public ResponsePanel {
     // No earlier response: the empty-state help is not a "previous response" to fade.
     waiting_msg_ = help_shown;
     progress_shown_at_ = {};
-    if (help_shown) body_->show_message("Waiting for the response.");
-    else body_->set_stale(true);
+    live_bytes_ = 0;
+    if (help_shown) {
+      body_->show_message("Waiting for the response.");
+    } else {
+      // The previous body stays (faded, labelled) only for a short moment, so a fast resend does
+      // not flash an empty pane; a request still out after that clears it (Bruno does the same):
+      // the body pane then shows the request in flight, never an old answer under a small label.
+      body_->set_stale(true);
+      if (stale_timer_.GetOwner() != this) {
+        stale_timer_.SetOwner(this, wxWindow::NewControlId());
+        Bind(wxEVT_TIMER, [this](wxTimerEvent&) { show_in_flight(stale_seq_); }, stale_timer_.GetId());
+      }
+      stale_seq_ = view_seq_;
+      stale_timer_.StartOnce(static_cast<int>(kStaleBodyMs));
+    }
     if (!tests_->asserts().empty()) {
       tests_->set_running();
       tabs_->set_label(kTests, "Tests", "\xE2\x80\xA6");
@@ -1570,27 +2204,99 @@ class ResponseView : public wxPanel, public ResponsePanel {
     }
   }
 
+  // The request is still out kStaleBodyMs after the send: the previous body leaves the pane, which
+  // shows the request in flight instead (bytes so far once they arrive).
+  void show_in_flight(uint64_t seq) {
+    // A gRPC stream that started shows its messages in the body: nothing to replace.
+    if (seq != view_seq_ || !awaiting_ || waiting_msg_ || live_ || sse_live_) return;
+    waiting_msg_ = true;
+    body_->set_stale(false);
+    body_->show_message(
+        live_bytes_ > 0 ? in_flight_text(live_bytes_)
+                        : "Waiting for the response\xE2\x80\xA6 no byte yet.\n\nEsc cancels.");
+  }
+  std::string in_flight_text(uint64_t bytes) const {
+    return "Receiving the response: " + fmt::human_bytes(bytes) + " so far (body data since +" +
+           fmt::ms(first_ms_ >= 0 ? first_ms_ : ms_between(send_t0_, Clock::now())) +
+           ").\n\nThe body is shown when it is complete. Esc cancels.";
+  }
+
   void show_progress(uint64_t bytes) override {
-    status_->set_busy_label("Receiving " + fmt::human_bytes(bytes) + "\xE2\x80\xA6");
+    // The tap saw the first body bytes exactly (progress reports come at most every 50 ms).
+    if (tap_ && tap_->first_ms() >= 0) first_ms_ = tap_->first_ms();
+    if (first_ms_ < 0) first_ms_ = ms_between(send_t0_, Clock::now());
+    live_bytes_ = bytes;
+    if (sse_live_) {  // the event list says what arrives (sse_drain)
+      wf_->set_live(first_ms_, bytes, 0);
+      return;
+    }
+    status_->set_busy_label(live_label() + "\xE2\x80\xA6");
+    // A download still running after kStaleBodyMs: the old body goes (see show_in_flight).
+    if (!waiting_msg_ && awaiting_ && ms_between(send_t0_, Clock::now()) >= kStaleBodyMs) show_in_flight(view_seq_);
     // The body area says what is arriving (not "Waiting"), a few times a second at most.
     if (waiting_msg_ && awaiting_) {
       const auto now = Clock::now();
       if (progress_shown_at_ == Clock::time_point{} || ms_between(progress_shown_at_, now) > 250) {
         progress_shown_at_ = now;
-        body_->show_message("Receiving the response: " + fmt::human_bytes(bytes) + " so far, first byte at +" +
-                            fmt::ms(first_ms_ >= 0 ? first_ms_ : ms_between(send_t0_, now)) +
-                            ".\n\nThe body is shown when it is complete (Esc cancels).");
+        body_->show_message(in_flight_text(bytes));
       }
     }
-    if (first_ms_ < 0) first_ms_ = ms_between(send_t0_, Clock::now());
     wf_->set_live(first_ms_, bytes, 0);
   }
 
   void show_http(std::shared_ptr<const HttpResponse> r, std::shared_ptr<const SentHttp> sent) override {
+    // A restored response (no show_sending() before it) is shown in a UI turn of its own: the tab
+    // builds this view and restores its last run in the same turn, and the two together were
+    // 20-90 ms of UI time on a busy machine. Shown one turn later (and in two parts, see
+    // show_run), no step is longer than either alone. A send or clear in between drops it.
+    if (!awaiting_ && !restore_now_ && r) {
+      RestoreArgs a{std::move(r),      std::move(sent),   history_when_,  extras_applied_, extras_prompt_ms_,
+                    extras_cut_size_, body_not_kept_,    not_kept_size_, view_seq_, extras_body_key_,
+                    extras_sse_at_};
+      // Taken over by the deferred call: the caller resets its own flags after this returns.
+      extras_prompt_ms_ = 0;
+      extras_cut_size_ = 0;
+      extras_body_key_.clear();
+      extras_sse_at_.reset();
+      CallAfter([this, a = std::move(a), alive = alive_]() mutable {
+        if (!*alive || a.seq != view_seq_ || awaiting_) return;
+        restore_now_ = true;
+        history_when_ = a.history_when;
+        extras_applied_ = a.extras_applied;
+        extras_prompt_ms_ = a.prompt_ms;
+        extras_cut_size_ = a.cut_size;
+        extras_body_key_ = std::move(a.body_key);
+        extras_sse_at_ = std::move(a.sse_at);
+        body_not_kept_ = a.body_not_kept;
+        not_kept_size_ = a.not_kept_size;
+        show_http(std::move(a.r), std::move(a.sent));
+        restore_now_ = false;
+        history_when_.clear();
+        extras_applied_ = false;
+        body_not_kept_ = false;
+        not_kept_size_ = 0;
+      });
+      return;
+    }
     TraceScope ts("show_http");
     // A response without show_sending() before it is a restored one (the tab's last response of
     // an earlier session, or one read from the history): never "sent now".
     const bool restored = !awaiting_;
+    // An event stream listed live: the events after the last batch go on the list now, and their
+    // offsets are kept with the run (a restored stream lists them as they came).
+    std::shared_ptr<std::vector<double>> live_sse_at;
+    if (!restored && tap_ && tap_->is_sse()) {
+      sse_timer_.Stop();
+      sse_drain();
+      if (sse_live_) {
+        live_sse_at = std::make_shared<std::vector<double>>();
+        live_sse_at->reserve(sse_->events().size());
+        for (const SseEvent& e : sse_->events()) live_sse_at->push_back(e.at_ms);
+      }
+    }
+    const bool live_sse = live_sse_at != nullptr;
+    sse_live_ = false;
+    if (!restored) stop_live_head();
     if (restored && !extras_applied_ && r) {
       // The tab's own last response: what the view kept of that run (dialog time, scripts, TLS)
       // is in memory when it ran in this process, else on disk (read on a worker, then shown
@@ -1603,25 +2309,7 @@ class ResponseView : public wxPanel, public ResponsePanel {
         extras_applied_ = false;
         return;
       }
-      if (!key.empty())
-        if (RequestTab* t = tab())
-          if (const Workspace* ws = t->workspace(); ws && !ws->root().empty()) {
-            const uint64_t want = view_seq_ + 1;  // the seq this show_http leaves
-            std::thread([root = ws->root(), key, r, sent, want, hw = history_when_, alive = alive_, this] {
-              auto x = rv::find_extras(root, key);
-              if (!x || !wxTheApp) return;
-              wxTheApp->CallAfter([alive, this, want, r, sent, x, hw] {
-                if (!*alive || want != view_seq_ || runs_.empty() || runs_.back().resp != r) return;
-                runs_.pop_back();
-                auto [rr, ss] = with_extras(*r, sent, *x);
-                extras_applied_ = true;
-                history_when_ = hw;
-                show_http(std::move(rr), std::move(ss));
-                history_when_.clear();
-                extras_applied_ = false;
-              });
-            }).detach();
-          }
+      if (!key.empty()) fetch_extras(key, r, sent, history_when_, 0);
     }
     // A body the history cut carries a note in its status text ("OK (body cut: history keeps the
     // first 64 KB of 10.2 MB)"): the status chip shows the status, the "first ... kept" segment
@@ -1666,12 +2354,17 @@ class ResponseView : public wxPanel, public ResponsePanel {
       }
       x.head = rv::response_head(*r);
       x.body_size = r->body.size();
+      x.visualize = vis_chosen_by_request().count(vis_key()) > 0;
+      if (live_sse_at)
+        x.sse_at.assign(live_sse_at->begin(),
+                        live_sse_at->begin() + static_cast<std::ptrdiff_t>(std::min(live_sse_at->size(), rv::kKeptSseTimes)));
       const std::string key = extras_key(*r);
       if (!key.empty()) {
         const RequestTab* t = tab();
         const Workspace* ws = t ? t->workspace() : nullptr;
-        rv::keep_extras(ws ? ws->root() : std::filesystem::path(), key, std::move(x));
+        rv::keep_extras(ws ? ws->root() : std::filesystem::path(), key, std::move(x), r);
       }
+      record_cookies(*r, sent.get());
     }
     if (prompt_ms > 0) {
       auto c = std::make_shared<HttpResponse>(*r);  // rare (a dialog was shown): the copy is fine
@@ -1685,6 +2378,8 @@ class ResponseView : public wxPanel, public ResponsePanel {
             wxDateTime::Now()};
     run.prompt_ms = prompt_ms;
     run.restored = restored;
+    run.sse_live = live_sse;
+    run.sse_at = live_sse_at;
     run.from_history = history_when_;
     // A run read from the history happened when the history says (UTC there): its Log line and
     // the History menu's "n min ago" show that time, not the moment the tab was opened.
@@ -1696,9 +2391,13 @@ class ResponseView : public wxPanel, public ResponsePanel {
       // The dialog time with_extras() took out: said so again, as it was live.
       run.prompt_ms = extras_applied_ && extras_prompt_ms_ > kPromptMinMs ? extras_prompt_ms_ : 0;
       run.cut_size = extras_applied_ ? extras_cut_size_ : 0;
+      if (run.cut_size) run.body_key = extras_body_key_;
       if (!run.cut_size) run.cut_size = hist_cut;
+      if (extras_applied_ && extras_sse_at_ && !extras_sse_at_->empty()) run.sse_at = extras_sse_at_;
+      extras_sse_at_.reset();
       extras_prompt_ms_ = 0;
       extras_cut_size_ = 0;
+      extras_body_key_.clear();
     }
     if (!r->ok) mark_failure(run.model, *r);
     if (run.restored && r->tls_version.empty() && !plain && r->ok) run.model.conn_note += " \xC2\xB7 TLS";
@@ -1751,15 +2450,26 @@ class ResponseView : public wxPanel, public ResponsePanel {
     if (!r->ok) {
       const std::string where = classify_failure(*r).text;
       segs.push_back({fmt::ms(t.total_ms), "Time until the failure.", Tone::Plain, true});
-      segs.push_back({r->error, where + "\n" + r->error, Tone::Err, false});
+      segs.push_back({shown_error(*r), where + "\n" + r->error, Tone::Err, false});
       add_script_segs(segs, run);
       status_->set("Failed", Tone::Err, std::move(segs));
       wf_->set(model, nullptr);
-      body_->show_message("Request failed: " + r->error + "\n\n" + where + "\n");
+      body_->show_message("Request failed: " + shown_error(*r) + "\n\n" + where + "\n");
+      if (run.sse_live && sse_->count() > 0) {
+        // An event stream cut by an error (a timeout, the server going away): its events stay.
+        sse_resp_ = r;
+        sse_show(true);
+        sse_->set_caption("stream ended: " + shown_error(*r) + " after " + fmt::ms(t.total_ms) + " \xC2\xB7 " +
+                              std::to_string(sse_->count()) + " events",
+                          Tone::Err);
+        tabs_->set_label(kBody, "Events", std::to_string(sse_->count()));
+      } else {
+        sse_off();
+      }
       headers_->set({});
       tabs_->set_label(kHeaders, "Headers");
       set_kind_tabs(false, true);
-      set_cookies(*r);
+      set_cookies(*r, run);
       set_request(sent.get(), r.get());
       set_log(run);
       set_script_results(sent.get());
@@ -1773,12 +2483,17 @@ class ResponseView : public wxPanel, public ResponsePanel {
     std::string badge = std::to_string(r->status);
     if (!r->status_text.empty()) badge += " " + r->status_text;
     else if (r->status == 200) badge += " OK";
-    segs.push_back({fmt::ms(t.total_ms), "Total: Send click -> complete response (the sum of all phases).",
+    segs.push_back({fmt::ms(model.total),
+                    model.before > 0 ? "Total: request start -> complete response (the sum of the request's phases; "
+                                       "the pre-request script before it, " + fmt::ms(model.before) + ", is not counted)."
+                                     : std::string("Total: Send click -> complete response (the sum of all phases)."),
                     Tone::Plain, true});
-    segs.push_back({"server " + fmt::ms(model.server_wait), model.server_tip, Tone::Dim, false, 5});
-    segs.push_back({"client " + fmt::ms(model.client),
-                    model.client_tip + "\nNetwork (DNS, connect, TLS, transfer): " + fmt::ms(model.network) + ".",
-                    Tone::Dim, false, 6});
+    // Server / client split: one segment, kept longer than the "vs previous" delta (the
+    // waterfall's footer has the delta too), so the headline reads the same on every send.
+    segs.push_back({"server " + fmt::ms(model.server_wait) + " \xC2\xB7 client " + fmt::ms(model.client),
+                    model.server_tip + "\n\n" + model.client_tip + "\nNetwork (DNS, connect, TLS, transfer): " +
+                        fmt::ms(model.network) + ".",
+                    Tone::Dim, false, 2});
     const HttpSizes& s = r->sizes;
     std::string size_tip = "Body " + fmt::human_bytes(s.response_body);
     if (s.response_body_wire != s.response_body)
@@ -1833,8 +2548,20 @@ class ResponseView : public wxPanel, public ResponsePanel {
       segs.push_back(std::move(seg));
     }
     if (before) add_delta(segs, model, *before, run.label, run.base_at);
+    if (run.cancelled_ms >= 0) {
+      segs.insert(segs.begin(), StatusSeg{"cancelled after " + fmt::ms(run.cancelled_ms),
+                                          "Cancelled by you (Esc or the Cancel button) while the body arrived: the "
+                                          "status, headers and phases up to Wait (TTFB) are as received, the body is "
+                                          "what arrived before the cancel.\nCtrl+Enter sends it again.",
+                                          Tone::Warn, true, 0});
+      for (StatusSeg& sg : segs)
+        if (sg.text == fmt::human_bytes(s.response_body)) {
+          sg.text += " received";
+          sg.tip = "Body bytes that arrived before the cancel (the response was not complete).\n" + sg.tip;
+        }
+    }
     add_script_segs(segs, run);
-    if (run.restored) segs.insert(segs.begin() + 1, run.from_history.empty() ? restored_seg() : history_seg(run.from_history));
+    if (run.restored) segs.insert(segs.begin() + 1, run.from_history.empty() ? restored_seg(r.get()) : history_seg(run.from_history));
     if (run.cut_size > 0)
       segs.insert(segs.begin() + 2, StatusSeg{"first " + fmt::human_bytes(r->body.size()) + " of " +
                                                   fmt::human_bytes(run.cut_size) + " kept",
@@ -1850,30 +2577,148 @@ class ResponseView : public wxPanel, public ResponsePanel {
                                               "A saved example of this request, not a live response.\nCtrl+Enter "
                                               "sends the request; Examples (right) lists the saved ones.",
                                               Tone::Info, true, 0});
+    TraceLaps tl("run");
     status_->set(badge, http_tone(r->status), std::move(segs));
+    tl.lap("status");
     wf_->set(model, before);
+    tl.lap("wf");
+    if (run.restored) {
+      // The rest (pages, body, checks) in the next UI turn: a restored run is shown as the tab
+      // opens, when the UI thread is busiest (see show_http).
+      CallAfter([this, i, resp = run.resp, seq = view_seq_, alive = alive_] {
+        if (!*alive || seq != view_seq_ || shown_run_ != i || i >= runs_.size() || runs_[i].resp != resp) return;
+        show_run_rest(i);
+      });
+      return;
+    }
+    show_run_rest(i);
+  }
 
+  // The extras of a restored response read from disk on a worker, then the run shown again with
+  // them, as long as it is still this view's newest and shown run. At start-up a tab can restore
+  // its response before it has its workspace: retried a few times (200 ms apart) until it has.
+  void fetch_extras(const std::string& key, std::shared_ptr<const HttpResponse> r,
+                    std::shared_ptr<const SentHttp> sent, const std::string& hw, int tries) {
+    const RequestTab* t = tab();
+    const Workspace* ws = t ? t->workspace() : nullptr;
+    const bool ready = ws && !ws->root().empty();
+    if (!ready && tries >= 15) return;
+    std::thread([root = ready ? ws->root() : std::filesystem::path(), ready, key, r, sent, hw, tries,
+                 alive = alive_, this] {
+      std::optional<rv::RunExtras> x;
+      if (ready) x = rv::find_extras(root, key);
+      else std::this_thread::sleep_for(std::chrono::milliseconds(200));
+      if ((ready && !x) || !wxTheApp) return;
+      wxTheApp->CallAfter([alive, this, ready, key, r, sent, x, hw, tries] {
+        if (!*alive || runs_.empty() || runs_.back().resp != r || shown_run_ + 1 != runs_.size() || showing_grpc_)
+          return;
+        if (!ready) return fetch_extras(key, r, sent, hw, tries + 1);
+        runs_.pop_back();
+        auto [rr, ss] = with_extras(*r, sent, *x);
+        extras_applied_ = true;
+        history_when_ = hw;
+        show_http(std::move(rr), std::move(ss));
+        history_when_.clear();
+        extras_applied_ = false;
+      });
+    }).detach();
+  }
+
+  // Run i was restored with the start of its body only: reads the whole body response_keep kept
+  // for it (worker), then replaces the run's response and shows it again (the body is formatted
+  // on the body view's worker like a live one: one short UI step).
+  void load_whole_body(size_t i) {
+    Run& run = runs_[i];
+    const std::string key = std::move(run.body_key);
+    run.body_key.clear();
+    const RequestTab* t = tab();
+    const Workspace* ws = t ? t->workspace() : nullptr;
+    if (!ws || ws->root().empty()) return;
+    std::thread([root = ws->root(), key, size = run.cut_size, resp = run.resp, alive = alive_, this] {
+      std::shared_ptr<std::string> body = rv::load_kept_body(root, key, size);
+      if (!body || !wxTheApp) return;
+      auto full = std::make_shared<HttpResponse>(*resp);
+      full->body = std::move(*body);
+      wxTheApp->CallAfter([alive, this, resp, full = std::shared_ptr<const HttpResponse>(std::move(full))] {
+        if (!*alive) return;
+        for (size_t k = 0; k < runs_.size(); ++k) {
+          if (runs_[k].resp != resp) continue;
+          runs_[k].resp = full;
+          runs_[k].cut_size = 0;
+          if (shown_run_ == k && !showing_grpc_) show_run(k);
+          return;
+        }
+      });
+    }).detach();
+  }
+
+  // Everything below the status line and the waterfall of run i.
+  void show_run_rest(size_t i) {
+    TraceLaps tl("run");
+    const Run& run = runs_[i];
+    std::shared_ptr<const HttpResponse> r = run.resp;
+    const std::shared_ptr<const SentHttp>& sent = run.sent;
     KV h;
     h.reserve(r->headers.size());
     for (const auto& [k, v] : r->headers) h.emplace_back(std::string(k), std::string(v));
     headers_->set(std::move(h));
     tabs_->set_label(kHeaders, "Headers", std::to_string(r->headers.size()));
+    tl.lap("headers");
     set_kind_tabs(false, true);
-    set_cookies(*r);
+    tl.lap("kind_tabs");
+    set_cookies(*r, run);
+    tl.lap("cookies");
     set_request(sent.get(), r.get());
+    tl.lap("request");
     set_log(run);
+    tl.lap("log");
     set_script_results(sent.get());
+    tl.lap("scripts");
+    if (!run.body_not_kept && (run.sse_live || is_sse_response(*r))) sse_for_run(run);
+    else sse_off();
+    tl.lap("sse");
     if (run.body_not_kept) {
       body_->show_message("The body of this response (" + fmt::human_bytes(run.not_kept_size) +
                           ") was too large to keep with the history: status, headers and timing are as received."
                           "\n\nCtrl+Enter sends the request again.");
       ++test_seq_;
-      tests_->set_no_response();
+      tests_->set_no_response("the body of this run was not kept: send again to check");
       update_tests_label();
       return;
     }
+    // A body the history cut: the whole body, when this view kept it with the run, is read on a
+    // worker and the run shown again with it (the cut copy meanwhile).
+    if (run.cut_size > 0 && r->body.size() < run.cut_size && !run.body_key.empty()) load_whole_body(i);
+    // A body the history cut (and indented, for JSON): Raw / Hex show the kept bytes, and say so.
+    if (run.cut_size > 0 && r->body.size() < run.cut_size) {
+      const std::string_view b = r->body;
+      const bool indented = b.size() > 2 && (b[0] == '{' || b[0] == '[') && (b[1] == '\n' || b[1] == '\r');
+      body_->set_origin_note(indented ? "history copy, indented" : "history copy");
+    } else {
+      body_->set_origin_note({});
+    }
+    // pm.visualizer.set() of this run (live, or kept with a restored run): the Visualize chip, open
+    // when it was the view last picked for this request.
+    body_->set_visualize_chosen(vis_chosen_by_request().count(vis_key()) > 0);
+    body_->set_visualizer(sent ? sent->post_script : nullptr);
+    if (run.cancelled_ms >= 0) {
+      const bool cut = r->body.size() < run.cancelled_bytes;
+      body_->set_origin_note("cancelled after " + fmt::ms(run.cancelled_ms) + ": " +
+                             (cut ? "the first " + fmt::human_bytes(r->body.size()) + " of " +
+                                        fmt::human_bytes(run.cancelled_bytes)
+                                  : fmt::human_bytes(run.cancelled_bytes) + " received, incomplete"));
+    }
     body_->set_http(std::move(r));
+    tl.lap("body");
+    if (run.cancelled_ms >= 0) {
+      ++test_seq_;
+      tests_->set_no_response("cancelled while the response arrived: not checked");
+      tests_->set_script({});
+      update_tests_label();
+      return;
+    }
     run_tests();
+    tl.lap("tests");
   }
 
   void append_grpc_messages(const std::vector<GrpcMessageEvent>& batch) override {
@@ -1892,6 +2737,15 @@ class ResponseView : public wxPanel, public ResponsePanel {
     const bool restored = !awaiting_;
     awaiting_ = false;
     ++view_seq_;
+    sse_off();
+    // A restored call was not sent from this view: its target is the request's (the chip of a
+    // restored gRPC-Web call reads gRPC-Web, not the last call's h2c).
+    if (restored)
+      if (const RequestTab* t = tab(); t && t->request().kind == RequestKind::Grpc) {
+        const GrpcTarget& gt = t->request().grpc_target;
+        grpc_meta_ = GrpcConnMeta{gt.address, gt.authority, gt.server_name, gt.tls || gt.address.rfind("https:", 0) == 0,
+                                  !gt.client_cert_pem.empty(), gt.web};
+      }
     const size_t shown = live_ ? msgs_->count() : 0;
     if (!live_) start_stream();
     if (r->messages.size() > shown) {
@@ -1984,11 +2838,19 @@ class ResponseView : public wxPanel, public ResponsePanel {
 
   void show_cancelled(double after_ms) override {
     ++view_seq_;
+    // HTTP: what arrived before the cancel (an event stream's events, the start of a body) stays.
+    if (kind_ == RequestKind::Http && awaiting_ && tap_ && tap_->head_response())
+      return show_cancelled_with_head(after_ms, tap_->head_response());
+    stop_live_head();
+    if (kind_ == RequestKind::Http && awaiting_ && tap_ && tap_->bytes() > 0) return show_cancelled_partial(after_ms);
+    sse_timer_.Stop();
+    sse_live_ = false;
+    sse_off();
     const bool streamed = live_ && msgs_->count() > 0;
     live_ = false;
     awaiting_ = false;
     ++test_seq_;
-    tests_->set_no_response();
+    tests_->set_no_response("cancelled, no response");
     tests_->set_script({});
     update_tests_label();
     body_->set_stale(false);
@@ -2026,8 +2888,156 @@ class ResponseView : public wxPanel, public ResponsePanel {
     status_->set("Cancelled", Tone::Warn, std::move(segs));
   }
 
+  // An HTTP request cancelled after its head arrived (an event stream that never ends, a slow
+  // download): a run of its own like any response, with the status, headers, connection and the
+  // phases up to Wait (TTFB) as measured, Download cut at the cancel, and the events or body
+  // bytes that arrived. It stays in "Earlier runs" to look at again.
+  void show_cancelled_with_head(double after_ms, std::shared_ptr<const HttpResponse> h) {
+    TraceScope ts("cancel_head");
+    sse_timer_.Stop();
+    stop_live_head();
+    const bool sse = tap_->is_sse();
+    if (sse) sse_drain();
+    live_ = false;
+    awaiting_ = false;
+    sse_live_ = false;
+    stale_timer_.Stop();
+    const uint64_t got = tap_->bytes();
+    auto r = std::make_shared<HttpResponse>(*h);
+    r->ok = true;
+    if (sse) {
+      r->body = std::move(sse_raw_bytes_);
+      sse_raw_bytes_.clear();
+    } else {
+      r->body = tap_->partial();
+    }
+    r->sizes.response_body = got;
+    r->sizes.response_body_wire = got;
+    const double dl = std::max(0.0, after_ms - h->timing.total_ms);
+    r->timing.download_ms = dl;
+    r->timing.total_ms = h->timing.total_ms + dl;
+    r->timing.bytes_received += got;
+    const bool plain = r->effective_url.rfind("http:", 0) == 0;
+    Run run{r, nullptr, http_model(*r, plain), wxDateTime::Now()};
+    run.cancelled_ms = after_ms;
+    run.cancelled_bytes = got;
+    for (size_t i = 0; i < run.model.phases.size(); ++i)
+      if (run.model.phases[i].name == "Download") {
+        run.model.live_row = static_cast<int>(i);
+        run.model.phases[i].tip = "First response byte -> your cancel: the transfer was cut there (" +
+                                  fmt::human_bytes(got) + " of the body had arrived). Every phase before it is "
+                                  "as measured.";
+      }
+    run.model.live_cut = true;
+    for (Phase& ph : run.model.phases)
+      if (ph.name == "Process") ph.has_value = false;  // never ran: the transfer was cut
+    run.model.live_head = "cancelled by you \xC2\xB7 " + fmt::human_bytes(got) + " received";
+    run.model.total_tip = "Send click -> your cancel (the response was not complete).";
+    if (sse && sse_->count() > 0) {
+      run.sse_live = true;
+      auto at = std::make_shared<std::vector<double>>();
+      at->reserve(sse_->events().size());
+      for (const SseEvent& e : sse_->events()) at->push_back(e.at_ms);
+      run.sse_at = std::move(at);
+    }
+    if (const RequestTab* t = tab()) run.label = t->request().http.method + " " + r->effective_url;
+    fresh_response_ = false;
+    runs_.push_back(std::move(run));
+    size_t bytes = 0;
+    for (const Run& x : runs_) bytes += x.resp->body.size();
+    while (runs_.size() > kRuns || (runs_.size() > 1 && bytes > (64u << 20))) {
+      bytes -= runs_.front().resp->body.size();
+      runs_.erase(runs_.begin());
+    }
+    show_run(runs_.size() - 1);
+  }
+
+  // An HTTP request cancelled while its body arrived: the events or the bytes so far, the time to
+  // the first of them and the partial transfer in the waterfall, marked cancelled. The engine
+  // hands the status line and headers over only with a complete response, so they are not shown.
+  void show_cancelled_partial(double after_ms) {
+    sse_timer_.Stop();
+    const bool sse = tap_->is_sse();
+    if (sse) sse_drain();
+    live_ = false;
+    awaiting_ = false;
+    sse_live_ = false;
+    const uint64_t got = tap_->bytes();
+    const double fb = tap_->first_ms();
+    const size_t events = sse ? sse_->count() : 0;
+    ++test_seq_;
+    tests_->set_no_response("cancelled while the response arrived: not checked");
+    tests_->set_script({});
+    update_tests_label();
+    stale_timer_.Stop();
+    body_->set_stale(false);
+    wf_->set_live(fb, got, 0);
+    wf_->set_cancelled(after_ms);
+    std::vector<StatusSeg> segs;
+    segs.push_back({"after " + fmt::ms(after_ms), "Cancelled by you (Esc or the Cancel button) while the response arrived.",
+                    Tone::Plain, true});
+    if (sse)
+      segs.push_back({std::to_string(events) + (events == 1 ? " event" : " events"),
+                      "Events that arrived before the cancel: they stay listed in the Body tab.", Tone::Plain, false, 2});
+    segs.push_back({fmt::human_bytes(got) + " received",
+                    "Body bytes that arrived before the cancel (the response was not complete).", Tone::Plain, false, 3});
+    if (fb >= 0)
+      segs.push_back({"first body byte +" + fmt::ms(fb),
+                      "The first body bytes arrived then (the status line and headers came before them).", Tone::Dim,
+                      false, 4});
+    segs.push_back({"headers not kept",
+                    "A cancelled transfer ends without its status line, headers and per-phase split (the engine hands "
+                    "them over with a complete response only). What arrived of the body is shown.\nCtrl+Enter sends "
+                    "it again.",
+                    Tone::Dim, false, 6});
+    status_->set("Cancelled", Tone::Warn, std::move(segs));
+    headers_->set({});
+    trailers_->set({});
+    msgs_->reset();
+    cookies_->set({});
+    request_->set({});
+    std::string log = "* Cancelled by you after " + fmt::ms(after_ms) + ": " + fmt::human_bytes(got) +
+                      " of the body had arrived";
+    if (fb >= 0) log += " (the first at +" + fmt::ms(fb) + ")";
+    if (sse) log += ", " + std::to_string(events) + (events == 1 ? " event" : " events");
+    log += ".\n* The status line and headers are not kept for a cancelled transfer.\n";
+    fill_log(std::move(log));
+    set_kind_tabs(false, false);
+    tabs_->set_label(kRequest, "Request");
+    shown_run_ = runs_.size();  // none of the kept runs is on screen
+    update_history_chip();
+    auto r = std::make_shared<HttpResponse>();
+    r->ok = true;
+    if (sse) {
+      r->body = std::move(sse_raw_bytes_);
+      sse_raw_bytes_.clear();
+      r->headers.add("Content-Type", "text/event-stream");
+    } else {
+      r->body = tap_->partial();
+    }
+    const bool cut = r->body.size() < got;
+    body_->set_origin_note("cancelled after " + fmt::ms(after_ms) + ": " +
+                           (cut ? "the first " + fmt::human_bytes(r->body.size()) + " of " + fmt::human_bytes(got)
+                                : fmt::human_bytes(got) + " received, incomplete"));
+    body_->set_visualizer(nullptr);
+    body_->set_http(r);
+    if (sse) {
+      sse_resp_ = r;
+      sse_show(true);
+      sse_->set_caption("cancelled by you after " + fmt::ms(after_ms) + " \xC2\xB7 " + std::to_string(events) +
+                            (events == 1 ? " event" : " events") + " \xC2\xB7 " + fmt::human_bytes(got),
+                        Tone::Warn);
+      tabs_->set_label(kBody, "Events", std::to_string(events));
+    } else {
+      sse_off();
+    }
+  }
+
   void show_error(const std::string& message) override {
     ++view_seq_;
+    sse_timer_.Stop();
+    sse_live_ = false;
+    sse_off();
     live_ = false;
     awaiting_ = false;
     ++test_seq_;
@@ -2049,6 +3059,20 @@ class ResponseView : public wxPanel, public ResponsePanel {
     tabs_->set_label(kRequest, "Request");
   }
 
+  void show_waiting_for_user(const std::string& what) override {
+    if (!awaiting_) return;
+    ++view_seq_;  // the stale-body timer of this send does nothing now
+    stale_timer_.Stop();
+    stop_live_head();
+    const std::string msg = "Not sent yet: waiting for your answer (" + what +
+                            ").\n\nThe time you take is not counted: the clock starts when the request goes out.";
+    status_->set("Waiting", Tone::Info, {{"for your answer: " + what, msg, Tone::Dim, false}});
+    wf_->clear();
+    body_->set_stale(false);
+    body_->show_message(msg);
+    waiting_msg_ = true;
+  }
+
  private:
   // ------------------------------------------------------------------ tests
 
@@ -2056,6 +3080,25 @@ class ResponseView : public wxPanel, public ResponsePanel {
     for (wxWindow* w = GetParent(); w; w = w->GetParent())
       if (auto* t = dynamic_cast<RequestTab*>(w)) return t;
     return nullptr;
+  }
+
+  // Requests whose body view is Visualize (for this process, every tab): by request id, or by
+  // method + URL as edited for a request without one.
+  static std::set<std::string>& vis_chosen_by_request() {
+    static std::set<std::string> s;
+    return s;
+  }
+  // A restored run that was shown as Visualize: this request opens in it again.
+  void remember_visualize() {
+    const std::string k = vis_key();
+    if (!k.empty() && vis_chosen_by_request().size() < 4096) vis_chosen_by_request().insert(k);
+  }
+  std::string vis_key() const {
+    const RequestTab* t = tab();
+    if (!t) return {};
+    const SavedRequest& q = t->request();
+    if (!q.id.empty()) return "id " + q.id;
+    return "http " + q.http.method + " " + q.http.url;
   }
 
   // Which saved request a run belongs to, for the delta's base: two requests with the same URL
@@ -2132,8 +3175,12 @@ class ResponseView : public wxPanel, public ResponsePanel {
               sf = tests_->script_failed() + tests_->inherited_failed();
     // The send failed before any response: the checks did not run, which counts as a failure.
     if (!tests_->no_response_reason().empty() && on > 0) {
-      tabs_->set_label(kTests, "Tests", "not run");
-      tabs_->set_count_tone(kTests, Tone::Err);
+      // A send that failed or was cancelled fails its checks (as watt --run and the runner
+      // count it); a restored run without its body only skips them.
+      const std::string& why = tests_->no_response_reason();
+      const bool skipped = why.rfind("the ", 0) == 0;
+      tabs_->set_label(kTests, "Tests", skipped ? "skipped" : "not run");
+      tabs_->set_count_tone(kTests, skipped ? Tone::Warn : Tone::Err);
       return;
     }
     if (on == 0 && sp + sf == 0) {
@@ -2152,9 +3199,27 @@ class ResponseView : public wxPanel, public ResponsePanel {
     // A restored run's checks were evaluated now, not when it was sent: the count says so (the
     // Tests page spells it out).
     const bool re = tests_->rechecked() && tests_->passed() + tests_->failed() > 0;
-    tabs_->set_label(kTests, "Tests", (re ? std::string("now ") : std::string()) + std::to_string(pass) + "/" +
-                                          std::to_string(pass + fail));
+    const std::string count = (re ? std::string("now ") : std::string()) + std::to_string(pass) + "/" +
+                              std::to_string(pass + fail);
+    tabs_->set_label(kTests, "Tests", count);
     tabs_->set_count_tone(kTests, fail ? Tone::Err : Tone::Ok);
+    // The status strip says the same total as the Tab (assertions, folder checks and script tests
+    // together), once the assertions have been evaluated.
+    if (tests_->passed() + tests_->failed() + tests_->inherited_passed() + tests_->inherited_failed() > 0) {
+      std::string tip = std::to_string(pass) + " of " + std::to_string(pass + fail) + " checks passed: assertions " +
+                        std::to_string(tests_->passed()) + "/" + std::to_string(tests_->passed() + tests_->failed());
+      if (tests_->inherited_passed() + tests_->inherited_failed() > 0)
+        tip += ", folder checks " + std::to_string(tests_->inherited_passed()) + "/" +
+               std::to_string(tests_->inherited_passed() + tests_->inherited_failed());
+      if (tests_->script_passed() + tests_->script_failed() > 0)
+        tip += ", script tests " + std::to_string(tests_->script_passed()) + "/" +
+               std::to_string(tests_->script_passed() + tests_->script_failed()) +
+               " (a script that threw counts as one failed check)";
+      StatusSeg seg{"tests " + count, tip + ".\nClick for the Tests tab.", fail ? Tone::Err : Tone::Ok, false, 2};
+      seg.click = kClickTests;
+      seg.key = kSegChecks;
+      status_->put(kSegChecks, std::move(seg));
+    }
   }
 
   // Evaluates the checks against the response shown, on a worker thread (the body is parsed
@@ -2333,10 +3398,35 @@ class ResponseView : public wxPanel, public ResponsePanel {
         if (!*alive || seq != test_seq_) return;
         tests_->set_inherited_results(std::move(inh_rows));
         tests_->set_results(std::move(rows), ms, parse_us / 1000.0);
-        if (!caps->empty()) tests_->set_captures(store_captures(*caps, cvals, fresh));
+        if (!caps->empty()) {
+          std::vector<CaptureRow> crows = store_captures(*caps, cvals, fresh);
+          log_->set_tail(capture_log(crows, fresh));
+          tests_->set_captures(std::move(crows));
+        } else {
+          log_->set_tail({});
+        }
         update_tests_label();
       });
     }).detach();
+  }
+
+  // The captures of the run for the Log, next to the script's variable writes ("set runtime cnt").
+  static std::string capture_log(const std::vector<CaptureRow>& rows, bool fresh) {
+    std::string o;
+    for (const CaptureRow& r : rows) {
+      if (!r.enabled) continue;
+      if (o.empty()) o = "*\n* captures" + std::string(fresh ? "" : " (shown again: nothing written)") + "\n";
+      if (r.state == CaptureRow::Failed) {
+        o += "! capture {{" + r.var + "}} from " + r.target + ": " + one_line(r.message) + "\n";
+        continue;
+      }
+      std::string v = r.value.size() > 160 ? r.value.substr(0, 160) + "\xE2\x80\xA6" : r.value;
+      for (char& c : v)
+        if (c == '\n' || c == '\r' || c == '\t') c = ' ';
+      o += std::string("* ") + (r.state == CaptureRow::Stored && fresh ? "set " : "would set ") + r.scope + " " +
+           r.var + " = " + v + "  (capture from " + r.target + ")\n";
+    }
+    return o;
   }
 
   // Stores the resolved capture values into the workspace (UI thread: memory only; a changed
@@ -2446,6 +3536,8 @@ class ResponseView : public wxPanel, public ResponsePanel {
     std::shared_ptr<const HttpResponse> r = rv::restore_response(&kept, x);
     extras_prompt_ms_ = x.prompt_ms <= kept.timing.queue_ms ? x.prompt_ms : 0;
     extras_cut_size_ = x.head && kept.body.size() < x.body_size ? x.body_size : 0;
+    extras_body_key_ = x.key;
+    extras_sse_at_ = x.sse_at.empty() ? nullptr : std::make_shared<const std::vector<double>>(x.sse_at);
     auto s = sent ? std::make_shared<SentHttp>(*sent) : std::make_shared<SentHttp>();
     if (!sent) {
       s->request.method = "GET";
@@ -2454,17 +3546,20 @@ class ResponseView : public wxPanel, public ResponsePanel {
     if (!s->pre_script) s->pre_script = x.pre;
     if (!s->post_script) s->post_script = x.post;
     s->scripts_skipped_untrusted = s->scripts_skipped_untrusted || x.scripts_skipped_untrusted;
+    if (x.visualize) remember_visualize();
     return {std::move(r), std::move(s)};
   }
   std::pair<std::shared_ptr<const HttpResponse>, std::shared_ptr<const SentHttp>> with_extras_head(
       const rv::RunExtras& x) {
     std::shared_ptr<const HttpResponse> r = rv::restore_response(nullptr, x);
     extras_prompt_ms_ = x.head && x.prompt_ms <= x.head->timing.queue_ms ? x.prompt_ms : 0;
+    extras_sse_at_.reset();
     auto s = std::make_shared<SentHttp>();
     if (const RequestTab* t = tab()) s->request = t->request().http;
     s->pre_script = x.pre;
     s->post_script = x.post;
     s->scripts_skipped_untrusted = x.scripts_skipped_untrusted;
+    if (x.visualize) remember_visualize();
     return {std::move(r), std::move(s)};
   }
 
@@ -2487,6 +3582,10 @@ class ResponseView : public wxPanel, public ResponsePanel {
     body_->show_message("The last response of this request was not kept with the history (" + fmt::ms(e.total_ms) +
                         ", status " + (e.status > 0 ? std::to_string(e.status) : std::string("none")) +
                         ").\n\nCtrl+Enter sends the request again.");
+    // Nothing to check: the checks say so instead of a bare count that reads like a result.
+    ++test_seq_;
+    tests_->set_no_response("the last response was not kept: send again to check");
+    update_tests_label();
   }
 
   // ------------------------------------------------------------------ log
@@ -2498,8 +3597,11 @@ class ResponseView : public wxPanel, public ResponsePanel {
     // Stored in UTC: shown in local time.
     std::string when = when_iso;
     wxDateTime dt;
-    if (when.size() >= 19 && dt.ParseISOCombined(wxString(when.substr(0, 19))))
-      when = dt.FromTimezone(wxDateTime::UTC).Format("%Y-%m-%d %H:%M").utf8_string();
+    if (when.size() >= 19 && dt.ParseISOCombined(wxString(when.substr(0, 19)))) {
+      const wxDateTime local = dt.FromTimezone(wxDateTime::UTC);
+      // Today: the time alone (the strip keeps room for the timing split).
+      when = local.Format(local.IsSameDate(wxDateTime::Now()) ? "%H:%M" : "%Y-%m-%d %H:%M").utf8_string();
+    }
     return {"last run \xC2\xB7 " + when,
             "The last response of this request, from the workspace history (" + when_iso +
                 "): it was not sent now.\nIts timing is as measured then (time in confirmation dialogs left out); "
@@ -2507,15 +3609,27 @@ class ResponseView : public wxPanel, public ResponsePanel {
             Tone::Warn, false, 1};
   }
 
-  static StatusSeg restored_seg() {
-    return {"restored \xC2\xB7 earlier session",
+  // Labelled like a run read from the history ("last run · 21:18"): the same state reads the same
+  // on every tab. The time is the response's Date header when it has one.
+  static StatusSeg restored_seg(const HttpResponse* r = nullptr) {
+    std::string when = "earlier session";
+    if (r)
+      if (const std::string_view d = r->headers.get("date"); !d.empty()) {
+        wxDateTime dt;
+        wxString::const_iterator end;
+        const wxString ds = wxString::FromUTF8(d.data(), d.size());
+        if (dt.ParseRfc822Date(ds, &end)) {
+          const wxDateTime local = dt;  // parsed as an absolute time, shown in local time
+          when = local.Format(local.IsSameDate(wxDateTime::Now()) ? "%H:%M" : "%Y-%m-%d %H:%M").utf8_string();
+        }
+      }
+    return {"last run \xC2\xB7 " + when,
             "This response was received in an earlier session and restored with the tab: it is not fresh.\n"
             "Its timing is as measured then (time in confirmation dialogs left out); the connection details are "
             "those of that run.\nCtrl+Enter sends the request again.",
             Tone::Warn, false, 1};
   }
 
-  struct Run;
   void set_log(const Run& run) {
     std::string text = http_transcript(*run.resp, run.sent.get(), request_->rows(),
                                        run.at.Format("%Y-%m-%d %H:%M:%S").utf8_string());
@@ -2546,10 +3660,14 @@ class ResponseView : public wxPanel, public ResponsePanel {
     o += "*\n* " + std::string(phase) + " script \xC2\xB7 " + fmt::ms(r->elapsed_us / 1000.0);
     if (r->setup_us > 0) o += " (sandbox setup " + fmt::ms(r->setup_us / 1000.0) + ")";
     if (r->requests_sent > 0) o += " \xC2\xB7 " + std::to_string(r->requests_sent) + " sendRequest";
-    if (!r->tests.empty()) {
+    if (!r->tests.empty() || !r->ok) {
+      // Counted as the Tests tab and the status strip count: a script that threw is one failed
+      // check of its own.
       int pass = 0;
       for (const ScriptTest& t : r->tests) pass += t.pass;
-      o += " \xC2\xB7 tests " + std::to_string(pass) + "/" + std::to_string(r->tests.size());
+      const size_t n = r->tests.size() + (r->ok ? 0 : 1);
+      o += " \xC2\xB7 script tests " + std::to_string(pass) + "/" + std::to_string(n) +
+           (r->ok ? std::string() : std::string(" (the error counts as a failed check)"));
     }
     o += '\n';
     auto put = [&](char prefix, const std::string& label, const std::string& text) {
@@ -2664,12 +3782,15 @@ class ResponseView : public wxPanel, public ResponsePanel {
       segs.push_back(std::move(seg));
     }
     if (pass + fail > 0) {
+      // Until the assertions are evaluated (run_tests); update_tests_label then puts the one total
+      // the Tests tab shows in its place.
       StatusSeg seg{"script tests " + std::to_string(pass) + "/" + std::to_string(pass + fail),
                     std::to_string(pass) + " of " + std::to_string(pass + fail) + " script checks passed" +
                         (errors ? " (a script that threw counts as one failed check)." : ".") +
                         "\nClick for the Tests tab.",
                     fail ? Tone::Err : Tone::Ok, false, 2};
       seg.click = kClickTests;
+      seg.key = kSegChecks;
       segs.push_back(std::move(seg));
     }
   }
@@ -2725,6 +3846,10 @@ class ResponseView : public wxPanel, public ResponsePanel {
                       grpc_conn_rows(grpc_shown_meta_, *grpc_last_));
       return;
     }
+    if (awaiting_ && head_shown_) {  // the response in flight (its head is in)
+      show_info_popup(this, anchor, "Connection \xC2\xB7 in flight", http_conn_rows(*head_shown_, nullptr));
+      return;
+    }
     if (runs_.empty() || shown_run_ >= runs_.size()) return;
     const Run& run = runs_[shown_run_];
     std::string title = "Connection";
@@ -2733,6 +3858,7 @@ class ResponseView : public wxPanel, public ResponsePanel {
   }
 
   void start_stream() {
+    sse_off();
     body_->set_stale(false);
     live_ = true;
     body_->begin_stream();
@@ -2763,6 +3889,11 @@ class ResponseView : public wxPanel, public ResponsePanel {
   // Page i becomes visible: created now if it never was.
   void show_page(int i) {
     if (i < 0 || static_cast<size_t>(i) >= book_->GetPageCount()) return;
+    if (i == kBody && sse_on_ && !sse_raw_) {
+      sse_->ensure();
+      book_->SetSelection(static_cast<size_t>(kSsePage));
+      return;
+    }
     wxWindow* w = book_->GetPage(static_cast<size_t>(i));
     if (auto* lp = dynamic_cast<LazyPage*>(w)) {
       if (!lp->built()) {
@@ -2798,7 +3929,7 @@ class ResponseView : public wxPanel, public ResponsePanel {
              " and the previous one " + (prev.reused ? "reused one" : "opened a new one") +
              ", so most of the difference is connection setup. Server wait: " +
              fmt::delta_ms(cur.server_wait - prev.server_wait) + ".";
-    segs.push_back({text, tip, noise || conn_changed ? Tone::Dim : (d < 0 ? Tone::Ok : Tone::Err), false, 4});
+    segs.push_back({text, tip, noise || conn_changed ? Tone::Dim : (d < 0 ? Tone::Ok : Tone::Err), false, 5});
   }
 
   struct Base {
@@ -2865,11 +3996,25 @@ class ResponseView : public wxPanel, public ResponsePanel {
     }).detach();
   }
 
+  // Where a chip menu opens: under the chips, moved left so that it ends inside the pane (a menu
+  // opened at the chips' left edge ran past the window's right edge at 1600 px).
+  wxPoint menu_pos(const wxMenu& m) const {
+    int w = 0;
+    for (const wxMenuItem* it : m.GetMenuItems())
+      if (!it->IsSeparator()) w = std::max(w, GetTextExtent(it->GetItemLabelText()).x);
+    // The menu font is a little larger than the pane's; then the check mark column, the
+    // submenu-arrow column, padding and the border.
+    w = w * 115 / 100 + FromDIP(96);
+    wxPoint p = hist_->GetPosition() + wxPoint(0, hist_->GetSize().y);
+    p.x = std::max(0, std::min(p.x, GetClientSize().x - w));
+    return p;
+  }
+
   void examples_menu() {
     wxMenu m;
     const Run* run = !showing_grpc_ && shown_run_ < runs_.size() ? &runs_[shown_run_] : nullptr;
     const bool can_save = run && run->resp->ok && run->example.empty() && !examples_dir_.empty();
-    m.Append(1, "Save this response as example\xE2\x80\xA6")->Enable(can_save);
+    m.Append(1, wxString::FromUTF8("Save this response as example\xE2\x80\xA6"))->Enable(can_save);
     if (!examples_.empty()) {
       m.AppendSeparator();
       for (size_t i = 0; i < examples_.size() && i < 40; ++i) {
@@ -2880,7 +4025,7 @@ class ResponseView : public wxPanel, public ResponsePanel {
     } else {
       m.Append(2, showing_grpc_ ? "(examples are for HTTP responses)" : "(no examples saved yet)")->Enable(false);
     }
-    const int id = GetPopupMenuSelectionFromUser(m, hist_->GetPosition() + wxPoint(0, hist_->GetSize().y));
+    const int id = GetPopupMenuSelectionFromUser(m, menu_pos(m));
     if (id == 1 && can_save) return save_example_of(*run);
     if (id >= 100 && static_cast<size_t>(id - 100) < examples_.size()) open_example(examples_[static_cast<size_t>(id - 100)]);
   }
@@ -2957,12 +4102,12 @@ class ResponseView : public wxPanel, public ResponsePanel {
                                                               : x.at.Format("%H:%M:%S").utf8_string();
       std::string label = "#" + std::to_string(i + 1) + "   " + when + "   ";
       label += x.resp->ok ? std::to_string(x.resp->status) : std::string("failed");
-      label += "   " + fmt::ms(x.resp->timing.total_ms) + "   " + fmt::human_bytes(x.resp->body.size());
+      label += "   " + fmt::ms(x.model.total) + "   " + fmt::human_bytes(x.resp->body.size());  // as the status line
       if (!x.example.empty()) label += "   \xC2\xB7   example " + elide_middle(x.example, 40);
       else if (!x.label.empty()) label += "   \xC2\xB7   " + elide_middle(x.label, 80);
       m.AppendCheckItem(static_cast<int>(i) + 100, U(label))->Check(i == shown_run_);
     }
-    const int id = GetPopupMenuSelectionFromUser(m, hist_->GetPosition() + wxPoint(0, hist_->GetSize().y));
+    const int id = GetPopupMenuSelectionFromUser(m, menu_pos(m));
     if (id >= 100 && static_cast<size_t>(id - 100) < runs_.size() && static_cast<size_t>(id - 100) != shown_run_)
       show_run(static_cast<size_t>(id - 100));
   }
@@ -2975,33 +4120,91 @@ class ResponseView : public wxPanel, public ResponsePanel {
     return false;
   }
 
-  // Set-Cookie headers of the final response: name -> "value; Path=/; HttpOnly ...".
-  void set_cookies(const HttpResponse& r) {
-    KV rows;
-    for (const auto& [k, v] : r.headers) {
-      if (k.size() != 10) continue;
-      std::string lk(k);
-      for (char& c : lk) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-      if (lk != "set-cookie") continue;
-      const std::string_view sv = v;
-      const size_t semi = sv.find(';');
-      const std::string_view pair = sv.substr(0, semi);
-      const size_t eq = pair.find('=');
-      std::string name(pair.substr(0, eq));
-      std::string value(eq == std::string_view::npos ? std::string_view() : pair.substr(eq + 1));
-      if (semi != std::string_view::npos) {
-        std::string_view attrs = sv.substr(semi + 1);
-        while (!attrs.empty() && attrs.front() == ' ') attrs.remove_prefix(1);
-        value += "  \xC2\xB7  ";
-        value += attrs;
-      }
-      rows.emplace_back(std::move(name), std::move(value));
-    }
+  // Set-Cookie headers of the final response, parsed as the workspace jar reads them (and what
+  // the jar did with each). The tab stays for every HTTP response (empty: says none were set).
+  void set_cookies(const HttpResponse& r, const Run& run) {
+    std::vector<std::pair<std::string, std::string>> sc;
+    for (const auto& [k, v] : r.headers)
+      if (k.size() == 10 && wxString::FromUTF8(k.data(), k.size()).IsSameAs("set-cookie", false))
+        sc.emplace_back(std::string(k), std::string(v));
+    const int64_t at = run.at.IsValid() ? static_cast<int64_t>(run.at.GetTicks()) : static_cast<int64_t>(wxDateTime::Now().GetTicks());
+    std::string url = r.effective_url;
+    if (url.empty() && run.sent) url = run.sent->request.url;
+    std::vector<rv::SetCookieRow> rows = rv::set_cookie_rows(sc, url, at);
     const size_t n = rows.size();
-    cookies_->set(std::move(rows));
-    tabs_->show_tab(kCookies, n > 0);
+    size_t stored = 0, deleted = 0, ignored = 0;
+    for (const auto& x : rows)
+      (x.fate == rv::SetCookieRow::Fate::Stored ? stored : x.fate == rv::SetCookieRow::Fate::Deletes ? deleted : ignored)++;
+    bool jar_off = false;
+    if (const RequestTab* t = tab()) jar_off = t->request().no_cookie_jar;
+    std::string note;
+    Tone tone = Tone::Dim;
+    if (n == 0) {
+      note = r.ok ? "This response set no cookies (no Set-Cookie header)." : "No response, no cookies.";
+    } else {
+      // Short parts, most important first: the bar drops whole " · " parts from the end when it
+      // is narrow (the full text is its tooltip).
+      note = std::to_string(n) + (n == 1 ? " cookie" : " cookies") + " set";
+      if (jar_off) {
+        note += " \xC2\xB7 cookie jar off for this request: none stored";
+        tone = Tone::Warn;
+      } else {
+        // Not sent now (restored, an example): what the jar's rules made of them then.
+        const bool then = run.restored || !run.example.empty();
+        if (stored) note += " \xC2\xB7 " + std::to_string(stored) + " went to the workspace jar";
+        if (deleted) note += " \xC2\xB7 " + std::to_string(deleted) + " deleted";
+        if (ignored) note += " \xC2\xB7 " + std::to_string(ignored) + " ignored (see Jar)";
+        if (stored) note += " \xC2\xB7 later requests that match send them";
+        if (then) note += " \xC2\xB7 as of that run";
+        if (ignored) tone = Tone::Warn;
+      }
+    }
+    if (r.redirect_count > 0)
+      note += " \xC2\xB7 cookies set by the " + std::to_string(r.redirect_count) +
+              (r.redirect_count == 1 ? " redirect" : " redirects") + " are not seen";
+    cookies_->set(std::move(rows), std::move(note), tone);
+    tabs_->show_tab(kCookies, true);
     tabs_->set_label(kCookies, "Cookies", n ? std::to_string(n) : std::string());
     if (!tabs_->tab_shown(tabs_->selection())) select_tab(kBody);
+  }
+
+  // A response received now: its Set-Cookie headers go into the workspace jar (Workspace::
+  // record_cookies' rules, the URL the response came from), unless the request turned the jar
+  // off. On a worker: the jar may still have to be read from disk; its writes are its own.
+  void record_cookies(const HttpResponse& r, const SentHttp* sent) {
+    RequestTab* t = tab();
+    const Workspace* ws = t ? t->workspace() : nullptr;
+    if (!ws || ws->root().empty() || t->request().no_cookie_jar) return;
+    std::vector<std::pair<std::string, std::string>> sc;
+    for (const auto& [k, v] : r.headers)
+      if (k.size() == 10 && wxString::FromUTF8(k.data(), k.size()).IsSameAs("set-cookie", false))
+        sc.emplace_back(std::string(k), std::string(v));
+    if (sc.empty()) return;
+    std::string url = r.effective_url;
+    if (url.empty() && sent) url = sent->request.url;
+    std::shared_ptr<CookieJar> jar = ws->cookie_jar();
+    if (!jar || url.empty()) return;
+    std::thread([jar, url = std::move(url), sc = std::move(sc)] { jar->record(url, sc); }).detach();
+  }
+
+  // "Manage cookies...": the workspace jar's editor, on this host. The jar is read from disk on
+  // a worker first (the editor needs it in memory; the UI thread never waits on the disk).
+  void manage_cookies(const std::string& host) {
+    RequestTab* t = tab();
+    const Workspace* ws = t ? t->workspace() : nullptr;
+    if (!ws) return;
+    std::shared_ptr<CookieJar> jar = ws->cookie_jar();
+    if (!jar) return;
+    std::thread([jar, host, alive = alive_, this] {
+      jar->preload();
+      if (!wxTheApp) return;
+      wxTheApp->CallAfter([jar, host, alive, this] {
+        if (!*alive) return;
+        // Centred on the window, not on this pane (the dialog is wider than the pane).
+        wxWindow* top = wxGetTopLevelParent(this);
+        http_editor::show_cookie_manager(top ? top : this, jar, host, [] {});
+      });
+    }).detach();
   }
 
   // What went out: request line, the headers as sent (the ones libcurl adds itself dimmed), the
@@ -3089,9 +4292,15 @@ class ResponseView : public wxPanel, public ResponsePanel {
     bool body_not_kept = false;  // restored without its body (too large to keep)
     uint64_t cut_size = 0;       // restored with the start of its body only: the size received
     uint64_t not_kept_size = 0;
+    std::string body_key;        // cut: the run key its whole body may be kept under (response_keep)
+    bool sse_live = false;       // an event stream listed live while it arrived (this send)
+    double cancelled_ms = -1;    // cancelled by the user after its head arrived (ms after the send)
+    uint64_t cancelled_bytes = 0;  // ... with this much of the body
+    std::shared_ptr<const std::vector<double>> sse_at;  // event offsets (live, or kept with the run)
   };
   static constexpr double kPromptMinMs = 50;  // less is UI work, not a dialog someone answered
   static constexpr int kClickTests = 3, kClickLog = 4;  // status strip segment ids (1 conn, 2 redirects)
+  static constexpr int kSegChecks = 1;  // StatusSeg::key of the tests total
   static constexpr size_t kRuns = 10;
   std::vector<Run> runs_;
   size_t shown_run_ = 0;
@@ -3102,7 +4311,7 @@ class ResponseView : public wxPanel, public ResponsePanel {
   wxSimplebook* book_;
   BodyView* body_;
   KvPage* headers_;
-  KvPage* cookies_;
+  CookiePage* cookies_;
   KvPage* trailers_;
   MsgPage* msgs_;
   KvPage* request_;
@@ -3130,16 +4339,38 @@ class ResponseView : public wxPanel, public ResponsePanel {
   bool awaiting_ = false;     // show_sending() was called and its result has not arrived yet
   bool waiting_msg_ = false;  // the body shows "Waiting for the response" (no earlier response to fade)
   Clock::time_point progress_shown_at_{};  // when show_progress() last rewrote that message
+  // A previous body stays faded on screen at most this long after a send (then show_in_flight).
+  static constexpr double kStaleBodyMs = 300;
+  wxTimer stale_timer_;
+  uint64_t stale_seq_ = 0;
+  uint64_t live_bytes_ = 0;  // body bytes of the request in flight so far
   uint64_t view_seq_ = 0;
   uint64_t help_seq_ = ~0ull;
   wxTimer hist_timer_;  // retries the history lookup until the workspace is open
   uint64_t hist_seq_ = 0;
   int hist_tries_ = 0;  // == view_seq_ while the empty-state help is shown     // bumps on clear / send / result: a history lookup is dropped after it
   std::string history_when_;  // show_* of a response read from history: when it was received
+  // A restored show_http, deferred to a turn of its own with the state its caller set for it.
+  struct RestoreArgs {
+    std::shared_ptr<const HttpResponse> r;
+    std::shared_ptr<const SentHttp> sent;
+    std::string history_when;
+    bool extras_applied = false;
+    double prompt_ms = 0;
+    uint64_t cut_size = 0;
+    bool body_not_kept = false;
+    uint64_t not_kept_size = 0;
+    uint64_t seq = 0;
+    std::string body_key;
+    std::shared_ptr<const std::vector<double>> sse_at;
+  };
+  bool restore_now_ = false;  // inside the deferred restored show_http (or one it calls)
   std::string grpc_history_when_;  // ... the gRPC response shown
   bool extras_applied_ = false;    // show_http of a restored response already merged with its RunExtras
   double extras_prompt_ms_ = 0;    // ... the dialog time with_extras() took out of it
   uint64_t extras_cut_size_ = 0;   // ... its body as received, when only the start of it was kept
+  std::string extras_body_key_;    // ... and the run key its whole body may be kept under
+  std::shared_ptr<const std::vector<double>> extras_sse_at_;  // ... its event offsets
   bool body_not_kept_ = false;     // ... rebuilt without its body (too large to keep)
   uint64_t not_kept_size_ = 0;     // ... which was this large
   std::map<std::string, std::string> filters_;  // JSONPath filter per request (by ident)
@@ -3156,6 +4387,27 @@ class ResponseView : public wxPanel, public ResponsePanel {
     const auto it = ident.empty() ? filters_.end() : filters_.find(ident);
     body_->set_filter(it == filters_.end() ? std::string() : it->second);
   }
+  // Event streams (see body_tap).
+  static constexpr double kSseBatchMs = 50;          // at most one batch onto the list this often
+  static constexpr size_t kSseRawMax = 64u << 20;    // the stream's bytes kept for Raw while live
+  static constexpr size_t kSseSyncParse = 1u << 20;  // a restored stream up to this is parsed inline
+  SsePage* sse_ = nullptr;
+  std::shared_ptr<SseTap> tap_;  // the tap of the HTTP send in flight (or the last one)
+  Clock::time_point tap_t0_{};   // when it was made (its clock's zero)
+  std::shared_ptr<const HttpResponse> head_shown_;  // the in-flight response's head on screen
+  double head_at_ms_ = -1;       // ... which arrived then (ms on the tap's clock)
+  wxTimer head_timer_;           // shows the head kHeadDelayMs after it arrived (unless done by then)
+  wxTimer live_timer_;           // Download / rates of a response with its head shown
+  uint64_t tap_seq_ = 0;         // bumps with every tap: a late post of an old one drops out
+  bool tap_armed_ = false;       // body_tap() ran and the show_sending() of its send has not
+  wxTimer sse_timer_;
+  Clock::time_point sse_drained_at_{};
+  bool sse_live_ = false;   // the send in flight is an event stream listed live
+  bool sse_on_ = false;     // the Body tab shows the event list
+  bool sse_raw_ = false;    // ... switched to Raw by the user
+  std::string sse_raw_bytes_;  // the live stream's bytes (Raw while it runs)
+  uint64_t sse_comments_ = 0;
+  std::shared_ptr<const HttpResponse> sse_resp_;  // the run the list was made for
   std::shared_ptr<bool> alive_ = std::make_shared<bool>(true);
 
  public:

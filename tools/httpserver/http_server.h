@@ -13,6 +13,8 @@
 //   /drip/<n>?interval=ms -> n body bytes, one every `interval` ms (Content-Length known)
 //   /gzip/<n>             -> n bytes of 'x', sent with Content-Encoding: gzip (wire << n)
 //   /close                -> responds then closes the connection
+//   /ws                   -> WebSocket echo (?burst=n, ?every=ms&count=n, ?protocol=p; a text
+//                            "close [code reason]" closes), see websocket()
 // Authentication (watt's auth tests; credentials are test fixtures):
 //   /digest-auth/<user>/<pass> -> RFC 7616 Digest (MD5, qop=auth): 401 + challenge, then
 //                                {"authenticated":true,"user":...} when the response checks out
@@ -45,6 +47,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <mutex>
@@ -947,7 +950,180 @@ class Server {
         if (bad) respond(s, req, 400, "text/plain", "bad request", true);
         return;
       }
+      if (req.path == "/ws" || req.path.rfind("/ws/", 0) == 0) {
+        websocket(s, req, buf);
+        return;
+      }
       if (!handle(s, req)) return;
+    }
+  }
+
+  // ---------------------------------------------------------------- WebSocket (RFC 6455)
+  // /ws                     echo: every text / binary message comes back as it was sent
+  //   ?burst=<n>            right after the upgrade, n text messages {"i":k,"msg":"burst"}
+  //   ?every=<ms>&count=<n> then n messages {"tick":k}, one every ms
+  //   ?protocol=<p>         answers Sec-WebSocket-Protocol: p
+  // A text message "close" makes the server close with 1000 "bye"; "close <code> <reason>"
+  // with that code and reason. Pings are answered with pongs.
+  static bool ws_frame(SOCKET s, int opcode, std::string_view payload) {
+    std::string f;
+    f.reserve(payload.size() + 10);
+    f.push_back(static_cast<char>(0x80 | opcode));
+    if (payload.size() < 126) {
+      f.push_back(static_cast<char>(payload.size()));
+    } else if (payload.size() < 65536) {
+      f.push_back(126);
+      f.push_back(static_cast<char>((payload.size() >> 8) & 0xff));
+      f.push_back(static_cast<char>(payload.size() & 0xff));
+    } else {
+      f.push_back(127);
+      for (int i = 7; i >= 0; --i) f.push_back(static_cast<char>((static_cast<uint64_t>(payload.size()) >> (8 * i)) & 0xff));
+    }
+    f.append(payload);
+    return send_all(s, f.data(), f.size());
+  }
+  static bool ws_close(SOCKET s, int code, std::string_view reason) {
+    std::string p;
+    p.push_back(static_cast<char>((code >> 8) & 0xff));
+    p.push_back(static_cast<char>(code & 0xff));
+    p.append(reason.substr(0, 120));
+    return ws_frame(s, 8, p);
+  }
+  static uint64_t query_num(std::string_view q, std::string_view key, uint64_t def) {
+    size_t i = 0;
+    while (i <= q.size()) {
+      const size_t amp = q.find('&', i);
+      const std::string_view item = q.substr(i, amp == std::string_view::npos ? std::string_view::npos : amp - i);
+      if (item.size() > key.size() && item.compare(0, key.size(), key) == 0 && item[key.size()] == '=') {
+        uint64_t v = 0;
+        if (detail::parse_u64(item.substr(key.size() + 1), v)) return v;
+      }
+      if (amp == std::string_view::npos) break;
+      i = amp + 1;
+    }
+    return def;
+  }
+  void websocket(SOCKET s, const detail::Request& req, std::string& buf) {
+    const std::string* up = req.header("upgrade");
+    const std::string* key = req.header("sec-websocket-key");
+    if (!up || !detail::iequals(*up, "websocket") || !key || req.method != "GET") {
+      respond(s, req, 426, "text/plain", "WebSocket upgrade required", true, {{"Upgrade", "websocket"}});
+      return;
+    }
+    const std::string accept =
+        detail::b64(detail::bcrypt_digest(BCRYPT_SHA1_ALGORITHM, *key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"), false);
+    std::string h = "HTTP/1.1 101 Switching Protocols\r\nServer: watt_httpserver\r\nUpgrade: websocket\r\n"
+                    "Connection: Upgrade\r\nSec-WebSocket-Accept: " + accept + "\r\n";
+    const size_t pq = req.query.find("protocol=");
+    if (pq != std::string::npos && (pq == 0 || req.query[pq - 1] == '&')) {
+      std::string p = req.query.substr(pq + 9, req.query.find('&', pq) - pq - 9);
+      p.erase(std::remove_if(p.begin(), p.end(), [](char c) { return c == '\r' || c == '\n'; }), p.end());
+      h += "Sec-WebSocket-Protocol: " + p + "\r\n";
+    }
+    h += "\r\n";
+    ++served_;
+    if (!send_all(s, h.data(), h.size())) return;
+    const uint64_t burst = std::min<uint64_t>(query_num(req.query, "burst", 0), 1000000);
+    for (uint64_t i = 0; i < burst; ++i)
+      if (!ws_frame(s, 1, "{\"i\":" + std::to_string(i) + ",\"msg\":\"burst\"}")) return;
+    const uint64_t every = query_num(req.query, "every", 0);
+    uint64_t ticks = every ? std::min<uint64_t>(query_num(req.query, "count", 10), 100000) : 0, tick = 0;
+    auto next_tick = std::chrono::steady_clock::now() + std::chrono::milliseconds(every);
+    std::string msg;  // a fragmented message being reassembled
+    int msg_op = 0;
+    for (;;) {
+      // A complete frame in buf?
+      while (buf.size() >= 2) {
+        const auto b0 = static_cast<unsigned char>(buf[0]), b1 = static_cast<unsigned char>(buf[1]);
+        uint64_t len = b1 & 0x7f;
+        size_t off = 2;
+        if (len == 126) {
+          if (buf.size() < 4) break;
+          len = (uint64_t{static_cast<unsigned char>(buf[2])} << 8) | static_cast<unsigned char>(buf[3]);
+          off = 4;
+        } else if (len == 127) {
+          if (buf.size() < 10) break;
+          len = 0;
+          for (int i = 0; i < 8; ++i) len = (len << 8) | static_cast<unsigned char>(buf[2 + i]);
+          off = 10;
+        }
+        const bool masked = (b1 & 0x80) != 0;
+        if (len > (64u << 20)) {
+          ws_close(s, 1009, "message too big");
+          return;
+        }
+        if (buf.size() < off + (masked ? 4 : 0) + len) break;
+        char mk[4] = {0, 0, 0, 0};
+        if (masked) {
+          std::memcpy(mk, buf.data() + off, 4);
+          off += 4;
+        }
+        std::string payload = buf.substr(off, static_cast<size_t>(len));
+        for (size_t i = 0; i < payload.size(); ++i) payload[i] ^= mk[i & 3];
+        buf.erase(0, off + static_cast<size_t>(len));
+        const int op = b0 & 0x0f;
+        const bool fin = (b0 & 0x80) != 0;
+        if (op == 8) {  // close: answer with the same code, then hang up
+          ws_frame(s, 8, payload.substr(0, 2));
+          return;
+        }
+        if (op == 9) {
+          if (!ws_frame(s, 10, payload)) return;
+          continue;
+        }
+        if (op == 10) continue;
+        if (op != 0) {
+          msg_op = op;
+          msg.clear();
+        }
+        msg += payload;
+        if (!fin) continue;
+        if (msg_op == 1 && msg.rfind("close", 0) == 0) {
+          int code = 1000;
+          std::string reason = "bye";
+          if (msg.size() > 6) {
+            code = std::atoi(msg.c_str() + 6);
+            const size_t sp = msg.find(' ', 6);
+            reason = sp == std::string::npos ? "" : msg.substr(sp + 1);
+            if (code < 1000 || code > 4999) code = 1000;
+          }
+          ws_close(s, code, reason);
+          // Wait (briefly) for the client's close echo.
+          fd_set rs;
+          FD_ZERO(&rs);
+          FD_SET(s, &rs);
+          timeval tv{1, 0};
+          select(0, &rs, nullptr, nullptr, &tv);
+          return;
+        }
+        ++served_;
+        if (!ws_frame(s, msg_op, msg)) return;
+        msg.clear();
+      }
+      // Wait for more input or the next tick.
+      int wait_ms = 1000;
+      if (tick < ticks) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= next_tick) {
+          if (!ws_frame(s, 1, "{\"tick\":" + std::to_string(tick) + "}")) return;
+          ++tick;
+          next_tick += std::chrono::milliseconds(every);
+          continue;
+        }
+        wait_ms = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(next_tick - now).count()) + 1;
+      }
+      fd_set rs;
+      FD_ZERO(&rs);
+      FD_SET(s, &rs);
+      timeval tv{wait_ms / 1000, (wait_ms % 1000) * 1000};
+      const int sel = select(0, &rs, nullptr, nullptr, &tv);
+      if (sel < 0) return;
+      if (sel == 0) {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (stopping_) return;
+        continue;
+      }
+      if (!fill(s, buf)) return;
     }
   }
 

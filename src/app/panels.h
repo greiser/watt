@@ -14,6 +14,7 @@
 // worker thread (e.g. pretty-printing a 10 MB body) without copying.
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -49,6 +50,9 @@ class EditorHost {
   // scripts): its own file; for a history snapshot the saved request it came from; for an unsaved
   // request the folder its first save goes to. Empty: the collection only.
   virtual std::filesystem::path inherit_file() const { return {}; }
+  // The user chose "Send as written" for these undefined {{names}} in the editor's banner: the
+  // shell's own check (it also sees inherited headers and auth) must not ask about them again.
+  virtual void accept_unresolved(const std::vector<std::string>& names) { (void)names; }
 
   // gRPC only ---------------------------------------------------------------
   // Load the schema for r (reflection when r.proto_files is empty, else .proto / .protoset files)
@@ -62,6 +66,11 @@ class EditorHost {
   virtual void stream_close() = 0;
   // The shared gRPC engine (for example_request() / describe() once a schema is loaded). Never null.
   virtual const GrpcClient& grpc_client() const = 0;
+
+  // WebSocket only ----------------------------------------------------------
+  // Close the open connection cleanly (close frame 1000). send() connects while closed and, while
+  // open, sends the composer's message; cancel() aborts a connect.
+  virtual void ws_close() {}
 };
 
 // Common part of both editors.
@@ -83,6 +92,16 @@ class RequestEditorPanel {
   // The workspace opened, or its environment / variables changed: refresh what shows resolved
   // {{variables}} (the HTTP editor's "Sent as" line).
   virtual void vars_changed() {}
+  // The shell found {{names}} that would go out literally (inherited headers / auth included):
+  // show the editor's own "Not sent" banner, whose "Send as written" calls send_anyway (null or
+  // in_url: no such button). false: this editor has no banner (the shell reports it otherwise).
+  virtual bool show_unresolved(const std::vector<std::string>& missing, bool in_url,
+                               std::function<void()> send_anyway) {
+    (void)missing;
+    (void)in_url;
+    (void)send_anyway;
+    return false;
+  }
 };
 
 class HttpEditorPanel : public RequestEditorPanel {};
@@ -126,6 +145,22 @@ struct SentHttp {
   std::shared_ptr<const TokenStep> token;
 };
 
+// Live body bytes of one HTTP send (Server-Sent Events). The panel hands one out on the UI thread
+// before the send starts; the shell's worker calls feed() for every received body chunk. feed() is
+// thread-safe and cheap: a tap whose stream is not text/event-stream turns itself off on the
+// first chunk and every later call returns at once. The tap never calls into the panel from the
+// worker (it posts to the UI thread itself).
+class HttpBodyTap {
+ public:
+  virtual ~HttpBodyTap() = default;
+  virtual void feed(const char* data, size_t len) = 0;
+  // The final response's status line, headers, connection and phases up to the first byte
+  // (HttpClient's HeadFn), as soon as the header block ended: worker thread, before the first
+  // feed(). Its timing.queue_ms / total_ms include the shell's click-to-engine time, like
+  // show_http's. Optional (a stream that never ends shows its status and headers from it).
+  virtual void head(std::shared_ptr<const HttpResponse> h) { (void)h; }
+};
+
 class ResponsePanel {
  public:
   virtual ~ResponsePanel() = default;
@@ -136,6 +171,8 @@ class ResponsePanel {
   virtual void show_sending(RequestKind kind) = 0;
   // HTTP download progress, at most ~20 times a second while a body arrives. Optional.
   virtual void show_progress(uint64_t bytes_received) { (void)bytes_received; }
+  // A tap for the body of the HTTP send about to start (UI thread, right before it). Optional.
+  virtual std::shared_ptr<HttpBodyTap> body_tap() { return nullptr; }
   // Final HTTP response. resp->timing.queue_ms includes the shell's click-to-engine time, and
   // timing.total_ms is the user-visible total (phase_total(*resp) == resp->timing.total_ms).
   // Transport failures arrive here too with resp->ok == false and resp->error set.
@@ -150,6 +187,10 @@ class ResponsePanel {
   virtual void show_cancelled(double after_ms) = 0;
   // Could not send at all (bad URL, blocked upload file, no method selected, ...).
   virtual void show_error(const std::string& message) = 0;
+  // A send that showed show_sending() now waits on a question to the user (a consent prompt):
+  // stop the running clock and say so, so think-time never reads as request time. The next
+  // show_sending() / show_error() replaces it. Ignored when nothing is being sent.
+  virtual void show_waiting_for_user(const std::string& what) { (void)what; }
   // The next restored show_http / show_grpc (one without show_sending) is a history entry's
   // response received at `when_iso` (UTC ISO); empty: a tab's response from an earlier session.
   virtual void set_history_when(const std::string& when_iso) { (void)when_iso; }

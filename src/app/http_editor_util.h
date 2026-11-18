@@ -3,6 +3,7 @@
 // {{var}} spans, and a JSON re-indenter that never parses values (so {{vars}}, big numbers,
 // comments and odd formatting survive a Beautify byte for byte, and 10 MB re-indents in ~30 ms on
 // a worker thread).
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -48,6 +49,10 @@ std::string with_decoded_query(std::string_view url, const std::vector<KvItem>& 
 // %20 and control characters, non-ASCII bytes, '"' '<' '>' '' '^' '`' '{' '|' '}' and a '%'
 // not followed by two hex digits are %XX-encoded. Scheme and host are left alone.
 std::string normalize_url(std::string_view url);
+// The URL as written, for a request whose "Encode URL" option is off: only what no HTTP request
+// line can carry is %XX-encoded (space and control characters, outside {{vars}}, after the
+// authority). Everything else ('"', '|', '{', non-ASCII, a lone '%') goes out as typed.
+std::string minimal_url(std::string_view url);
 
 // {{var}} substitution as the request is sent. expand_var("{{name}}") returns the value, or its
 // argument unchanged when the variable is not defined (then it stays as written).
@@ -57,6 +62,8 @@ using VarExpander = std::function<std::string(const std::string&)>;
 // the whole result is then normalize_url()ed, so a value elsewhere ({{base}}, a path segment) is
 // kept as written but made safe. The "Sent as" preview and the send both use this.
 std::string expand_url(std::string_view tmpl, const VarExpander& expand_var);
+// encode = false: {{var}} values go in as they are and the result is only minimal_url()ed.
+std::string expand_url(std::string_view tmpl, const VarExpander& expand_var, bool encode);
 // Path variables: "/:name" segments of the path (Postman, Insomnia, Bruno). The name is
 // [A-Za-z0-9_-]+ right after "/:"; the scheme, the authority (a ":port"), the query, the
 // fragment and {{vars}} are never read as one.
@@ -73,7 +80,9 @@ std::vector<std::string> path_var_names(std::string_view url);
 std::string path_encode(std::string_view s);
 // url with each ":name" whose value is not empty replaced by path_encode(value); an empty or
 // unknown one stays as written.
-std::string with_path_values(std::string_view url, const std::function<std::string(const std::string&)>& value);
+// encode = false (the request's "Encode URL" is off): the values go in as written.
+std::string with_path_values(std::string_view url, const std::function<std::string(const std::string&)>& value,
+                             bool encode = true);
 // An application/x-www-form-urlencoded body as sent: each {{var}} value form_encode()d.
 std::string expand_form(std::string_view tmpl, const VarExpander& expand_var);
 
@@ -84,6 +93,9 @@ std::string to_bulk(const std::vector<KvItem>& items);
 std::vector<KvItem> parse_bulk(std::string_view text);
 // Header name as sent: control characters and whitespace removed.
 std::string clean_header_name(std::string_view s);
+// Why `name` is not a valid header name (RFC 9110 token: no spaces, ':', '/', control or
+// non-ASCII characters), "" when it is. {{variables}} in it are not checked (they expand later).
+std::string header_name_problem(std::string_view name);
 // Header value as sent: CR, LF and other control characters (except tab) removed.
 std::string clean_header_value(std::string_view s);
 // Enabled items joined with '&'.
@@ -124,19 +136,56 @@ std::string reindent_json(std::string_view in);
 // line comment keeps its line break). minify_json(reindent_json(s)) == s for minified s.
 std::string minify_json(std::string_view in);
 
+// The JSON body's own lexer (Scintilla's LexJSON styles the rest of a line as an error after an
+// unquoted {{var}}): styles in LexJSON's numbering, so the colours and folding stay the same.
+// {{var}} spans are plain text (their indicator colours them), a bare word other than
+// true / false / null is an error up to its end only.
+enum JsonStyle : char {
+  kJsDefault = 0, kJsNumber = 1, kJsString = 2, kJsStringEol = 3, kJsProperty = 4, kJsEscape = 5,
+  kJsLineComment = 6, kJsBlockComment = 7, kJsOperator = 8, kJsKeyword = 11, kJsError = 13,
+};
+struct JsonLexState {
+  int depth = 0;            // open { / [ before the line
+  bool in_comment = false;  // inside /* */ at the start of the line
+};
+// Styles `text` (whole lines from a line start); one style byte per input byte into *styles.
+// For each line: lines->push_back({depth at its start, whether it opens a block}); `st` is
+// updated to the state after the text (the start of the next line).
+struct JsonLexLine {
+  int depth;
+  bool header;
+  bool in_comment;
+};
+void lex_json(std::string_view text, JsonLexState& st, std::string* styles, std::vector<JsonLexLine>* lines);
+
+// The offset of the bracket that closes the '{' / '[' at `opener` (strings, \ escapes, // and
+// /* */ comments skipped), or npos when it is not closed. 16 bytes per step: ~3 ms per 18 MB.
+size_t json_block_end(std::string_view text, size_t opener);
+
+// The blocks of a JSON text spanning at least min_lines lines, as (line of the opener, line of
+// its closer), sorted by opener line; for a line opening several, the outermost (the one a fold
+// of that line hides). Strings, \ escapes, // and /* */ comments are skipped like
+// json_block_end. One pass on a worker (~30 ms per 18 MB), so folding a 1M-line block needs no
+// scan on the UI thread.
+std::vector<std::pair<int, int>> json_big_blocks(std::string_view text, int min_lines);
+
 // Find bar: how many times needle occurs in hay (non-overlapping, ASCII case folding unless
 // match_case), and how many of them start before `before` (the "3 of 120" index). Stops after
-// `limit` matches (the count is then a lower bound). ~10 ms per 10 MB.
+// `limit` matches (the count is then a lower bound). One pass, ~10 ms per 10 MB. A set *stop
+// ends the walk early (cancelled: a newer search replaced this one).
 struct MatchCount {
   size_t total = 0;
   size_t before = 0;
   bool capped = false;
+  bool cancelled = false;
 };
 MatchCount count_matches(std::string_view hay, std::string_view needle, bool match_case, size_t before,
-                         size_t limit = 1000000);
+                         size_t limit = 1000000, const std::atomic<bool>* stop = nullptr);
 // The match the find bar goes to: forward, the first at or after `from`; backward, the last
 // that starts before `from`; either wraps around the end. npos when there is none.
-size_t find_match(std::string_view hay, std::string_view needle, bool match_case, size_t from, bool forward);
+// npos too when *stop is set meanwhile.
+size_t find_match(std::string_view hay, std::string_view needle, bool match_case, size_t from, bool forward,
+                  const std::atomic<bool>* stop = nullptr);
 // Every non-overlapping occurrence of needle in hay replaced by with (same rules as
 // count_matches); *n is the number replaced.
 std::string replace_all(std::string_view hay, std::string_view needle, std::string_view with, bool match_case,
@@ -202,7 +251,8 @@ struct RowDocs {
   std::vector<std::pair<std::string, std::string>> headers;
   std::vector<PreRow> pre;
   std::vector<std::pair<std::string, std::string>> auth;
-  bool empty() const { return params.empty() && headers.empty() && pre.empty() && auth.empty(); }
+  std::vector<std::pair<std::string, std::string>> asserts;  // assertion target -> description
+  bool empty() const { return params.empty() && headers.empty() && pre.empty() && auth.empty() && asserts.empty(); }
   bool operator==(const RowDocs&) const = default;
 };
 // The docs as the user wrote them, and the descriptions found at their end (if any).

@@ -92,6 +92,9 @@ wxBitmap render(int which, double scale) {
     if (which == kImgUnknown) {
       label = "\xE2\x80\xA2\xE2\x80\xA2\xE2\x80\xA2";  // three bullets: badge not read yet
       col = dim_colour();
+    } else if (which == kImgWs) {
+      label = badge_label(RequestKind::WebSocket, "");
+      col = badge_colour(RequestKind::WebSocket, "");
     } else if (which >= kImgGrpcServer && which <= kImgGrpcBidi) {
       label = "gRPC" + grpc_kind_glyph(which - kImgGrpcServer + 1);
       col = badge_colour(RequestKind::Grpc, "");
@@ -133,6 +136,7 @@ bool is_dark() { return wxSystemSettings::GetAppearance().IsDark(); }
 
 std::string badge_label(RequestKind kind, std::string_view method) {
   if (kind == RequestKind::Grpc) return "gRPC";
+  if (kind == RequestKind::WebSocket) return "WS";
   std::string m = upper(method);
   if (m.empty()) return "GET";
   if (m == "DELETE") return "DEL";
@@ -144,6 +148,7 @@ std::string badge_label(RequestKind kind, std::string_view method) {
 wxColour badge_colour(RequestKind kind, std::string_view method) {
   if (kind == RequestKind::Grpc) return pick("#2EC4CF", "#077C86");
   const std::string m = upper(method);
+  if (kind == RequestKind::WebSocket || m == "WS") return pick("#E8875A", "#B04A12");
   if (m == "GET" || m.empty()) return pick("#3FCF73", "#127A3A");
   if (m == "POST") return pick("#F0B43C", "#9A6500");
   if (m == "PUT") return pick("#4E9EF5", "#0B5CB8");
@@ -157,6 +162,7 @@ wxColour badge_colour(RequestKind kind, std::string_view method) {
 wxColour status_colour(RequestKind kind, long status) {
   if (kind == RequestKind::Grpc) return status == 0 ? pick("#3FCF73", "#127A3A") : pick("#F26B6B", "#B42318");
   if (status >= 200 && status < 300) return pick("#3FCF73", "#127A3A");
+  if (status == 101) return pick("#3FCF73", "#127A3A");  // a WebSocket that connected
   if (status >= 300 && status < 400) return pick("#4E9EF5", "#0B5CB8");
   if (status >= 400 && status < 500) return pick("#F0A03C", "#A04F00");
   return pick("#F26B6B", "#B42318");
@@ -239,6 +245,7 @@ std::string grpc_kind_glyph(int call_kind) {
 
 int tree_image(RequestKind kind, std::string_view method) {
   if (kind == RequestKind::Grpc) return kImgGrpc;
+  if (kind == RequestKind::WebSocket) return kImgWs;
   const std::string m = upper(method);
   if (m == "GET" || m.empty()) return kImgGet;
   if (m == "POST") return kImgPost;

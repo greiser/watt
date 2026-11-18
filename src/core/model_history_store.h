@@ -16,9 +16,11 @@
 // No wx: unit tested in tests/test_sidebar.cpp. Any thread.
 #include <cstdint>
 #include <filesystem>
+#include <map>
 #include <optional>
 #include <set>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "core/model.h"
@@ -62,5 +64,17 @@ bool hide_history_entries(const std::filesystem::path& root, const std::vector<H
 bool clear_history(const std::filesystem::path& root, const std::vector<HistoryEntry>& newest_first);
 // Drops hidden entries from a list (newest first), in place.
 void filter_hidden_history(const HistoryHidden& h, std::vector<HistoryEntry>& entries);
+
+// .watt/snapshots/origins.json: which saved request (or folder, for a request sent unsaved) a
+// history snapshot tab was opened from, so a snapshot tab restored after a restart keeps
+// inheriting that folder's settings. Keys are snapshot file names ("<hex>.req.json"), values
+// workspace-relative generic paths ("api/users/Get user.req.json"). Loading drops anything that
+// is not a plain relative path inside the workspace (absolute, "..", or under .watt), and keeps
+// at most kSnapshotOriginsMax entries.
+inline constexpr size_t kSnapshotOriginsMax = 4000;
+std::map<std::string, std::string> load_snapshot_origins(const std::filesystem::path& root);
+bool save_snapshot_origins(const std::filesystem::path& root, const std::map<std::string, std::string>& origins);
+// True for a value load_snapshot_origins() keeps.
+bool safe_relative_origin(std::string_view rel);
 
 }  // namespace watt

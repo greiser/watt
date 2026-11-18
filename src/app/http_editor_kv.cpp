@@ -2,8 +2,13 @@
 
 #include <wx/arrstr.h>
 #include <wx/dc.h>
+#include <wx/clipbrd.h>
+#include <wx/dataobj.h>
 #include <wx/filedlg.h>
+#include <wx/generic/grideditors.h>
 #include <wx/renderer.h>
+#include <wx/toplevel.h>
+#include <wx/weakref.h>
 #include <wx/simplebook.h>
 #include <wx/sizer.h>
 #include <wx/stattext.h>
@@ -18,10 +23,12 @@ namespace watt::app::http_editor {
 
 namespace {
 
+// Most used first within a prefix ("Cont" offers Content-Type first, "Acc" Accept): the
+// completion list keeps this order.
 const char* const kHeaderNames[] = {
-    "Accept", "Accept-Charset", "Accept-Encoding", "Accept-Language", "Authorization", "Cache-Control",
-    "Connection", "Content-Disposition", "Content-Encoding", "Content-Language", "Content-Length",
-    "Content-Type", "Cookie", "DNT", "Date", "Expect", "Forwarded", "From", "Host", "If-Match",
+    "Accept", "Accept-Encoding", "Accept-Language", "Accept-Charset", "Authorization", "Cache-Control",
+    "Connection", "Content-Type", "Content-Length", "Content-Encoding", "Content-Disposition",
+    "Content-Language", "Cookie", "DNT", "Date", "Expect", "Forwarded", "From", "Host", "If-Match",
     "If-Modified-Since", "If-None-Match", "If-Range", "If-Unmodified-Since", "Idempotency-Key",
     "Keep-Alive", "Max-Forwards", "Origin", "Pragma", "Prefer", "Proxy-Authorization", "Range", "Referer",
     "TE", "Traceparent", "Tracestate", "Upgrade", "User-Agent", "Via", "X-API-Key", "X-Correlation-ID",
@@ -81,6 +88,24 @@ class CompletingEditor : public wxGridCellTextEditor {
  public:
   CompletingEditor() = default;
   wxGridCellEditor* Clone() const override { return new CompletingEditor(); }
+  // The open editor of a blank row keeps its placeholder ("Header" in the new row after Tab).
+  void BeginEdit(int row, int col, wxGrid* grid) override {
+    wxGridCellTextEditor::BeginEdit(row, col, grid);
+    auto* g = dynamic_cast<KvGrid*>(grid);
+    Text()->SetHint(g && g->row_empty(row) ? g->blank_hint(col) : wxString());
+  }
+  // A character typed on a cell that is not being edited opens it and goes at the end of its
+  // text (as in an input box), instead of replacing what the cell holds (the spreadsheet way,
+  // which lost a value typed before an app switch or an Esc).
+  void StartingKey(wxKeyEvent& event) override {
+    const int ch = static_cast<int>(event.GetUnicodeKey());
+    if (ch != WXK_NONE && ch != WXK_BACK && ch != WXK_DELETE) {
+      Text()->SetInsertionPointEnd();
+      Text()->WriteText(static_cast<wxChar>(ch));
+      return;
+    }
+    wxGridCellTextEditor::StartingKey(event);
+  }
   // Single-line editor centred in the row, aligned with the rendered text.
   void SetSize(const wxRect& rect) override {
     wxRect r = rect;
@@ -105,6 +130,17 @@ class KvRenderer : public wxGridCellStringRenderer {
             bool) override {
     wxGridCellRenderer::Draw(grid, attr, dc, rect, row, col, false);
     const Theme& t = Theme::get();
+    // The cursor cell gets an accent frame while the grid has the focus (the grid's own highlight
+    // is off): visible on the Operator / Scope choice cells too, not only in an open editor.
+    if (row == grid.GetGridCursorRow() && col == grid.GetGridCursorCol() && col != 0 && col != g_->col_del() &&
+        !grid.IsCellEditControlShown()) {
+      const wxWindow* f = wxWindow::FindFocus();
+      if (f && (f == &grid || grid.IsDescendant(const_cast<wxWindow*>(f)))) {
+        wxDCPenChanger pen(dc, wxPen(t.accent, grid.FromDIP(2)));
+        wxDCBrushChanger brush(dc, *wxTRANSPARENT_BRUSH);
+        dc.DrawRectangle(wxRect(rect).Deflate(grid.FromDIP(1)));
+      }
+    }
     const bool blank = g_->row_empty(row);
     const bool enabled = g_->row_enabled(row);
     dc.SetFont(grid.GetDefaultCellFont());
@@ -137,6 +173,7 @@ class KvRenderer : public wxGridCellStringRenderer {
       if (blank && (kind == KvGrid::Kind::Multipart || s.empty() || s == g_->default_type())) return;
       dc.SetTextForeground(kind == KvGrid::Kind::Multipart || !enabled || blank ? t.dim : t.accent);
       if (kind == KvGrid::Kind::Multipart) s = file_row ? "File" : "Text";
+      if (s.empty()) s = g_->default_type();  // what an unset operator / scope means when sent
       dc.DrawText(wxString::FromUTF8(s), x, ty);
       // a chevron: this cell is a choice
       const int cx = rect.GetRight() - grid.FromDIP(12), cy = rect.y + rect.height / 2;
@@ -174,20 +211,7 @@ class KvRenderer : public wxGridCellStringRenderer {
     if (s.empty()) {
       wxString ph;
       if (blank) {
-        if (col == g_->col_key()) {
-          switch (kind) {
-            case KvGrid::Kind::Headers: ph = "Header"; break;
-            case KvGrid::Kind::Assert: ph = "res.status"; break;
-            case KvGrid::Kind::Capture: ph = "token"; break;
-            case KvGrid::Kind::PreVar: ph = "signature"; break;
-            default: ph = "Key"; break;
-          }
-        } else {
-          ph = kind == KvGrid::Kind::Assert    ? "200"
-               : kind == KvGrid::Kind::Capture ? "res.body.access_token"
-               : kind == KvGrid::Kind::PreVar  ? "hmacSha256({{secret}}, req.url)"
-                                               : "Value";
-        }
+        ph = g_->blank_hint(col);
       } else if (kind == KvGrid::Kind::Assert && col == g_->col_value() &&
                  assert_op_unary(g_->GetCellValue(row, g_->col_type()).utf8_string())) {
         ph = "(no value)";
@@ -198,6 +222,11 @@ class KvRenderer : public wxGridCellStringRenderer {
         return;
       } else if (col == g_->col_value() && file_row) {
         ph = wxString::FromUTF8("Choose a file\xE2\x80\xA6");
+      } else if (col == g_->col_value() && kind == KvGrid::Kind::Headers) {
+        // Legal (an empty field value), but rarely meant: say what goes on the wire.
+        dc.SetTextForeground(enabled ? t.warn_border : t.dim);
+        dc.DrawText("(empty value: sent as \"Name:\")", x, ty);
+        return;
       } else if (col == g_->col_key()) {
         // A value with no key is never sent: say so on the row itself.
         dc.SetTextForeground(t.var_bad);
@@ -258,7 +287,8 @@ KvGrid::KvGrid(wxWindow* parent, Kind kind)
   switch (kind) {
     case Kind::Params: case Kind::Headers: case Kind::Path: key_c_ = 1; value_c_ = 2; desc_c_ = 3; del_c_ = 4; break;
     case Kind::UrlEncoded: key_c_ = 1; value_c_ = 2; del_c_ = 3; break;
-    case Kind::Multipart: case Kind::Assert: key_c_ = 1; type_c_ = 2; value_c_ = 3; del_c_ = 4; break;
+    case Kind::Multipart: key_c_ = 1; type_c_ = 2; value_c_ = 3; del_c_ = 4; break;
+    case Kind::Assert: key_c_ = 1; type_c_ = 2; value_c_ = 3; desc_c_ = 4; del_c_ = 5; break;
     case Kind::Capture: key_c_ = 1; value_c_ = 2; type_c_ = 3; del_c_ = 4; break;
     case Kind::PreVar: key_c_ = 1; value_c_ = 2; type_c_ = 3; desc_c_ = 4; del_c_ = 5; break;
   }
@@ -293,6 +323,7 @@ KvGrid::KvGrid(wxWindow* parent, Kind kind)
       SetColLabelValue(col_key(), "Target");
       SetColLabelValue(col_type(), "Operator");
       SetColLabelValue(col_value(), "Expected");
+      SetColLabelValue(col_desc(), "Description");
       break;
     case Kind::Capture:
       SetColLabelValue(col_key(), "Variable");
@@ -430,7 +461,23 @@ KvGrid::KvGrid(wxWindow* parent, Kind kind)
   Bind(wxEVT_GRID_SELECT_CELL, [this](wxGridEvent& e) {
     e.Skip();
     if (pick_ && (e.GetRow() != pick_row_ || e.GetCol() != col_type())) close_picker();
+    // The renderer frames the cursor cell: repaint the old and the new one.
+    const int r0 = GetGridCursorRow(), c0 = GetGridCursorCol();
+    if (r0 >= 0 && c0 >= 0) RefreshBlock(r0, c0, r0, c0);
+    CallAfter([this] {
+      const int r = GetGridCursorRow(), c = GetGridCursorCol();
+      if (r >= 0 && c >= 0 && r < GetNumberRows()) RefreshBlock(r, c, r, c);
+    });
   });
+  auto refresh_cursor = [this](wxFocusEvent& e) {
+    e.Skip();
+    CallAfter([this] {
+      const int r = GetGridCursorRow(), c = GetGridCursorCol();
+      if (r >= 0 && c >= 0 && r < GetNumberRows()) RefreshBlock(r, c, r, c);
+    });
+  };
+  GetGridWindow()->Bind(wxEVT_SET_FOCUS, refresh_cursor);
+  GetGridWindow()->Bind(wxEVT_KILL_FOCUS, refresh_cursor);
   Bind(wxEVT_SCROLLWIN_THUMBTRACK, [this](wxScrollWinEvent& e) {
     e.Skip();
     close_picker();
@@ -458,9 +505,52 @@ KvGrid::KvGrid(wxWindow* parent, Kind kind)
       // Tab / Enter move to the next cell here (ahead of the text control, which would insert
       // a tab or eat the Enter). With the completion list open, the arrows move in it and Tab,
       // Enter or a click insert the highlighted entry; Esc closes it (the edit stays open).
+      // wxGrid closes the editor when it loses the focus. Not when the focus goes to another app
+      // (or another window of this one): the typed text, the caret and the undo stay as they
+      // were, and on_activate gives the editor the focus back (copy a token in a browser, come
+      // back, paste). The grid's handler (pushed on the control) skips a focus loss while its
+      // "in set focus" flag is up: raise it for this one event.
+      if (!activate_bound_) {
+        if (wxWindow* tlw = wxGetTopLevelParent(this)) {
+          tlw->Bind(wxEVT_ACTIVATE, &KvGrid::on_activate, this);
+          activate_bound_ = true;
+        }
+      }
+      wxEvtHandler* gh = tc->GetEventHandler();
+      if (gh != tc && gh->GetClassInfo() && wxString(gh->GetClassInfo()->GetClassName()) == "wxGridCellEditorEvtHandler") {
+        gh->Bind(wxEVT_KILL_FOCUS, [this, tc, gh](wxFocusEvent& fe) {
+          fe.Skip();
+          wxWindow* to = fe.GetWindow();
+          wxWindow* tlw = wxGetTopLevelParent(this);
+          const bool same_tlw = to && tlw && wxGetTopLevelParent(to) == tlw;
+          if (same_tlw || !tlw) return;  // within this window: the edit ends as usual
+          auto* eh = static_cast<wxGridCellEditorEvtHandler*>(gh);
+          eh->SetInSetFocus(true);
+          tc->GetSelection(&kept_from_, &kept_to_);
+          kept_open_ = true;
+          close_suggest();
+          CallAfter([this, w = wxWeakRef<wxEvtHandler>(gh)] {
+            if (w) static_cast<wxGridCellEditorEvtHandler*>(w.get())->SetInSetFocus(false);
+            // A native child of this window (WebView2) took the focus, not another app: end the
+            // edit as a focus loss inside the window would.
+            auto* top = dynamic_cast<wxTopLevelWindow*>(wxGetTopLevelParent(this));
+            if (kept_open_ && top && top->IsActive()) {
+              wxWindow* f = wxWindow::FindFocus();
+              if (!f || !IsDescendant(f)) {
+                kept_open_ = false;
+                if (IsCellEditControlEnabled()) DisableCellEditControl();
+              }
+            }
+          });
+        });
+      }
       tc->Bind(wxEVT_CHAR_HOOK, [this](wxKeyEvent& ke) {
         const int k = ke.GetKeyCode();
         if (suggest_ && !ke.ControlDown() && !ke.AltDown() && suggest_key(k, ke.ShiftDown())) return;
+        if (k == WXK_ESCAPE && !ke.HasAnyModifiers()) {
+          commit_edit();  // no list to close: the edit ends, keeping what was typed
+          return;
+        }
         if (!ke.ControlDown() && !ke.AltDown()) {
           if (k == WXK_TAB) {
             nav_move(!ke.ShiftDown(), false);
@@ -476,9 +566,19 @@ KvGrid::KvGrid(wxWindow* parent, Kind kind)
       tc->Bind(wxEVT_TEXT, [this, tc](wxCommandEvent& te) {
         te.Skip();
         if (updating_) return;
-        live_row_ = GetGridCursorRow();
-        live_col_ = GetGridCursorCol();
-        live_text_ = tc->GetValue();
+        const int r = GetGridCursorRow(), c = GetGridCursorCol();
+        const wxString now = tc->GetValue();
+        // The editor fills itself with the cell's text when the edit starts (a click, F2,
+        // Enter from the previous cell): that is not a change. The cell keeps its old text
+        // until the edit ends, so it is what the edit began with.
+        const bool same = r >= 0 && c >= 0 && r < GetNumberRows() && now == GetCellValue(r, c);
+        if (same && !(live_row_ == r && live_col_ == c)) {
+          if (!inserting_) update_suggest(tc);
+          return;
+        }
+        live_row_ = r;
+        live_col_ = c;
+        live_text_ = now;
         // The new blank row is added when the edit ends: changing the table while the editor
         // is open would close it and lose what was typed.
         changed();
@@ -504,6 +604,7 @@ KvGrid::KvGrid(wxWindow* parent, Kind kind)
   });
   Bind(wxEVT_GRID_EDITOR_HIDDEN, [this](wxGridEvent& e) {
     e.Skip();
+    kept_open_ = false;
     close_suggest();
     CallAfter([this] {
       if (live_row_ < 0) return;
@@ -516,6 +617,9 @@ KvGrid::KvGrid(wxWindow* parent, Kind kind)
   Bind(wxEVT_GRID_CELL_CHANGED, [this](wxGridEvent& e) {
     e.Skip();
     const int r = e.GetRow();
+    // The committed text is what was already reported live while typing (a save in between
+    // stored it): an echo, not a new edit, unless the clean-up below changes something.
+    bool echo = live_row_ == r && live_col_ == e.GetCol() && live_text_ == GetCellValue(r, e.GetCol());
     live_row_ = live_col_ = -1;
     live_text_.clear();
     // The tooltip was for the old text (an error since fixed): drop it, the next mouse move
@@ -524,14 +628,29 @@ KvGrid::KvGrid(wxWindow* parent, Kind kind)
     GetGridWindow()->UnsetToolTip();
     if (kind_ == Kind::Headers && (e.GetCol() == col_key() || e.GetCol() == col_value())) {
       const std::string v = GetCellValue(r, e.GetCol()).utf8_string();
-      std::string c = e.GetCol() == col_key() ? canonical_header_name(v) : clean_header_value(v);
-      if (c != v) SetCellValue(r, e.GetCol(), wxString::FromUTF8(c));
+      // A name with blanks inside ("Authorization Bearer x") is kept as typed (trimmed) so its
+      // lint shows; squeezing the blanks out would hide the mistake ("AuthorizationBearerx").
+      const std::string tk(trim(v));
+      const bool blanks = tk.find_first_of(" \t") != std::string::npos;
+      std::string c = e.GetCol() != col_key() ? clean_header_value(v) : blanks ? tk : canonical_header_name(v);
+      if (c != v) {
+        SetCellValue(r, e.GetCol(), wxString::FromUTF8(c));
+        echo = false;
+      }
     }
-    if (!row_empty(r) && GetCellValue(r, 0).empty()) SetCellValue(r, 0, "1");
-    if (col_type() >= 0 && GetCellValue(r, col_type()).empty()) SetCellValue(r, col_type(), wxString::FromUTF8(default_type()));
-    if (kind_ == Kind::Multipart && e.GetCol() == col_type()) SetCellValue(r, col_value(), "");
+    if (!row_empty(r) && GetCellValue(r, 0).empty()) SetCellValue(r, 0, "1");  // rows(): enabled either way
+    if (col_type() >= 0 && GetCellValue(r, col_type()).empty()) {
+      SetCellValue(r, col_type(), wxString::FromUTF8(default_type()));
+      echo = false;
+    }
+    if (kind_ == Kind::Multipart && e.GetCol() == col_type()) {
+      SetCellValue(r, col_value(), "");
+      echo = false;
+    }
     ensure_blank_row();
+    echo_ = echo;
     changed();
+    echo_ = false;
   });
 
   GetGridWindow()->Bind(wxEVT_MOTION, [this](wxMouseEvent& e) {
@@ -605,11 +724,12 @@ void KvGrid::layout_columns() {
   if (kind_ == Kind::PreVar) {
     key = rest * 18 / 100;
     desc = rest * 30 / 100;
+  } else if (kind_ == Kind::Assert) {
+    key = rest * 36 / 100;
+    desc = rest * 30 / 100;
   } else if (col_desc() >= 0) {
     key = rest * 30 / 100;
     desc = rest * 28 / 100;
-  } else if (kind_ == Kind::Assert) {
-    key = rest * 45 / 100;
   } else if (kind_ == Kind::Capture) {
     key = rest * 30 / 100;
   }
@@ -708,6 +828,14 @@ std::vector<KvRow> KvGrid::rows() const {
     out.push_back(std::move(kv));
   }
   return out;
+}
+
+int KvGrid::live_index(int* col) const {
+  if (live_row_ < 0 || live_row_ >= GetNumberRows() || row_empty(live_row_)) return -1;
+  int n = 0;
+  for (int r = 0; r < live_row_; ++r) n += !row_empty(r);
+  if (col) *col = live_col_;
+  return n;
 }
 
 size_t KvGrid::enabled_count() const {
@@ -927,6 +1055,11 @@ void KvGrid::on_key(wxKeyEvent& e) {
       return;
     }
   }
+  if (!editing && !e.AltDown() &&
+      ((e.GetModifiers() == wxMOD_CONTROL && code == 'V') ||
+       (e.GetModifiers() == wxMOD_SHIFT && (code == WXK_INSERT || code == WXK_NUMPAD_INSERT))) &&
+      paste_into_cell())
+    return;
   if (e.ControlDown() && !(code == WXK_BACK && !editing)) {
     e.Skip();  // Ctrl+Enter sends, Ctrl+C copies, ...
     return;
@@ -1046,6 +1179,23 @@ void KvGrid::nav_move(bool forward, bool enter) {
   go(r, nc, nc != col_type());
 }
 
+wxString KvGrid::blank_hint(int col) const {
+  if (col == col_key()) {
+    switch (kind_) {
+      case Kind::Headers: return "Header";
+      case Kind::Assert: return "res.status";
+      case Kind::Capture: return "token";
+      case Kind::PreVar: return "signature";
+      default: return "Key";
+    }
+  }
+  if (col == col_desc()) return kind_ == Kind::PreVar ? wxString() : wxString("Description");
+  return kind_ == Kind::Assert    ? "200"
+         : kind_ == Kind::Capture ? "res.body.access_token"
+         : kind_ == Kind::PreVar  ? "hmacSha256({{secret}}, req.url)"
+                                  : "Value";
+}
+
 void KvGrid::go(int r, int c, bool edit) {
   if (r < 0 || r >= GetNumberRows()) return;
   SetGridCursor(r, c);
@@ -1060,6 +1210,67 @@ void KvGrid::go(int r, int c, bool edit) {
     if (!f || (f != this && !IsDescendant(f))) return;
     if (CanEnableCellControl()) EnableCellEditControl();
   });
+}
+
+void KvGrid::on_activate(wxActivateEvent& e) {
+  e.Skip();
+  if (!e.GetActive() || !kept_open_) return;
+  // After the window has put the focus back where it was (its own activation handling).
+  CallAfter([this] {
+    if (!kept_open_) return;
+    kept_open_ = false;
+    if (!IsCellEditControlShown()) return;
+    wxGridCellEditor* ed = GetCellEditor(GetGridCursorRow(), GetGridCursorCol());
+    auto* tc = ed ? wxDynamicCast(ed->GetWindow(), wxTextCtrl) : nullptr;
+    if (ed) ed->DecRef();
+    if (!tc) return;
+    wxWindow* f = wxWindow::FindFocus();
+    if (f == tc) return;  // Windows gave it back, caret and all
+    // The click that activated the window went to another control: the edit ends there.
+    if (f && f != this && !IsDescendant(f) && f != wxGetTopLevelParent(this)) {
+      DisableCellEditControl();
+      return;
+    }
+    tc->SetFocus();
+    const long n = tc->GetLastPosition();
+    if (kept_from_ >= 0 && kept_to_ >= kept_from_ && kept_to_ <= n) tc->SetSelection(kept_from_, kept_to_);
+    else tc->SetInsertionPointEnd();
+  });
+}
+
+bool KvGrid::paste_into_cell() {
+  const int r = GetGridCursorRow(), c = GetGridCursorCol();
+  if (r < 0 || r >= GetNumberRows()) return false;
+  if (c != col_key() && c != col_value() && c != col_desc()) return false;
+  if (kind_ == Kind::Multipart && c == col_value() && GetCellValue(r, col_type()) == "File") return false;
+  if (!CanEnableCellControl()) return false;
+  wxString text;
+  if (wxTheClipboard->Open()) {
+    if (wxTheClipboard->IsSupported(wxDF_UNICODETEXT) || wxTheClipboard->IsSupported(wxDF_TEXT)) {
+      wxTextDataObject d;
+      if (wxTheClipboard->GetData(d)) text = d.GetText();
+    }
+    wxTheClipboard->Close();
+  }
+  if (text.empty()) return false;
+  // A cell holds one line: a pasted block keeps its first line (as an <input> would join it,
+  // the trailing newline of a copied token is dropped).
+  text = text.BeforeFirst('\n');
+  text.Trim(true);
+  text.Replace("\r", "");
+  EnableCellEditControl();
+  wxGridCellEditor* ed = GetCellEditor(r, c);
+  auto* tc = ed ? wxDynamicCast(ed->GetWindow(), wxTextCtrl) : nullptr;
+  if (ed) ed->DecRef();
+  if (!tc || !IsCellEditControlShown()) return false;
+  tc->SetInsertionPointEnd();
+  tc->WriteText(text);  // wxEVT_TEXT: the live text and the URL follow
+  return true;
+}
+
+void KvGrid::commit_edit() {
+  close_suggest();
+  if (IsCellEditControlEnabled()) DisableCellEditControl();
 }
 
 void KvGrid::close_picker() {
@@ -1154,10 +1365,18 @@ bool KvGrid::suggest_key(int k, bool shift) {
     case WXK_ESCAPE:
       close_suggest();
       return true;
-    case WXK_TAB: case WXK_RETURN: case WXK_NUMPAD_ENTER:
-      if (!shift && accept_suggest(suggest_tc_)) return true;
+    case WXK_TAB: case WXK_RETURN: case WXK_NUMPAD_ENTER: {
+      bool whole = false;
+      if (!shift && accept_suggest(suggest_tc_, &whole)) {
+        // A whole-cell choice (a header name, a known value): the cell is done, so the key also
+        // moves on as it would without the list (Tab: "Auth" Tab -> Authorization, caret in the
+        // value). A {{variable}} inside a text, or Enter, keeps the caret there.
+        if (whole && k == WXK_TAB) nav_move(true, false);
+        return true;
+      }
       close_suggest();
       return false;
+    }
     case WXK_LEFT: case WXK_RIGHT: case WXK_NUMPAD_LEFT: case WXK_NUMPAD_RIGHT:
     case WXK_HOME: case WXK_END: case WXK_NUMPAD_HOME: case WXK_NUMPAD_END:
       close_suggest();
@@ -1166,7 +1385,7 @@ bool KvGrid::suggest_key(int k, bool shift) {
   }
 }
 
-bool KvGrid::accept_suggest(wxTextCtrl* tc) {
+bool KvGrid::accept_suggest(wxTextCtrl* tc, bool* whole) {
   if (!tc) return false;
   if (!suggest_) return false;
   const wxString v = suggest_->selected_value();
@@ -1177,6 +1396,7 @@ bool KvGrid::accept_suggest(wxTextCtrl* tc) {
   const wxString repl = s.var ? "{{" + v + "}}" : v;
   const wxString after = text.Left(static_cast<size_t>(s.from)) + repl + text.Mid(static_cast<size_t>(s.to));
   if (after == text) return false;  // already that: Enter / Tab commit and move on
+  if (whole) *whole = !s.var;
   insert_suggest(tc, v);
   return true;
 }
@@ -1248,7 +1468,7 @@ void KvGrid::open_picker(int row, wxChar first) {
     if (kind_ == Kind::Multipart && v != old) SetCellValue(row, col_value(), "");
     if (!row_empty(row) && GetCellValue(row, 0).empty()) SetCellValue(row, 0, "1");
     ensure_blank_row();
-    changed();
+    if (v != old) changed();  // the same entry picked again: nothing changed
     SetFocus();
     if (kind_ == Kind::Multipart && v == "File") {
       CallAfter([this, row] { choose_file(row); });

@@ -162,21 +162,24 @@ void FlatButton::paint() {
     case Style::Subtle:
     case Style::Method:
     case Style::Outline:
-      fill = hover_ ? t.hover : parent_bg;
+      fill = hover_ ? t.hover : field_look_ ? t.field : parent_bg;
       fg = text_.IsOk() ? text_ : t.fg;
       break;
   }
   if (!IsEnabled()) fg = t.dim;
   dc.SetPen(HasFocus() && style_ != Style::Primary ? wxPen(t.accent, FromDIP(1))
-            : style_ == Style::Outline           ? wxPen(hover_ ? t.dim : t.border, FromDIP(1))
+            : style_ == Style::Outline || field_look_ ? wxPen(hover_ ? t.dim : t.border, FromDIP(1))
                                                  : *wxTRANSPARENT_PEN);
   if (HasFocus() && style_ == Style::Primary) dc.SetPen(wxPen(t.accent_fg, FromDIP(1), wxPENSTYLE_DOT));
   dc.SetBrush(wxBrush(fill));
-  dc.DrawRoundedRectangle(0, 0, sz.x, sz.y, FromDIP(4));
+  if (field_look_) dc.DrawRectangle(0, 0, sz.x, sz.y);  // square, like the wxBORDER_SIMPLE fields
+  else dc.DrawRoundedRectangle(0, 0, sz.x, sz.y, FromDIP(4));
   dc.SetFont(GetFont());
   dc.SetTextForeground(fg);
   const wxSize ts = dc.GetTextExtent(label_);
-  int x = style_ == Style::Method ? FromDIP(12) : (sz.x - ts.x - (dropdown_ ? FromDIP(14) : 0)) / 2;
+  int x = style_ == Style::Method ? FromDIP(12)
+          : field_look_            ? FromDIP(4)
+                                   : (sz.x - ts.x - (dropdown_ ? FromDIP(14) : 0)) / 2;
   dc.DrawText(label_, x, (sz.y - ts.y) / 2);
   if (dropdown_) {
     const int ax = sz.x - FromDIP(16), ay = sz.y / 2 - FromDIP(2);
@@ -186,6 +189,12 @@ void FlatButton::paint() {
     dc.SetBrush(wxBrush(style_ == Style::Primary ? fg : t.dim));
     dc.DrawPolygon(3, pts);
   }
+}
+
+void FlatButton::set_field_look(bool on) {
+  if (field_look_ == on) return;
+  field_look_ = on;
+  Refresh(false);
 }
 
 // ------------------------------------------------------------------ ChoiceButton
@@ -273,6 +282,20 @@ void ChoiceButton::set_selection(int index) {
   if (index < 0 || index >= static_cast<int>(items_.size())) return;
   sel_ = index;
   SetLabel(items_[static_cast<size_t>(index)]);
+}
+
+void ChoiceButton::set_item(int index, const wxString& text) {
+  if (index < 0 || index >= static_cast<int>(items_.size()) || items_[static_cast<size_t>(index)] == text) return;
+  items_[static_cast<size_t>(index)] = text;
+  if (index == sel_) SetLabel(text);
+  const wxString shown = GetLabel();
+  SetLabel(text);
+  const int w = GetBestSize().x;
+  SetLabel(shown);
+  if (w > GetMinSize().x) {
+    SetMinSize(wxSize(w, GetMinSize().y));  // a height set by the owner stays
+    if (GetParent()) GetParent()->Layout();
+  }
 }
 
 void ChoiceButton::pick(int index) {

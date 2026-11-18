@@ -7,7 +7,10 @@
 // run's environment, scripts (asked once to trust the workspace), and export to JSON, JUnit XML
 // and HTML. The engine (runner_engine.h) runs on a worker thread against a copy of
 // the workspace; the UI thread only copies the workspace, asks for consent once up front and
-// draws batched results. UI thread only.
+// draws batched results. Run, Run again and Rerun failed read the folder again first (on a
+// worker), and an open runner follows changes on disk (its own WorkspaceWatcher): it always
+// sends the requests as saved, in the order of run-order.json (as `watt --run` does), and
+// says when the plan changed since the run shown. UI thread only.
 #include <filesystem>
 #include <functional>
 #include <memory>
@@ -24,8 +27,12 @@ namespace watt::app {
 // (null while it is still opening) and is read when the window opens and when Run is pressed;
 // captured values are merged back into it after a run when "Keep variable values" is on.
 // The runner is a tab of parent's wxAuiNotebook (the main window's request tabs).
+// select = false (a restored session): the tab is added behind the current one.
 void open_runner(wxWindow* parent, std::function<Workspace*()> workspace, const std::filesystem::path& folder,
-                 std::function<std::shared_ptr<GrpcClient>()> grpc);
+                 std::function<std::shared_ptr<GrpcClient>()> grpc, bool select = true);
+// When `page` is a runner tab: true, with *folder the folder it was opened for (as given to
+// open_runner). The session keeps it to open the runner again after a restart.
+bool runner_folder(wxWindow* page, std::filesystem::path* folder);
 // When `page` (a notebook page) is a runner tab: starts a run (Ctrl+Enter; failed_only: Ctrl+
 // Shift+Enter, the failed requests again) and returns true.
 bool runner_shortcut(wxWindow* page, bool failed_only);

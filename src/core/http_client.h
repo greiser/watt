@@ -119,6 +119,9 @@ class ResponseHeaders {
 };
 
 enum class HttpVersion { Auto, Http1_1, Http2, Http2PriorKnowledge };
+// Lowest TLS version offered (CURLOPT_SSLVERSION). Default: what Schannel allows (TLS 1.2 and
+// 1.3 on current Windows).
+enum class TlsVersion { Default, Tls1_0, Tls1_1, Tls1_2, Tls1_3 };
 
 struct HttpRequest {
   std::string method = "GET";
@@ -127,6 +130,21 @@ struct HttpRequest {
   std::string body;
   long timeout_ms = 30000;      // 0 = no timeout
   bool follow_redirects = true;
+  // Redirects (only while follow_redirects):
+  //   max_redirects            hops followed before the send fails (CURLOPT_MAXREDIRS, 0..100)
+  //   keep_method_on_redirect  keep the method and body on 301 / 302 / 303 (CURLOPT_POSTREDIR
+  //                            CURL_REDIR_POST_ALL) instead of switching to GET like a browser
+  //   keep_auth_on_redirect    also send credentials (Authorization / Cookie headers, Basic,
+  //                            Digest, SigV4) to a redirect target on another host or port
+  //                            (CURLOPT_UNRESTRICTED_AUTH). Off by default: credentials go to the
+  //                            original host only. Windows SSO (NTLM / Negotiate) never follows.
+  long max_redirects = 30;
+  bool keep_method_on_redirect = false;
+  bool keep_auth_on_redirect = false;
+  // false: the path and query go out as written, dot segments ("/a/../b") included
+  // (CURLOPT_PATH_AS_IS). The app percent-encodes the URL before it gets here when true.
+  bool encode_url = true;
+  TlsVersion tls_min_version = TlsVersion::Default;
   bool verify_tls = true;
   // PEM CA certificate(s) trusted for this request's TLS instead of the system store (a private
   // CA, e.g. a dev proxy's). Revocation is not checked for such a chain: private CAs rarely
@@ -316,6 +334,19 @@ inline bool is_http_token(std::string_view s) {
 // Optional streaming hook: called on the worker thread for each received body chunk.
 using BodyChunkFn = std::function<void(const char* data, size_t len)>;
 
+// Optional head hook: called on the worker thread as soon as the final response's header block
+// has ended (the blank line after a non-1xx status line that curl does not follow), before any
+// body byte. `head` is a partial HttpResponse: ok, status, status_text, http_version, headers,
+// effective_url, remote_ip / port, conn (with the TLS details when the connection was read),
+// redirect_count, sizes.response_headers and the timing so far: prepare_ms, redirect_ms and
+// queue .. ttfb are final (DNS, socket, connect, TLS, send, Wait); download_ms and process_ms
+// are 0 and timing.total_ms is the time until the head. It may fire more than once in one send
+// (an authentication retry: Digest / NTLM answer a 401 with a second request); the last one
+// belongs to the response send() returns. A send that never gets a final header block (refused,
+// cut before the blank line) never calls it. It also fires for a send that is then cancelled,
+// which is the point: a stream that never ends still shows its status, headers and phases.
+using HeadFn = std::function<void(const HttpResponse& head)>;
+
 class HttpClient {
  public:
   HttpClient();
@@ -336,6 +367,7 @@ class HttpClient {
   static void global_init();
 
   HttpResponse send(const HttpRequest& req, const BodyChunkFn& on_chunk = {});
+  HttpResponse send(const HttpRequest& req, const BodyChunkFn& on_chunk, const HeadFn& on_head);
   void cancel();  // aborts the in-flight send() ASAP; it returns with ok=false, error="cancelled"
 
  private:

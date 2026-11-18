@@ -1,5 +1,6 @@
 #include "app/sidebar_dialogs.h"
 
+#include <wx/app.h>
 #include <wx/button.h>
 #include <wx/clipbrd.h>
 #include <wx/dialog.h>
@@ -9,6 +10,10 @@
 #include <wx/textctrl.h>
 
 #include <algorithm>
+#include <thread>
+
+#include <wx/msw/wrapwin.h>
+#include <shobjidl.h>
 
 #include "app/sidebar_style.h"
 
@@ -255,6 +260,48 @@ int folder_settings(wxWindow* parent, FolderSettings& s) {
   s.name = nm->GetValue().Strip(wxString::both).utf8_string();
   s.dragged_order = dragged->GetValue();
   return rc;
+}
+
+}  // namespace watt::app::sidebar
+
+// ------------------------------------------------------------------ OS file dialog on a thread
+
+namespace watt::app::sidebar {
+
+void pick_file_async(wxWindow* owner, const std::wstring& title,
+                     const std::vector<std::pair<std::wstring, std::wstring>>& filters, bool folders,
+                     std::function<void(const std::filesystem::path&)> done) {
+  const HWND hwnd = owner ? static_cast<HWND>(owner->GetHWND()) : nullptr;
+  std::thread([hwnd, title, filters, folders, done = std::move(done)]() mutable {
+    std::filesystem::path chosen;
+    const HRESULT init = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+    IFileOpenDialog* dlg = nullptr;
+    if (SUCCEEDED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dlg)))) {
+      FILEOPENDIALOGOPTIONS opts = 0;
+      dlg->GetOptions(&opts);
+      opts |= FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST | (folders ? FOS_PICKFOLDERS : FOS_FILEMUSTEXIST);
+      dlg->SetOptions(opts);
+      dlg->SetTitle(title.c_str());
+      std::vector<COMDLG_FILTERSPEC> spec;
+      for (const auto& [label, pattern] : filters) spec.push_back({label.c_str(), pattern.c_str()});
+      if (!folders && !spec.empty()) dlg->SetFileTypes(static_cast<UINT>(spec.size()), spec.data());
+      if (SUCCEEDED(dlg->Show(hwnd))) {
+        IShellItem* item = nullptr;
+        if (SUCCEEDED(dlg->GetResult(&item))) {
+          PWSTR path = nullptr;
+          if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &path)) && path) {
+            chosen = path;
+            CoTaskMemFree(path);
+          }
+          item->Release();
+        }
+      }
+      dlg->Release();
+    }
+    if (SUCCEEDED(init)) CoUninitialize();
+    if (wxAppConsole* app = wxTheApp)
+      app->CallAfter([done = std::move(done), chosen = std::move(chosen)] { done(chosen); });
+  }).detach();
 }
 
 }  // namespace watt::app::sidebar

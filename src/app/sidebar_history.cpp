@@ -25,7 +25,7 @@ std::string target_of(const HistoryEntry& e) {
   if (e.kind == RequestKind::Http) {
     const size_t sp = s.find(' ');
     if (sp != std::string::npos) s.erase(0, sp + 1);
-    for (const char* scheme : {"https://", "http://"})
+    for (const char* scheme : {"https://", "http://", "wss://", "ws://"})
       if (s.rfind(scheme, 0) == 0) {
         s.erase(0, std::char_traits<char>::length(scheme));
         break;

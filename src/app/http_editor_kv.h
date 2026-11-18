@@ -8,6 +8,7 @@
 #include <wx/panel.h>
 
 class wxTextCtrl;
+class wxActivateEvent;
 
 class wxSimplebook;
 class wxStaticText;
@@ -59,6 +60,10 @@ class KvGrid : public wxGrid {
   KvGrid(wxWindow* parent, Kind kind);
 
   std::function<void()> on_change;  // any user edit, live while typing
+  // True inside on_change when it only reports the commit of a cell whose text on_change had
+  // already reported live (nothing new to save: the tab's unsaved mark must not turn on again,
+  // e.g. after a Ctrl+S made while the cell was still being edited).
+  static bool echo() { return echo_; }
   std::function<void()> on_rows_set;  // after set_rows (a change made by code)
   // After any change: how many rows have a value but no key (they are never sent).
   std::function<void(size_t orphans)> on_orphans;
@@ -78,6 +83,9 @@ class KvGrid : public wxGrid {
 
   void set_rows(const std::vector<KvRow>& rows);  // does not call on_change
   std::vector<KvRow> rows() const;               // filled rows only, with the live editor text
+  // The cell being typed into: its index in rows() and its column (-1 when no cell editor is
+  // open). A lint under the table waits until that edit ends instead of flashing per keystroke.
+  int live_index(int* col) const;
   size_t enabled_count() const;  // rows that are sent (enabled, with a key)
   size_t orphan_count() const;   // rows with a value but no key
   // Multipart: pick a file for a row (the Value cell of a File row also opens the picker).
@@ -89,15 +97,18 @@ class KvGrid : public wxGrid {
   int col_value() const { return value_c_; }
   int col_desc() const { return desc_c_; }
   int col_del() const { return del_c_; }
+  bool row_empty(int row) const;
+  // The placeholder of a blank row's cell ("Header", "Value", "Description", ...).
+  wxString blank_hint(int col) const;
 
  protected:
   void DrawColLabel(wxDC& dc, int col) override;
+
 
  private:
   friend class KvRenderer;
   std::string default_type() const;
   std::string cell(int row, int col) const;  // live editor text when that cell is being edited
-  bool row_empty(int row) const;
   bool row_enabled(int row) const { return GetCellValue(row, 0) != "0"; }
   bool row_orphan(int row) const;  // a value (or a file) but no key: not sent
   void ensure_blank_row();
@@ -126,9 +137,22 @@ class KvGrid : public wxGrid {
   Suggest suggestions(int col, const wxString& text, long caret) const;
   void update_suggest(wxTextCtrl* tc);
   bool suggest_key(int key, bool shift);  // a key while the list is open: true when it used it
-  bool accept_suggest(wxTextCtrl* tc);  // false: nothing to change (the key does its own thing)
+  // false: nothing to change (the key does its own thing). *whole: the choice replaced the whole
+  // cell (a header name / value), not a {{variable}} inside it.
+  bool accept_suggest(wxTextCtrl* tc, bool* whole = nullptr);
   void insert_suggest(wxTextCtrl* tc, const wxString& value);
   void close_suggest();
+  // The open cell editor survives a switch to another app (Postman / Bruno inputs keep their
+  // caret): its focus loss to outside this window does not close it, and the window's
+  // reactivation gives it the focus back with the caret where it was.
+  void on_activate(wxActivateEvent& e);
+  // Ctrl+V / Shift+Insert on a cell that is not being edited: open it and paste at the end.
+  bool paste_into_cell();
+  // Esc in an editor with no completion list: close it keeping the typed text.
+  void commit_edit();
+  bool kept_open_ = false;           // the editor lost the focus to another app
+  long kept_from_ = -1, kept_to_ = -1;  // its selection then
+  bool activate_bound_ = false;
 
   Kind kind_;
   PickPopup* pick_ = nullptr;
@@ -144,6 +168,7 @@ class KvGrid : public wxGrid {
   wxString live_text_;
   int tip_row_ = -2, tip_col_ = -2;
   bool updating_ = false;
+  static inline bool echo_ = false;
   size_t orphans_ = 0;
 };
 

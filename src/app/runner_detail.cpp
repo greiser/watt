@@ -77,7 +77,7 @@ wxColour status_colour(const StepResult& r) {
 std::string status_label(const StepResult& r) {
   if (r.skipped) return "skipped";
   if (r.stopped()) return "stopped";
-  if (!r.sent) return "not sent";
+  if (!r.sent) return r.client_error ? "error" : "not sent";
   if (r.kind == RequestKind::Http) {
     if (!r.transport_ok) return "error";
     return std::to_string(r.status) + (r.status_text.empty() ? "" : " " + r.status_text);

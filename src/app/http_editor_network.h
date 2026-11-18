@@ -10,7 +10,9 @@
 #include <filesystem>
 #include <functional>
 #include <string>
+#include <vector>
 
+#include "app/http_editor_inherit.h"
 #include "core/model.h"
 
 class wxStaticText;
@@ -31,10 +33,16 @@ class NetworkPanel : public wxPanel {
   bool passphrase_changed() const { return passphrase() != passphrase0_; }
   // "Inherited: client certificate certs/a.pem from Collection, proxy: system from api" (or "").
   void set_inherited(const wxString& text);
+  // What the levels above set for the redirect / URL / TLS options: the "Inherit" choices name
+  // the value that applies and where it comes from ("Inherit: on (api)").
+  void set_above(const OptionsAbove& above);
+  // Follow redirects is off (the request's own check box): the redirect rows are dimmed.
+  void set_follow(bool on);
   std::function<void()> on_change;  // a user edit
 
  private:
   void sync();
+  void label_inherit();
   wxTextCtrl* field(const char* hint, bool secret = false);
   void browse(wxTextCtrl* f, const wxString& title, const wxString& wildcard);
 
@@ -46,6 +54,12 @@ class NetworkPanel : public wxPanel {
              *no_proxy_ = nullptr;
   CheckButton *ca_off_ = nullptr, *cert_off_ = nullptr;
   ChoiceButton* proxy_ = nullptr;
+  // Redirect / URL / TLS options (NetworkSettings' optional ones): index 0 = inherit.
+  wxTextCtrl* max_redirs_ = nullptr;
+  ChoiceButton *keep_method_ = nullptr, *keep_auth_ = nullptr, *encode_url_ = nullptr, *tls_min_ = nullptr;
+  std::vector<wxWindow*> redirect_rows_;
+  OptionsAbove above_;
+  bool above_known_ = false;  // set_above() was called (the request's Options tab)
   wxStaticText* inherited_ = nullptr;
   wxWindow *proxy_url_row_ = nullptr, *no_proxy_row_ = nullptr, *proxy_url_label_ = nullptr,
            *no_proxy_label_ = nullptr;

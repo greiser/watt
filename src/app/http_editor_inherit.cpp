@@ -102,9 +102,33 @@ std::string network_summary(const EffectiveSettings& e) {
   return out;
 }
 
+OptionsAbove options_above(const EffectiveSettings& e) {
+  OptionsAbove o;
+  o.n.max_redirects = e.network.max_redirects;
+  o.n.keep_method = e.network.keep_method;
+  o.n.keep_auth = e.network.keep_auth;
+  o.n.encode_url = e.network.encode_url;
+  o.n.tls_min = e.network.tls_min;
+  auto from = [](bool set, const SettingsOrigin& s) { return set ? level_name(s) : std::string(); };
+  o.max_redirects_from = from(o.n.max_redirects.has_value(), e.max_redirects_from);
+  o.keep_method_from = from(o.n.keep_method.has_value(), e.keep_method_from);
+  o.keep_auth_from = from(o.n.keep_auth.has_value(), e.keep_auth_from);
+  o.encode_url_from = from(o.n.encode_url.has_value(), e.encode_url_from);
+  o.tls_min_from = from(o.n.tls_min.has_value(), e.tls_min_from);
+  return o;
+}
+
+HttpRequest effective_options(const NetworkSettings& own, const OptionsAbove& above) {
+  HttpRequest h;
+  apply_network_options(above.n, h);
+  apply_network_options(own, h);
+  return h;
+}
+
 InheritView make_inherit_view(const EffectiveSettings& eff) {
   InheritView v;
   v.known = true;
+  v.opts = options_above(eff);
   v.errors = eff.errors;
   v.network = network_summary(eff);
   for (const auto& r : eff.headers) {

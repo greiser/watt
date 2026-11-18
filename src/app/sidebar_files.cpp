@@ -144,7 +144,8 @@ std::optional<SavedRequest> create_request(Workspace& ws, const fs::path& folder
                                            const std::string& name, std::string* err) {
   SavedRequest r;
   r.kind = kind;
-  if (kind == RequestKind::Http) r.http.method = "GET";
+  if (kind != RequestKind::Grpc) r.http.method = "GET";
+  if (kind == RequestKind::WebSocket) r.auth.type = HttpAuth::Type::Inherit;  // as Workspace::new_request()
   r.file = free_request_file(folder, name, &r.name);
   if (!ws.save_request(r, err)) return std::nullopt;
   return r;

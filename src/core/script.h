@@ -17,7 +17,8 @@
 //            pm.request.body.raw, pm.response.code/status/responseTime/responseSize/json()/
 //            text()/headers.get/has/toObject, pm.response.to.have.status/header/jsonBody,
 //            pm.response.to.be.ok/success/json/clientError/serverError/..., pm.test,
-//            pm.expect, pm.sendRequest, pm.info
+//            pm.expect, pm.sendRequest, pm.info, pm.visualizer.set(template, data, options) /
+//            clear() (kept on ScriptRun for the response view's Visualize tab, never rendered here)
 //   Both:    console.log/info/warn/error/debug (captured into ScriptRun::logs), crypto.sha1/
 //            sha256/sha384/sha512/md5(data, enc = "hex"), crypto.hmac(alg, key, data, enc),
 //            crypto.base64/base64Decode/hex/hexDecode, crypto.randomUUID(), crypto.
@@ -134,7 +135,19 @@ struct ScriptRun {
   double elapsed_us = 0;            // the whole run, setup and teardown included
   double setup_us = 0;              // runtime + context + prelude (first run: + compiling the prelude)
   double wait_us = 0;               // time in sendRequest / sleep (not counted as CPU time)
+  // pm.visualizer.set(template, data, options): the Handlebars template and its data as JSON text
+  // (options are ignored), shown by the response view's Visualize tab. Rendering is the viewer's
+  // job; nothing here runs the template. visualizer == false: never set, or cleared again.
+  bool visualizer = false;
+  bool visualizer_cleared = false;  // pm.visualizer.clear() was called (drops an earlier script's set)
+  std::string visualizer_template;
+  std::string visualizer_data;      // JSON ("{}" when set() got no data)
+  std::string visualizer_error;     // why set() could not keep it (too large, data not JSON-serialisable)
 };
+
+// Largest template / data JSON pm.visualizer.set() keeps (a larger one sets visualizer_error).
+inline constexpr size_t kMaxVisualizerTemplate = 1u << 20;
+inline constexpr size_t kMaxVisualizerData = 32u << 20;
 
 // Runs req.pre_script (if any). It may change req's method, URL (query), headers and body (HTTP)
 // or address, method, metadata and body (gRPC); on an error nothing is changed. Nothing is

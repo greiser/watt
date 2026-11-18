@@ -4,6 +4,9 @@
 #include <cctype>
 #include <cstring>
 
+#include <emmintrin.h>
+#include <intrin.h>
+
 #include <rapidjson/document.h>
 #include <rapidjson/prettywriter.h>
 #include <rapidjson/stringbuffer.h>
@@ -781,7 +784,8 @@ std::string path_encode(std::string_view s) {
   return out;
 }
 
-std::string with_path_values(std::string_view url, const std::function<std::string(const std::string&)>& value) {
+std::string with_path_values(std::string_view url, const std::function<std::string(const std::string&)>& value,
+                             bool encode) {
   const auto vars = find_path_vars(url);
   if (vars.empty()) return std::string(url);
   std::string out;
@@ -791,7 +795,7 @@ std::string with_path_values(std::string_view url, const std::function<std::stri
     const std::string val = value ? value(v.name) : std::string();
     if (val.empty()) continue;
     out.append(url.substr(pos, v.begin - pos));
-    out += path_encode(val);
+    out += encode ? path_encode(val) : val;
     pos = v.end;
   }
   out.append(url.substr(pos));
@@ -822,6 +826,32 @@ std::string normalize_url(std::string_view url) {
                c == '{' || c == '|' || c == '}';
     if (c == '%' && !(i + 2 < url.size() && hex_value(url[i + 1]) >= 0 && hex_value(url[i + 2]) >= 0)) enc = true;
     if (enc) put_pct(out, c);
+    else out += static_cast<char>(c);
+    ++i;
+  }
+  return out;
+}
+
+std::string minimal_url(std::string_view url) {
+  size_t from = 0;
+  const size_t sch = url.find("://");
+  const size_t first_delim = url.find_first_of("/?#");
+  if (sch != std::string_view::npos && (first_delim == std::string_view::npos || sch < first_delim)) {
+    from = url.find_first_of("/?#", sch + 3);
+  } else {
+    from = first_delim;
+  }
+  if (from == std::string_view::npos) return std::string(url);
+  std::string out(url.substr(0, from));
+  out.reserve(url.size() + 8);
+  for (size_t i = from; i < url.size();) {
+    if (const size_t e = var_end(url, i); e != std::string_view::npos) {
+      out.append(url.substr(i, e - i));
+      i = e;
+      continue;
+    }
+    const auto c = static_cast<unsigned char>(url[i]);
+    if (c <= 0x20 || c == 0x7F) put_pct(out, c);
     else out += static_cast<char>(c);
     ++i;
   }
@@ -913,6 +943,12 @@ std::string expand_url(std::string_view tmpl, const VarExpander& expand_var) {
   }));
 }
 
+std::string expand_url(std::string_view tmpl, const VarExpander& expand_var, bool encode) {
+  if (encode) return expand_url(tmpl, expand_var);
+  if (tmpl.find("{{") == std::string_view::npos) return minimal_url(tmpl);
+  return minimal_url(substitute(tmpl, expand_var, false, [](std::string& out, const std::string& v, bool) { out += v; }));
+}
+
 std::string expand_form(std::string_view tmpl, const VarExpander& expand_var) {
   if (tmpl.find("{{") == std::string_view::npos) return std::string(tmpl);
   return substitute(tmpl, expand_var, false,
@@ -977,6 +1013,54 @@ std::string clean_header_name(std::string_view s) {
     out += ch;
   }
   return out;
+}
+
+std::string header_name_problem(std::string_view name) {
+  // {{variables}} expand at send time: only the literal text around them is checked.
+  std::string lit;
+  size_t pos = 0;
+  for (const auto& v : find_vars(name)) {
+    lit.append(name.substr(pos, v.begin - pos));
+    lit += 'x';
+    pos = v.end;
+  }
+  lit.append(name.substr(pos));
+  const std::string_view t = trim(lit);
+  if (t.empty()) return {};
+  auto tchar = [](unsigned char c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+           std::string_view("!#$%&'*+-.^_`|~").find(static_cast<char>(c)) != std::string_view::npos;
+  };
+  for (char ch : t) {
+    const auto c = static_cast<unsigned char>(ch);
+    if (tchar(c)) continue;
+    if (c == ' ' || c == '\t') {
+      // "Authorization Bearer x": a known name followed by its value. Anything else ("X Bad/Name")
+      // is a name of several words: suggest them joined with '-'.
+      const std::string_view head = t.substr(0, t.find_first_of(" \t"));
+      static constexpr const char* kKnown[] = {"Authorization", "Content-Type", "Accept", "Cookie", "User-Agent",
+                                               "Cache-Control", "Accept-Encoding", "Accept-Language", "Origin",
+                                               "Referer", "If-None-Match", "If-Match", "X-Api-Key", "Api-Key",
+                                               "X-Request-Id", "Content-Length", "Connection", "Host", "Range"};
+      bool known = false;
+      for (const char* k : kKnown) known = known || iequals(head, k);
+      const std::string msg = "a header name cannot contain spaces (it would be sent as \"" + clean_header_name(t) + "\")";
+      if (known) return msg + ": put the value in the Value column";
+      if (name.find("{{") != std::string_view::npos) return msg + ": join the words with '-'";
+      std::string joined;
+      for (const char x : t) {
+        if (tchar(static_cast<unsigned char>(x))) joined += x;
+        else if (!joined.empty() && joined.back() != '-') joined += '-';
+      }
+      while (!joined.empty() && joined.back() == '-') joined.pop_back();
+      return msg + ": join the words with '-', like \"" + joined + "\"";
+    }
+    if (c == ':') return "a header name cannot contain ':': put the value in the Value column";
+    if (c < 0x20 || c == 0x7F) return "a header name cannot contain control characters";
+    if (c >= 0x80) return "a header name must be ASCII (RFC 9110 token)";
+    return std::string("'") + ch + "' is not allowed in a header name (RFC 9110 token: letters, digits and !#$%&'*+-.^_`|~)";
+  }
+  return {};
 }
 
 std::string clean_header_value(std::string_view s) {
@@ -1101,6 +1185,7 @@ std::string split_row_docs(std::string_view docs, RowDocs& out) {
     if (key.empty() || text.empty()) continue;
     if (kind == "param") out.params.emplace_back(std::move(key), std::move(text));
     else if (kind == "header") out.headers.emplace_back(std::move(key), std::move(text));
+    else if (kind == "assert") out.asserts.emplace_back(std::move(key), std::move(text));
   }
   std::string_view rest = docs.substr(0, open);
   while (!rest.empty() && (rest.back() == '\n' || rest.back() == '\r')) rest.remove_suffix(1);
@@ -1127,6 +1212,7 @@ std::string join_row_docs(std::string_view docs, const RowDocs& d) {
   };
   add("param", d.params);
   add("header", d.headers);
+  add("assert", d.asserts);
   for (const auto& p : d.pre) {
     if (p.var.empty()) continue;
     o += "pre\t" + escape_doc_field(p.var) + '\t' + escape_doc_field(p.expr) + '\t' + escape_doc_field(p.scope) +
@@ -1251,50 +1337,332 @@ bool split_graphql_body(std::string_view body, std::string& query, std::string& 
   return true;
 }
 
-namespace {
-// Next occurrence of needle at or after from (npos when none).
-size_t find_from(std::string_view hay, std::string_view needle, bool match_case, size_t from) {
-  if (needle.empty() || from > hay.size()) return std::string_view::npos;
-  if (match_case) return hay.find(needle, from);
-  auto low = [](unsigned char c) { return static_cast<unsigned char>(c >= 'A' && c <= 'Z' ? c + 32 : c); };
-  const unsigned char f0 = low(static_cast<unsigned char>(needle[0]));
-  const unsigned char f1 = f0 >= 'a' && f0 <= 'z' ? static_cast<unsigned char>(f0 - 32) : f0;
-  const size_t last = hay.size() - std::min(hay.size(), needle.size() - 1);
-  // memchr for either case of the first byte, then compare the rest. The next hit of each case
-  // is kept until passed: searching again from every candidate for a case that occurs late (or
-  // never: "item" in a body without a capital I) rescanned the rest of a 10 MB text each time.
-  const char* const base = hay.data();
-  const char* const end = base + last;
-  auto next = [&](unsigned char c, size_t at) -> const char* {
-    const void* q = at < last ? std::memchr(base + at, c, last - at) : nullptr;
-    return q ? static_cast<const char*>(q) : end;
+void lex_json(std::string_view text, JsonLexState& st, std::string* styles, std::vector<JsonLexLine>* lines) {
+  const size_t n = text.size();
+  styles->assign(n, static_cast<char>(kJsDefault));
+  char* out = styles->data();
+  const char* p = text.data();
+  auto word_char = [](char c) { return std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '$' || c == '.' || c == '-' || c == '+'; };
+  size_t i = 0;
+  while (i < n) {
+    // One line: [i, eol), then the line break.
+    const void* nlp = std::memchr(p + i, '\n', n - i);
+    const size_t eol = nlp ? static_cast<size_t>(static_cast<const char*>(nlp) - p) : n;
+    JsonLexLine line{st.depth, false, st.in_comment};
+    size_t k = i;
+    while (k < eol) {
+      const char c = p[k];
+      if (st.in_comment) {
+        const size_t s0 = k;
+        while (k < eol && !(p[k] == '*' && k + 1 < eol && p[k + 1] == '/')) ++k;
+        if (k < eol) {
+          k += 2;
+          st.in_comment = false;
+        }
+        std::memset(out + s0, kJsBlockComment, k - s0);
+        continue;
+      }
+      if (c == ' ' || c == '\t' || c == '\r') {
+        ++k;
+        continue;
+      }
+      if (c == '"') {
+        const size_t s0 = k++;
+        bool closed = false;
+        while (k < eol) {
+          if (p[k] == '\\') {
+            const size_t e = std::min(k + 2, eol);
+            std::memset(out + k, kJsEscape, e - k);
+            k = e;
+            continue;
+          }
+          if (p[k] == '"') {
+            ++k;
+            closed = true;
+            break;
+          }
+          out[k++] = kJsString;
+        }
+        // A key when ':' follows.
+        size_t a = k;
+        while (a < eol && (p[a] == ' ' || p[a] == '\t')) ++a;
+        const char st_kind = !closed ? kJsStringEol : (a < eol && p[a] == ':') ? kJsProperty : kJsString;
+        for (size_t x = s0; x < k; ++x)
+          if (out[x] != kJsEscape || !closed) out[x] = st_kind;
+        continue;
+      }
+      if (c == '{' && k + 1 < eol && p[k + 1] == '{') {
+        // {{var}}: plain text up to the closing braces on this line.
+        const size_t e = text.substr(0, eol).find("}}", k + 2);
+        if (e != std::string_view::npos) {
+          k = e + 2;  // style stays kJsDefault
+          continue;
+        }
+      }
+      if (c == '{' || c == '[') {
+        out[k++] = kJsOperator;
+        ++st.depth;
+        continue;
+      }
+      if (c == '}' || c == ']') {
+        out[k++] = kJsOperator;
+        if (st.depth > 0) --st.depth;
+        continue;
+      }
+      if (c == ',' || c == ':') {
+        out[k++] = kJsOperator;
+        continue;
+      }
+      if (c == '/' && k + 1 < eol && p[k + 1] == '/') {
+        std::memset(out + k, kJsLineComment, eol - k);
+        k = eol;
+        continue;
+      }
+      if (c == '/' && k + 1 < eol && p[k + 1] == '*') {
+        out[k] = out[k + 1] = kJsBlockComment;
+        k += 2;
+        st.in_comment = true;
+        continue;
+      }
+      if (word_char(c)) {
+        const size_t s0 = k;
+        while (k < eol && word_char(p[k])) ++k;
+        const std::string_view w = text.substr(s0, k - s0);
+        char sty = kJsError;
+        if (w == "true" || w == "false" || w == "null") {
+          sty = kJsKeyword;
+        } else {
+          // A number: -?digits[.digits][e[+-]digits]
+          size_t j = 0;
+          if (j < w.size() && w[j] == '-') ++j;
+          const size_t d0 = j;
+          while (j < w.size() && std::isdigit(static_cast<unsigned char>(w[j]))) ++j;
+          if (j > d0) {
+            if (j < w.size() && w[j] == '.') {
+              ++j;
+              while (j < w.size() && std::isdigit(static_cast<unsigned char>(w[j]))) ++j;
+            }
+            if (j < w.size() && (w[j] == 'e' || w[j] == 'E')) {
+              ++j;
+              if (j < w.size() && (w[j] == '+' || w[j] == '-')) ++j;
+              while (j < w.size() && std::isdigit(static_cast<unsigned char>(w[j]))) ++j;
+            }
+            if (j == w.size()) sty = kJsNumber;
+          }
+        }
+        std::memset(out + s0, sty, k - s0);
+        continue;
+      }
+      out[k++] = kJsError;
+    }
+    line.header = st.depth > line.depth;
+    if (lines) lines->push_back(line);
+    i = eol + 1;
+    if (!nlp) break;
+  }
+}
+
+size_t json_block_end(std::string_view text, size_t opener) {
+  const char* const p = text.data();
+  const size_t len = text.size();
+  if (opener >= len || (p[opener] != '{' && p[opener] != '[')) return std::string_view::npos;
+  size_t depth = 0;
+  bool str = false;
+  size_t skip_to = 0;  // the byte after a backslash inside a string is not looked at
+  // One byte that may matter: go on, the block end (Found), or resume at `jump` (a comment).
+  enum class Step { Go, Found, Jump };
+  auto handle = [&](size_t pos, size_t& jump) -> Step {
+    if (pos < skip_to) return Step::Go;
+    const char c = p[pos];
+    if (str) {
+      if (c == '\\') skip_to = pos + 2;
+      else if (c == '"') str = false;
+      return Step::Go;
+    }
+    switch (c) {
+      case '"': str = true; break;
+      case '{': case '[': ++depth; break;
+      case '}': case ']':
+        if (depth > 0 && --depth == 0) return Step::Found;
+        break;
+      case '/':
+        if (pos + 1 < len && p[pos + 1] == '/') {
+          const void* nl = std::memchr(p + pos, '\n', len - pos);
+          jump = nl ? static_cast<size_t>(static_cast<const char*>(nl) - p) : len;
+          return Step::Jump;
+        }
+        if (pos + 1 < len && p[pos + 1] == '*') {
+          const size_t e = text.find("*/", pos + 2);
+          jump = e == std::string_view::npos ? len : e + 2;
+          return Step::Jump;
+        }
+        break;
+      default: break;
+    }
+    return Step::Go;
   };
-  size_t i = from;
-  if (i >= last) return std::string_view::npos;
-  const char* na = next(f0, i);
-  const char* nb = f1 != f0 ? next(f1, i) : end;
-  while (i < last) {
-    if (na < base + i) na = next(f0, i);
-    if (nb < base + i && f1 != f0) nb = next(f1, i);
-    const char* p = na < nb ? na : nb;
-    if (p >= end) return std::string_view::npos;
-    i = static_cast<size_t>(p - base);
-    size_t k = 1;
-    while (k < needle.size() && low(static_cast<unsigned char>(hay[i + k])) == low(static_cast<unsigned char>(needle[k]))) ++k;
-    if (k == needle.size()) return i;
-    ++i;
+  // 16 bytes per step; every candidate byte of a block is handled from its bit mask (JSON is dense
+  // with quotes and brackets, so leaving the vector loop per candidate would cost more than it saves).
+  const __m128i q = _mm_set1_epi8('"'), bs = _mm_set1_epi8('\\'), ob = _mm_set1_epi8('{'), cb = _mm_set1_epi8('}'),
+                os = _mm_set1_epi8('['), cs = _mm_set1_epi8(']'), sl = _mm_set1_epi8('/');
+  size_t i = opener;
+  while (i + 16 <= len) {
+    const __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(p + i));
+    const __m128i m = _mm_or_si128(
+        _mm_or_si128(_mm_or_si128(_mm_cmpeq_epi8(v, q), _mm_cmpeq_epi8(v, bs)),
+                     _mm_or_si128(_mm_cmpeq_epi8(v, ob), _mm_cmpeq_epi8(v, cb))),
+        _mm_or_si128(_mm_or_si128(_mm_cmpeq_epi8(v, os), _mm_cmpeq_epi8(v, cs)), _mm_cmpeq_epi8(v, sl)));
+    unsigned bits = static_cast<unsigned>(_mm_movemask_epi8(m));
+    size_t next = i + 16;
+    while (bits) {
+      unsigned long k = 0;
+      _BitScanForward(&k, bits);
+      bits &= bits - 1;
+      size_t jump = 0;
+      const Step s = handle(i + k, jump);
+      if (s == Step::Found) return i + k;
+      if (s == Step::Jump) {
+        next = jump;
+        break;
+      }
+    }
+    i = next;
+  }
+  for (; i < len; ++i) {
+    size_t jump = 0;
+    const Step s = handle(i, jump);
+    if (s == Step::Found) return i;
+    if (s == Step::Jump) i = jump - 1;  // the loop's ++i lands on jump
   }
   return std::string_view::npos;
 }
+
+std::vector<std::pair<int, int>> json_big_blocks(std::string_view text, int min_lines) {
+  std::vector<std::pair<int, int>> out;
+  std::vector<int> open;  // opener lines, innermost last
+  const char* p = text.data();
+  const size_t len = text.size();
+  int line = 0;
+  for (size_t i = 0; i < len; ++i) {
+    switch (p[i]) {
+      case '\n': ++line; break;
+      case '"':
+        for (++i; i < len && p[i] != '"'; ++i) {
+          if (p[i] == '\\') ++i;
+          if (i < len && p[i] == '\n') ++line;  // not JSON, but keep the count right
+        }
+        break;
+      case '{': case '[': open.push_back(line); break;
+      case '}': case ']':
+        if (!open.empty()) {
+          const int from = open.back();
+          open.pop_back();
+          if (line - from >= min_lines) out.emplace_back(from, line);
+        }
+        break;
+      case '/':
+        if (i + 1 < len && p[i + 1] == '/') {
+          const void* nl = std::memchr(p + i, '\n', len - i);
+          i = nl ? static_cast<size_t>(static_cast<const char*>(nl) - p) - 1 : len;  // ++i lands on the '\n'
+        } else if (i + 1 < len && p[i + 1] == '*') {
+          const size_t e = text.find("*/", i + 2);
+          const size_t stop = e == std::string_view::npos ? len : e + 2;
+          for (size_t k = i; k < stop; ++k) line += p[k] == '\n';
+          i = stop - 1;
+        }
+        break;
+      default: break;
+    }
+  }
+  // Inner blocks close first: sort by opener line and keep the outermost (longest) per line.
+  std::sort(out.begin(), out.end());
+  std::vector<std::pair<int, int>> merged;
+  for (const auto& b : out) {
+    if (!merged.empty() && merged.back().first == b.first) merged.back().second = std::max(merged.back().second, b.second);
+    else merged.push_back(b);
+  }
+  return merged;
+}
+
+namespace {
+// Finds successive occurrences of needle (ASCII case folding unless match_case). The next hit of
+// each case of the first byte is kept across calls, so walking every match of a 10 MB text is
+// one pass: a fresh memchr per call for a case that never occurs ("name" in a body without a
+// capital N) rescanned the rest of the text for every match (O(matches x size)).
+class Scanner {
+ public:
+  Scanner(std::string_view hay, std::string_view needle, bool match_case)
+      : hay_(hay), needle_(needle), mc_(match_case) {
+    if (needle.empty() || needle.size() > hay.size()) {
+      last_ = 0;
+      return;
+    }
+    last_ = hay.size() - needle.size() + 1;
+    f0_ = low(static_cast<unsigned char>(needle[0]));
+    f1_ = f0_ >= 'a' && f0_ <= 'z' ? static_cast<unsigned char>(f0_ - 32) : f0_;
+    if (mc_) f0_ = f1_ = static_cast<unsigned char>(needle[0]);
+  }
+
+  // Next occurrence at or after from; from must not go backwards between calls.
+  size_t next(size_t from) {
+    if (from >= last_) return std::string_view::npos;
+    const char* const base = hay_.data();
+    const char* const end = base + last_;
+    size_t i = from;
+    while (i < last_) {
+      if (na_ < base + i) na_ = scan(f0_, i);
+      if (f1_ != f0_) {
+        if (nb_ < base + i) nb_ = scan(f1_, i);
+      } else {
+        nb_ = end;
+      }
+      const char* p = na_ < nb_ ? na_ : nb_;
+      if (p >= end) return std::string_view::npos;
+      i = static_cast<size_t>(p - base);
+      size_t k = 1;
+      if (mc_) {
+        while (k < needle_.size() && hay_[i + k] == needle_[k]) ++k;
+      } else {
+        while (k < needle_.size() &&
+               low(static_cast<unsigned char>(hay_[i + k])) == low(static_cast<unsigned char>(needle_[k])))
+          ++k;
+      }
+      if (k == needle_.size()) return i;
+      ++i;
+    }
+    return std::string_view::npos;
+  }
+
+ private:
+  static unsigned char low(unsigned char c) { return static_cast<unsigned char>(c >= 'A' && c <= 'Z' ? c + 32 : c); }
+  const char* scan(unsigned char c, size_t at) const {
+    const void* q = at < last_ ? std::memchr(hay_.data() + at, c, last_ - at) : nullptr;
+    return q ? static_cast<const char*>(q) : hay_.data() + last_;
+  }
+
+  std::string_view hay_, needle_;
+  bool mc_;
+  size_t last_ = 0;  // one past the last position a match can start at
+  unsigned char f0_ = 0, f1_ = 0;
+  const char* na_ = nullptr;  // next hit of f0_ / f1_ (stale when before the cursor)
+  const char* nb_ = nullptr;
+};
+
+bool stopped(const std::atomic<bool>* stop) { return stop && stop->load(std::memory_order_relaxed); }
 }  // namespace
 
-MatchCount count_matches(std::string_view hay, std::string_view needle, bool match_case, size_t before, size_t limit) {
+MatchCount count_matches(std::string_view hay, std::string_view needle, bool match_case, size_t before, size_t limit,
+                         const std::atomic<bool>* stop) {
   MatchCount m;
   if (needle.empty()) return m;
-  for (size_t at = find_from(hay, needle, match_case, 0); at != std::string_view::npos;
-       at = find_from(hay, needle, match_case, at + needle.size())) {
+  Scanner sc(hay, needle, match_case);
+  for (size_t at = sc.next(0); at != std::string_view::npos; at = sc.next(at + needle.size())) {
     if (m.total >= limit) {
       m.capped = true;
+      break;
+    }
+    if ((m.total & 0xFFF) == 0 && stopped(stop)) {
+      m.cancelled = true;
       break;
     }
     ++m.total;
@@ -1303,16 +1671,19 @@ MatchCount count_matches(std::string_view hay, std::string_view needle, bool mat
   return m;
 }
 
-size_t find_match(std::string_view hay, std::string_view needle, bool match_case, size_t from, bool forward) {
+size_t find_match(std::string_view hay, std::string_view needle, bool match_case, size_t from, bool forward,
+                  const std::atomic<bool>* stop) {
   if (needle.empty() || needle.size() > hay.size()) return std::string_view::npos;
   from = std::min(from, hay.size());
   if (forward) {
-    const size_t at = find_from(hay, needle, match_case, from);
-    return at != std::string_view::npos ? at : find_from(hay, needle, match_case, 0);
+    const size_t at = Scanner(hay, needle, match_case).next(from);
+    return at != std::string_view::npos ? at : Scanner(hay, needle, match_case).next(0);
   }
+  Scanner sc(hay, needle, match_case);
   size_t last_before = std::string_view::npos, last = std::string_view::npos;
-  for (size_t at = find_from(hay, needle, match_case, 0); at != std::string_view::npos;
-       at = find_from(hay, needle, match_case, at + 1)) {
+  size_t n = 0;
+  for (size_t at = sc.next(0); at != std::string_view::npos; at = sc.next(at + 1)) {
+    if ((++n & 0xFFF) == 0 && stopped(stop)) return std::string_view::npos;
     if (at >= from && last_before != std::string_view::npos) break;
     if (at < from) last_before = at;
     last = at;
@@ -1329,8 +1700,8 @@ std::string replace_all(std::string_view hay, std::string_view needle, std::stri
   }
   out.reserve(hay.size());
   size_t from = 0;
-  for (size_t at = find_from(hay, needle, match_case, 0); at != std::string_view::npos;
-       at = find_from(hay, needle, match_case, from)) {
+  Scanner sc(hay, needle, match_case);
+  for (size_t at = sc.next(0); at != std::string_view::npos; at = sc.next(from)) {
     out.append(hay.substr(from, at - from));
     out.append(with);
     from = at + needle.size();

@@ -25,4 +25,8 @@ struct QuickItem {
 // Modal; returns the chosen file or an empty path.
 std::filesystem::path quick_open(wxWindow* parent, std::vector<QuickItem> items);
 
+// True once for the file quick_open() returned last (within a few seconds): the sidebar then
+// reveals it even when its filter hides it (the filter is cleared), as a tree click cannot.
+bool take_quick_pick(const std::filesystem::path& file);
+
 }  // namespace watt::app::sidebar

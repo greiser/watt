@@ -180,6 +180,7 @@ class EnvDialog : public wxDialog {
                  wxDEFAULT_DIALOG_STYLE | wxRESIZE_BORDER),
         ws_(ws) {
     load_models();
+    loaded_ = envs_;
     build_ui();
     int first = 0;
     const std::string want = select.empty() ? ws_.active_env : select;
@@ -410,6 +411,46 @@ class EnvDialog : public wxDialog {
     Bind(wxEVT_BUTTON, [this](wxCommandEvent& e) {
       if (save()) e.Skip();
     }, wxID_OK);
+    // Esc, Cancel and the close box all arrive here. Esc while a cell is being edited only ends
+    // that edit; closing with changes (a secret typed and committed with Enter, say) asks
+    // instead of dropping them silently.
+    Bind(wxEVT_BUTTON, [this](wxCommandEvent& e) {
+      if (grid_->IsCellEditControlShown()) {
+        grid_->HideCellEditControl();  // cancels the edit: the cell keeps its old value
+        return;
+      }
+      if (!changed()) {
+        e.Skip();
+        return;
+      }
+      const int a = wxMessageBox("Save the changes to the environments?", "Environments",
+                                 wxYES_NO | wxCANCEL | wxICON_QUESTION, this);
+      if (a == wxYES) {
+        if (save()) EndModal(wxID_OK);
+      } else if (a == wxNO) {
+        e.Skip();
+      }
+    }, wxID_CANCEL);
+  }
+
+  static bool same(const std::vector<EnvModel>& a, const std::vector<EnvModel>& b) {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i) {
+      const EnvModel &x = a[i], &y = b[i];
+      if (x.name != y.name || x.orig_name != y.orig_name || x.vars.size() != y.vars.size()) return false;
+      for (size_t k = 0; k < x.vars.size(); ++k) {
+        const VarRow &p = x.vars[k], &q = y.vars[k];
+        if (p.name != q.name || p.value != q.value || p.secret != q.secret || p.unreadable != q.unreadable)
+          return false;
+      }
+    }
+    return true;
+  }
+
+  // Anything edited since the dialog opened (the grid shown included)?
+  bool changed() {
+    store_env();
+    return !same(envs_, loaded_);
   }
 
   void fit_columns() {
@@ -693,6 +734,7 @@ class EnvDialog : public wxDialog {
 
   Workspace& ws_;
   std::vector<EnvModel> envs_;
+  std::vector<EnvModel> loaded_;  // as opened: what "changed" compares against
   int cur_ = -1;
   bool loading_ = false;
   // Per grid row of the environment shown.

@@ -157,6 +157,13 @@ class TestsView : public wxPanel {
   std::vector<CaptureRow> cap_rows_;
   wxStaticText* script_title_ = nullptr;
   wxListCtrl* script_list_ = nullptr;
+  // The script errors in full, wrapped to the pane width (the Message column cuts them).
+  wxStaticText* script_err_ = nullptr;
+  std::string script_err_text_;
+  std::string script_err_shown_;  // what the label was last wrapped from, and at which width
+  int script_err_w_ = 0;
+  void wrap_script_err();
+  void fit_script_columns();
   ScriptResults script_;
   wxStaticText* inh_title_ = nullptr;
   wxStaticText* inh_link_ = nullptr;

@@ -18,6 +18,7 @@
 #include <filesystem>
 #include <map>
 #include <optional>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -32,6 +33,15 @@ struct ImportFolder {
   // saves them as this folder's FolderSettings::vars (<folder>/folder.json), so they resolve under
   // any active environment, the way Postman and Bruno treat collection variables.
   std::vector<SettingsRow> vars;
+  // Folder / collection auth (Postman folder "auth"): saved in the same folder.json as headers
+  // (a bearer token or API key header), auth and basic_auth, so its requests inherit it
+  // (HttpAuth::Type::Inherit) and a later change of the folder's auth applies to all of them.
+  std::vector<SettingsRow> headers;
+  HttpAuth auth{HttpAuth::Type::Inherit};
+  BasicAuth basic_auth;
+  bool has_settings() const {
+    return !vars.empty() || !headers.empty() || auth.type != HttpAuth::Type::Inherit || basic_auth.enabled;
+  }
   std::vector<SavedRequest> requests;  // in collection order
   std::vector<ImportFolder> folders;
 };
@@ -65,6 +75,9 @@ struct ImportWritten {
   std::vector<std::string> skipped;  // parse skips, then write failures
   std::filesystem::path top;         // the collection's folder
   std::filesystem::path first_file;  // the first request written (to select)
+  // Variables the imported requests use that nothing defines (undefined_import_vars, with the
+  // workspace's active environment, globals, runtime and inherited folder / collection vars).
+  std::vector<std::string> undefined;
   // Collection order per folder (file names), for the sidebar's manual order.
   std::map<std::filesystem::path, std::vector<std::wstring>> order;
 };
@@ -75,6 +88,12 @@ ImportWritten write_import(Workspace& ws, const std::filesystem::path& dest, Imp
 // Adds the imported environments to `envs`: a new name is appended, an existing one gets the
 // variables it lacks (its own values win). Returns how many environments were added or changed.
 size_t merge_import_envs(std::vector<Environment>& envs, const std::vector<Environment>& imported);
+
+// Variables the imported requests use ({{name}} in the URL, enabled headers, body, basic auth,
+// path params) that neither their folders' variables, r.envs nor `defined` (the workspace's
+// active environment and globals) define, in first-use order. Sending such a request stops at
+// "{{name}} is not defined", so the import notice names them up front.
+std::vector<std::string> undefined_import_vars(const ImportResult& r, const std::set<std::string>& defined);
 
 // "Imported 12 requests, 3 folders, 2 skipped (ftp:// URL; ...)" for the import notice.
 std::string import_summary(const ImportResult& r, const ImportWritten& w);

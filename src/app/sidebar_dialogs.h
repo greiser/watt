@@ -1,6 +1,10 @@
 #pragma once
 // Small modal dialogs drawn in the app's colours (native message boxes stay light in dark mode).
+#include <filesystem>
+#include <functional>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include <wx/string.h>
 
@@ -37,5 +41,18 @@ struct FolderSettings {
 // What the user chose: wxID_OK (apply name / order), wxID_CANCEL, or kFolderRun (OK + run it).
 inline constexpr int kFolderRun = 7001;
 int folder_settings(wxWindow* parent, FolderSettings& s);
+
+}  // namespace watt::app::sidebar
+
+namespace watt::app::sidebar {
+
+// The OS "Open" dialog (IFileOpenDialog), run on a thread of its own and modal to `owner` (the
+// owner is disabled while it is open). The UI thread keeps painting meanwhile, and the dialog's
+// teardown (30-40 ms of shell work on close) happens on that thread, not in a UI step. `filters`
+// are (label, "*.json;*.yaml") pairs; `done` runs on the UI thread with the chosen file, or an
+// empty path when cancelled. `folders`: pick a folder instead of a file.
+void pick_file_async(wxWindow* owner, const std::wstring& title,
+                     const std::vector<std::pair<std::wstring, std::wstring>>& filters, bool folders,
+                     std::function<void(const std::filesystem::path&)> done);
 
 }  // namespace watt::app::sidebar

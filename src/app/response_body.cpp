@@ -25,6 +25,7 @@
 #include <mutex>
 #include <thread>
 
+#include "app/response_visualize.h"
 #include "app/response_widgets.h"
 
 #ifdef _WIN32
@@ -211,6 +212,29 @@ constexpr size_t kSyncBytes = 256 * 1024;
 // Longest line shown unbroken: Scintilla lays out a whole line to paint any of it, so a page of
 // 4 KB lines costs ~60 ms per paint (the Raw toggle on a minified 10 MB body); 1 KB lines ~15 ms.
 constexpr size_t kDisplayLine = 1024;
+// Display breaks only where they pay: a line over kForceBreakLine (one such line costs more per
+// paint than a screen of short ones), or more than kLongLineBytes in lines over kDisplayLine
+// (a page of them). A 3.6 KB one-line JSON is shown as it is.
+constexpr size_t kForceBreakLine = 64u << 10;
+constexpr size_t kLongLineBytes = 128u << 10;
+bool needs_display_breaks(std::string_view text) {
+  if (text.size() <= kDisplayLine) return false;
+  size_t long_bytes = 0;
+  const char* p = text.data();
+  const char* end = p + text.size();
+  while (p < end) {
+    const void* nl = std::memchr(p, '\n', static_cast<size_t>(end - p));
+    const char* e = nl ? static_cast<const char*>(nl) : end;
+    const size_t len = static_cast<size_t>(e - p);
+    if (len > kForceBreakLine) return true;
+    if (len > kDisplayLine && (long_bytes += len) > kLongLineBytes) return true;
+    p = e + 1;
+  }
+  return false;
+}
+// Bodies over this size remember their own view choice (chosen_mode_).
+constexpr size_t kBigChoice = 1u << 20;
+int size_class(size_t body_size) { return body_size > kBigChoice ? 1 : 0; }
 constexpr size_t kWrapNative = 1u << 20;   // Raw bodies above this wrap via a worker-built document
 constexpr size_t kAutoWrapMax = 64 * 1024; // wrap is switched on by itself only below this size
 constexpr size_t kHexMax = 64u << 20;      // hex view covers at most the first 64 MB
@@ -227,6 +251,17 @@ struct LoaderBox {
   }
 };
 
+// WATT_RV_TRACE=<file> (as in response_view.cpp): "label ms" lines for body view UI steps.
+void body_trace(const char* what, Clock::time_point t0) {
+  static FILE* f = []() -> FILE* {
+    const wchar_t* p = _wgetenv(L"WATT_RV_TRACE");
+    return p && *p ? _wfopen(p, L"a") : nullptr;
+  }();
+  if (!f) return;
+  std::fprintf(f, "body.%s %.2f\n", what, std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+  std::fflush(f);
+}
+
 void post_ui(const std::shared_ptr<bool>& alive, std::function<void()> fn) {
   if (!wxTheApp) return;
   wxTheApp->CallAfter([alive, fn = std::move(fn)] {
@@ -234,7 +269,7 @@ void post_ui(const std::shared_ptr<bool>& alive, std::function<void()> fn) {
   });
 }
 
-enum ChipId { kPretty = 1, kRaw, kHex, kPreview, kTable, kViewAs = 6, kWrap = 10, kFold, kUnfold, kFind, kCopy, kSave,
+enum ChipId { kPretty = 1, kRaw, kHex, kPreview, kTable, kViewAs = 6, kVisualize = 7, kEvents = 8, kWrap = 10, kFold, kUnfold, kFind, kCopy, kSave,
               kFilter, kCase = 20, kPrev, kNext, kClose, kFilterClose = 30, kFilterHelp };
 
 int lexer_for(fmt::BodyKind k) {
@@ -432,13 +467,19 @@ BodyView::BodyView(wxWindow* parent)
       alive_(std::make_shared<bool>(true)) {
   const Theme& th = Theme::get();
   SetBackgroundColour(th.bg);
+  const auto t_ctor = Clock::now();
   bar_ = new ChipBar(this, [this](int id) { on_chip(id); });
+  bar_->add(kEvents, "Events", "The event stream as one row per event (offset, event, id, data)", 0);
+  bar_->set_visible(kEvents, false);
   bar_->add(kPretty, "Pretty", "Indented and highlighted (JSON, XML, HTML), formatted off the UI thread", 0);
   bar_->add(kRaw, "Raw", "Exactly the bytes received (after content decoding)", 0);
   bar_->add(kHex, "Hex", "Hex dump of the body", 0);
   bar_->add(kPreview, "Preview", "The page rendered like a browser (Edge WebView2): no scripts run and nothing is fetched (images, stylesheets and links stay local)", 0);
   bar_->add(kTable, "Table", "Visualize the JSON as a table: an array of objects as rows and columns (the largest "
                             "array in the body, or the Filter's result). Click a column header to sort.", 0);
+  bar_->add(kVisualize, "Visualize",
+            "The post-response script's pm.visualizer.set(template, data), rendered like Postman's Visualize "
+            "(Handlebars) in a page where scripts are off and nothing is fetched", 0);
   bar_->add(kViewAs, "JSON \xE2\x96\xBE",
             "View as: the format the body is shown in, detected from Content-Type and the content. Click to show it "
             "as JSON, XML, HTML or plain text instead (for a wrong or missing Content-Type).");
@@ -452,38 +493,22 @@ BodyView::BodyView(wxWindow* parent)
                           "the #n annotations, a stream as a JSON array). Ctrl+C copies a selection.", -1, true);
   bar_->add(kSave, "Save", "Save the response body to a file, byte for byte as received", -1, true);
 
-  findbar_ = new wxPanel(this, wxID_ANY);
-  findbar_->SetBackgroundColour(th.bg);
-  find_text_ = new wxTextCtrl(findbar_, wxID_ANY, "", wxDefaultPosition, FromDIP(wxSize(260, -1)),
-                              wxTE_PROCESS_ENTER);
-  find_text_->SetHint("Find in body");
-  find_chips_ = new ChipBar(findbar_, [this](int id) { on_chip(id); });
-  find_chips_->add(kCase, "Aa", "Match case", 1);
-  find_chips_->add(kPrev, "Prev", "Previous match (Shift+Enter, Shift+F3)", -1, true);
-  find_chips_->add(kNext, "Next", "Next match (Enter, F3)", -1, true);
-  find_chips_->add(kClose, "Close", "Close (Esc)", -1, true);
-  auto* fs = new wxBoxSizer(wxHORIZONTAL);
-  fs->Add(find_text_, 0, wxALIGN_CENTER_VERTICAL | wxLEFT, FromDIP(8));
-  fs->Add(find_chips_, 1, wxEXPAND);
-  findbar_->SetSizer(fs);
-  findbar_->Hide();
+  body_trace("ctor.chips", t_ctor);
+  // The find bar (a native text box: 1.5-4.5 ms) is created on the first Ctrl+F.
 
   stc_ = new wxStyledTextCtrl(this, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxBORDER_NONE);
+  body_trace("ctor.stc", t_ctor);
   setup_stc();
+  body_trace("ctor.setup", t_ctor);
   // The document factory is created in an idle moment after the view is up (or by the first
   // body that needs it, whichever comes first): not part of the view's build.
   CallAfter([this] { factory(); });
 
   auto* sz = new wxBoxSizer(wxVERTICAL);
   sz->Add(bar_, 0, wxEXPAND);
-  sz->Add(findbar_, 0, wxEXPAND | wxBOTTOM, FromDIP(2));
   sz->Add(stc_, 1, wxEXPAND);
   SetSizer(sz);
 
-  find_text_->Bind(wxEVT_TEXT, [this](wxCommandEvent&) { find_timer_.StartOnce(90); });
-  find_text_->Bind(wxEVT_TEXT_ENTER, [this](wxCommandEvent&) {
-    find_from(!wxGetKeyState(WXK_SHIFT), false);
-  });
   Bind(wxEVT_TIMER, [this](wxTimerEvent&) {
     find_from(true, true);
   }, find_timer_.GetId());
@@ -505,11 +530,11 @@ BodyView::BodyView(wxWindow* parent)
     if (k == WXK_ESCAPE && filterbar_ && filterbar_->IsShown() && wxWindow::FindFocus() == filter_text_)
       return close_filter();
     if (k == WXK_F3) {
-      if (!findbar_->IsShown()) return show_find();
+      if (!find_shown()) return show_find();
       find_from(!e.ShiftDown(), false);
       return;
     }
-    if (k == WXK_ESCAPE && findbar_->IsShown()) return close_find();
+    if (k == WXK_ESCAPE && find_shown()) return close_find();
     e.Skip();
   });
   stc_->Bind(wxEVT_STC_MARGINCLICK, [this](wxStyledTextEvent& e) { on_margin_click(e); });
@@ -519,7 +544,7 @@ BodyView::BodyView(wxWindow* parent)
   });
   stc_->Bind(wxEVT_STC_UPDATEUI, [this](wxStyledTextEvent& e) {
     e.Skip();
-    if (findbar_->IsShown()) highlight_visible();
+    if (find_shown()) highlight_visible();
   });
 
   set_mode_chips();
@@ -795,6 +820,25 @@ void BodyView::sync_wrap() {
   }
 }
 
+void BodyView::swap_doc(void* doc) {
+  // View state Scintilla applies to whatever document comes next: with wrap on and annotations
+  // visible, SetDocPointer lays out every line of the new document on the UI thread (a bitmap per
+  // line: 34-41 s for a 655k-line hex dump). Our boxes leave with their document, wrap and
+  // annotations go off, and show_doc / update_margin / display_break_note turn them back on for
+  // the new document only.
+  if (stc_->GetDocPointer() != doc) {
+    const int lines = stc_->GetLineCount();
+    if (lines > 0 && stc_->AnnotationGetLines(0) > 0) stc_->AnnotationSetText(0, wxEmptyString);
+    if (miss_line_ >= 0 && miss_doc_ == stc_->GetDocPointer() && miss_line_ < lines)
+      stc_->AnnotationSetText(miss_line_, wxEmptyString);
+    miss_line_ = -1;
+    miss_doc_ = nullptr;
+  }
+  stc_->AnnotationSetVisible(wxSTC_ANNOTATION_HIDDEN);
+  stc_->SetWrapMode(wxSTC_WRAP_NONE);
+  stc_->SetDocPointer(doc);
+}
+
 void BodyView::show_message(const std::string& text) {
   reset_find();
   ++*gen_;
@@ -805,10 +849,13 @@ void BodyView::show_message(const std::string& text) {
   outline_ = false;
   kind_ = fmt::BodyKind::Empty;
   msg_pos_.clear();
+  origin_note_.clear();
+  vis_.reset();
+  ++vis_seq_;
   mode_ = Pretty;
   wrap_chosen_ = false;
   wrap_ = true;  // messages are prose (errors): always wrapped
-  stc_->SetDocPointer(nullptr);  // fresh empty document owned by the control
+  swap_doc(nullptr);  // fresh empty document owned by the control
   stc_->SetScrollWidth(1);  // tracking only grows it: start again from this document's lines
   release_docs();
   stc_->SetLexer(wxSTC_LEX_NULL);
@@ -848,22 +895,33 @@ void BodyView::apply_kind(fmt::BodyKind k) {
   wrap_ = false;
   wrap_cols_ = 0;
   int m = Raw;
+  const bool structured = kind_ == fmt::BodyKind::Json || kind_ == fmt::BodyKind::Xml || kind_ == fmt::BodyKind::Html;
   if (kind_ == fmt::BodyKind::Binary) m = Hex;
-  else if (kind_ == fmt::BodyKind::Json || kind_ == fmt::BodyKind::Xml || kind_ == fmt::BodyKind::Html) m = Pretty;
+  else if (structured) m = Pretty;
+  // The view the user picked for this kind of body in this tab (Preview of HTML, Raw, Table of
+  // JSON) stays chosen across sends and restores, like Postman and Bruno.
+  if (const int c = chosen_mode_[size_class(resp_->body.size())][static_cast<int>(kind_)]; c >= 0) {
+    if ((c == Pretty && structured) || c == Raw || c == Hex || (c == Preview && kind_ == fmt::BodyKind::Html) ||
+        (c == Table && kind_ == fmt::BodyKind::Json))
+      m = c;
+  }
+  // Visualize, when this request's view is Visualize and the run set a template.
+  if (vis_ && vis_chosen_) m = Visualize;
   // A body built on the worker: the previous document stays on screen, faded and labelled, until
   // the new one is swapped in (no flash of an empty pane). A small body replaces it in this turn.
-  const bool async = resp_->body.size() > kSyncBytes && stc_->GetLength() > 0;
+  const bool async = m != Visualize && resp_->body.size() > kSyncBytes && stc_->GetLength() > 0;
   if (async) {
     holding_ = true;
     fade_styles();
   } else {
-    stc_->SetDocPointer(nullptr);
+    swap_doc(nullptr);
   }
   release_docs();  // our references; a held document lives on in the control until the swap
   stc_->SetReadOnly(true);
   request_mode(m);
+  if (kind_ == fmt::BodyKind::Html || vis_) prewarm_web();
   // Large non-raw view: build Raw in the background too, so the toggle is instant.
-  if (m != Raw && resp_->body.size() > kSyncBytes) build(Raw);
+  if (m != Raw && m != Visualize && resp_->body.size() > kSyncBytes) build(Raw);
 }
 
 void BodyView::view_as_menu() {
@@ -890,10 +948,34 @@ void BodyView::view_as_menu() {
   }
 }
 
-bool BodyView::show_web_preview(const std::string& page) {
+void BodyView::prewarm_web() {
 #if WATT_EDGE_PREVIEW
+  // After the first HTML response: the runtime check (loader DLL, registry) on the worker, then
+  // the WebView2 control created hidden in a later idle turn, so the first Preview click only
+  // navigates (creating it there was 64 ms on the UI thread).
+  if (web_ || web_prewarm_) return;
+  web_prewarm_ = true;
+  worker_->post([alive = alive_, this] {
+    const bool ok = preview_runtime_present();
+    post_ui(alive, [this, ok] {
+      if (!ok || web_) return;
+      CallAfter([this] {
+        if (web_) return;
+        const auto t0 = Clock::now();
+        create_web();
+        if (web_) web_->Hide();
+        body_trace("web_prewarm", t0);
+      });
+    });
+  });
+#endif
+}
+
+bool BodyView::create_web() {
+#if WATT_EDGE_PREVIEW
+  if (web_) return true;
   if (!preview_runtime_present()) return false;
-  if (!web_) {
+  {
     web_ = wxWebView::New(this, wxID_ANY, "about:blank", wxDefaultPosition, wxDefaultSize, wxWebViewBackendEdge,
                           wxBORDER_NONE);
     if (!web_) return false;
@@ -943,6 +1025,17 @@ bool BodyView::show_web_preview(const std::string& page) {
     });
     GetSizer()->Add(web_, 1, wxEXPAND);
   }
+  return true;
+#else
+  return false;
+#endif
+}
+
+bool BodyView::show_web_preview(const std::string& page) {
+#if WATT_EDGE_PREVIEW
+  const auto t0 = Clock::now();
+  if (!create_web()) return false;
+  body_trace("web_create", t0);
   web_load(page);
   if (html_) html_->Hide();
   stc_->Hide();
@@ -1025,9 +1118,11 @@ void BodyView::hide_html_preview() {
 
 void BodyView::request_mode(int m) {
   if (m != Pretty) outline_ = false;
-  if (m == Table) reset_find();  // the table has its own Filter; the find bar searches the text views
+  if (m == Table || m == Visualize) reset_find();  // the find bar searches the text views
+  if (m == Visualize && !vis_) m = Pretty;
   mode_ = m;
   set_mode_chips();
+  if (m == Visualize) return show_visualize();
   if (m == Preview && show_html_preview()) return;
   if (m == Table && resp_) return show_table();
   hide_html_preview();
@@ -1183,7 +1278,7 @@ void BodyView::build(int m) {
     } else if (m == RawWrap) {
       b->full_owner = r;
       b->full = body;
-    } else if (m != Hex && m != Outline && fmt::longest_line(b->text) > kDisplayLine) {
+    } else if (m != Hex && m != Outline && needs_display_breaks(b->text)) {
       b->full_owner = b->owner;
       b->full = b->text;
       auto s = std::make_shared<std::string>();
@@ -1321,7 +1416,7 @@ void BodyView::show_doc(int m) {
   }
   const Keep kp = keep_;
   keep_ = Keep{};
-  stc_->SetDocPointer(d.doc);
+  swap_doc(d.doc);
   stc_->SetScrollWidth(1);
   if (holding_) {
     holding_ = false;
@@ -1353,7 +1448,7 @@ void BodyView::show_doc(int m) {
   }
   display_break_note(d);
   update_note();
-  if (findbar_->IsShown()) {
+  if (find_shown()) {
     schedule_count();
     highlight_visible();
   }
@@ -1429,8 +1524,15 @@ void BodyView::update_margin() {
   stc_->SetWrapVisualFlags(wrap_ && !preview ? wxSTC_WRAPVISUALFLAG_END : wxSTC_WRAPVISUALFLAG_NONE);
 }
 
+void BodyView::set_events_chip(std::function<void()> on_events) {
+  on_events_ = std::move(on_events);
+  set_mode_chips();
+}
+
 void BodyView::set_mode_chips() {
   const bool http = resp_ != nullptr;
+  bar_->set_visible(kEvents, http && on_events_ != nullptr);
+  bar_->set_on(kEvents, false);
   bar_->set_visible(kPretty, http);
   bar_->set_visible(kRaw, http);
   bar_->set_visible(kHex, http);
@@ -1446,6 +1548,8 @@ void BodyView::set_mode_chips() {
   bar_->set_on(kPreview, mode_ == Preview);
   bar_->set_visible(kTable, http && kind_ == fmt::BodyKind::Json);
   bar_->set_on(kTable, mode_ == Table);
+  bar_->set_visible(kVisualize, http && vis_ != nullptr);
+  bar_->set_on(kVisualize, mode_ == Visualize);
   const bool has_doc = http || grpc_;
   bar_->set_on(kWrap, wrap_ && has_doc);
   bar_->set_on(kFold, outline_);
@@ -1463,6 +1567,9 @@ void BodyView::set_mode_chips() {
   // it (Filter narrows its rows).
   if (mode_ == Table)
     for (int id : {kWrap, kFold, kUnfold, kFind}) bar_->set_visible(id, false);
+  // The rendered template is a page, not text (Copy / Save still take the body).
+  if (mode_ == Visualize)
+    for (int id : {kWrap, kFold, kUnfold, kFind, kFilter}) bar_->set_visible(id, false);
 }
 
 void BodyView::update_note() {
@@ -1494,16 +1601,156 @@ void BodyView::update_note() {
   if (wrap_ && !d.building && d.heavy && k != Wrapped && k != RawWrap && (k == Pretty || k == Filter || k == Raw))
     n += " \xC2\xB7 wrap: every line fits the pane";
   if (d.doc && !d.building) n += " \xC2\xB7 " + std::to_string(stc_->GetLineCount()) + " lines";
+  // Raw / Hex of a kept copy (not the bytes as received) say so.
+  if (!origin_note_.empty() && (k == Raw || k == RawWrap || k == Hex)) {
+    // First: a narrow bar drops the note's trailing parts.
+    n = origin_note_ + " \xC2\xB7 " + n;
+    if (tone == Tone::Dim) tone = Tone::Warn;
+  }
   bar_->set_note(n, tone);
+}
+
+void BodyView::choose_mode(int m) {
+  if (resp_ && m != Visualize)
+    chosen_mode_[size_class(resp_->body.size())][static_cast<int>(kind_)] = static_cast<signed char>(m);
+  if (vis_ && vis_chosen_ != (m == Visualize)) {
+    vis_chosen_ = m == Visualize;
+    if (on_visualize_chosen) on_visualize_chosen(vis_chosen_);
+  }
+  request_mode(m);
+}
+
+void BodyView::set_visualizer(std::shared_ptr<const ScriptRun> post) {
+  if (post && !post->visualizer) post.reset();
+  if (post == vis_) return;
+  vis_ = std::move(post);
+  ++vis_seq_;
+  vis_page_.clear();
+  vis_note_.clear();
+  vis_rendering_ = false;
+  if (vis_) prewarm_web();
+}
+
+namespace {
+std::string html_text(std::string_view s) {
+  std::string o;
+  for (char c : s) {
+    if (c == '<') o += "&lt;";
+    else if (c == '>') o += "&gt;";
+    else if (c == '&') o += "&amp;";
+    else o += c;
+  }
+  return o;
+}
+}  // namespace
+
+void BodyView::show_visualize() {
+  if (!vis_ || !resp_) return request_mode(Pretty);
+  if (vis_built_ == vis_seq_) return show_vis_page();
+  if (vis_rendering_) return;
+  vis_rendering_ = true;
+  bar_->set_note("Visualize \xC2\xB7 rendering the template\xE2\x80\xA6", Tone::Accent);
+  // Rendered on the worker (a template over a 10 MB data set takes a while); the UI thread only
+  // loads the finished page.
+  worker_->post([run = vis_, seq = vis_seq_, alive = alive_, dark = Theme::get().dark, this] {
+    const auto t0 = Clock::now();
+    std::string page, note;
+    Tone tone = Tone::Dim;
+    if (!run->visualizer_error.empty()) {
+      note = "Visualize: " + run->visualizer_error;
+      tone = Tone::Err;
+    } else {
+      VisualizeResult r = render_handlebars(run->visualizer_template, run->visualizer_data);
+      const double ms = ms_between(t0, Clock::now());
+      if (!r.ok) {
+        note = "Visualize: " + r.error;
+        tone = Tone::Err;
+      } else {
+        page = visualize_page(r.html, dark);
+        note = "pm.visualizer \xC2\xB7 " + fmt::human_bytes(r.html.size()) + " in " + fmt::ms(ms) +
+               " \xC2\xB7 no scripts, nothing fetched";
+        if (r.truncated) {
+          note += " \xC2\xB7 cut at " + fmt::human_bytes(r.html.size());
+          tone = Tone::Warn;
+        }
+        if (!r.warnings.empty()) {
+          note += " \xC2\xB7 " + r.warnings.front();
+          tone = Tone::Warn;
+        } else if (run->visualizer_template.find("<script") != std::string::npos) {
+          note += " \xC2\xB7 the template's <script> does not run";
+          tone = Tone::Warn;
+        }
+      }
+    }
+    if (page.empty())  // could not render: the pane says why too
+      page = visualize_page("<p style=\"color:" + std::string(dark ? "#f47171" : "#b42318") + "\">" +
+                                html_text(note) + "</p>",
+                            dark);
+    post_ui(alive, [this, seq, page = std::move(page), note = std::move(note), tone]() mutable {
+      if (seq != vis_seq_) return;
+      vis_rendering_ = false;
+      vis_built_ = seq;
+      vis_page_ = std::move(page);
+      vis_note_ = std::move(note);
+      vis_tone_ = tone;
+      if (mode_ == Visualize) show_vis_page();
+    });
+  });
+}
+
+void BodyView::show_vis_page() {
+  const auto t0 = Clock::now();
+#if WATT_EDGE_PREVIEW
+  if (create_web()) {
+    web_base_.clear();
+    web_load(vis_page_);
+    if (html_) html_->Hide();
+    if (table_win_) table_win_->Hide();
+    stc_->Hide();
+    web_->Show();
+    Layout();
+    bar_->set_note(vis_note_, vis_tone_);
+    body_trace("visualize_show", t0);
+    return;
+  }
+#endif
+  // No Edge runtime: wxHtmlWindow lays the page out on the UI thread, so only a small one.
+  if (vis_page_.size() > (256u << 10)) {
+    hide_html_preview();
+    bar_->set_note("Visualize needs the Edge WebView2 runtime for a page of " + fmt::human_bytes(vis_page_.size()),
+                   Tone::Warn);
+    return;
+  }
+  if (!html_) {
+    html_ = new wxHtmlWindow(this, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxHW_SCROLLBAR_AUTO | wxBORDER_NONE);
+    html_->SetBorders(FromDIP(12));
+    html_->SetStandardFonts(FromDIP(10), "Segoe UI", "Consolas");
+    html_->Bind(wxEVT_HTML_LINK_CLICKED, [this](wxHtmlLinkEvent& e) {
+      bar_->set_note("link (not followed): " + e.GetLinkInfo().GetHref().utf8_string(), Tone::Dim);
+    });
+    GetSizer()->Add(html_, 1, wxEXPAND);
+  }
+  html_->SetPage(wxString::FromUTF8(vis_page_));
+  stc_->Hide();
+  if (web_) web_->Hide();
+  if (table_win_) table_win_->Hide();
+  html_->Show();
+  Layout();
+  bar_->set_note(vis_note_ + " (simple renderer: no Edge runtime)", vis_tone_);
+  body_trace("visualize_show", t0);
 }
 
 void BodyView::on_chip(int id) {
   switch (id) {
-    case kPretty: request_mode(Pretty); break;
-    case kRaw: request_mode(Raw); break;
-    case kHex: request_mode(Hex); break;
-    case kPreview: request_mode(Preview); break;
-    case kTable: request_mode(Table); break;
+    case kEvents:
+      if (on_events_) on_events_();
+      break;
+    case kPretty: choose_mode(Pretty); break;
+    case kRaw: choose_mode(Raw); break;
+    case kHex: choose_mode(Hex); break;
+    case kPreview: choose_mode(Preview); break;
+    case kTable: choose_mode(Table); break;
+    case kVisualize: choose_mode(Visualize); break;
     case kViewAs: view_as_menu(); break;
     case kWrap:
       wrap_ = !wrap_;
@@ -1516,7 +1763,7 @@ void BodyView::on_chip(int id) {
       break;
     case kFold: fold_level1(); break;
     case kUnfold: unfold_all(); break;
-    case kFind: findbar_->IsShown() ? close_find() : show_find(); break;
+    case kFind: find_shown() ? close_find() : show_find(); break;
     case kFilter: (filterbar_ && filterbar_->IsShown()) ? close_filter() : show_filter(); break;
     case kFilterClose: close_filter(); break;
     case kFilterHelp:
@@ -1527,7 +1774,7 @@ void BodyView::on_chip(int id) {
     case kSave: save_body(); break;
     case kCase:
       match_case_ = !match_case_;
-      find_chips_->set_on(kCase, match_case_);
+      if (find_chips_) find_chips_->set_on(kCase, match_case_);
       find_from(true, true);
       break;
     case kPrev:
@@ -1820,12 +2067,19 @@ void BodyView::unfold_all() {
     // invalidating the margin every time (~0.8 s on a 10 MB JSON).
     const int first = stc_->DocLineFromVisible(stc_->GetFirstVisibleLine());
     const int pos = stc_->GetCurrentPos(), anchor = stc_->GetAnchor();
+    // Same document (its boxes stay), but wrap and annotations off around the re-attach: with
+    // both on Scintilla lays out every line in SetDocPointer.
+    const int vis = stc_->AnnotationGetVisible();
+    stc_->AnnotationSetVisible(wxSTC_ANNOTATION_HIDDEN);
+    stc_->SetWrapMode(wxSTC_WRAP_NONE);
     stc_->SetDocPointer(doc);
+    update_margin();
+    if (vis != wxSTC_ANNOTATION_HIDDEN) stc_->AnnotationSetVisible(vis);
     stc_->SetScrollWidth(1);
     stc_->SetReadOnly(true);
     stc_->SetSelection(anchor, pos);
     stc_->SetFirstVisibleLine(first);
-    if (findbar_->IsShown()) highlight_visible();
+    if (find_shown()) highlight_visible();
   } else {
     wxBusyCursor busy;
     stc_->Hide();  // invalidating a hidden window is free
@@ -1911,7 +2165,7 @@ void BodyView::begin_stream() {
   wrap_chosen_ = false;
   follow_ = true;
   auto_first_ = 0;
-  stc_->SetDocPointer(nullptr);
+  swap_doc(nullptr);
   stc_->SetScrollWidth(1);
   release_docs();
   Doc& d = docs_[Pretty];
@@ -2722,11 +2976,38 @@ void BodyView::apply_filter() {
   request_mode(Pretty);
 }
 
+void BodyView::make_findbar() {
+  if (findbar_) return;
+  const Theme& th = Theme::get();
+  findbar_ = new wxPanel(this, wxID_ANY);
+  findbar_->SetBackgroundColour(th.bg);
+  find_text_ = new wxTextCtrl(findbar_, wxID_ANY, "", wxDefaultPosition, FromDIP(wxSize(260, -1)),
+                              wxTE_PROCESS_ENTER);
+  find_text_->SetHint("Find in body");
+  find_chips_ = new ChipBar(findbar_, [this](int id) { on_chip(id); });
+  find_chips_->add(kCase, "Aa", "Match case", 1);
+  find_chips_->add(kPrev, "Prev", "Previous match (Shift+Enter, Shift+F3)", -1, true);
+  find_chips_->add(kNext, "Next", "Next match (Enter, F3)", -1, true);
+  find_chips_->add(kClose, "Close", "Close (Esc)", -1, true);
+  find_chips_->set_on(kCase, match_case_);
+  auto* fs = new wxBoxSizer(wxHORIZONTAL);
+  fs->Add(find_text_, 0, wxALIGN_CENTER_VERTICAL | wxLEFT, FromDIP(8));
+  fs->Add(find_chips_, 1, wxEXPAND);
+  findbar_->SetSizer(fs);
+  findbar_->Hide();
+  // Under the chip bar (and the filter row, when it is there), above the text.
+  GetSizer()->Insert(filterbar_ ? 2 : 1, findbar_, 0, wxEXPAND | wxBOTTOM, FromDIP(2));
+  find_text_->Bind(wxEVT_TEXT, [this](wxCommandEvent&) { find_timer_.StartOnce(90); });
+  find_text_->Bind(wxEVT_TEXT_ENTER, [this](wxCommandEvent&) { find_from(!wxGetKeyState(WXK_SHIFT), false); });
+}
+
 void BodyView::show_find() {
+  if (mode_ == Visualize) return;
   if (mode_ == Table) {
     bar_->set_note("Find searches Pretty / Raw: use Filter to narrow the table", Tone::Dim);
     return;
   }
+  make_findbar();
   if (!findbar_->IsShown()) {
     findbar_->Show();
     Layout();
@@ -2742,6 +3023,7 @@ void BodyView::show_find() {
 
 void BodyView::reset_find() {
   ++find_seq_;  // a search still running on the worker reports nothing
+  if (!findbar_) return;
   find_chips_->set_note("");
   if (!findbar_->IsShown()) return;
   findbar_->Hide();
@@ -2752,6 +3034,7 @@ void BodyView::reset_find() {
 }
 
 void BodyView::close_find() {
+  if (!findbar_) return;
   findbar_->Hide();
   Layout();
   stc_->SetIndicatorCurrent(8);
@@ -2761,6 +3044,7 @@ void BodyView::close_find() {
 }
 
 void BodyView::find_from(bool forward, bool from_sel_start) {
+  if (!find_text_) return;
   const wxString q = find_text_->GetValue();
   if (q.empty()) {
     find_chips_->set_note("");
@@ -2842,6 +3126,7 @@ std::pair<std::shared_ptr<const void>, std::string_view> BodyView::search_text()
 }
 
 void BodyView::schedule_count() {
+  if (!find_text_) return;
   const std::string q = find_text_->GetValue().utf8_string();
   if (q.empty()) {
     find_chips_->set_note("");
@@ -2880,7 +3165,7 @@ void BodyView::highlight_visible() {
     stc_->IndicatorClearRange(a, std::min(hl_range_.second, len) - a);
   }
   hl_range_ = {0, 0};
-  const wxString q = findbar_->IsShown() ? find_text_->GetValue() : wxString();
+  const wxString q = find_shown() ? find_text_->GetValue() : wxString();
   if (q.empty()) return;
   const wxSize cs = stc_->GetClientSize();
   int a = stc_->PositionFromPoint(wxPoint(0, 0));

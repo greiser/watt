@@ -158,7 +158,7 @@ class FolderDialog : public wxDialog {
     // Headers / Variables / Assertions / Pre-request / Post-response, each built when first shown.
     tabs_ = new TabStrip(this);
     tabs_->set_tabs({"Headers", "Variables", "Assertions", "Pre-request script", "Post-response script",
-                     "Certificates & proxy"});
+                     "Network & TLS"});
     top->Add(tabs_, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, pad);
     book_ = new wxSimplebook(this);
     book_->SetBackgroundColour(t.bg);

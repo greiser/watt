@@ -816,6 +816,23 @@ const pm = {
   test,
   get expect() { return getExpect(); },
   sendRequest: (o, cb) => doSend(o, cb, pmResponse),
+  // Postman's Visualize: the template and its data are kept for the response view (which renders
+  // them, Handlebars-style, in a page without scripts or network); options are ignored.
+  visualizer: Object.freeze({
+    set: (template, data, options) => {
+      const t = template === undefined || template === null ? "" : String(template);
+      let d, err = "";
+      try {
+        d = data === undefined ? "{}" : JSON.stringify(data);
+        if (d === undefined) d = "null";
+      } catch (e) {
+        d = "";
+        err = "pm.visualizer.set: the data cannot be turned into JSON (" + (e && e.message ? e.message : String(e)) + ")";
+      }
+      H.vis(1, t, d, err);
+    },
+    clear: () => { H.vis(0, "", "", ""); },
+  }),
 };
 return pm;
 });

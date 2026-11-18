@@ -119,8 +119,11 @@ class MainFrame : public wxFrame, public SidebarHost {
   bool quick_open_pending_ = false;
   bool quick_open_shown_ = false;
   Clock::time_point ws_opened_at_{};
-  RequestTab* spare_[2] = {nullptr, nullptr};  // ready new tabs (HTTP, gRPC), hidden children of spare_park_
+  RequestTab* spare_[3] = {nullptr, nullptr, nullptr};  // ready new tabs (HTTP, gRPC, WebSocket), hidden children of spare_park_
+  static int spare_slot(RequestKind k) { return k == RequestKind::Http ? 0 : k == RequestKind::Grpc ? 1 : 2; }
   wxWindow* spare_park_ = nullptr;              // hidden parent for spares, outside the notebook
+  std::vector<wxWindow*> retired_;  // tabs replaced by a spare, parked hidden, destroyed in a quiet moment
+  RequestTab* replace_with_spare(size_t idx, SavedRequest& r, bool preview);
   bool want_grpc_spare_ = false;  // gRPC is in use: keep a spare gRPC tab too
   wxTimer* prebuild_timer_ = nullptr;
   wxTimer* session_timer_ = nullptr;

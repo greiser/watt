@@ -1450,3 +1450,69 @@ TEST_CASE("connection info: warm per-request cost", "[.bench]") {
                                                   "short strings), CONN_ID lookup "
                                                << getinfo_us * 1000 << " ns");
 }
+
+TEST_CASE("redirect options: limit, keep method, keep credentials; URL as written", "[http][redirect]") {
+  HttpClient c;
+  HttpRequest lim = get("/redirect/3");
+  lim.max_redirects = 2;
+  auto l = c.send(lim);
+  CHECK_FALSE(l.ok);  // curl stops at the limit
+  lim.max_redirects = 3;
+  l = c.send(lim);
+  REQUIRE(l.ok);
+  CHECK(l.status == 200);
+
+  HttpRequest post = get("/status/302?location=/echo");
+  post.method = "POST";
+  post.body = "kept";
+  auto p = c.send(post);
+  REQUIRE(p.ok);
+  CHECK(p.body.find("\"method\":\"GET\"") != std::string::npos);  // like a browser
+  post.keep_method_on_redirect = true;
+  p = c.send(post);
+  REQUIRE(p.ok);
+  CHECK(p.body.find("\"method\":\"POST\"") != std::string::npos);
+  CHECK(p.body.find("\"body\":\"kept\"") != std::string::npos);
+  HttpRequest put = get("/status/303?location=/echo");
+  put.method = "PUT";
+  put.body = "x";
+  put.keep_method_on_redirect = true;
+  p = c.send(put);
+  REQUIRE(p.ok);
+  CHECK(p.body.find("\"method\":\"PUT\"") != std::string::npos);
+
+  // Credentials go to the original host only, unless keep_auth_on_redirect.
+  const std::string other = "http://localhost:" + std::to_string(server().port()) + "/echo";
+  HttpRequest au = get("/status/302?location=" + other);
+  au.headers = {{"Authorization", "Bearer s3cret"}};
+  auto a = c.send(au);
+  REQUIRE(a.ok);
+  CHECK(a.body.find("s3cret") == std::string::npos);
+  au.keep_auth_on_redirect = true;
+  a = c.send(au);
+  REQUIRE(a.ok);
+  CHECK(a.body.find("s3cret") != std::string::npos);
+  // Windows SSO never follows to another host, even then.
+  au.headers.clear();
+  au.auth = HttpRequest::Auth::Ntlm;
+  au.auth_user = "u";
+  au.auth_password = "p";
+  a = c.send(au);
+  REQUIRE(a.ok);
+  CHECK(a.body.find("authorization") == std::string::npos);
+
+  // encode_url = false: dot segments are sent as written (curl would remove them).
+  HttpRequest dots = get("/x/../echo");
+  auto d = c.send(dots);
+  REQUIRE(d.ok);
+  CHECK(d.status == 200);
+  dots.encode_url = false;
+  d = c.send(dots);
+  REQUIRE(d.ok);
+  CHECK(d.status != 200);
+
+  // TLS minimum version: a plain http request is unaffected.
+  HttpRequest tls = get("/echo");
+  tls.tls_min_version = TlsVersion::Tls1_3;
+  CHECK(c.send(tls).status == 200);
+}

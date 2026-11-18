@@ -1916,14 +1916,14 @@ TEST_CASE("to_curl_command round-trips through the parser", "[curl][export]") {
   g.url = "https://h.test/";
   g.follow_redirects = false;
   g.timeout_ms = 0;
-  CHECK(to_curl_command(g) == "curl https://h.test/");
+  CHECK(to_curl_command(g) == "curl https://h.test/ \\\n  --compressed");
   HttpRequest p;
   p.method = "POST";
   p.url = "https://h.test/";
   p.body = "x=1";
   p.follow_redirects = false;
   p.timeout_ms = 0;
-  CHECK(to_curl_command(p) == "curl https://h.test/ \\\n  --data-raw x=1");
+  CHECK(to_curl_command(p) == "curl https://h.test/ \\\n  --data-raw x=1 \\\n  --compressed");
   HttpRequest h;
   h.method = "HEAD";
   h.url = "https://h.test/";
@@ -1950,7 +1950,7 @@ TEST_CASE("curl round-trip keeps what curl sends", "[curl][export]") {
     REQUIRE(r);
     CHECK_THAT(to_curl_command(*r), StartsWith("curl -g 'https://h.test/g?f[a]=1&q={a,b}'"));
     r = parse_curl_command("curl https://h.test/plain");
-    CHECK(to_curl_command(*r) == "curl https://h.test/plain");  // and no default --max-time 30
+    CHECK(to_curl_command(*r) == "curl https://h.test/plain \\\n  --compressed");  // and no default --max-time 30
   }
   SECTION("control characters use $'...'") {
     HttpRequest r;
@@ -1960,12 +1960,12 @@ TEST_CASE("curl round-trip keeps what curl sends", "[curl][export]") {
     r.follow_redirects = false;
     r.body = "a\r\nb\\c 'd'\x1b\tend";
     const std::string cmd = to_curl_command(r);
-    CHECK(cmd == "curl https://h.test/ \\\n  --data-raw $'a\\r\\nb\\\\c \\'d\\'\\x1B\\tend'");
+    CHECK(cmd == "curl https://h.test/ \\\n  --data-raw $'a\\r\\nb\\\\c \\'d\\'\\x1B\\tend' \\\n  --compressed");
     auto back = parse_curl_command(cmd);
     REQUIRE(back);
     CHECK(back->body == r.body);
     r.body = "multi\nline\tbody";  // LF and TAB alone keep the readable '...' form
-    CHECK_THAT(to_curl_command(r), EndsWith("--data-raw 'multi\nline\tbody'"));
+    CHECK_THAT(to_curl_command(r), ContainsSubstring("--data-raw 'multi\nline\tbody'"));
   }
   SECTION("--url-query is encoded like --data-urlencode; + means pre-encoded") {
     auto r = parse_curl_command("curl --url-query 'k=v w&z' --url-query '+a=%41 b' --url-query 'plain x' https://h.test/q");
@@ -1986,20 +1986,22 @@ TEST_CASE("curl round-trip keeps what curl sends", "[curl][export]") {
     CHECK(back->headers == r->headers);
     r = parse_curl_command("curl -d '' https://h.test/post");
     CHECK(to_curl_command(*r) ==
-          "curl https://h.test/post \\\n  -H 'Content-Type: application/x-www-form-urlencoded' \\\n  --data-raw ''");
+          "curl https://h.test/post \\\n  -H 'Content-Type: application/x-www-form-urlencoded' \\\n  --data-raw '' \\\n  --compressed");
   }
-  SECTION("--compressed survives as Accept-Encoding + --compressed") {
+  SECTION("--compressed is the engine's automatic Accept-Encoding: no header row, exported back as is") {
     auto r = parse_curl_command("curl https://h.test --compressed");
     REQUIRE(r);
-    CHECK(header(*r, "Accept-Encoding") == "deflate, gzip");
-    CHECK(to_curl_command(*r) == "curl https://h.test \\\n  -H 'Accept-Encoding: deflate, gzip' \\\n  --compressed");
+    CHECK(header(*r, "Accept-Encoding") == "<missing>");
+    CHECK(to_curl_command(*r) == "curl https://h.test \\\n  --compressed");
+    r = parse_curl_command("curl https://h.test -H 'Accept-Encoding:'");  // removed: curl does not decode either
+    CHECK(to_curl_command(*r) == "curl https://h.test \\\n  -H Accept-Encoding:");
     r = parse_curl_command("curl https://h.test -H 'accept-encoding: br, zstd'");  // kept as given
     CHECK(header(*r, "accept-encoding") == "br, zstd");
     CHECK_THAT(to_curl_command(*r), ContainsSubstring("-H 'accept-encoding: br, zstd'"));
   }
   SECTION("a user-set timeout is exported") {
     auto r = parse_curl_command("curl -m 2.5 https://h.test");
-    CHECK(to_curl_command(*r) == "curl https://h.test \\\n  --max-time 2.5");
+    CHECK(to_curl_command(*r) == "curl https://h.test \\\n  --max-time 2.5 --compressed");
   }
 }
 
@@ -2225,7 +2227,7 @@ TEST_CASE("curl import matches what curl sends", "[curl]") {
     r.follow_redirects = false;
     r.body = std::string("a\0b\\c'd\x01" "7\n", 10);
     const std::string cmd = to_curl_command(r);
-    CHECK(cmd == "printf %b 'a\\0000b\\\\c'\\''d\\00017\n' | curl -X PUT https://h.test/bin \\\n  --data-binary @-");
+    CHECK(cmd == "printf %b 'a\\0000b\\\\c'\\''d\\00017\n' | curl -X PUT https://h.test/bin \\\n  --data-binary @- \\\n  --compressed");
     auto back = parse_curl_command(cmd);
     REQUIRE(back);
     CHECK(back->body == r.body);
@@ -2238,7 +2240,7 @@ TEST_CASE("curl import matches what curl sends", "[curl]") {
     CHECK_THAT(ps, StartsWith("$wattBody = Join-Path ([IO.Path]::GetTempPath()) 'watt-body.bin'; "
                               "[IO.File]::WriteAllBytes($wattBody, [Convert]::FromBase64String('YQBiXGMnZAE3Cg=='))\n"
                               "curl.exe -X PUT "));
-    CHECK_THAT(ps, EndsWith("--data-binary \"@$wattBody\""));
+    CHECK_THAT(ps, EndsWith("--data-binary \"@$wattBody\" `\n  --compressed"));
     back = parse_curl_command(ps);
     REQUIRE(back);
     CHECK(back->body == r.body);
@@ -2370,7 +2372,7 @@ TEST_CASE("curl: -e ;auto, -H without a colon, and @file bodies", "[curl]") {
     CHECK(send->body == bytes);
     // Exported as --data-binary @file (POST, no file name appended to the URL), in every shell.
     CHECK(to_curl_command(*loaded) ==
-          "curl https://h.test/up \\\n  -H 'Content-Type: application/x-www-form-urlencoded' \\\n  --data-binary @body.bin");
+          "curl https://h.test/up \\\n  -H 'Content-Type: application/x-www-form-urlencoded' \\\n  --data-binary @body.bin \\\n  --compressed");
     CHECK_THAT(to_curl_command(*loaded, CurlShell::PowerShell), ContainsSubstring("--data-binary '@body.bin'"));
     CHECK_THAT(to_curl_command(*loaded, CurlShell::Cmd), ContainsSubstring("--data-binary @body.bin"));
     // -d @file is kept as a -d reference (curl strips CR/LF when it reads it, at send time).
@@ -2397,9 +2399,9 @@ TEST_CASE("curl: -e ;auto, -H without a colon, and @file bodies", "[curl]") {
     p.http.url = "https://h.test/dir/";
     p.http.follow_redirects = false;
     p.body_file = "x.bin";
-    CHECK(to_curl_command(p) == "curl -X PUT https://h.test/dir/ \\\n  --data-binary @x.bin");
+    CHECK(to_curl_command(p) == "curl -X PUT https://h.test/dir/ \\\n  --data-binary @x.bin \\\n  --compressed");
     p.http.url = "https://h.test/dir/x.bin";
-    CHECK(to_curl_command(p) == "curl https://h.test/dir/x.bin \\\n  -T x.bin");
+    CHECK(to_curl_command(p) == "curl https://h.test/dir/x.bin \\\n  -T x.bin \\\n  --compressed");
   }
   SECTION("a body that is not UTF-8 is saved as base64 and loads back byte for byte") {
     TempDir t;
@@ -2478,8 +2480,8 @@ TEST_CASE("to_curl_command for cmd.exe and PowerShell parses back", "[curl][expo
   HttpRequest plain;
   plain.url = "https://h.test/";
   plain.headers = {{"Accept", "application/json"}};
-  CHECK(to_curl_command(plain, CurlShell::PowerShell) == "curl.exe https://h.test/ `\n  -H 'Accept: application/json' `\n  -L");
-  CHECK(to_curl_command(plain, CurlShell::Cmd) == "curl https://h.test/ ^\n  -H \"Accept: application/json\" ^\n  -L");
+  CHECK(to_curl_command(plain, CurlShell::PowerShell) == "curl.exe https://h.test/ `\n  -H 'Accept: application/json' `\n  -L --compressed");
+  CHECK(to_curl_command(plain, CurlShell::Cmd) == "curl https://h.test/ ^\n  -H \"Accept: application/json\" ^\n  -L --compressed");
 }
 
 namespace {
@@ -2862,7 +2864,7 @@ TEST_CASE("curl file references are read when sent, as curl reads them", "[curl]
   const std::string bash = to_curl_command(saved);
   CHECK(bash ==
         "curl https://h.test/ \\\n  -H 'Content-Type: application/x-www-form-urlencoded' \\\n  -H @data/h.txt \\\n"
-        "  -b data/jar.txt \\\n  -d @data/crlf.txt \\\n  --data-urlencode greeting@data/text.txt");
+        "  -b data/jar.txt \\\n  -d @data/crlf.txt \\\n  --data-urlencode greeting@data/text.txt \\\n  --compressed");
   for (auto sh : {CurlShell::Bash, CurlShell::Cmd, CurlShell::PowerShell}) {
     const std::string cmd = to_curl_command(saved, sh);
     INFO(cmd);
@@ -2880,7 +2882,7 @@ TEST_CASE("curl file references are read when sent, as curl reads them", "[curl]
   CHECK_THAT(to_curl_command(saved, CurlShell::PowerShell), ContainsSubstring("-H '@data/h.txt'"));
   SavedRequest js;
   send("curl https://h.test/ --json @data/body.json", &js);
-  CHECK_THAT(to_curl_command(js), EndsWith("--json @data/body.json"));
+  CHECK_THAT(to_curl_command(js), EndsWith("--json @data/body.json \\\n  --compressed"));
   CHECK(slurp(t.path / "data" / "body.json") == "{\"k\": 1}\n");
 }
 

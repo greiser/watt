@@ -35,6 +35,7 @@ struct StatusSeg {
   // elided with "..." as a last resort). Dropped segments are listed in the strip's tooltip.
   int drop = 0;
   int click = 0;  // != 0: clickable (hand cursor); StatusStrip's on_click gets this id
+  int key = 0;    // != 0: names the segment for StatusStrip::put
 };
 
 class StatusStrip : public wxWindow {
@@ -45,6 +46,16 @@ class StatusStrip : public wxWindow {
   // Running clock: draws "label  12.3 ms" with the time since `since`, repainted ~30x/s until set().
   void set_busy(const std::string& label, Clock::time_point since);
   void set_busy_label(const std::string& label) { busy_label_ = label; Refresh(); }
+  // While the clock runs: the response's status pill ("200 OK") once its head arrived, drawn
+  // before the label (empty: none). Cleared by set() / set_busy().
+  void set_busy_badge(const std::string& badge, Tone tone) {
+    busy_badge_ = badge;
+    busy_badge_tone_ = tone;
+    Refresh(false);
+  }
+  // Replaces the segment with seg.key (or appends it): a count that is known only later. Ignored
+  // while the busy clock runs (the segments are about to be replaced).
+  void put(int key, StatusSeg seg);
   // A clickable segment was clicked: its id and its rectangle in screen coordinates.
   void set_on_click(std::function<void(int, const wxRect&)> f) { on_click_ = std::move(f); }
   wxSize DoGetBestClientSize() const override;
@@ -59,8 +70,11 @@ class StatusStrip : public wxWindow {
   std::vector<wxRect> hit_;  // per segment, for tooltips (empty: dropped for lack of room)
   std::string dropped_tip_;  // what did not fit, shown when hovering the strip outside a segment
   int hover_ = -2;
+  wxRect mute_;  // a clicked spot whose popover is open: no tooltip there until the mouse leaves it
   bool busy_ = false;
   std::string busy_label_;
+  std::string busy_badge_;
+  Tone busy_badge_tone_ = Tone::Plain;
   Clock::time_point since_{};
   wxTimer timer_;
 };
@@ -88,7 +102,11 @@ struct TimingModel {
   // Phases drawn after the total (the post-response script: it runs once the response is
   // complete, so it is not part of the response time). The last phases add up to it.
   double after = 0;
+  // Phases drawn before the total (the pre-request script: it runs before the request is built,
+  // so it is not part of the response time either). The first phases add up to it.
+  double before = 0;
   double server_wait = 0;  // the TTFB / wait phase
+  bool server_na = false;  // the request failed before any response was awaited: "n/a", not 0 ms
   // total = server_wait + network + client: network is DNS, connect, TLS, upload, download (and
   // the non-server part of redirects), client is watt's own time (queue, prepare, process).
   double network = 0;
@@ -101,6 +119,11 @@ struct TimingModel {
   std::string server_label = "server wait";  // footer label for server_wait
   std::string server_tip =
       "Request fully sent -> first response byte: server processing plus one network round trip.";
+  // A response whose head is in and whose body still arrives (or was cut by a cancel): the phase
+  // at live_row (Download) runs, live_head says what is arriving; live_cut: cancelled.
+  int live_row = -1;
+  bool live_cut = false;
+  std::string live_head;
 };
 
 class Waterfall : public wxWindow {
@@ -129,6 +152,9 @@ class Waterfall : public wxWindow {
   // The request was cancelled: the reserved rows stay (nothing below moves) and say so; the
   // figures of an earlier run are not shown under a cancelled request. Ends with set() / clear().
   void set_cancelled(double after_ms);
+  // A live model (TimingModel::live_row) moves on: the running phase's time, the total so far and
+  // the header note. Repaints only (no layout).
+  void live_tick(double live_ms, double total_ms, const std::string& head);
   bool has_figures() const { return cur_.valid; }
   // The connection pill in the header was clicked (screen rectangle of the pill). Set: the pill
   // is drawn with a drop-down mark and a hand cursor.
@@ -152,6 +178,7 @@ class Waterfall : public wxWindow {
   int reserve_rows_ = 10;
   std::vector<std::pair<wxRect, std::string>> tips_;
   int hover_ = -2;
+  wxRect mute_;  // a clicked spot whose popover is open: no tooltip there until the mouse leaves it
   wxRect pill_;  // connection pill as last drawn (empty: none)
   bool waiting_ = false;
   bool cancelled_ = false;

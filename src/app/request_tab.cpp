@@ -11,6 +11,7 @@
 #include <rapidjson/stringbuffer.h>
 #include <rapidjson/writer.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cctype>
 #include <condition_variable>
@@ -22,13 +23,25 @@
 #include "app/history_summary.h"
 #include "app/main_frame.h"        // startup::
 #include "core/oauth2.h"
+#include "core/ws_client.h"
 #include "app/response_widgets.h"  // rv::Theme (the placeholder's colour)
+#include "app/ws_view.h"
 
 #include <windows.h>
 
 namespace watt::app {
 
 namespace {
+
+// protobuf's JSON parse errors pad their parts with runs of spaces ("invalid JSON  in  x,   near
+// 1:6"): one space each, as the rest of the UI writes them.
+std::string one_space(const std::string& s) {
+  std::string o;
+  o.reserve(s.size());
+  for (const char c : s)
+    if (!(c == ' ' && !o.empty() && o.back() == ' ')) o += c;
+  return o;
+}
 
 // A tab opened from a history row is named "Protected @ 15:57" (the snapshot's send time). A
 // fresh send from it shows a new response: the old time is dropped so the title never names a
@@ -191,6 +204,67 @@ std::string web_port_hint(const GrpcTarget& t, const std::string& error) {
   return hint + ".";
 }
 
+// {{names}} still in `r` after expansion with the active environment (and its folders' vars):
+// they would go out literally ("Authorization: Bearer {{token}}"). The URL, the headers (own and
+// inherited, enabled), Basic / scheme credentials, the OAuth 2.0 fields and a small body are
+// checked; {{process.env.X}} is left to the environment-variable consent prompt.
+std::vector<std::string> unresolved_vars(const Workspace& ws, const SavedRequest& rq, bool* in_url = nullptr) {
+  const SavedRequest r = ws.resolved(rq);
+  if (in_url) *in_url = false;
+  std::string text = r.http.url;
+  for (size_t k = 0; k < r.http.headers.size(); ++k)
+    if (!r.disabled_headers.count(k)) text += "\n" + r.http.headers[k].first + ": " + r.http.headers[k].second;
+  if (r.basic_auth.enabled) text += "\n" + r.basic_auth.user + "\n" + r.basic_auth.password;
+  if (r.auth.type != HttpAuth::Type::None) {
+    text += "\n" + r.auth.user + "\n" + r.auth.password;
+    if (r.auth.type == HttpAuth::Type::OAuth2) {
+      const OAuth2Config& o = r.auth.oauth2;
+      for (const std::string* s : {&o.token_url, &o.client_id, &o.client_secret, &o.scope, &o.username, &o.password})
+        text += "\n" + *s;
+    }
+    if (r.auth.type == HttpAuth::Type::AwsSigV4) text += "\n" + r.auth.aws_access_key + "\n" + r.auth.aws_secret_key;
+  }
+  if (r.http.body.size() <= (64u << 10) && r.form.empty() && r.body_file.empty()) text += "\n" + r.http.body;
+  if (text.find("{{") == std::string::npos) return {};
+  const std::string x = ws.expand(text, rq);
+  std::vector<std::string> out;
+  for (size_t a = x.find("{{"); a != std::string::npos; a = x.find("{{", a + 2)) {
+    if (a + 2 < x.size() && x[a + 2] == '{') continue;  // "{{{" is a literal brace
+    const size_t b = x.find("}}", a + 2);
+    if (b == std::string::npos) break;
+    std::string n(trim(std::string_view(x).substr(a + 2, b - a - 2)));
+    if (n.empty() || n.size() > 64 || n.find_first_of("{}\n\" ") != std::string::npos) continue;
+    if (n.rfind("process.env.", 0) == 0 || n.rfind("$env.", 0) == 0) continue;
+    if (std::find(out.begin(), out.end(), n) == out.end()) out.push_back(std::move(n));
+  }
+  if (in_url && !out.empty() && r.http.url.find("{{") != std::string::npos)
+    *in_url = ws.expand(r.http.url, rq).find("{{") != std::string::npos;
+  return out;
+}
+
+// {{names}} left in a request as it would go out (after http_to_send): URL, headers, a small body.
+std::vector<std::string> unresolved_in(const HttpRequest& q) {
+  std::vector<std::string> out;
+  auto scan = [&](std::string_view x) {
+    for (size_t a = x.find("{{"); a != std::string_view::npos; a = x.find("{{", a + 2)) {
+      if (a + 2 < x.size() && x[a + 2] == '{') continue;
+      const size_t b = x.find("}}", a + 2);
+      if (b == std::string_view::npos) return;
+      std::string n(trim(x.substr(a + 2, b - a - 2)));
+      if (n.empty() || n.size() > 64 || n.find_first_of("{}\n\" ") != std::string::npos) continue;
+      if (n.rfind("process.env.", 0) == 0 || n.rfind("$env.", 0) == 0) continue;
+      if (std::find(out.begin(), out.end(), n) == out.end()) out.push_back(std::move(n));
+    }
+  };
+  scan(q.url);
+  for (const auto& [k, v] : q.headers) {
+    scan(k);
+    scan(v);
+  }
+  if (q.body.size() <= (64u << 10)) scan(q.body);
+  return out;
+}
+
 std::string url_tail(const std::string& url) {
   auto p = url.find("://");
   std::string s = p == std::string::npos ? url : url.substr(p + 3);
@@ -350,6 +424,9 @@ std::string last_response_to_json(const LastResponse& r) {
   } else {
     return {};
   }
+  // When it was received: a restored tab says "last run at 00:35" like one opened from history,
+  // instead of "earlier session" for some tabs and a time for others.
+  if (!r.when_iso.empty()) put(w, "when", r.when_iso);
   w.EndObject();
   return std::string(sb.GetString(), sb.GetSize());
 }
@@ -360,7 +437,7 @@ LastResponse last_response_from_json(const std::string& json, const SavedRequest
   d.Parse(json.data(), json.size());
   if (d.HasParseError() || !d.IsObject()) return out;
   const std::string kind = str(d, "kind");
-  if (kind == "http" && req.kind == RequestKind::Http) {
+  if (kind == "http" && req.kind != RequestKind::Grpc) {  // a WebSocket tab: its handshake
     auto h = std::make_shared<HttpResponse>();
     h->ok = flag(d, "ok");
     h->error = str(d, "error");
@@ -415,6 +492,7 @@ LastResponse last_response_from_json(const std::string& json, const SavedRequest
     g->timing = get_timing(d);
     out.grpc = std::move(g);
   }
+  if (out) out.when_iso = str(d, "when");
   return out;
 }
 
@@ -556,6 +634,7 @@ struct TabWorker : std::enable_shared_from_this<TabWorker> {
 
   std::mutex call_m;
   std::shared_ptr<GrpcCall> call;
+  std::shared_ptr<WsClient> ws;  // the WebSocket connection of this tab (under call_m)
   std::atomic<uint64_t> cancelled_gen{0};
 
   std::mutex msg_m;
@@ -632,6 +711,7 @@ struct TabWorker : std::enable_shared_from_this<TabWorker> {
     }
     std::lock_guard lk(call_m);
     if (call) call->cancel();
+    if (ws) ws->cancel();
   }
   void cancel_all() { cancel(UINT64_MAX); }
   bool is_cancelled(uint64_t gen) const {
@@ -825,7 +905,8 @@ ResponsePanel* RequestTab::response() {
   if (had && wxGetTopLevelParent(had) == wxGetTopLevelParent(this)) focus_keep_ = had;
   {
     wxWindowUpdateLocker lock(split_);
-    resp_ = make_response_view(split_);
+    resp_ws_ = req_.kind == RequestKind::WebSocket;
+    resp_ = resp_ws_ ? static_cast<ResponsePanel*>(make_ws_view(split_)) : make_response_view(split_);
     split_->ReplaceWindow(resp_ph_, resp_->window());
     resp_ph_->Destroy();
     resp_ph_ = nullptr;
@@ -872,8 +953,27 @@ void RequestTab::on_resp_focus(wxChildFocusEvent& e) {
 RequestTab::~RequestTab() { worker_->shutdown(); }
 
 RequestEditorPanel* RequestTab::editor() const {
+  if (req_.kind == RequestKind::WebSocket) return ws_;
   return req_.kind == RequestKind::Http ? static_cast<RequestEditorPanel*>(http_)
                                         : static_cast<RequestEditorPanel*>(grpc_);
+}
+
+void RequestTab::match_response_kind() {
+  if (!resp_ || resp_ws_ == (req_.kind == RequestKind::WebSocket)) return;
+  wxWindowUpdateLocker lock(split_);
+  wxWindow* old = resp_->window();
+  resp_ws_ = req_.kind == RequestKind::WebSocket;
+  resp_ = resp_ws_ ? static_cast<ResponsePanel*>(make_ws_view(split_)) : make_response_view(split_);
+  split_->ReplaceWindow(old, resp_->window());
+  old->Destroy();
+  resp_->clear();
+  split_->UpdateSize();
+  resp_->window()->Layout();
+}
+
+WsResponsePanel* RequestTab::ws_view() {
+  match_response_kind();
+  return resp_ws_ ? dynamic_cast<WsResponsePanel*>(response()) : nullptr;
 }
 
 RequestEditorPanel* RequestTab::ensure_editor(RequestKind kind) {
@@ -881,6 +981,9 @@ RequestEditorPanel* RequestTab::ensure_editor(RequestKind kind) {
   if (kind == RequestKind::Http) {
     if (!http_) http_ = make_http_editor(split_, this);
     ed = http_;
+  } else if (kind == RequestKind::WebSocket) {
+    if (!ws_) ws_ = make_ws_editor(split_, this);
+    ed = ws_;
   } else {
     if (!grpc_) {
       // The gRPC engine (and its delay-loaded protobuf / gRPC DLLs, ~60 ms) starts now on a
@@ -907,6 +1010,7 @@ void RequestTab::show_editor(RequestKind kind) {
     old->Hide();
     ed->window()->Show();
   }
+  match_response_kind();
 }
 
 void RequestTab::store() const {
@@ -924,7 +1028,7 @@ std::wstring RequestTab::title() const {
   // restored tab of it is titled by what it calls (Echo/Chat), not "gRPC Untitled".
   if (!req_.name.empty() && req_.name != "Untitled") {
     t = req_.kind == RequestKind::Grpc ? grpc_display_name(req_.name, req_.grpc_method) : req_.name;
-  } else if (req_.kind == RequestKind::Http) {
+  } else if (req_.kind != RequestKind::Grpc) {
     t = req_.http.url.empty() ? "Untitled" : url_tail(req_.http.url);
   } else {
     // "/watt.test.Echo/Chat" -> "Echo/Chat", as the method picker shows it.
@@ -934,8 +1038,13 @@ std::wstring RequestTab::title() const {
       if (const auto dot = m.rfind('.', sl); dot != std::string::npos) m.erase(0, dot + 1);
     t = m.empty() ? "Untitled" : m;
   }
-  std::string prefix = req_.kind == RequestKind::Http ? req_.http.method : std::string("gRPC");
-  return wxString::FromUTF8(prefix + " " + t).ToStdWstring() + (dirty_ ? L" \u25CF" : L"");
+  std::string prefix = req_.kind == RequestKind::Http        ? req_.http.method
+                       : req_.kind == RequestKind::WebSocket ? std::string("WS")
+                                                             : std::string("gRPC");
+  // A name that already starts with the kind ("WS echo", "GET users") is not prefixed twice.
+  const bool named_with_kind = t.size() > prefix.size() && t[prefix.size()] == ' ' &&
+                               wxString::FromUTF8(t.substr(0, prefix.size())).IsSameAs(wxString::FromUTF8(prefix), false);
+  return wxString::FromUTF8(named_with_kind ? t : prefix + " " + t).ToStdWstring() + (dirty_ ? L" \u25CF" : L"");
 }
 
 void RequestTab::make_permanent() {
@@ -965,6 +1074,7 @@ void RequestTab::set_request(SavedRequest req, bool preview) {
   }
   last_ = {};
   last_pending_ = false;
+  match_response_kind();
   if (resp_) resp_->clear();
   if (on_title_changed) on_title_changed(this);
 }
@@ -972,7 +1082,7 @@ void RequestTab::set_request(SavedRequest req, bool preview) {
 std::string RequestTab::suggested_name() const {
   store();
   std::string s;
-  if (req_.kind == RequestKind::Http) {
+  if (req_.kind != RequestKind::Grpc) {
     s = req_.http.url;
     if (const auto p = s.find("://"); p != std::string::npos) s = s.substr(p + 3);
     s = s.substr(0, s.find_first_of("?#"));
@@ -996,7 +1106,7 @@ std::string RequestTab::suggested_name() const {
     while (!head.empty() && head.back() == '/') head.pop_back();
     const auto q = head.rfind('/');
     std::string prev = q == std::string::npos ? std::string() : head.substr(q + 1);
-    if (q == std::string::npos && req_.kind == RequestKind::Http) prev.clear();  // the host: not a name
+    if (q == std::string::npos && req_.kind != RequestKind::Grpc) prev.clear();  // the host: not a name
     s = id && !prev.empty() ? prev + " " + last : last;
   }
   for (char& c : s)
@@ -1038,6 +1148,7 @@ void RequestTab::focus_url() {
 void RequestTab::restore_response(LastResponse r) {
   if (!r || in_flight_ || pending_send_) return;
   last_ = std::move(r);
+  shown_method_ = last_.grpc ? req_.grpc_method : std::string();
   last_pending_ = true;
   if (resp_) {
     last_pending_ = false;
@@ -1099,6 +1210,17 @@ void RequestTab::file_moved(const std::filesystem::path& to) {
 void RequestTab::changed() {
   if (loading_) return;
   editor()->store_head(req_);  // cheap: name, method, url, target (never the body)
+  // Another gRPC method picked: the response and timing on screen belong to the old one, so
+  // they go (as switching the request would) instead of standing under the new method.
+  if (req_.kind == RequestKind::Grpc && !in_flight_ && last_.grpc && !shown_method_.empty()) {
+    auto bare = [](const std::string& m) { return m.empty() || m[0] != '/' ? m : m.substr(1); };
+    if (bare(req_.grpc_method) != bare(shown_method_)) {
+      shown_method_.clear();
+      last_ = {};
+      last_pending_ = false;
+      if (resp_) resp_->clear();
+    }
+  }
   dirty_ = true;
   preview_ = false;
   if (on_title_changed) on_title_changed(this);
@@ -1163,16 +1285,170 @@ void RequestTab::send() {
 }
 
 void RequestTab::send_now(Clock::time_point click) {
+  if (req_.kind == RequestKind::WebSocket && ws_open_) {
+    // Ctrl+Enter / Send while connected: the composer's message on the open connection.
+    store();
+    ws_send_message();
+    return;
+  }
   if (in_flight_) cancel();
   last_pending_ = false;
   store();
+  // A preview tab that was sent holds a response the user is looking at: the next single click in
+  // the tree or history must not replace it (VS Code / Postman keep a tab once it is used).
+  make_permanent();
   if (req_.kind == RequestKind::Http)
     send_http(click);
+  else if (req_.kind == RequestKind::WebSocket)
+    send_ws(click);
   else
     send_grpc(click);
 }
 
-void RequestTab::send_http(Clock::time_point click) {
+// ------------------------------------------------------------------ WebSocket
+
+void RequestTab::send_ws(Clock::time_point click) {
+  Workspace* ws = ctx_.workspace ? ctx_.workspace() : nullptr;
+  if (req_.http.url.empty()) {
+    response()->show_error("Enter a ws:// or wss:// address first.");
+    return;
+  }
+  // The upgrade request is an HTTP GET as far as inheritance, {{vars}}, auth and every consent
+  // check go: it is built exactly like one (http_to_send), from a copy with kind Http and the
+  // ws(s):// scheme written as http(s):// (a scheme inside a {{var}} is mapped by WsClient).
+  auto rq_p = std::make_shared<SavedRequest>(for_inheritance(req_));
+  SavedRequest& rq = *rq_p;
+  rq.kind = RequestKind::Http;
+  rq.http.method = "GET";
+  rq.http.body.clear();
+  rq.form.clear();
+  rq.body_file.clear();
+  rq.body_data.clear();
+  if (std::string u = ws_http_url(rq.http.url); !u.empty()) rq.http.url = std::move(u);
+  bool prompted = false;
+  if (ws && !confirm_http_consents(*ws, rq, &prompted)) return;
+  if (ws && !confirm_unresolved(*ws, rq, &prompted)) return;
+  if (prompted) click = Clock::now();
+  const uint64_t gen = ++gen_;
+  in_flight_ = true;
+  ws_open_ = false;
+  sent_at_ = click;
+  if (drop_snapshot_time(req_) && on_title_changed) on_title_changed(this);
+  std::shared_ptr<const SavedRequest> h = std::move(rq_p);
+  auto saved = std::make_shared<const SavedRequest>(req_);  // as written, for the history row
+  auto wsc = ws ? std::make_shared<Workspace>(*ws) : nullptr;
+  auto w = worker_;
+  w->push([w, gen, click, h, saved, wsc] {
+    if (w->is_cancelled(gen)) return;
+    std::string err;
+    std::optional<HttpRequest> r;
+    if (wsc) r = wsc->http_to_send(*h, &err);
+    else r = h->http;
+    if (!r) {
+      w->post([gen, err](RequestTab& t) { t.on_error(gen, err); });
+      return;
+    }
+    auto client = std::make_shared<WsClient>();
+    {
+      std::lock_guard lk(w->call_m);
+      w->ws = client;
+      if (w->is_cancelled(gen)) client->cancel();
+    }
+    const double ui_queue = ms_between(click, Clock::now());
+    auto hs = std::make_shared<const WsHandshake>(client->connect(*r));
+    auto sent = std::make_shared<const HttpRequest>(std::move(*r));
+    w->post([gen, hs, sent, ui_queue](RequestTab& t) { t.on_ws_handshake(gen, hs, sent, ui_queue); });
+    if (wsc && hs->error != "cancelled") {
+      HistoryEntry e;
+      e.when_iso = now_iso();
+      e.kind = RequestKind::Http;  // listed like an HTTP row ("WS" badge, 101); the request is a WebSocket one
+      e.summary = make_history_summary("WS " + saved->http.url, ws_display_url(sent->url), wsc->active_env);
+      e.status = hs->status;
+      e.total_ms = ui_queue + hs->total_ms;
+      e.request = *saved;
+      {
+        std::lock_guard lk(history_mutex());
+        wsc->append_history(e);
+      }
+      w->post([e = std::move(e)](RequestTab& t) {
+        if (t.ctx_.history_added) t.ctx_.history_added(e);
+      });
+    }
+    if (hs->ok) {
+      // Batches of at most one per 50 ms (WsClient::run), so a burst never floods the UI queue.
+      auto c = std::make_shared<const WsClose>(client->run([w, gen](std::vector<WsMessage>&& b) {
+        auto p = std::make_shared<std::vector<WsMessage>>(std::move(b));
+        w->post([gen, p](RequestTab& t) { t.on_ws_batch(gen, p); });
+      }));
+      w->post([gen, c](RequestTab& t) { t.on_ws_closed(gen, c); });
+    }
+    std::lock_guard lk(w->call_m);
+    if (w->ws == client) w->ws.reset();
+  });
+  editor()->set_in_flight(true);
+  if (WsResponsePanel* v = ws_view()) v->show_sending(RequestKind::WebSocket);
+}
+
+void RequestTab::on_ws_handshake(uint64_t gen, std::shared_ptr<const WsHandshake> hs,
+                                 std::shared_ptr<const HttpRequest> sent, double queue_ms) {
+  if (gen != gen_ || !in_flight_) return;
+  WsResponsePanel* v = ws_view();
+  if (!v) return;
+  if (hs->error == "cancelled") return;  // cancel() showed it already
+  v->ws_handshake(hs, sent, queue_ms);
+  auto s = std::make_shared<SentHttp>();
+  s->request = *sent;
+  last_ = LastResponse{ws_handshake_response(*hs, queue_ms), s, nullptr};
+  last_.when_iso = now_iso();
+  last_pending_ = false;
+  if (hs->ok) {
+    ws_open_ = true;
+    if (ws_) ws_->set_state(WsEditorPanel::State::Open);
+  } else {
+    finish(gen);
+  }
+  if (on_response) on_response(this);
+}
+
+void RequestTab::on_ws_batch(uint64_t gen, std::shared_ptr<std::vector<WsMessage>> batch) {
+  if (gen != gen_ || !ws_open_) return;
+  if (WsResponsePanel* v = ws_view()) v->ws_messages(std::move(*batch));
+}
+
+void RequestTab::on_ws_closed(uint64_t gen, std::shared_ptr<const WsClose> c) {
+  if (gen != gen_ || !in_flight_) return;
+  ws_open_ = false;
+  finish(gen);
+  if (WsResponsePanel* v = ws_view()) v->ws_closed(*c);
+}
+
+void RequestTab::ws_send_message() {
+  std::shared_ptr<WsClient> c;
+  {
+    std::lock_guard lk(worker_->call_m);
+    c = worker_->ws;
+  }
+  WsResponsePanel* v = ws_view();
+  std::string text = req_.http.body;
+  if (const Workspace* ws = workspace(); ws && text.find("{{") != std::string::npos)
+    text = ws->expand(text, for_inheritance(req_));  // {{vars}} in a message, as Postman and Insomnia do
+  std::string err;
+  if (!c || !c->send(std::move(text), false, &err)) {
+    if (v) v->ws_info(err.empty() ? "Not connected." : err, true);
+  }
+}
+
+void RequestTab::ws_close() {
+  std::shared_ptr<WsClient> c;
+  {
+    std::lock_guard lk(worker_->call_m);
+    c = worker_->ws;
+  }
+  if (c && ws_open_) c->close(1000, {});
+  else cancel();
+}
+
+void RequestTab::send_http(Clock::time_point click, bool checked) {
   Workspace* ws = ctx_.workspace ? ctx_.workspace() : nullptr;
   if (req_.http.url.empty()) {
     response()->show_error("Enter a URL first.");
@@ -1182,6 +1458,15 @@ void RequestTab::send_http(Clock::time_point click) {
   // from the folders of the request it came from; an unsaved one from the folder it will be saved in).
   auto rq_p = std::make_shared<SavedRequest>(for_inheritance(req_));
   const SavedRequest& rq = *rq_p;
+  // Fast path: the folder chain, the consent lookups and the variable check below cost 0.3-1 ms
+  // on the UI thread for every send, and they almost never find anything to ask. So the worker
+  // builds the request right away: http_to_send() is the gate for every consent (it refuses what
+  // is not allowed) and the worker comes back here (on_send_bounced -> checked) whenever
+  // something needs the user, which then asks exactly as before.
+  if (!checked && ws) {
+    send_http_job(click, std::move(rq_p), ws, false, false, false, false, false, /*fast=*/true);
+    return;
+  }
   // Files from outside the workspace and OS environment variables need the user's consent
   // (Workspace::blocked_files / blocked_env_vars). http_to_send() refuses them regardless, so
   // this is the prompt, not the gate. Only requests that go through http_to_send can reach them.
@@ -1191,61 +1476,7 @@ void RequestTab::send_http(Clock::time_point click) {
   // Folder / collection settings (folder.json) add headers, auth, vars and scripts that only
   // http_to_send applies: such a request never takes the fast path.
   const bool inherited = ws && ws->has_inherited_settings(rq);
-  if (ws && (needs_workspace(rq) || inherited)) {
-    prompted = !ws->blocked_env_vars(rq).empty();
-    if (std::string err; !confirm_env_vars(*ws, rq, this, &err)) {
-      response()->show_error(err);
-      return;
-    }
-    for (const auto& p : ws->blocked_files(rq)) {
-      prompted = true;
-      const auto ans = wxMessageBox(
-          wxString::Format("This request wants to upload\n\n%s\n\nfrom outside the workspace. Allow it?",
-                           p.wstring()),
-          "watt", wxYES_NO | wxNO_DEFAULT | wxICON_WARNING, this);
-      std::string err;
-      if (ans != wxYES || !ws->allow_file(p, &err)) {
-        response()->show_error(err.empty() ? "Upload not allowed: " + p.string() : err);
-        return;
-      }
-    }
-    // NTLM / Negotiate with no user name signs in as the current Windows user: a cloned
-    // workspace could aim that at a hostile host, so each host needs the user's consent.
-    for (const auto& host : ws->blocked_sso_hosts(rq)) {
-      prompted = true;
-      const auto ans = wxMessageBox(
-          wxString::Format("This request signs in to\n\n%s\n\nwith your Windows account (%s, no user name "
-                           "given). Only allow this for servers you trust. Allow it for this workspace?",
-                           wxString::FromUTF8(host),
-                           rq.auth.type == HttpAuth::Type::Ntlm ? "NTLM" : "Negotiate"),
-          "watt", wxYES_NO | wxNO_DEFAULT | wxICON_WARNING, this);
-      std::string err;
-      if (ans != wxYES || !ws->allow_sso_host(host, &err)) {
-        response()->show_error(err.empty() ? "Windows sign-in not allowed for " + host : err);
-        return;
-      }
-    }
-    // Proxy / CA / client certificate from workspace files (a cloned repo could route every
-    // request through its proxy and make watt trust its CA: a silent MITM of HTTPS). A CA file
-    // outside the workspace is first allowed to be read, then its content is asked about: at
-    // most a few rounds.
-    for (int round = 0; round < 3; ++round) {
-      const auto items = ws->blocked_network_settings(rq);
-      if (items.empty()) break;
-      for (const auto& it : items) {
-        prompted = true;
-        if (!confirm_network_item(it, this)) {
-          response()->show_error("Not sent: " + it.text + " (set in the " + it.level + ") is not allowed.");
-          return;
-        }
-        std::string err;
-        if (!ws->allow_network_item(it, &err)) {
-          response()->show_error(err.empty() ? "Not allowed: " + it.text : err);
-          return;
-        }
-      }
-    }
-  }
+  if (ws && (needs_workspace(rq) || inherited) && !confirm_http_consents(*ws, rq, &prompted)) return;
   // Scripts are code from the workspace (possibly a cloned repo): ask once per workspace.
   bool run_scripts = false, scripts_skipped = false, has_pre = false, has_post = false;
   if (ws) {  // the request's own scripts plus those inherited from its folders / collection
@@ -1257,6 +1488,7 @@ void RequestTab::send_http(Clock::time_point click) {
     run_scripts = ws->scripts_trusted();
     if (!run_scripts) {
       prompted = true;
+      before_prompt("run this workspace's scripts?");
       const auto ans = wxMessageBox(
           wxString::Format("Requests in this workspace contain scripts:\n\n%s\n\nScripts run in a sandbox "
                            "(no file or process access; network only through watt's own checks), but they "
@@ -1268,7 +1500,140 @@ void RequestTab::send_http(Clock::time_point click) {
       scripts_skipped = !run_scripts;  // sent without its scripts; the response says so
     }
   }
+  // A pre-request script may define the variables itself: then nothing is known to be missing.
+  if (ws && !has_pre && (needs_workspace(rq) || inherited) && !confirm_unresolved(*ws, rq, &prompted)) return;
   if (prompted) click = Clock::now();
+  send_http_job(click, std::move(rq_p), ws, inherited, run_scripts, scripts_skipped, has_pre, has_post, false);
+}
+
+void RequestTab::on_send_bounced(uint64_t gen) {
+  if (gen != gen_ || !in_flight_) return;  // cancelled or superseded meanwhile
+  in_flight_ = false;
+  // Not in flight until the checked path sends again (send_http_job sets it back): a prompt
+  // declined or a "Not sent" banner leaves Send a Send button, never a Cancel that cancels nothing.
+  editor()->set_in_flight(false);
+  send_http(sent_at_, /*checked=*/true);  // the click time stays unless a prompt is answered
+}
+
+void RequestTab::before_prompt(const std::string& what) {
+  if (!in_flight_) response()->show_waiting_for_user(what);
+}
+
+bool RequestTab::confirm_unresolved(const Workspace& ws, const SavedRequest& rq, bool* prompted) {
+  bool in_url = false;
+  const std::vector<std::string> miss = unresolved_vars(ws, rq, &in_url);
+  if (miss.empty()) return true;
+  // "Send as written" was chosen for each of these in this tab.
+  if (std::all_of(miss.begin(), miss.end(), [&](const std::string& n) { return unresolved_ok_.count(n) > 0; }))
+    return true;
+  std::string names;
+  for (const auto& n : miss) names += (names.empty() ? "{{" : ", {{") + n + "}}";
+  const std::string not_sent =
+      "Not sent: " + names + (miss.size() == 1 ? " is" : " are") + " not defined (" +
+      (ws.active_env.empty() ? std::string("no environment") : "environment " + ws.active_env) + ").";
+  // The same "Not sent" banner the editor shows for its own check: one condition, one UI. Its
+  // "Send as written" resends with these names accepted (the click time is the new click).
+  if (editor()->show_unresolved(miss, in_url, [this, miss] {
+        unresolved_ok_.insert(miss.begin(), miss.end());
+        send();
+      })) {
+    response()->show_error(not_sent + " See the banner above the request.");
+    return false;
+  }
+  *prompted = true;
+  before_prompt("send undefined variables?");
+  wxString list;
+  for (const auto& n : miss) list += "    {{" + wxString::FromUTF8(n) + "}}\n";
+  const wxString env = ws.active_env.empty() ? wxString("no environment is active")
+                                             : "the environment '" + wxString::FromUTF8(ws.active_env) + "'";
+  wxMessageDialog dlg(this,
+                      wxString::Format("%s not defined in %s, its folders or the globals:\n\n%s\nThe request would "
+                                       "send %s literally. Send anyway?",
+                                       miss.size() == 1 ? "This variable is" : "These variables are", env, list,
+                                       miss.size() == 1 ? "it" : "them"),
+                      "watt", wxOK | wxCANCEL | wxCANCEL_DEFAULT | wxICON_WARNING);
+  dlg.SetOKCancelLabels("&Send anyway", "Cancel");  // a real Cancel: Esc declines
+  if (dlg.ShowModal() != wxID_OK) {
+    response()->show_error(not_sent + " Define it in the environment, or send anyway.");
+    return false;
+  }
+  unresolved_ok_.insert(miss.begin(), miss.end());
+  return true;
+}
+
+bool RequestTab::confirm_http_consents(Workspace& wsr, const SavedRequest& rq, bool* prompted_out) {
+  Workspace* ws = &wsr;
+  bool prompted = false;
+  struct Out {
+    bool* p;
+    bool* v;
+    ~Out() { *p = *p || *v; }
+  } out{prompted_out, &prompted};
+  {
+    prompted = !ws->blocked_env_vars(rq).empty();
+    if (prompted) before_prompt("read an environment variable?");
+    if (std::string err; !confirm_env_vars(*ws, rq, this, &err)) {
+      response()->show_error(err);
+      return false;
+    }
+    for (const auto& p : ws->blocked_files(rq)) {
+      prompted = true;
+      before_prompt("upload a file from outside the workspace?");
+      const auto ans = wxMessageBox(
+          wxString::Format("This request wants to upload\n\n%s\n\nfrom outside the workspace. Allow it?",
+                           p.wstring()),
+          "watt", wxYES_NO | wxNO_DEFAULT | wxICON_WARNING, this);
+      std::string err;
+      if (ans != wxYES || !ws->allow_file(p, &err)) {
+        response()->show_error(err.empty() ? "Upload not allowed: " + p.string() : err);
+        return false;
+      }
+    }
+    // NTLM / Negotiate with no user name signs in as the current Windows user: a cloned
+    // workspace could aim that at a hostile host, so each host needs the user's consent.
+    for (const auto& host : ws->blocked_sso_hosts(rq)) {
+      prompted = true;
+      before_prompt("sign in with your Windows account?");
+      const auto ans = wxMessageBox(
+          wxString::Format("This request signs in to\n\n%s\n\nwith your Windows account (%s, no user name "
+                           "given). Only allow this for servers you trust. Allow it for this workspace?",
+                           wxString::FromUTF8(host),
+                           rq.auth.type == HttpAuth::Type::Ntlm ? "NTLM" : "Negotiate"),
+          "watt", wxYES_NO | wxNO_DEFAULT | wxICON_WARNING, this);
+      std::string err;
+      if (ans != wxYES || !ws->allow_sso_host(host, &err)) {
+        response()->show_error(err.empty() ? "Windows sign-in not allowed for " + host : err);
+        return false;
+      }
+    }
+    // Proxy / CA / client certificate from workspace files (a cloned repo could route every
+    // request through its proxy and make watt trust its CA: a silent MITM of HTTPS). A CA file
+    // outside the workspace is first allowed to be read, then its content is asked about: at
+    // most a few rounds.
+    for (int round = 0; round < 3; ++round) {
+      const auto items = ws->blocked_network_settings(rq);
+      if (items.empty()) break;
+      for (const auto& it : items) {
+        prompted = true;
+        before_prompt("trust a network setting?");
+        if (!confirm_network_item(it, this)) {
+          response()->show_error("Not sent: " + it.text + " (set in the " + it.level + ") is not allowed.");
+          return false;
+        }
+        std::string err;
+        if (!ws->allow_network_item(it, &err)) {
+          response()->show_error(err.empty() ? "Not allowed: " + it.text : err);
+          return false;
+        }
+      }
+    }
+  }
+  return true;
+}
+
+void RequestTab::send_http_job(Clock::time_point click, std::shared_ptr<SavedRequest> rq_p, Workspace* ws,
+                               bool inherited, bool run_scripts, bool scripts_skipped, bool has_pre, bool has_post,
+                               bool fast) {
   const uint64_t gen = ++gen_;
   in_flight_ = true;
   sent_at_ = click;
@@ -1277,8 +1642,24 @@ void RequestTab::send_http(Clock::time_point click) {
   std::shared_ptr<const SavedRequest> saved = std::move(rq_p);
   auto wsc = ws ? std::make_shared<Workspace>(*ws) : nullptr;
   auto w = worker_;
-  w->push([w, gen, click, saved, wsc, run_scripts, scripts_skipped, has_pre, has_post, inherited] {
+  std::shared_ptr<HttpBodyTap> tap = response()->body_tap();  // live SSE events (UI thread, by value)
+  const std::set<std::string> acked = unresolved_ok_;
+  w->push([w, gen, click, saved, wsc, run_scripts, scripts_skipped, has_pre, has_post, inherited, tap, fast,
+           acked]() mutable {
     if (w->is_cancelled(gen)) return;
+    // Fast path (see send_http): nothing was checked on the UI thread. Anything that may need
+    // the user (a consent, an untrusted script, a variable that is not defined) sends the request
+    // back to the UI thread's checked path instead of going out.
+    auto bounce = [&] { w->post([gen](RequestTab& t) { t.on_send_bounced(gen); }); };
+    if (fast && wsc) {
+      inherited = wsc->has_inherited_settings(*saved);
+      const EffectiveSettings eff = wsc->effective_settings(*saved);
+      has_pre = !eff.pre_scripts.empty();
+      has_post = !eff.post_scripts.empty();
+      // A pre-request script runs before the request is built: consents are asked before it.
+      if (has_pre || (has_post && !wsc->scripts_trusted())) return bounce();
+      run_scripts = has_post;
+    }
     // Every send that got as far as the network (or failed on its way there: an OAuth token step)
     // is a history row; status 0 is a failed one.
     auto record_history = [&](long status, double total_ms) {
@@ -1338,6 +1719,7 @@ void RequestTab::send_http(Clock::time_point click) {
         step->from = eff.auth_from.label;
         sent->token = step;
         if (!t.ok) {  // the same message http_to_send() would give, without a second token call
+          if (fast) return bounce();  // perhaps a consent (an OS environment variable) is missing
           const std::string err = "OAuth 2.0: " + t.error + ": request not sent.";
           w->post([gen, err](RequestTab& t) { t.on_error(gen, err); });
           record_history(0, ms_between(click, Clock::now()));
@@ -1349,10 +1731,18 @@ void RequestTab::send_http(Clock::time_point click) {
       std::string err;
       auto r = wsc->http_to_send(*toSend, &err);
       if (!r) {
+        // http_to_send() is the gate for every consent: the checked path asks the user (or shows
+        // this error again when there is nothing to ask).
+        if (fast) return bounce();
         w->post([gen, err](RequestTab& t) { t.on_error(gen, err); });
         return;
       }
       sent->request = std::move(*r);
+      if (fast && !has_pre) {
+        const std::vector<std::string> miss = unresolved_in(sent->request);
+        if (std::any_of(miss.begin(), miss.end(), [&](const std::string& n) { return !acked.count(n); }))
+          return bounce();
+      }
     } else {
       sent->request = toSend->http;
     }
@@ -1362,7 +1752,8 @@ void RequestTab::send_http(Clock::time_point click) {
     // Progress: at most every 50 ms.
     uint64_t got = 0;
     auto last = Clock::now();
-    auto on_chunk = [&](const char*, size_t n) {
+    auto on_chunk = [&](const char* data, size_t n) {
+      if (tap) tap->feed(data, n);
       got += n;
       const auto now = Clock::now();
       if (ms_between(last, now) >= 50) {
@@ -1378,7 +1769,17 @@ void RequestTab::send_http(Clock::time_point click) {
       w->give_back(origin);
       return;
     }
-    auto resp = std::make_shared<HttpResponse>(client.send(sent->request, on_chunk));
+    // The head (status, headers, phases to the first byte) as soon as it arrives: a stream that
+    // never ends, or a send cancelled mid-body, still shows them.
+    HeadFn on_head;
+    if (tap)
+      on_head = [&](const HttpResponse& h) {
+        auto c = std::make_shared<HttpResponse>(h);
+        c->timing.queue_ms += ui_queue;
+        c->timing.total_ms += ui_queue;
+        tap->head(std::move(c));
+      };
+    auto resp = std::make_shared<HttpResponse>(client.send(sent->request, on_chunk, on_head));
     w->give_back(origin);
     resp->timing.queue_ms += ui_queue;
     resp->timing.total_ms += ui_queue;
@@ -1430,6 +1831,7 @@ void RequestTab::send_grpc(Clock::time_point click) {
   const uint64_t gen = ++gen_;
   in_flight_ = true;
   sent_at_ = click;
+  shown_method_ = req_.grpc_method;
   if (drop_snapshot_time(req_) && on_title_changed) on_title_changed(this);
   {
     std::lock_guard lk(worker_->msg_m);
@@ -1464,7 +1866,7 @@ void RequestTab::send_grpc(Clock::time_point click) {
           std::string err;
           if (!call->send(m, &err)) {
             call->cancel();
-            w->post([gen, err](RequestTab& t) { t.on_error(gen, "Request message: " + err); });
+            w->post([gen, err](RequestTab& t) { t.on_error(gen, "Request message: " + one_space(err)); });
             break;
           }
         }
@@ -1509,8 +1911,12 @@ void RequestTab::cancel() {
     response()->show_cancelled(0);
     return;
   }
-  if (!in_flight_) return;
+  if (!in_flight_) {
+    editor()->set_in_flight(false);  // never a Cancel button with nothing to cancel
+    return;
+  }
   worker_->cancel(gen_);
+  ws_open_ = false;
   const double after = ms_between(sent_at_, Clock::now());
   finish(gen_);
   response()->show_cancelled(after);
@@ -1527,6 +1933,7 @@ void RequestTab::on_http_done(uint64_t gen, std::shared_ptr<const HttpResponse> 
   if (gen != gen_ || !in_flight_) return;
   finish(gen);
   last_ = LastResponse{r, sent, nullptr};
+  last_.when_iso = now_iso();
   last_pending_ = false;
   response()->show_http(std::move(r), std::move(sent));
   if (on_response) on_response(this);
@@ -1556,6 +1963,7 @@ void RequestTab::on_grpc_done(uint64_t gen, std::shared_ptr<const GrpcResponse> 
       r = std::move(c);
     }
   last_ = LastResponse{nullptr, nullptr, r};
+  last_.when_iso = now_iso();
   last_pending_ = false;
   response()->show_grpc(std::move(r));
   if (on_response) on_response(this);

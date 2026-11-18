@@ -54,8 +54,11 @@ void update_tip(wxWindow* w, int& hover, int idx, const std::string& tip) {
 // Collapsed or expanded waterfall: one choice for every tab, remembered across runs.
 bool& collapsed_pref() {
   static bool v = [] {
-    bool c = false;
-    if (wxConfigBase* cfg = wxConfigBase::Get()) cfg->Read("Response/TimingCollapsed", &c, false);
+    // Collapsed by default (one line: the stacked phase bar, the total and its delta; the full
+    // breakdown is its tooltip and one click away), so the body starts right under the status
+    // line, as in Postman. An expanded choice is remembered.
+    bool c = true;
+    if (wxConfigBase* cfg = wxConfigBase::Get()) cfg->Read("Response/TimingCollapsed", &c, true);
     return c;
   }();
   return v;
@@ -125,12 +128,16 @@ StatusStrip::StatusStrip(wxWindow* parent) : wxWindow(parent, wxID_ANY), timer_(
   SetBackgroundColour(Theme::get().bg);
   Bind(wxEVT_PAINT, [this](wxPaintEvent&) { on_paint(); });
   Bind(wxEVT_MOTION, [this](wxMouseEvent& e) { on_motion(e.GetPosition()); });
-  Bind(wxEVT_LEAVE_WINDOW, [this](wxMouseEvent&) { update_tip(this, hover_, -1, {}); });
+  Bind(wxEVT_LEAVE_WINDOW, [this](wxMouseEvent&) {
+    mute_ = wxRect();
+    update_tip(this, hover_, -1, {});
+  });
   Bind(wxEVT_LEFT_DOWN, [this](wxMouseEvent& e) {
     for (size_t i = 0; i < hit_.size(); ++i)
       if (segs_[i].click && hit_[i].Contains(e.GetPosition()) && on_click_) {
         hide_tooltip_now(this);
-        hover_ = -2;
+        hover_ = static_cast<int>(i);  // its tip stays off until the mouse leaves the segment
+        mute_ = hit_[i];
         const wxRect r = hit_[i];
         on_click_(segs_[i].click, wxRect(ClientToScreen(r.GetTopLeft()), r.GetSize()));
         return;
@@ -143,8 +150,25 @@ StatusStrip::StatusStrip(wxWindow* parent) : wxWindow(parent, wxID_ANY), timer_(
 
 wxSize StatusStrip::DoGetBestClientSize() const { return wxSize(FromDIP(200), FromDIP(34)); }
 
+void StatusStrip::put(int key, StatusSeg seg) {
+  if (busy_ || badge_.empty()) return;
+  seg.key = key;
+  for (StatusSeg& s : segs_)
+    if (s.key == key) {
+      if (s.text == seg.text && s.tip == seg.tip && s.tone == seg.tone) return;
+      s = std::move(seg);
+      hover_ = -2;
+      Refresh(false);
+      return;
+    }
+  segs_.push_back(std::move(seg));
+  hover_ = -2;
+  Refresh(false);
+}
+
 void StatusStrip::set(const std::string& badge, Tone badge_tone, std::vector<StatusSeg> segs) {
   busy_ = false;
+  busy_badge_.clear();
   timer_.Stop();
   badge_ = badge;
   badge_tone_ = badge_tone;
@@ -172,6 +196,7 @@ void StatusStrip::set(const std::string& badge, Tone badge_tone, std::vector<Sta
 void StatusStrip::set_busy(const std::string& label, Clock::time_point since) {
   busy_ = true;
   busy_label_ = label;
+  busy_badge_.clear();
   since_ = since;
   badge_.clear();
   segs_.clear();
@@ -196,6 +221,19 @@ void StatusStrip::on_paint() {
   wxFont big = bold.Larger();
   hit_.assign(segs_.size(), wxRect());
   if (busy_) {
+    if (!busy_badge_.empty()) {
+      dc.SetFont(big);
+      const wxSize e = dc.GetTextExtent(U(busy_badge_));
+      const wxColour c = tone_colour(busy_badge_tone_);
+      const int h = e.y + FromDIP(6);
+      const wxRect pill(x, (cr.height - h) / 2, e.x + FromDIP(16), h);
+      dc.SetPen(*wxTRANSPARENT_PEN);
+      dc.SetBrush(wxBrush(mix(th.bg, c, th.dark ? 0.22 : 0.14)));
+      dc.DrawRoundedRectangle(pill, FromDIP(4));
+      dc.SetTextForeground(c);
+      dc.DrawText(U(busy_badge_), pill.x + FromDIP(8), pill.y + (pill.height - e.y) / 2);
+      x = pill.GetRight() + FromDIP(12);
+    }
     dc.SetFont(base);
     dc.SetTextForeground(th.dim);
     x += draw_text(dc, U(busy_label_), x, cr) + FromDIP(10);
@@ -282,6 +320,10 @@ void StatusStrip::on_paint() {
 }
 
 void StatusStrip::on_motion(const wxPoint& p) {
+  if (!mute_.IsEmpty()) {
+    if (mute_.Contains(p)) return;
+    mute_ = wxRect();
+  }
   for (size_t i = 0; i < hit_.size(); ++i)
     if (hit_[i].Contains(p)) {
       SetCursor(segs_[i].click ? wxCursor(wxCURSOR_HAND) : wxNullCursor);
@@ -301,11 +343,21 @@ Waterfall::Waterfall(wxWindow* parent) : wxWindow(parent, wxID_ANY) {
   SetBackgroundColour(Theme::get().bg);
   Bind(wxEVT_PAINT, [this](wxPaintEvent&) { on_paint(); });
   Bind(wxEVT_MOTION, [this](wxMouseEvent& e) { on_motion(e.GetPosition()); });
-  Bind(wxEVT_LEAVE_WINDOW, [this](wxMouseEvent&) { update_tip(this, hover_, -1, {}); });
+  Bind(wxEVT_LEAVE_WINDOW, [this](wxMouseEvent&) {
+    mute_ = wxRect();
+    update_tip(this, hover_, -1, {});
+  });
   Bind(wxEVT_LEFT_DOWN, [this](wxMouseEvent& e) {
     if (on_conn_ && !pill_.IsEmpty() && pill_.Contains(e.GetPosition())) {
       hide_tooltip_now(this);
+      // The pill's tip stays off (over the popover) until the mouse leaves the pill.
       hover_ = -2;
+      for (size_t i = tips_.size(); i-- > 0;)
+        if (tips_[i].first.Contains(e.GetPosition())) {
+          hover_ = static_cast<int>(i);
+          break;
+        }
+      mute_ = pill_;
       on_conn_(wxRect(ClientToScreen(pill_.GetTopLeft()), pill_.GetSize()));
       return;
     }
@@ -347,6 +399,15 @@ void Waterfall::set_live(double first_ms, uint64_t bytes, size_t msgs) {
   live_bytes_ = bytes;
   live_msgs_ = msgs;
   if (waiting_) Refresh(false);
+}
+
+void Waterfall::live_tick(double live_ms, double total_ms, const std::string& head) {
+  if (!cur_.valid || cur_.live_row < 0 || cur_.live_row >= static_cast<int>(cur_.phases.size())) return;
+  cur_.phases[static_cast<size_t>(cur_.live_row)].ms = std::max(0.0, live_ms);
+  cur_.total = total_ms;
+  cur_.network = std::max(0.0, cur_.total - cur_.server_wait - cur_.client);
+  cur_.live_head = head;
+  Refresh(false);
 }
 
 void Waterfall::set_waiting(Clock::time_point since) {
@@ -395,7 +456,10 @@ void Waterfall::paint_waiting(wxDC& dc) {
   dc.SetFont(GetFont());
   dc.SetTextForeground(cancelled_ ? th.warn : th.accent);
   const bool grpc = reserve_rows_ == 8;
-  const bool got = !cancelled_ && live_first_ms_ >= 0;
+  // Cancelled after body data arrived: what was seen until the cancel stays drawn (frozen).
+  const bool got = live_first_ms_ >= 0;
+  const bool partial = cancelled_ && got;
+  const double shown_el = partial ? cancel_ms_ : el;
   auto el_text = [](double v) {
     char b[32];
     if (v < 1000) std::snprintf(b, sizeof b, "%.0f ms", v);
@@ -403,7 +467,11 @@ void Waterfall::paint_waiting(wxDC& dc) {
     return std::string(b);
   };
   std::string head;
-  if (cancelled_) {
+  if (partial) {
+    head = "cancelled by you after " + fmt::ms(cancel_ms_) + " \xC2\xB7 " +
+           (grpc ? std::to_string(live_msgs_) + (live_msgs_ == 1 ? " message" : " messages")
+                 : fmt::human_bytes(live_bytes_) + " received");
+  } else if (cancelled_) {
     head = "cancelled after " + fmt::ms(cancel_ms_) + " \xC2\xB7 no response, so no phase breakdown";
   } else if (!got) {
     head = "waiting for the response \xC2\xB7 " + el_text(el);
@@ -425,7 +493,7 @@ void Waterfall::paint_waiting(wxDC& dc) {
   const int bar_w = std::max(FromDIP(40), cr.width - bar_x - value_w - pad - FromDIP(8));
   const int value_r = bar_x + bar_w + FromDIP(8) + value_w;
   const int rh = row_h();
-  if (cancelled_) {
+  if (cancelled_ && !partial) {
     // Same rows, frozen: the phases the request did not finish.
     for (int i = 0; i < n; ++i) {
       const int y = header_h() + i * rh;
@@ -445,7 +513,7 @@ void Waterfall::paint_waiting(wxDC& dc) {
   // the response, so what is known now is drawn as such: the phases up to the first byte as one
   // block (running, or done at the first byte), then the transfer (Download) as it runs.
   const int down = grpc ? 6 : 8;  // index of the Download row
-  const double span = std::max(el, 1.0);
+  const double span = std::max(shown_el, 1.0);
   auto xt = [&](double t) { return bar_x + static_cast<int>(std::lround(std::clamp(t / span, 0.0, 1.0) * bar_w)); };
   const wxColour wait_c = th.dark ? wxColour(80, 200, 120) : wxColour(30, 160, 80);
   const wxColour down_c = th.dark ? wxColour(90, 170, 255) : wxColour(40, 130, 230);
@@ -463,18 +531,18 @@ void Waterfall::paint_waiting(wxDC& dc) {
     if (i == down && got) {
       // The transfer so far: first byte -> now, growing.
       const int x0 = xt(live_first_ms_);
-      dc.SetBrush(wxBrush(down_c));
+      dc.SetBrush(wxBrush(partial ? th.warn : down_c));
       dc.DrawRoundedRectangle(wxRect(x0, y + (rh - FromDIP(10)) / 2, std::max(FromDIP(2), bar_x + bar_w - x0), FromDIP(10)),
                               FromDIP(2));
       dc.SetFont(GetFont().Smaller());
-      dc.SetTextForeground(th.accent);
+      dc.SetTextForeground(partial ? th.warn : th.accent);
       const std::string v = grpc ? std::to_string(live_msgs_) + " msgs" : fmt::human_bytes(live_bytes_);
-      const wxString t = wxString::FromUTF8(v + " \xE2\x80\xA6");
+      const wxString t = wxString::FromUTF8(partial ? v + " \xC2\xB7 cut" : v + " \xE2\x80\xA6");
       dc.DrawText(t, value_r - dc.GetTextExtent(t).x, y + (rh - dc.GetCharHeight()) / 2);
     } else if (!pre) {
       dc.SetFont(GetFont().Smaller());
       dc.SetTextForeground(th.faint);
-      const wxString t = "pending";
+      const wxString t = partial ? "n/a" : "pending";
       dc.DrawText(t, value_r - dc.GetTextExtent(t).x, y + (rh - dc.GetCharHeight()) / 2);
     }
   }
@@ -511,8 +579,12 @@ void Waterfall::paint_waiting(wxDC& dc) {
     dc.SetFont(GetFont().Smaller());
     dc.SetTextForeground(th.dim);
     const std::string what = grpc ? "connect, send, server wait" : "DNS, connect, TLS, send, server wait";
-    const std::string t = got ? "\xE2\x9C\x93 first " + std::string(grpc ? "message" : "byte") + " at +" + fmt::ms(live_first_ms_) +
-                                    " (" + what + " done; split with the response)"
+    // HTTP: what is seen live is body data (the progress reports), not the first response byte:
+    // the headers came before it, and the exact TTFB (Wait) arrives with the response's split.
+    const std::string t = got ? (grpc ? "\xE2\x9C\x93 first message at +" + fmt::ms(live_first_ms_) + " (" + what +
+                                            " done; split with the response)"
+                                      : "\xE2\x9C\x93 body data by +" + fmt::ms(live_first_ms_) +
+                                            " (headers earlier; exact Wait (TTFB) with the response)")
                               : what + ": in progress";
     const wxString wt = wxString::FromUTF8(t);
     const wxSize e = dc.GetTextExtent(wt);
@@ -525,7 +597,7 @@ void Waterfall::paint_waiting(wxDC& dc) {
       if (tx + e.x > bar_x + bar_w) tx = std::max(bar_x + FromDIP(4), x1 - FromDIP(8) - e.x);
     }
     dc.DrawText(wt, std::max(bar_x + FromDIP(4), tx), ty);
-    if (got) {
+    if (got && grpc) {  // HTTP: the Wait row's value is the exact TTFB, known with the response
       const wxString v = wxString::FromUTF8("+" + fmt::ms(live_first_ms_));
       dc.SetTextForeground(th.dim);
       dc.DrawText(v, value_r - dc.GetTextExtent(v).x, header_h() + (down - 1) * rh + (rh - dc.GetCharHeight()) / 2);
@@ -533,7 +605,9 @@ void Waterfall::paint_waiting(wxDC& dc) {
   }
   dc.SetTextForeground(th.dim);
   dc.SetFont(GetFont().Smaller());
-  dc.DrawText(wxString::FromUTF8(got ? (grpc ? "per-phase split with the trailers, when the stream ends"
+  dc.DrawText(wxString::FromUTF8(partial ? "cancelled by you while it downloaded: the engine reports the exact "
+                                           "per-phase split only with a complete response"
+                                 : got ? (grpc ? "per-phase split with the trailers, when the stream ends"
                                             : "per-phase split when the download completes")
                                      : "the engine times each phase and reports the split with the response"),
               pad, header_h() + n * rh + (footer_h() - dc.GetCharHeight()) / 2);
@@ -563,7 +637,24 @@ wxSize Waterfall::DoGetBestClientSize() const {
   if (!cur_.valid && !reserved_) return wxSize(FromDIP(200), 0);
   // Collapsed: the header line alone (with the stacked bar and the total in it).
   if (collapsed_pref()) return wxSize(FromDIP(200), header_h() + FromDIP(2));
-  const int rows = cur_.valid ? row_count(cur_) : reserve_rows_;
+  const int base = cur_.valid ? static_cast<int>(cur_.phases.size()) : reserve_rows_;
+  const bool grpc = cur_.valid ? cur_.kind == "grpc" : reserve_rows_ == 8;
+  // One floor for every tab: switching tabs moves nothing either. It starts at the rows of a
+  // request with a pre-request and a post-response script (Pre-script + 10 phases + Post-script),
+  // so the tab strip sits at the same height on a plain request, a scripted one and a cancelled
+  // one from the first send on (it only grows for a rarer model: OAuth token + redirects).
+  // HTTP starts at its 10 phase rows (no empty band under the total on a plain request); a
+  // scripted / redirecting response grows it once, and the tabs stay there from then on.
+  static int floors[2] = {10, 8};
+  int& floor = floors[grpc ? 1 : 0];
+  if (base > floor) {
+    floor = base;
+    // The other tabs' waterfalls grow to it now (after this layout), not when next shown.
+    for (Waterfall* w : all_waterfalls())
+      if (w != this) w->CallAfter([w] { w->relayout(); });
+  }
+  // Expanded redirect hops come on top of the floor (they are the user's own click).
+  const int rows = floor + (cur_.valid ? row_count(cur_) - base : 0);
   return wxSize(FromDIP(200), header_h() + rows * row_h() + footer_h() + FromDIP(6));
 }
 
@@ -625,6 +716,38 @@ void Waterfall::set_stale(bool stale) {
   Refresh(false);
 }
 
+namespace {
+// Offsets on the waterfall's time axis -> pixels. Scripts that took longer than the request itself
+// (a 10 ms post-script after a 1.9 ms response) would leave DNS / Connect / Wait as 1-3 px slivers:
+// then the axis is broken, the request keeps most of the width on its own scale and the script
+// bars share the rest on theirs (break marks drawn between them).
+struct AxisMap {
+  double before = 0, net = 0, after = 0;
+  int w = 0;
+  bool broken = false;
+  int pre_w = 0, net_w = 0, post_w = 0;
+  AxisMap(double b, double n, double a, int width) : before(b), net(std::max(n, 1e-9)), after(a), w(width) {
+    broken = before + after > net && n > 1e-6;
+    if (!broken) return;
+    const double share = 0.22;  // of the width, for the script bars together
+    pre_w = static_cast<int>(std::lround(w * share * before / (before + after)));
+    post_w = static_cast<int>(std::lround(w * share * after / (before + after)));
+    net_w = w - pre_w - post_w;
+  }
+  int operator()(double v) const {
+    if (!broken) return static_cast<int>(std::lround(v / std::max(before + net + after, 1e-9) * w));
+    double x;
+    if (v <= before) x = before > 0 ? v / before * pre_w : 0;
+    else if (v <= before + net) x = pre_w + (v - before) / net * net_w;
+    else x = pre_w + net_w + (after > 0 ? std::min(1.0, (v - before - net) / after) * post_w : 0);
+    return static_cast<int>(std::lround(x));
+  }
+};
+constexpr const char* kBrokenAxisTip =
+    "The scripts took longer than the request: their bars are drawn on their own scale (the axis is broken at the "
+    "marks), so the request's phases keep their width.";
+}  // namespace
+
 void Waterfall::on_paint() {
   wxAutoBufferedPaintDC dc(this);
   // Safety net: a layout made before the collapsed choice changed (e.g. while this tab was
@@ -660,8 +783,7 @@ void Waterfall::on_paint() {
   const int bar_w = std::max(FromDIP(40), cr.width - bar_x - value_w - delta_w - pad - FromDIP(8));
   const int value_r = bar_x + bar_w + FromDIP(8) + value_w;
   const int delta_r = value_r + delta_w;
-  const double total = std::max(cur_.total + cur_.after, 1e-9);
-  auto px = [&](double v) { return static_cast<int>(std::lround(v / total * bar_w)); };
+  const AxisMap px(cur_.before, cur_.total, cur_.after, bar_w);
 
   // Header: title, connection marker, delta column title. Click toggles collapsed.
   wxRect hr(0, 0, cr.width, header_h());
@@ -702,13 +824,15 @@ void Waterfall::on_paint() {
     // own phase.
     dc.SetFont(bold);
     std::string tot = "Total " + fmt::ms(cur_.total);
-    if (has_prev_) tot += "  " + fmt::delta_ms(cur_.total - prev_.total);
+    if (!cur_.live_head.empty()) tot = cur_.live_head;
+    else if (has_prev_) tot += "  " + fmt::delta_ms(cur_.total - prev_.total);
     // The post-response script runs after the clock stops but has its own bar on this scale:
     // the headline names it, so a bar longer than the total is never unexplained.
+    if (cur_.before > 0) tot += " + pre-script " + fmt::ms(cur_.before);
     if (cur_.after > 0) tot += " + post-script " + fmt::ms(cur_.after);
     const wxString twx = U(tot);
     const int tw = dc.GetTextExtent(twx).x;
-    dc.SetTextForeground(fg);
+    dc.SetTextForeground(cur_.live_head.empty() ? fg : cur_.live_cut ? th.warn : th.accent);
     draw_text_right(dc, twx, cr.width - pad, hr);
     tips_.push_back({wxRect(cr.width - pad - tw, 0, tw, hr.height), cur_.total_tip});
     const int bx = x, bw = cr.width - pad - tw - FromDIP(14) - bx;
@@ -716,27 +840,34 @@ void Waterfall::on_paint() {
       const int bh = FromDIP(10);
       const int by = (hr.height - bh) / 2;
       std::string all = "Timing (click the title for every phase as a row):\n";
-      const double sum = std::max(cur_.total + cur_.after, 1e-9);
+      const AxisMap ax(cur_.before, cur_.total, cur_.after, bw);
       double off = 0;
       for (const Phase& ph : cur_.phases) {
         all += "  " + ph.name + "  " + (ph.reused ? std::string("reused") : ph.has_value ? fmt::ms(ph.ms) : "n/a") + "\n";
         if (ph.ms <= 0) continue;
-        const int x0 = bx + static_cast<int>(std::lround(off / sum * bw));
-        const int x1 = bx + static_cast<int>(std::lround((off + ph.ms) / sum * bw));
+        const int x0 = bx + ax(off);
+        const int x1 = bx + ax(off + ph.ms);
         const wxColour pc = ph.failed ? th.err : ph.colour;
         dc.SetPen(*wxTRANSPARENT_PEN);
         dc.SetBrush(wxBrush(stale_ ? mix(pc, th.bg, 0.6) : pc));
         dc.DrawRectangle(x0, by, std::max(1, x1 - x0), bh);
         off += ph.ms;
       }
-      all += "Total " + fmt::ms(cur_.total) + "  \xC2\xB7  " + cur_.server_label + " " + fmt::ms(cur_.server_wait) +
+      all += "Total " + fmt::ms(cur_.total) + "  \xC2\xB7  " + cur_.server_label + " " +
+             (cur_.server_na ? std::string("n/a") : fmt::ms(cur_.server_wait)) +
              ", network " + fmt::ms(cur_.network) + ", client " + fmt::ms(cur_.client);
+      if (ax.broken) {
+        all += std::string("\n") + kBrokenAxisTip;
+        dc.SetPen(wxPen(th.bg, FromDIP(2)));
+        for (int k : {ax.before > 0 ? ax.pre_w : -1, ax.after > 0 ? ax.pre_w + ax.net_w : -1})
+          if (k >= 0) dc.DrawLine(bx + k - FromDIP(2), by + bh + FromDIP(1), bx + k + FromDIP(2), by - FromDIP(1));
+      }
       tips_.push_back({wxRect(bx, 0, bw, hr.height), all});
       off = 0;
       for (const Phase& ph : cur_.phases) {
         if (ph.ms <= 0) continue;
-        const int x0 = bx + static_cast<int>(std::lround(off / sum * bw));
-        const int x1 = bx + static_cast<int>(std::lround((off + ph.ms) / sum * bw));
+        const int x0 = bx + ax(off);
+        const int x1 = bx + ax(off + ph.ms);
         if (x1 - x0 >= FromDIP(3))
           tips_.push_back({wxRect(x0, 0, x1 - x0, hr.height), ph.name + "  " + fmt::ms(ph.ms) + "\n" + ph.tip + "\n\n" + all});
         off += ph.ms;
@@ -744,6 +875,12 @@ void Waterfall::on_paint() {
     }
     hover_ = -2;
     return;
+  }
+  if (!cur_.live_head.empty()) {
+    // What is arriving (or was, before the cancel): next to the connection pill.
+    dc.SetFont(small);
+    dc.SetTextForeground(cur_.live_cut ? th.warn : th.accent);
+    draw_text(dc, U(cur_.live_head), x, hr);
   }
   dc.SetFont(small);
   dc.SetTextForeground(dim);
@@ -759,9 +896,25 @@ void Waterfall::on_paint() {
   const int nrows = collapsed_pref() ? 1 : row_count(cur_);
   const int rows_bottom = rows_top + nrows * row_h();
   dc.SetPen(wxPen(th.grid));
-  for (int q = 0; q <= 4; ++q) {
-    const int gx = bar_x + bar_w * q / 4;
-    dc.DrawLine(gx, rows_top, gx, rows_bottom);
+  if (!px.broken) {
+    for (int q = 0; q <= 4; ++q) {
+      const int gx = bar_x + bar_w * q / 4;
+      dc.DrawLine(gx, rows_top, gx, rows_bottom);
+    }
+  } else {
+    // Broken axis: the request's own span is gridded; a double slash marks each break.
+    for (int q = 0; q <= 4; ++q) {
+      const int gx = bar_x + px.pre_w + px.net_w * q / 4;
+      dc.DrawLine(gx, rows_top, gx, rows_bottom);
+    }
+    dc.SetPen(wxPen(th.dim));
+    for (int k : {px.before > 0 ? px.pre_w : -1, px.after > 0 ? px.pre_w + px.net_w : -1}) {
+      if (k < 0) continue;
+      const int gx = bar_x + k;
+      for (int d : {-FromDIP(2), FromDIP(2)})
+        dc.DrawLine(gx + d - FromDIP(2), rows_top + FromDIP(5), gx + d + FromDIP(2), rows_top - FromDIP(3));
+      tips_.push_back({wxRect(gx - FromDIP(4), rows_top, FromDIP(8), rows_bottom - rows_top), kBrokenAxisTip});
+    }
   }
 
   auto delta_text = [&](double d, const wxRect& r, double scale) {
@@ -843,13 +996,15 @@ void Waterfall::on_paint() {
         const int x0 = bar_x + px(off);
         const int w = std::max(1, px(off + p.ms) - px(off));
         dc.SetPen(*wxTRANSPARENT_PEN);
-        const wxColour pc = p.failed ? th.err : p.colour;
+        const bool live = !is_sub && cur_.live_row >= 0 && static_cast<size_t>(cur_.live_row) < cur_.phases.size() &&
+                          &p == &cur_.phases[static_cast<size_t>(cur_.live_row)];
+        const wxColour pc = p.failed ? th.err : live && cur_.live_cut ? th.warn : p.colour;
         dc.SetBrush(wxBrush(stale_ ? mix(pc, th.bg, 0.6) : pc));
         dc.DrawRoundedRectangle(wxRect(std::min(x0, bar_x + bar_w - 1), r.y + (r.height - bar_h) / 2, w, bar_h),
                                 w > 4 ? FromDIP(2) : 0);
         dc.SetFont(base);
-        dc.SetTextForeground(p.ms > 0 ? fg : dim);
-        draw_text_right(dc, U(fmt::ms(p.ms)), value_r, r);
+        dc.SetTextForeground(live ? (cur_.live_cut ? th.warn : th.accent) : p.ms > 0 ? fg : dim);
+        draw_text_right(dc, U(fmt::ms(p.ms) + (live ? (cur_.live_cut ? " cut" : " \xE2\x80\xA6") : "")), value_r, r);
       }
       double pv = 0;
       if (!is_sub && has_prev_ && prev_of(p.name, &pv)) {
@@ -869,24 +1024,55 @@ void Waterfall::on_paint() {
   x = pad;
   dc.SetFont(bold);
   dc.SetTextForeground(fg);
-  wxString tot = "Total " + U(fmt::ms(cur_.total));
-  if (cur_.after > 0) tot += U(" + post-script " + fmt::ms(cur_.after));
-  const int tw = draw_text(dc, tot, x, fr);
+  // Total (+ scripts), then total = server + network + client. When that does not fit next to
+  // the delta (both scripts ran, a narrow pane) the labels get shorter, then the gaps narrower:
+  // nothing is cut off at the right edge. The tooltips keep the long names.
+  const int sw = FromDIP(8);
+  const int avail = cr.width - pad - x - (has_prev_ ? FromDIP(96) : 0);
+  int gap = FromDIP(16);
+  auto layout = [&](bool brief) {
+    wxString tot = "Total " + U(fmt::ms(cur_.total));
+    if (cur_.before > 0) tot += U((brief ? " + pre " : " + pre-script ") + fmt::ms(cur_.before));
+    if (cur_.after > 0) tot += U((brief ? " + post " : " + post-script ") + fmt::ms(cur_.after));
+    return tot;
+  };
+  auto part_text = [&](const std::string& label, double v, bool brief) {
+    std::string l = label;
+    if (brief && l == "network") l = "net";
+    if (brief && l == "server wait") l = "server";
+    const bool na = cur_.server_na && label == cur_.server_label;
+    return U(l + " " + (na ? std::string("n/a") : fmt::ms(v)));
+  };
+  auto width_of = [&](bool brief, int g) {
+    dc.SetFont(bold);
+    int w = dc.GetTextExtent(layout(brief)).x + g;
+    dc.SetFont(base);
+    w += dc.GetTextExtent(part_text(cur_.server_label, cur_.server_wait, brief)).x + sw + FromDIP(5) + g;
+    w += dc.GetTextExtent(part_text("network", cur_.network, brief)).x + sw + FromDIP(5) + g;
+    w += dc.GetTextExtent(part_text("client", cur_.client, brief)).x + sw + FromDIP(5);
+    return w;
+  };
+  bool brief = false;
+  if (width_of(false, gap) > avail) {
+    brief = true;
+    if (width_of(true, gap) > avail) gap = FromDIP(8);
+  }
+  dc.SetFont(bold);
+  const int tw = draw_text(dc, layout(brief), x, fr);
   tips_.push_back({wxRect(x, fr.y, tw, fr.height), cur_.total_tip});
-  x += tw + FromDIP(16);
+  x += tw + gap;
   // total = server + network + client, each with a swatch in its phase colour family.
-  auto part = [&](const wxString& label, double v, const std::string& tip, const wxColour& c) {
-    const int sw = FromDIP(8);
+  auto part = [&](const std::string& label, double v, const std::string& tip, const wxColour& c) {
     dc.SetPen(*wxTRANSPARENT_PEN);
     dc.SetBrush(wxBrush(stale_ ? mix(c, th.bg, 0.6) : c));
     dc.DrawRoundedRectangle(wxRect(x, fr.y + (fr.height - sw) / 2, sw, sw), FromDIP(2));
     dc.SetFont(base);
     dc.SetTextForeground(fg);
-    const int w = draw_text(dc, label + " " + U(fmt::ms(v)), x + sw + FromDIP(5), fr) + sw + FromDIP(5);
+    const int w = draw_text(dc, part_text(label, v, brief), x + sw + FromDIP(5), fr) + sw + FromDIP(5);
     tips_.push_back({wxRect(x, fr.y, w, fr.height), tip});
-    x += w + FromDIP(16);
+    x += w + gap;
   };
-  part(U(cur_.server_label), cur_.server_wait, cur_.server_tip, th.dark ? wxColour(80, 200, 120) : wxColour(30, 160, 80));
+  part(cur_.server_label, cur_.server_wait, cur_.server_tip, th.dark ? wxColour(80, 200, 120) : wxColour(30, 160, 80));
   part("network", cur_.network, cur_.network_tip, th.dark ? wxColour(70, 130, 240) : wxColour(40, 100, 220));
   part("client", cur_.client, cur_.client_tip, th.dark ? wxColour(130, 130, 140) : wxColour(150, 150, 160));
   if (has_prev_) {
@@ -897,6 +1083,10 @@ void Waterfall::on_paint() {
 }
 
 void Waterfall::on_motion(const wxPoint& p) {
+  if (!mute_.IsEmpty()) {
+    if (mute_.Contains(p)) return;
+    mute_ = wxRect();
+  }
   SetCursor(on_conn_ && !pill_.IsEmpty() && pill_.Contains(p) ? wxCursor(wxCURSOR_HAND) : wxNullCursor);
   // Later entries are more specific (footer pieces, bars), search from the back.
   for (size_t i = tips_.size(); i-- > 0;)

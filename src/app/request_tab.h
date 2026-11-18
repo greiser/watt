@@ -10,6 +10,7 @@
 
 #include <functional>
 #include <memory>
+#include <set>
 #include <string>
 
 #include "app/panels.h"
@@ -20,9 +21,17 @@ class wxChildFocusEvent;
 class wxKeyEvent;
 class wxSplitterWindow;
 
+namespace watt {
+struct WsHandshake;
+struct WsClose;
+struct WsMessage;
+}  // namespace watt
+
 namespace watt::app {
 
 struct TabWorker;
+class WsEditorPanel;
+class WsResponsePanel;
 
 // A tab's last response, kept in the session so a restored tab shows it again (as Postman and
 // Insomnia do). Bodies over kMaxBytes are not kept.
@@ -144,6 +153,9 @@ class RequestTab : public wxPanel, public EditorHost {
   void switch_kind(RequestKind kind) override;
   const Workspace* workspace() const override;
   std::filesystem::path inherit_file() const override;
+  void accept_unresolved(const std::vector<std::string>& names) override {
+    unresolved_ok_.insert(names.begin(), names.end());
+  }
   // req with file = inherit_file(): what the workspace's inheritance (folder.json) is computed on.
   SavedRequest for_inheritance(const SavedRequest& req) const;
   void load_schema(const SavedRequest& r) override;
@@ -151,6 +163,9 @@ class RequestTab : public wxPanel, public EditorHost {
   bool stream_send(const std::string& json, std::string* error) override;
   void stream_close() override;
   const GrpcClient& grpc_client() const override { return *ctx_.grpc(); }
+  void ws_close() override;
+  // A WebSocket tab whose connection is open.
+  bool ws_open() const { return ws_open_; }
 
  private:
   friend struct TabWorker;
@@ -167,8 +182,32 @@ class RequestTab : public wxPanel, public EditorHost {
   void restore_focus();
   void on_resp_focus(wxChildFocusEvent& e);
   void finish(uint64_t gen);
-  void send_http(Clock::time_point click);
+  // checked: run the consent / script / variable checks on the UI thread first (the path a fast
+  // send comes back to when its worker found something that needs the user).
+  void send_http(Clock::time_point click, bool checked = false);
+  void on_send_bounced(uint64_t gen);
+  // A consent / trust question is about to be asked: the response stops its clock and says so.
+  void before_prompt(const std::string& what);
   void send_grpc(Clock::time_point click);
+  void send_http_job(Clock::time_point click, std::shared_ptr<SavedRequest> rq, Workspace* ws, bool inherited,
+                     bool run_scripts, bool scripts_skipped, bool has_pre, bool has_post, bool fast);
+  void send_ws(Clock::time_point click);
+  void ws_send_message();
+  // Consent prompts shared by HTTP and WebSocket sends (env vars, uploads, Windows sign-in,
+  // proxy / CA / client certificate). False (error shown) when the user declined one.
+  bool confirm_http_consents(Workspace& ws, const SavedRequest& rq, bool* prompted);
+  // {{vars}} that would go out literally: the editor's "Not sent" banner (its "Send as written"
+  // resends), once per name in this tab. False when not sent.
+  bool confirm_unresolved(const Workspace& ws, const SavedRequest& rq, bool* prompted);
+  std::set<std::string> unresolved_ok_;
+  // The response view matching req_.kind (the WebSocket log or the HTTP / gRPC view): replaces
+  // the one built for another kind (a preview tab reused for a request of another kind).
+  void match_response_kind();
+  WsResponsePanel* ws_view();
+  void on_ws_handshake(uint64_t gen, std::shared_ptr<const WsHandshake> hs, std::shared_ptr<const HttpRequest> sent,
+                       double queue_ms);
+  void on_ws_batch(uint64_t gen, std::shared_ptr<std::vector<WsMessage>> batch);
+  void on_ws_closed(uint64_t gen, std::shared_ptr<const WsClose> c);
   void load_schema_now(const SavedRequest& r);
   void hold_schema_ui();
   void on_tab_key(wxKeyEvent& e);
@@ -193,7 +232,10 @@ class RequestTab : public wxPanel, public EditorHost {
   wxSplitterWindow* split_ = nullptr;
   HttpEditorPanel* http_ = nullptr;
   GrpcEditorPanel* grpc_ = nullptr;
+  WsEditorPanel* ws_ = nullptr;
   ResponsePanel* resp_ = nullptr;      // null until response() (see the constructor)
+  bool resp_ws_ = false;               // resp_ is the WebSocket view
+  bool ws_open_ = false;               // the WebSocket connection is open (in_flight_ too)
   wxPanel* resp_ph_ = nullptr;         // stands in for resp_ until then
   wxWeakRef<wxWindow> focus_keep_;     // focus to keep while the response view is being built
   Clock::time_point focus_guard_until_{};
@@ -204,6 +246,7 @@ class RequestTab : public wxPanel, public EditorHost {
 
   LastResponse last_;
   bool last_pending_ = false;                    // last_ restored, not shown yet
+  std::string shown_method_;                     // gRPC: the method last_ was received for
   bool grpc_parked_ = false;                     // see park_grpc()
   std::unique_ptr<SavedRequest> parked_schema_;  // the schema load held while parked
   std::shared_ptr<const GrpcSchema> restored_schema_;  // see restore_schema()

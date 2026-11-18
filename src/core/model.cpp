@@ -646,8 +646,10 @@ std::vector<SettingsRow> rows_from(const Value& o, const char* key) {
 //     "asserts": [as in a request],
 //     "pre_script": ..., "post_script": ... (as in a request) }
 // Every key but "version" only when set.
-// "network": { ca_file?, ca_off?, cert_file?, key_file?, cert_off?, proxy?, proxy_url?, no_proxy? }
-// (NetworkSettings; proxy is "env" | "system" | "none" | "url", absent = inherit). Only what is set.
+// "network": { ca_file?, ca_off?, cert_file?, key_file?, cert_off?, proxy?, proxy_url?, no_proxy?,
+//   max_redirects?, keep_method_on_redirect?, keep_auth_on_redirect?, encode_url?, tls_min_version? }
+// (NetworkSettings; proxy is "env" | "system" | "none" | "url", absent = inherit; tls_min_version
+// "default" | "1.0" | "1.1" | "1.2" | "1.3"). Only what is set.
 const char* proxy_mode_name(NetworkSettings::Proxy p) {
   switch (p) {
     case NetworkSettings::Proxy::Env: return "env";
@@ -657,6 +659,38 @@ const char* proxy_mode_name(NetworkSettings::Proxy p) {
     default: return "inherit";
   }
 }
+
+const char* tls_version_name(TlsVersion v) {
+  switch (v) {
+    case TlsVersion::Tls1_0: return "1.0";
+    case TlsVersion::Tls1_1: return "1.1";
+    case TlsVersion::Tls1_2: return "1.2";
+    case TlsVersion::Tls1_3: return "1.3";
+    default: return "default";
+  }
+}
+
+}  // namespace
+
+NetworkSettings with_http_options(NetworkSettings n, const HttpRequest& h) {
+  const HttpRequest def;
+  if (!n.max_redirects && h.max_redirects != def.max_redirects) n.max_redirects = h.max_redirects;
+  if (!n.keep_method && h.keep_method_on_redirect != def.keep_method_on_redirect) n.keep_method = h.keep_method_on_redirect;
+  if (!n.keep_auth && h.keep_auth_on_redirect != def.keep_auth_on_redirect) n.keep_auth = h.keep_auth_on_redirect;
+  if (!n.encode_url && h.encode_url != def.encode_url) n.encode_url = h.encode_url;
+  if (!n.tls_min && h.tls_min_version != def.tls_min_version) n.tls_min = h.tls_min_version;
+  return n;
+}
+
+void apply_network_options(const NetworkSettings& n, HttpRequest& h) {
+  if (n.max_redirects) h.max_redirects = std::clamp<long>(*n.max_redirects, 0, 100);
+  if (n.keep_method) h.keep_method_on_redirect = *n.keep_method;
+  if (n.keep_auth) h.keep_auth_on_redirect = *n.keep_auth;
+  if (n.encode_url) h.encode_url = *n.encode_url;
+  if (n.tls_min) h.tls_min_version = *n.tls_min;
+}
+
+namespace {
 
 Value network_value(const NetworkSettings& n, Alloc& a) {
   Value o(rapidjson::kObjectType);
@@ -669,6 +703,11 @@ Value network_value(const NetworkSettings& n, Alloc& a) {
     o.AddMember("proxy", Value(rapidjson::StringRef(proxy_mode_name(n.proxy))), a);
   if (!n.proxy_url.empty()) o.AddMember("proxy_url", jstr(n.proxy_url, a), a);
   if (!n.no_proxy.empty()) o.AddMember("no_proxy", jstr(n.no_proxy, a), a);
+  if (n.max_redirects) o.AddMember("max_redirects", static_cast<int64_t>(*n.max_redirects), a);
+  if (n.keep_method) o.AddMember("keep_method_on_redirect", *n.keep_method, a);
+  if (n.keep_auth) o.AddMember("keep_auth_on_redirect", *n.keep_auth, a);
+  if (n.encode_url) o.AddMember("encode_url", *n.encode_url, a);
+  if (n.tls_min) o.AddMember("tls_min_version", Value(rapidjson::StringRef(tls_version_name(*n.tls_min))), a);
   return o;
 }
 
@@ -689,6 +728,22 @@ NetworkSettings network_from(const Value& parent) {
                                                          : NetworkSettings::Proxy::Inherit;
   n.proxy_url = get_str(*o, "proxy_url");
   n.no_proxy = get_str(*o, "no_proxy");
+  if (const auto it = o->FindMember("max_redirects"); it != o->MemberEnd() && it->value.IsInt64())
+    n.max_redirects = static_cast<long>(std::clamp<int64_t>(it->value.GetInt64(), 0, 100));
+  auto opt_bool = [&](const char* k, std::optional<bool>& out) {
+    if (const auto it = o->FindMember(k); it != o->MemberEnd() && it->value.IsBool()) out = it->value.GetBool();
+  };
+  opt_bool("keep_method_on_redirect", n.keep_method);
+  opt_bool("keep_auth_on_redirect", n.keep_auth);
+  opt_bool("encode_url", n.encode_url);
+  if (const auto it = o->FindMember("tls_min_version"); it != o->MemberEnd() && it->value.IsString()) {
+    const std::string v = it->value.GetString();
+    if (v == "1.0") n.tls_min = TlsVersion::Tls1_0;
+    else if (v == "1.1") n.tls_min = TlsVersion::Tls1_1;
+    else if (v == "1.2") n.tls_min = TlsVersion::Tls1_2;
+    else if (v == "1.3") n.tls_min = TlsVersion::Tls1_3;
+    else if (v == "default") n.tls_min = TlsVersion::Default;
+  }
   return n;
 }
 
@@ -749,7 +804,8 @@ Value request_value(const SavedRequest& r, Alloc& a, bool lines, size_t body_cap
   o.AddMember("id", jstr(r.id, a), a);
   o.AddMember("name", jstr(r.name, a), a);
   if (!r.docs.empty()) o.AddMember("docs", jstr(r.docs, a), a);
-  o.AddMember("kind", Value(rapidjson::StringRef(r.kind == RequestKind::Grpc ? "grpc" : "http")), a);
+  if (r.no_cookie_jar) o.AddMember("no_cookie_jar", true, a);
+  o.AddMember("kind", Value(rapidjson::StringRef(request_kind_name(r.kind))), a);
   Value http = http_section(r.http, a, lines, body_cap);
   // A disabled header is [name, value, false], in its place.
   if (!r.disabled_headers.empty())
@@ -778,8 +834,9 @@ Value request_value(const SavedRequest& r, Alloc& a, bool lines, size_t body_cap
     http.AddMember("auth", auth, a);
   }
   if (r.auth.type != HttpAuth::Type::None) http.AddMember("auth_scheme", auth_scheme_value(r.auth, a), a);
-  if (!r.network.empty()) http.AddMember("network", network_value(r.network, a), a);
-  if (r.kind == RequestKind::Http || detail::json_compact(http) != default_http_json())
+  if (const NetworkSettings n = with_http_options(r.network, r.http); !n.empty())
+    http.AddMember("network", network_value(n, a), a);
+  if (r.kind != RequestKind::Grpc || detail::json_compact(http) != default_http_json())
     o.AddMember("http", http, a);
   Value grpc = grpc_section(r, a, lines, body_cap);
   if (r.kind == RequestKind::Grpc || detail::json_compact(grpc) != default_grpc_json())
@@ -809,7 +866,8 @@ void request_from_value(const Value& o, SavedRequest& r) {
   r.id = get_str(o, "id");
   r.name = get_str(o, "name");
   r.docs = get_str(o, "docs");
-  r.kind = get_str(o, "kind") == "grpc" ? RequestKind::Grpc : RequestKind::Http;
+  r.no_cookie_jar = get_bool(o, "no_cookie_jar", false);
+  r.kind = request_kind_from(get_str(o, "kind"));
   if (const Value* h = get_obj(o, "http")) {
     r.http.method = get_str(*h, "method", "GET");
     r.http.url = get_str(*h, "url");
@@ -930,6 +988,11 @@ bool badge_from_head(const std::string& head, RequestKind& kind, std::string& me
   if (head.compare(k + 9, ke - k - 9, "grpc") == 0) {
     kind = RequestKind::Grpc;
     method.clear();
+    return true;
+  }
+  if (head.compare(k + 9, ke - k - 9, "ws") == 0) {
+    kind = RequestKind::WebSocket;
+    method = "WS";
     return true;
   }
   kind = RequestKind::Http;
@@ -1211,13 +1274,13 @@ struct TreeIndex {
     if (!v[0].IsInt64() || !v[1].IsUint64() || !v[2].IsString() || !v[3].IsString()) return false;
     e.mtime = v[0].GetInt64();
     e.size = v[1].GetUint64();
-    e.kind = std::string_view(v[2].GetString(), v[2].GetStringLength()) == "grpc" ? RequestKind::Grpc : RequestKind::Http;
+    e.kind = request_kind_from(std::string_view(v[2].GetString(), v[2].GetStringLength()));
     e.method.assign(v[3].GetString(), v[3].GetStringLength());
     return true;
   }
   static void entry_value(Value& v, const Entry& e, Alloc& a) {
     v.PushBack(Value(e.mtime), a).PushBack(Value(e.size), a);
-    v.PushBack(Value(rapidjson::StringRef(e.kind == RequestKind::Grpc ? "grpc" : "http")), a);
+    v.PushBack(Value(rapidjson::StringRef(request_kind_name(e.kind))), a);
     v.PushBack(jstr(e.method, a), a);
   }
 
@@ -1390,7 +1453,7 @@ CollectionNode Workspace::tree(double badge_budget_ms) const {
     if (!(read_head(p, buf, 1024) && badge_from_head(buf, ne.kind, ne.method))) {
       if (auto r = load_request(p)) {
         ne.kind = r->kind;
-        ne.method = r->kind == RequestKind::Http ? r->http.method : "";
+        ne.method = r->kind == RequestKind::Http ? r->http.method : r->kind == RequestKind::WebSocket ? "WS" : "";
       }
     }
   };
@@ -1541,7 +1604,7 @@ void Workspace::note_saved(const fs::path& file, const SavedRequest& r) const {
   e.size = fs::file_size(file, ec);
   if (ec) return;
   e.kind = r.kind;
-  e.method = r.kind == RequestKind::Http ? r.http.method : "";
+  e.method = r.kind == RequestKind::Http ? r.http.method : r.kind == RequestKind::WebSocket ? "WS" : "";
   detail::TreeIndex& idx = tree_index();
   std::lock_guard<std::mutex> lock(idx.mu);
   idx.set(generic_utf8(file.lexically_relative(root_)), std::move(e));
@@ -1831,6 +1894,7 @@ namespace {
 struct NetworkResolved {
   NetworkSettings n;
   SettingsOrigin ca_from, cert_from, proxy_from;
+  SettingsOrigin max_redirects_from, keep_method_from, keep_auth_from, encode_url_from, tls_min_from;
 };
 
 NetworkResolved resolve_network(const NetworkSettings& own,
@@ -1839,6 +1903,7 @@ NetworkResolved resolve_network(const NetworkSettings& own,
   NetworkResolved out;
   const SettingsOrigin def{SettingsOrigin::Level::Collection, root, ""};
   out.ca_from = out.cert_from = out.proxy_from = def;
+  out.max_redirects_from = out.keep_method_from = out.keep_auth_from = out.encode_url_from = out.tls_min_from = def;
   out.n.proxy = NetworkSettings::Proxy::Env;
   bool ca = false, cert = false, proxy = false;
   auto take = [&](const NetworkSettings& s, const SettingsOrigin& o) {
@@ -1862,6 +1927,18 @@ NetworkResolved resolve_network(const NetworkSettings& own,
       out.n.no_proxy = s.no_proxy;
       out.proxy_from = o;
     }
+    // Redirect / URL / TLS options: each from the nearest level that sets it.
+    auto one = [&](const auto& v, auto& dst, SettingsOrigin& from) {
+      if (!dst && v) {
+        dst = v;
+        from = o;
+      }
+    };
+    one(s.max_redirects, out.n.max_redirects, out.max_redirects_from);
+    one(s.keep_method, out.n.keep_method, out.keep_method_from);
+    one(s.keep_auth, out.n.keep_auth, out.keep_auth_from);
+    one(s.encode_url, out.n.encode_url, out.encode_url_from);
+    one(s.tls_min, out.n.tls_min, out.tls_min_from);
   };
   take(own, SettingsOrigin{SettingsOrigin::Level::Request, {}, "Request"});
   for (const auto& [s, o] : outer) take(*s, o);
@@ -2104,6 +2181,11 @@ EffectiveSettings Workspace::effective_settings(const SavedRequest& r) const {
     e.ca_from = nr.ca_from;
     e.cert_from = nr.cert_from;
     e.proxy_from = nr.proxy_from;
+    e.max_redirects_from = nr.max_redirects_from;
+    e.keep_method_from = nr.keep_method_from;
+    e.keep_auth_from = nr.keep_auth_from;
+    e.encode_url_from = nr.encode_url_from;
+    e.tls_min_from = nr.tls_min_from;
   }
   // Asserts: the request's own, then the inherited ones (as resolved()).
   for (const auto& a : r.asserts) e.asserts.push_back({a, req});
@@ -2326,7 +2408,7 @@ struct HistoryListHandler : rapidjson::BaseReaderHandler<rapidjson::UTF8<>, Hist
   bool String(const char* s, SizeType n, bool) {
     if (field == When) h->when_iso.assign(s, n), ++seen;
     else if (field == Summary) h->summary.assign(s, n), ++seen;
-    else if (field == Kind) h->kind = std::string_view(s, n) == "grpc" ? RequestKind::Grpc : RequestKind::Http, ++seen;
+    else if (field == Kind) h->kind = request_kind_from(std::string_view(s, n)), ++seen;
     field = None;
     return true;
   }
@@ -2357,7 +2439,7 @@ bool parse_history_line(rapidjson::Reader& reader, const char* p, size_t n, Hist
   d.Parse(p, n);
   if (d.HasParseError() || !d.IsObject()) return false;
   h.when_iso = get_str(d, "when");
-  h.kind = get_str(d, "kind") == "grpc" ? RequestKind::Grpc : RequestKind::Http;
+  h.kind = request_kind_from(get_str(d, "kind"));
   h.summary = get_str(d, "summary");
   h.status = get_long(d, "status", 0);
   h.total_ms = get_num(d, "total_ms", 0);
@@ -2620,7 +2702,7 @@ void Workspace::append_history(const HistoryEntry& e) {
   d.SetObject();
   auto& a = d.GetAllocator();
   d.AddMember("when", jstr(e.when_iso.empty() ? now_iso() : e.when_iso, a), a);
-  d.AddMember("kind", Value(rapidjson::StringRef(e.kind == RequestKind::Grpc ? "grpc" : "http")), a);
+  d.AddMember("kind", Value(rapidjson::StringRef(request_kind_name(e.kind))), a);
   d.AddMember("summary", jstr(e.summary, a), a);
   d.AddMember("status", Value(static_cast<int64_t>(e.status)), a);
   d.AddMember("total_ms", e.total_ms, a);
@@ -3804,6 +3886,8 @@ std::optional<HttpRequest> Workspace::http_to_send(const SavedRequest& r, std::s
       if (!merged) x.http.headers.emplace_back("Cookie", jar_cookies);
     }
   }
+  // The workspace cookie jar (core/cookies.h): after the request's own and curl -b cookies.
+  if (!x.no_cookie_jar) detail::add_jar_cookies(*cookie_jar_for(root_), x.http.url, x.http.headers);
   // CA bundle, client certificate (mTLS) and proxy (NetworkSettings, already resolved and
   // expanded): all come from workspace files, so each is used only once the user approved it
   // (blocked_network_settings()); files read under the same policy as uploads, the passphrase
@@ -3848,6 +3932,8 @@ std::optional<HttpRequest> Workspace::http_to_send(const SavedRequest& r, std::s
     }
     x.http.no_proxy = n.no_proxy;
     x.http.proxy_url.clear();
+    // Redirect / URL / TLS options: a level that sets one decides, else the request's own field.
+    apply_network_options(n, x.http);
     if (has_ctl_break(n.proxy_url) || has_ctl_break(x.http.no_proxy)) {
       if (err) *err = "the proxy setting contains a line break: request not sent.";
       return std::nullopt;

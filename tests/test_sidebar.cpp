@@ -15,6 +15,8 @@
 #include "app/sidebar_files.cpp"
 #include "app/sidebar_fuzzy.cpp"
 #include "app/sidebar_import.cpp"
+#include "../tools/httpserver/http_server.h"
+#include "core/http_client.h"
 
 namespace fs = std::filesystem;
 using namespace watt;
@@ -966,4 +968,326 @@ TEST_CASE("environment files: a UTF-8 BOM is read, broken JSON is reported", "[s
   const std::string after((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
   CHECK(after == body);
   CHECK(remove_utf8_bom(t.dir / "environments" / "ok.json", nullptr));
+}
+
+// ---------------------------------------------------------------- cookie manager text helpers
+#include "app/sidebar_cookies_text.cpp"
+
+TEST_CASE("cookies: expiry parsing and labels", "[sidebar][cookies]") {
+  const int64_t now = 1795000000;  // 2026-11-18 ...
+  int64_t t = -1;
+  CHECK(parse_cookie_expiry("", now, t));
+  CHECK(t == 0);
+  CHECK(parse_cookie_expiry("  Session ", now, t));
+  CHECK(t == 0);
+  CHECK(parse_cookie_expiry("2026-12-31", now, t));
+  CHECK(t == 1798675200);
+  CHECK(parse_cookie_expiry("2026-12-31 23:59", now, t));
+  CHECK(t == 1798675200 + 23 * 3600 + 59 * 60);
+  CHECK(parse_cookie_expiry("2026-12-31T23:59:05Z", now, t));
+  CHECK(t == 1798675200 + 23 * 3600 + 59 * 60 + 5);
+  CHECK(parse_cookie_expiry("Thu, 31 Dec 2026 23:59:05 GMT", now, t));
+  CHECK(t == 1798675200 + 23 * 3600 + 59 * 60 + 5);
+  CHECK(parse_cookie_expiry("+2h", now, t));
+  CHECK(t == now + 7200);
+  CHECK(parse_cookie_expiry("+7d", now, t));
+  CHECK(t == now + 7 * 86400);
+  CHECK_FALSE(parse_cookie_expiry("tomorrow", now, t));
+  CHECK_FALSE(parse_cookie_expiry("2026-13-01", now, t));
+  CHECK_FALSE(parse_cookie_expiry("+h", now, t));
+  CHECK_FALSE(parse_cookie_expiry("+5w", now, t));
+
+  Cookie c;
+  c.name = "sid";
+  c.value = "abc";
+  c.domain = "api.example.com";
+  CHECK(cookie_expiry_label(c, now) == "Session");
+  CHECK(cookie_expiry_edit_text(c).empty());
+  c.expires = 1798675200 + 23 * 3600 + 59 * 60 + 5;
+  CHECK(cookie_expiry_edit_text(c) == "2026-12-31 23:59:05");
+  CHECK(cookie_expiry_label(c, now).rfind("2026-12-31 23:59 UTC (in ", 0) == 0);
+  CHECK(cookie_expiry_label(c, c.expires + 1).find("(expired)") != std::string::npos);
+  // The edit text parses back to the same instant.
+  CHECK(parse_cookie_expiry(cookie_expiry_edit_text(c), now, t));
+  CHECK(t == c.expires);
+}
+
+TEST_CASE("cookies: Set-Cookie line, flags and grouping", "[sidebar][cookies]") {
+  Cookie c;
+  c.name = "sid";
+  c.value = "abc";
+  c.domain = "example.com";
+  c.path = "/api";
+  c.host_only = false;
+  c.secure = true;
+  c.http_only = true;
+  c.same_site = SameSite::Lax;
+  c.expires = 1798761599;  // Thu, 31 Dec 2026 23:59:59 GMT
+  CHECK(set_cookie_line(c) ==
+        "sid=abc; Domain=example.com; Path=/api; Expires=Thu, 31 Dec 2026 23:59:59 GMT; Secure; HttpOnly; SameSite=Lax");
+  CHECK(cookie_flags_label(c) == "Secure  HttpOnly  SameSite=Lax");
+  // The line goes through the jar's own rules and comes back as the same cookie.
+  CookieJar jar;
+  REQUIRE(jar.set_from_header(cookie_origin_url("example.com"), set_cookie_line(c), nullptr, 1795000000));
+  const auto got = jar.list(1795000000);
+  REQUIRE(got.size() == 1);
+  CHECK(got[0].name == "sid");
+  CHECK(got[0].path == "/api");
+  CHECK(got[0].expires == c.expires);
+  CHECK(got[0].secure);
+  CHECK(got[0].http_only);
+  CHECK_FALSE(got[0].host_only);
+  CHECK(got[0].same_site == SameSite::Lax);
+
+  CHECK(cookie_origin_url(".Example.COM") == "https://example.com/");
+  CHECK(cookie_origin_url("") == "");
+  CHECK(cookie_origin_url("evil.com/path") == "");
+  CHECK(cookie_origin_url("a b") == "");
+
+  std::vector<Cookie> list(3);
+  list[0].domain = "a.test";
+  list[0].name = "x";
+  list[1].domain = "b.test";
+  list[1].name = "Token";
+  list[1].value = "zzz";
+  list[2].domain = "a.test";
+  list[2].name = "y";
+  auto g = group_cookies(list, "");
+  REQUIRE(g.size() == 2);
+  CHECK(g[0].domain == "a.test");
+  CHECK(g[0].cookies == std::vector<size_t>{0, 2});
+  g = group_cookies(list, "token");
+  REQUIRE(g.size() == 1);
+  CHECK(g[0].domain == "b.test");
+  g = group_cookies(list, " ZZ ");
+  REQUIRE(g.size() == 1);
+  g = group_cookies(list, "A.TE");
+  REQUIRE(g.size() == 1);
+  CHECK(g[0].cookies.size() == 2);
+}
+
+TEST_CASE("history: snapshot origins round-trip and stay inside the workspace", "[sidebar][history]") {
+  TempWs t;
+  std::map<std::string, std::string> m;
+  m["0123456789abcdef.req.json"] = "api/users/Get user.req.json";
+  m["fedcba9876543210.req.json"] = "api/(unsaved).req.json";
+  m["1111111111111111.req.json"] = "../outside.req.json";
+  m["2222222222222222.req.json"] = "C:/Windows/x.req.json";
+  m["3333333333333333.req.json"] = ".watt/snapshots/x.req.json";
+  m["4444444444444444.req.json"] = "/abs.req.json";
+  m["..\\evil.req.json"] = "api/x.req.json";
+  REQUIRE(save_snapshot_origins(t.dir, m));
+  const auto back = load_snapshot_origins(t.dir);
+  CHECK(back.size() == 2);
+  CHECK(back.at("0123456789abcdef.req.json") == "api/users/Get user.req.json");
+  CHECK(back.at("fedcba9876543210.req.json") == "api/(unsaved).req.json");
+  CHECK(fs::exists(t.dir / ".watt" / "snapshots" / "origins.json"));
+  // A planted file with hostile entries: only the safe ones are read.
+  {
+    std::ofstream out(t.dir / ".watt" / "snapshots" / "origins.json", std::ios::binary | std::ios::trunc);
+    out << R"({"version":1,"origins":{"aaaaaaaaaaaaaaaa.req.json":"a/b.req.json","bbbbbbbbbbbbbbbb.req.json":"a/../../x","c":5}})";
+  }
+  const auto planted = load_snapshot_origins(t.dir);
+  CHECK(planted.size() == 1);
+  CHECK(planted.count("aaaaaaaaaaaaaaaa.req.json") == 1);
+  CHECK(safe_relative_origin("a/b/c.req.json"));
+  CHECK_FALSE(safe_relative_origin("a//b"));
+  CHECK_FALSE(safe_relative_origin("\\\\server\\share\\x"));
+  CHECK_FALSE(safe_relative_origin(".git/config"));
+}
+
+// Folder settings saved from the sidebar (the dialog writes through a copy of the workspace on a
+// worker): the next send from an open tab resolves the new folder variable at once, also when
+// the file keeps its size (":18915" -> ":18916") and is rewritten within the same clock tick.
+TEST_CASE("folder settings: a saved folder variable is what the next send uses", "[sidebar][folders]") {
+  TempWs t;
+  const fs::path folder = t.dir / "petstore";
+  fs::create_directories(folder);
+  SavedRequest r = saved(t.ws, folder / "get-pet.req.json", "Get pet");
+  r.http.url = "{{baseUrl}}/json/1";
+  REQUIRE(t.ws.save_request(r));
+  auto set_base = [&](const std::string& v) {
+    FolderSettings s = t.ws.folder_settings(folder).value_or(FolderSettings{});
+    s.vars = {SettingsRow{"baseUrl", v, "", true}};
+    const Workspace copy(t.ws);  // as edit_folder_settings saves it
+    std::string err;
+    REQUIRE(copy.save_folder_settings(folder, s, &err));
+  };
+  set_base("http://127.0.0.1:18915");
+  CHECK(t.ws.expanded(r).http.url == "http://127.0.0.1:18915/json/1");  // read once: now cached
+  set_base("http://127.0.0.1:18916");
+  CHECK(t.ws.expanded(r).http.url == "http://127.0.0.1:18916/json/1");
+  set_base("http://localhost:18916");
+  CHECK(t.ws.expanded(r).http.url == "http://localhost:18916/json/1");
+  const EffectiveSettings eff = t.ws.effective_settings(r);
+  bool found = false;
+  for (const auto& v : eff.vars)
+    if (v.row.name == "baseUrl" && !v.overridden) found = v.row.value == "http://localhost:18916";
+  CHECK(found);
+}
+
+TEST_CASE("import: variables the requests use but nothing defines") {
+  ImportResult r;
+  r.format = "Postman Collection v2.1";
+  r.root.name = "Petstore";
+  r.root.vars.push_back({"baseUrl", "http://127.0.0.1:18917", "", true});
+  r.root.vars.push_back({"off", "1", "", false});  // disabled: does not define
+  SavedRequest a;
+  a.http.url = "{{baseUrl}}/json/{{ id }}?t={{$timestamp}}&e={{process.env.HOME}}";
+  a.http.headers.push_back({"X-Trace", "{{trace}}"});
+  a.http.headers.push_back({"X-Off", "{{disabledOnly}}"});
+  a.disabled_headers.insert(1);
+  a.http.body = "{\"o\":\"{{off}}\",\"g\":\"{{fromGlobals}}\"}";
+  r.root.requests.push_back(a);
+  ImportFolder sub;
+  sub.name = "users";
+  sub.vars.push_back({"id", "7", "", true});  // only defined below this folder
+  SavedRequest b;
+  b.http.url = "{{baseUrl}}/users/{{id}}";
+  b.basic_auth.user = "{{envUser}}";
+  sub.requests.push_back(b);
+  r.root.folders.push_back(sub);
+  Environment e;
+  e.name = "dev";
+  e.vars["envUser"] = "u";
+  r.envs.push_back(e);
+  const auto u = undefined_import_vars(r, {"fromGlobals"});
+  CHECK(u == std::vector<std::string>{"id", "trace", "off"});
+}
+
+TEST_CASE("import: Postman folder auth becomes the folder's setting, inherited by its requests", "[sidebar][import]") {
+  const std::string pm = R"PM({
+  "info": { "name": "Shop", "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json" },
+  "item": [
+    { "name": "users",
+      "auth": { "type": "bearer", "bearer": [ { "key": "token", "value": "{{token}}" } ] },
+      "item": [
+        { "name": "List users", "request": { "method": "GET", "url": "{{baseUrl}}/users" } },
+        { "name": "Get user", "request": { "method": "GET", "url": "{{baseUrl}}/users/1", "auth": { "type": "inherit" } } }
+      ] },
+    { "name": "orders",
+      "auth": { "type": "bearer", "bearer": [ { "key": "token", "value": "{{orderToken}}" } ] },
+      "item": [
+        { "name": "List orders", "request": { "method": "GET", "url": "{{baseUrl}}/orders" } },
+        { "name": "Public order", "request": { "method": "GET", "url": "{{baseUrl}}/orders/p", "auth": { "type": "noauth" } } }
+      ] }
+  ]
+})PM";
+  std::string err;
+  auto r = parse_collection_text(pm, &err);
+  REQUIRE(r);
+  REQUIRE(r->root.folders.size() == 2);
+  const ImportFolder& users = r->root.folders[0];
+  REQUIRE(users.headers.size() == 1);
+  CHECK(users.headers[0].name == "Authorization");
+  CHECK(users.headers[0].value == "Bearer {{token}}");
+  const SavedRequest* list = find_req(r->root, "List users");
+  REQUIRE(list);
+  CHECK(header(*list, "Authorization") == "<none>");  // not a copy: inherited
+  CHECK(list->auth.type == HttpAuth::Type::Inherit);
+  // A request under "orders" says "no auth": the folder's token stays on each other request.
+  const ImportFolder& orders = r->root.folders[1];
+  CHECK(orders.headers.empty());
+  const SavedRequest* lo = find_req(r->root, "List orders");
+  REQUIRE(lo);
+  CHECK(header(*lo, "Authorization") == "Bearer {{orderToken}}");
+  const SavedRequest* pub = find_req(r->root, "Public order");
+  REQUIRE(pub);
+  CHECK(header(*pub, "Authorization") == "<none>");
+
+  // Written: users/folder.json holds the header; a request there resolves with it, and a later
+  // change of the folder's token reaches every request.
+  TempWs t;
+  auto w = write_import(t.ws, t.dir, *r);
+  CHECK(w.requests == 4);
+  const fs::path ufolder = w.top / "users";
+  auto s = t.ws.folder_settings(ufolder);
+  REQUIRE(s);
+  REQUIRE(s->headers.size() == 1);
+  CHECK(s->headers[0].value == "Bearer {{token}}");
+  auto back = t.ws.load_request(ufolder / "list-users.req.json");
+  REQUIRE(back);
+  CHECK(header(t.ws.resolved(*back), "Authorization") == "Bearer {{token}}");
+  s->headers[0].value = "Bearer {{other}}";
+  REQUIRE(t.ws.save_folder_settings(ufolder, *s, &err));
+  Workspace again = *Workspace::open(t.dir, &err);
+  auto back2 = again.load_request(ufolder / "get-user.req.json");
+  REQUIRE(back2);
+  CHECK(header(again.resolved(*back2), "Authorization") == "Bearer {{other}}");
+}
+
+TEST_CASE("quick open: a number in the query matches unbroken", "[sidebar][fuzzy]") {
+  FuzzyQuery q("2 svc150");
+  int s = 0;
+  const std::string scattered = "service-152/delete resource 0 of svc152";
+  CHECK_FALSE(q.match(scattered, 12, &s, nullptr));  // 1,5 from "152", 0 from "resource 0"
+  CHECK(FuzzyQuery("2 svc152").match("service-152/delete resource 2 of svc152", 12, &s, nullptr));
+  CHECK(FuzzyQuery("svc150").match("service-150/delete resource 5 of svc150", 12, &s, nullptr));
+  CHECK(FuzzyQuery("ep0777").match("group 7/Endpoint 0777", 8, &s, nullptr));
+  CHECK(numbers_present("v2", "get order v2"));
+  CHECK_FALSE(numbers_present("150", "svc152 0"));
+  CHECK(numbers_present("a1b2", "x"));  // single digits may still be scattered
+}
+
+TEST_CASE("filter: a numeric URL host and its port are not searched", "[sidebar][fuzzy]") {
+  CHECK(url_search_text("http://127.0.0.1:18080/echo") == "http:///echo");
+  CHECK(url_search_text("https://[::1]:8443/v1/users?id=7") == "https:///v1/users?id=7");
+  CHECK(url_search_text("http://localhost:8080/json/7") == "http://localhost/json/7");
+  CHECK(url_search_text("https://api.github.com/repos") == "https://api.github.com/repos");
+  CHECK(url_search_text("{{baseUrl}}/orders/7") == "{{baseUrl}}/orders/7");
+  CHECK(url_search_text("http://{{host}}:{{port}}/x") == "http://{{host}}:{{port}}/x");
+  CHECK(url_search_text("127.0.0.1:8080/items") == "/items");
+  CHECK(url_search_text("users/42") == "users/42");
+  CHECK(url_search_text("42/items") == "42/items");
+  CHECK(url_search_text("") == "");
+  // "7" no longer matches every request on 127.0.0.1, but still one with 7 in its path.
+  CHECK(url_search_text("http://127.0.0.1:18080/echo").find('7') == std::string::npos);
+  CHECK(url_search_text("http://127.0.0.1:18080/json/7").find('7') != std::string::npos);
+}
+
+// The critic's restart case at the model level: a request whose host, port and Authorization
+// come only from folder.json, saved, then the workspace opened again from disk (a relaunch: no
+// state carried over) and sent.
+TEST_CASE("restart: a request whose URL host comes only from folder.json is sent there", "[sidebar][folders]") {
+  static httpserver::Server srv;
+  static const bool up = srv.start(0);
+  REQUIRE(up);
+  TempWs t;
+  const fs::path api = t.dir / "Shop API", orders = api / "orders";
+  fs::create_directories(orders);
+  {
+    FolderSettings top;
+    top.vars = {SettingsRow{"baseUrl", "http://127.0.0.1:" + std::to_string(srv.port()), "", true},
+                SettingsRow{"token", "dev-token-123", "", true}};
+    REQUIRE(t.ws.save_folder_settings(api, top));
+    FolderSettings o;
+    o.headers = {SettingsRow{"Authorization", "Bearer {{token}}", "", true}};
+    REQUIRE(t.ws.save_folder_settings(orders, o));
+    SavedRequest r = saved(t.ws, orders / "create-order.req.json", "Create order");
+    r.http.method = "POST";
+    r.http.url = "{{baseUrl}}/echo";
+    r.http.body = "{\"items\":[1,2]}";
+    REQUIRE(t.ws.save_request(r));
+  }
+  // Relaunch: a fresh Workspace from disk.
+  std::string err;
+  auto ws = Workspace::open(t.dir, &err);
+  REQUIRE(ws);
+  auto r = ws->load_request(orders / "create-order.req.json", &err);
+  REQUIRE(r);
+  const EffectiveSettings eff = ws->effective_settings(*r);
+  bool base = false, header = false;
+  for (const auto& v : eff.vars) base = base || v.row.name == "baseUrl";
+  for (const auto& h : eff.headers) header = header || h.row.name == "Authorization";
+  CHECK(base);
+  CHECK(header);
+  auto req = ws->http_to_send(*r, &err);
+  REQUIRE(req);
+  CHECK(req->url == "http://127.0.0.1:" + std::to_string(srv.port()) + "/echo");
+  HttpClient c;
+  const HttpResponse resp = c.send(*req);
+  REQUIRE(resp.ok);
+  CHECK(resp.status == 200);
+  CHECK(std::string(resp.body).find("Bearer dev-token-123") != std::string::npos);
+  CHECK(std::string(resp.body).find("POST") != std::string::npos);
 }

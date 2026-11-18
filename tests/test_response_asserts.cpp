@@ -386,6 +386,22 @@ TEST_CASE("run keys and the extras store", "[response_asserts]") {
   // Keys that are not run_key output never reach the file system.
   keep_extras(root, "../../evil", x);
   CHECK_FALSE(find_extras(root, "../../evil"));
+  CHECK_FALSE(load_kept_body(root, "../../evil", 3));
+
+  // The whole body is kept next to the extras and read back only at exactly its size.
+  auto full = std::make_shared<watt::HttpResponse>();
+  full->body = std::string(200000, 'b');
+  const std::string k2 = run_key("GET https://x/big", 200, 12.5);
+  keep_extras(root, k2, x, full);
+  CHECK(find_extras_cached(k2)->key == k2);
+  const fs::path bf = root / ".watt" / "response-bodies" / (k2 + ".body");
+  for (int i = 0; i < 200 && !(fs::exists(bf) && fs::file_size(bf) == 200000); ++i)
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  const auto back = load_kept_body(root, k2, 200000);
+  REQUIRE(back);
+  CHECK(*back == full->body);
+  CHECK_FALSE(load_kept_body(root, k2, 199999));
+  CHECK_FALSE(load_kept_body(root, run_key("GET https://x/other", 200, 1), 200000));
   fs::remove_all(root);
 }
 
@@ -506,4 +522,347 @@ TEST_CASE("a saved request restores its own last run, not another one with the s
   keep_runs_of(ws, other, summary, h);
   CHECK(h.empty());
   fs::remove_all(root, ec);
+}
+
+// ------------------------------------------------------------------ Cookies tab (response_cookies)
+
+#include "app/response_cookies.cpp"
+
+TEST_CASE("set-cookie rows read like the jar stores them", "[response_cookies]") {
+  const int64_t now = 1'800'000'000;
+  const std::vector<std::pair<std::string, std::string>> h = {
+      {"Content-Type", "text/plain"},
+      {"Set-Cookie", "sid=abc123; Path=/; HttpOnly; SameSite=Lax"},
+      {"set-cookie", "theme=dark; Max-Age=3600; Domain=.example.com"},
+      {"SET-COOKIE", "old=1; Max-Age=0"},
+      {"Set-Cookie", "evil=1; Domain=other.org"},
+      {"Set-Cookie", "sec=1; Secure"},
+      {"Set-Cookie", "part=1; Secure; Partitioned; Path=/a"},
+  };
+  const auto rows = set_cookie_rows(h, "http://api.example.com/v1/users?x=1", now);
+  REQUIRE(rows.size() == 6);
+  CHECK(rows[0].name == "sid");
+  CHECK(rows[0].value == "abc123");
+  CHECK(rows[0].domain == "api.example.com");
+  CHECK(rows[0].host_only);
+  CHECK(rows[0].path == "/");
+  CHECK(rows[0].expires == "Session");
+  CHECK(cookie_flags_text(rows[0]) == "HttpOnly Lax");
+  CHECK(cookie_fate_text(rows[0]) == "stored");
+  CHECK(rows[0].size == 9);
+
+  CHECK(rows[1].domain == "example.com");
+  CHECK_FALSE(rows[1].host_only);
+  CHECK(rows[1].path == "/v1");  // the default path of /v1/users
+  CHECK(rows[1].expires == "in 1 h");
+  CHECK(rows[1].expires_at == now + 3600);
+
+  CHECK(rows[2].fate == SetCookieRow::Fate::Deletes);
+  CHECK(cookie_fate_text(rows[2]) == "deletes it");
+
+  CHECK(rows[3].fate == SetCookieRow::Fate::Ignored);
+  CHECK(cookie_fate_text(rows[3]) == "ignored: Domain does not match the request host");
+  CHECK(rows[3].domain == "other.org");
+
+  // Secure from plain http to a non-loopback host: the jar ignores it.
+  CHECK(rows[4].fate == SetCookieRow::Fate::Ignored);
+  CHECK(rows[4].secure);
+
+  CHECK(rows[5].partitioned);
+  CHECK(cookie_flags_text(rows[5]) == "Secure Partitioned");
+}
+
+TEST_CASE("set-cookie rows from https and loopback, and expiry texts", "[response_cookies]") {
+  const int64_t now = 1'800'000'000;
+  auto rows = set_cookie_rows({{"Set-Cookie", "__Host-a=1; Secure; Path=/"}}, "https://x.test/", now);
+  REQUIRE(rows.size() == 1);
+  CHECK(rows[0].fate == SetCookieRow::Fate::Stored);
+  rows = set_cookie_rows({{"Set-Cookie", "__Host-a=1; Secure; Path=/x"}}, "https://x.test/", now);
+  CHECK(rows[0].fate == SetCookieRow::Fate::Ignored);
+  // Loopback http counts as secure (core/cookies.h); the port is not part of the domain.
+  rows = set_cookie_rows({{"Set-Cookie", "s=1; Secure"}}, "http://127.0.0.1:18080/a", now);
+  CHECK(rows[0].fate == SetCookieRow::Fate::Stored);
+  CHECK(rows[0].domain == "127.0.0.1");
+  CHECK(set_cookie_rows({{"X-Other", "a=1"}}, "http://h/", now).empty());
+  CHECK(cookie_expiry_text(0, now) == "Session");
+  CHECK(cookie_expiry_text(now - 5, now) == "expired");
+  CHECK(cookie_expiry_text(now + 30, now) == "in 30 s");
+  CHECK(cookie_expiry_text(now + 600, now) == "in 10 min");
+  CHECK(cookie_expiry_text(now + 3 * 86400, now) == "in 3 days");
+  CHECK(cookie_expiry_text(1'900'000'000 + 0, 1'800'000'000).size() == 10);  // a date
+}
+
+// ------------------------------------------------------------------ Visualize (pm.visualizer)
+
+#include "app/response_visualize.cpp"
+#include "core/asserts.h"
+#include "core/script.h"
+
+TEST_CASE("handlebars templates render like Postman's visualizer", "[response_visualize]") {
+  const std::string data =
+      R"({"response":[{"name":"a<b","n":1,"tags":["x","y"]},{"name":"c","n":0,"tags":[]}],"title":"T","empty":[],)"
+      R"("obj":{"k1":"v1","k2":"v2"},"zero":0,"f":1.5})";
+  auto render = [&](const std::string& t) {
+    VisualizeResult r = render_handlebars(t, data);
+    INFO(r.error);
+    REQUIRE(r.ok);
+    return r.html;
+  };
+  CHECK(render("<table>{{#each response}}<tr><td>{{name}}</td></tr>{{/each}}</table>") ==
+        "<table><tr><td>a&lt;b</td></tr><tr><td>c</td></tr></table>");
+  CHECK(render("{{{response.0.name}}}|{{& response.[0].name}}|{{response.1.name}}") == "a<b|a<b|c");
+  CHECK(render("{{#each response}}{{@index}}:{{n}}{{#if @first}}F{{/if}}{{#if @last}}L{{/if}},{{/each}}") ==
+        "0:1F,1:0L,");
+  CHECK(render("{{#each obj}}{{@key}}={{this}};{{/each}}") == "k1=v1;k2=v2;");
+  CHECK(render("{{#each empty}}x{{else}}none{{/each}}") == "none");
+  CHECK(render("{{#if zero}}y{{else}}n{{/if}}{{#if empty}}y{{^}}n{{/if}}{{#unless title}}u{{/unless}}") == "nn");
+  CHECK(render("{{#if missing}}1{{else if title}}2{{else}}3{{/if}}") == "2");
+  CHECK(render("{{#with obj}}{{k2}}{{/with}}") == "v2");
+  CHECK(render("{{#each response}}{{#each tags}}{{../name}}-{{this}} {{/each}}{{/each}}") == "a&lt;b-x a&lt;b-y ");
+  CHECK(render("{{#each response as |row i|}}{{i}}{{row.name}}{{/each}}") == "0a&lt;b1c");
+  CHECK(render("{{response.length}} {{response.0.tags}} {{f}} {{@root.title}}") == "2 x,y 1.5 T");
+  CHECK(render("{{lookup obj 'k1'}}{{! comment }}{{!-- {{x}} --}}") == "v1");
+  CHECK(render("a  {{~title~}}  b \\{{raw}}") =="aTb {{raw}}");
+  CHECK(render("{{#response}}[{{name}}]{{/response}}{{^empty}}E{{/empty}}") == "[a&lt;b][c]E");
+  CHECK(render("{{title}} = '\"`") == "T = '\"`");
+  CHECK(render("{{#with title}}{{.}}{{/with}}") == "T");
+
+  // Errors say where; unknown helpers render nothing with a warning.
+  VisualizeResult e = render_handlebars("<p>\n{{#each response}}x", data);
+  CHECK_FALSE(e.ok);
+  CHECK(e.error.find("line 2") != std::string::npos);
+  e = render_handlebars("{{#if a}}x{{/each}}", data);
+  CHECK_FALSE(e.ok);
+  e = render_handlebars("{{title", data);
+  CHECK_FALSE(e.ok);
+  e = render_handlebars("{{x}}", "{not json");
+  CHECK_FALSE(e.ok);
+  e = render_handlebars("{{formatDate title}}|{{> part}}", data);
+  REQUIRE(e.ok);
+  CHECK(e.html == "|");
+  CHECK(e.warnings.size() == 2);
+
+  // The output stops at the cap.
+  std::string big = "{\"a\":[";
+  for (int i = 0; i < 5000; ++i) big += (i ? ",\"" : "\"") + std::string(100, 'x') + "\"";
+  big += "]}";
+  e = render_handlebars("{{#each a}}{{this}}{{/each}}", big, 64 << 10);
+  REQUIRE(e.ok);
+  CHECK(e.truncated);
+  CHECK(e.html.size() < (64 << 10) + 200);
+
+  // The page allows inline styles and data: images only.
+  const std::string page = visualize_page("<b>x</b>");
+  CHECK(page.find("default-src 'none'") != std::string::npos);
+  CHECK(page.find("script-src") == std::string::npos);
+  CHECK(page.find("<b>x</b>") != std::string::npos);
+}
+
+TEST_CASE("pm.visualizer.set keeps the template and data, and later tests still run", "[response_visualize]") {
+  using namespace watt;
+  namespace fs = std::filesystem;
+  std::error_code ec;
+  const fs::path cfg = fs::temp_directory_path() / "watt_rv_vis_cfg";
+  const fs::path root = fs::temp_directory_path() / "watt_rv_vis_ws";
+  fs::remove_all(cfg, ec);
+  fs::remove_all(root, ec);
+  Workspace::set_user_config_dir(cfg);
+  Workspace ws = Workspace::create(root);
+  REQUIRE(ws.trust_scripts(true));
+  SavedRequest q;
+  q.id = "vis-1";
+  q.name = "Items";
+  q.http.method = "GET";
+  q.http.url = "http://example.invalid/items";
+  q.post_script =
+      "var t='<table>{{#each response}}<tr><td>{{name}}</td></tr>{{/each}}</table>';\n"
+      "pm.visualizer.set(t, {response: pm.response.json()});\n"
+      "pm.test('ok', () => pm.expect(pm.response.code).to.equal(200));\n";
+  HttpResponse resp;
+  resp.ok = true;
+  resp.status = 200;
+  resp.headers.add("Content-Type", "application/json");
+  resp.body = R"([{"name":"one"},{"name":"two"}])";
+  ResponseData rd(resp);
+  ScriptRun run = run_post_script(ws, q, rd);
+  INFO(run.error);
+  CHECK(run.ok);
+  REQUIRE(run.tests.size() == 1);
+  CHECK(run.tests[0].pass);
+  REQUIRE(run.visualizer);
+  CHECK(run.visualizer_data == R"({"response":[{"name":"one"},{"name":"two"}]})");
+  const VisualizeResult r = render_handlebars(run.visualizer_template, run.visualizer_data);
+  CHECK(r.html == "<table><tr><td>one</td></tr><tr><td>two</td></tr></table>");
+
+  // clear() drops it; a circular data object is an error kept on the run, not an exception.
+  q.post_script = "pm.visualizer.set('x'); pm.visualizer.clear(); pm.test('after', () => {});";
+  ScriptRun c = run_post_script(ws, q, rd);
+  CHECK(c.ok);
+  CHECK_FALSE(c.visualizer);
+  CHECK(c.tests.size() == 1);
+  q.post_script = "var o = {}; o.o = o; pm.visualizer.set('{{a}}', o); pm.test('after', () => {});";
+  ScriptRun cyc = run_post_script(ws, q, rd);
+  CHECK(cyc.ok);
+  CHECK(cyc.visualizer);
+  CHECK(cyc.visualizer_error.find("JSON") != std::string::npos);
+  CHECK(cyc.tests.size() == 1);
+
+  // A restored run carries the template and the data.
+  RunExtras x;
+  x.post = std::make_shared<ScriptRun>(run);
+  CHECK_FALSE(extras_from_json(extras_to_json(x))->visualize);
+  x.visualize = true;  // the run was shown as Visualize: reopened that way
+  const auto back = extras_from_json(extras_to_json(x));
+  REQUIRE(back);
+  CHECK(back->visualize);
+  REQUIRE(back->post);
+  CHECK(back->post->visualizer);
+  CHECK(back->post->visualizer_template == run.visualizer_template);
+  CHECK(back->post->visualizer_data == run.visualizer_data);
+  fs::remove_all(root, ec);
+  fs::remove_all(cfg, ec);
+}
+
+#include "app/response_sse.cpp"
+
+TEST_CASE("event streams are parsed per the WHATWG rules", "[response_sse]") {
+  using namespace watt::app::rv;
+  const auto ev = parse_sse("\xEF\xBB\xBF: hello\r\nid: 7\r\nevent: tick\r\ndata: {\"n\":1}\r\ndata: two\r\n\r\n"
+                            "data: plain\n\nretry: 1500\ndata:x\n\nevent: no-data\n\n");
+  REQUIRE(ev.size() == 3);
+  CHECK(ev[0].id == "7");
+  CHECK(ev[0].type == "tick");
+  CHECK(ev[0].data == "{\"n\":1}\ntwo");
+  CHECK(ev[0].at_ms < 0);
+  CHECK(ev[1].type.empty());
+  CHECK(ev[1].data == "plain");
+  CHECK(ev[2].retry == 1500);
+  CHECK(ev[2].data == "x");
+  // An event without a blank line after it is not dispatched (the stream may still be running).
+  CHECK(parse_sse("data: a\n\ndata: b\n").size() == 1);
+
+  // CRLF split across chunks, a BOM split across chunks, offsets from feed().
+  SseParser p;
+  std::vector<SseEvent> out;
+  p.feed("\xEF\xBB", 2, 1.0, out);
+  p.feed("\xBF" "data: a\r", 9, 2.0, out);
+  p.feed("\n\r", 2, 3.0, out);
+  p.feed("\n: c\n", 5, 4.0, out);
+  REQUIRE(out.size() == 1);
+  CHECK(out[0].data == "a");
+  CHECK(out[0].at_ms == 3.0);
+  CHECK(p.comments() == 1);
+
+  CHECK(sniff_sse(": keepalive\n") == 1);
+  CHECK(sniff_sse("\n\nevent: x\n") == 1);
+  CHECK(sniff_sse("da") == -1);
+  CHECK(sniff_sse("{\"a\":1}") == 0);
+  CHECK(sniff_sse("<html>") == 0);
+  CHECK(is_event_stream("text/event-stream"));
+  CHECK(is_event_stream(" Text/Event-Stream; charset=utf-8"));
+  CHECK_FALSE(is_event_stream("text/event-streams"));
+  CHECK_FALSE(is_event_stream("application/json"));
+  CHECK(one_line_preview("{\n  \"a\": 1\n}") == "{ \"a\": 1 }");
+  CHECK(one_line_preview(std::string(300, 'x'), 10).size() == 13);  // 10 + the ellipsis
+}
+
+TEST_CASE("the body tap batches events and keeps the start of a cut download", "[response_sse]") {
+  using namespace watt::app::rv;
+  int posts = 0;
+  SseTap t(SteadyClock::now(), [&] { ++posts; });
+  CHECK(t.first_ms() < 0);
+  t.feed("da", 2);  // undecided: held
+  CHECK_FALSE(t.is_sse());
+  CHECK_FALSE(t.is_off());
+  t.feed("ta: 1\n\nid: 9\ndata: 2\n\n", 22);
+  CHECK(t.is_sse());
+  CHECK(t.first_ms() >= 0);
+  t.feed(": ping\n\ndata: 3\n\n", 17);
+  CHECK(posts == 1);  // one post until the UI drains
+  SseTap::Batch b = t.drain();
+  REQUIRE(b.events.size() == 3);
+  CHECK(b.events[0].data == "1");
+  CHECK(b.events[1].id == "9");
+  CHECK(b.events[0].at_ms >= 0);
+  CHECK(b.raw == "data: 1\n\nid: 9\ndata: 2\n\n: ping\n\ndata: 3\n\n");
+  CHECK(b.comments == 1);
+  t.feed("data: 4\n\n", 9);
+  CHECK(posts == 2);
+  CHECK(t.drain().events.size() == 1);
+  CHECK(t.bytes() == 2 + 22 + 17 + 9);
+  CHECK(t.partial().empty());
+
+  // Not an event stream: off for good, its first bytes kept (a cancel shows them).
+  int posts2 = 0;
+  SseTap j(SteadyClock::now(), [&] { ++posts2; });
+  j.feed("{\"a\"", 4);
+  j.feed(":1}", 3);
+  CHECK(j.is_off());
+  CHECK(j.partial() == "{\"a\":1}");
+  CHECK(j.bytes() == 7);
+  const std::string big(SseTap::kPartialMax, 'x');
+  j.feed(big.data(), big.size());
+  CHECK(j.partial().size() == SseTap::kPartialMax);
+  CHECK(j.bytes() == 7 + big.size());
+  CHECK(posts2 == 0);
+}
+
+TEST_CASE("the response head reaches the view before the body", "[response_sse]") {
+  using namespace watt::app::rv;
+  int heads = 0;
+  SseTap t(SteadyClock::now(), [] {}, [&] { ++heads; });
+  CHECK(t.head_response() == nullptr);
+  CHECK(t.head_ms() < 0);
+  auto h = std::make_shared<watt::HttpResponse>();
+  h->ok = true;
+  h->status = 200;
+  h->headers.add("Content-Type", "text/event-stream; charset=utf-8");
+  h->headers.add("Cache-Control", "no-cache");
+  t.head(h);
+  CHECK(heads == 1);
+  REQUIRE(t.head_response() != nullptr);
+  CHECK(t.head_response()->status == 200);
+  CHECK(t.head_response()->headers.size() == 2);
+  CHECK(t.head_ms() >= 0);
+  // Declared an event stream: decided before any body byte (no sniffing).
+  CHECK(t.is_sse());
+  t.feed("data: x\n\n", 9);
+  CHECK(t.drain().events.size() == 1);
+
+  // A JSON head leaves the tap to sniff (and turn itself off) as before.
+  SseTap j(SteadyClock::now(), [] {});
+  auto jh = std::make_shared<watt::HttpResponse>();
+  jh->headers.add("Content-Type", "application/json");
+  j.head(jh);
+  CHECK(!j.is_sse());
+  CHECK(!j.is_off());
+  j.feed("{}", 2);
+  CHECK(j.is_off());
+  j.head(nullptr);  // ignored
+  CHECK(j.head_response() == jh);
+}
+
+TEST_CASE("a stream's event offsets are kept with the run", "[response_sse]") {
+  using namespace watt::app::rv;
+  RunExtras x;
+  x.sse_at = {2.15, 503.04, 1004.5};
+  const auto back = extras_from_json(extras_to_json(x));
+  REQUIRE(back);
+  REQUIRE(back->sse_at.size() == 3);
+  CHECK(back->sse_at[0] == 2.15);
+  CHECK(back->sse_at[2] == 1004.5);
+  RunExtras none;
+  CHECK(extras_to_json(none).find("sse_at") == std::string::npos);
+  CHECK(extras_from_json(extras_to_json(none))->sse_at.empty());
+}
+
+TEST_CASE("the Visualize page follows the app theme", "[response_visualize]") {
+  using namespace watt::app::rv;
+  const std::string dark = visualize_page("<table><tr><th>a</th></tr></table>", true);
+  CHECK(dark.find("color-scheme:dark") != std::string::npos);
+  CHECK(dark.find("background:#1e1e1e") != std::string::npos);
+  CHECK(dark.find("script-src") == std::string::npos);
+  // The base comes before the template, so the template's own styles win.
+  CHECK(dark.find("<style>") < dark.find("<table>"));
+  CHECK(visualize_page("x").find("color-scheme:light") != std::string::npos);
 }
