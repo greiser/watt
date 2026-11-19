@@ -124,7 +124,8 @@ $zip = Join-Path $dist "$name.zip"
 if (Test-Path $zip) { Remove-Item -Force $zip }
 Compress-Archive -Path $stage -DestinationPath $zip -CompressionLevel Optimal
 $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
-"$hash  $name.zip" | Set-Content -Encoding ascii (Join-Path $dist "$name.zip.sha256")
+# One LF-terminated line, as sha256sum writes it, so `sha256sum -c` reads it on any system.
+[System.IO.File]::WriteAllText((Join-Path $dist "$name.zip.sha256"), "$hash  $name.zip`n", [System.Text.Encoding]::ASCII)
 
 $size = "{0:N1} MB" -f ((Get-Item $zip).Length / 1MB)
 Write-Host "Packaged $($ship.Count) DLLs with watt.exe"
