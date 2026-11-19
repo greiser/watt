@@ -73,6 +73,7 @@ Copy-Item $exe $stage
 foreach ($f in $ship) { Copy-Item $f $stage }
 Copy-Item (Join-Path $PSScriptRoot "README.txt") $stage
 Copy-Item (Join-Path $root "CHANGELOG.md") (Join-Path $stage "CHANGELOG.txt")
+Copy-Item (Join-Path $root "LICENSE") (Join-Path $stage "LICENSE.txt")
 
 # ---- third-party notices: every library linked into watt.exe or a shipped DLL
 if (-not $VcpkgRoot) { $VcpkgRoot = if ($env:VCPKG_ROOT -and $env:VCPKG_ROOT -notlike "*\VC\vcpkg") { $env:VCPKG_ROOT } else { "C:\vcpkg" } }

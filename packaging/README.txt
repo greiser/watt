@@ -60,4 +60,5 @@ HKEY_CURRENT_USER\Software\watt.
 Licences
 --------
 
-THIRD-PARTY-NOTICES.txt lists the open source libraries included in watt and their licences.
+watt is released under the MIT License (LICENSE.txt). THIRD-PARTY-NOTICES.txt lists the open
+source libraries included in watt and their licences.

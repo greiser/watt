@@ -93,5 +93,5 @@ vcpkg set up:
 
 ## Licence
 
-Third-party components and their licences are listed in `THIRD-PARTY-NOTICES.txt` inside the
-distribution zip.
+watt is released under the [MIT License](LICENSE). The third-party libraries it includes and
+their licences are listed in `THIRD-PARTY-NOTICES.txt` inside the distribution zip.

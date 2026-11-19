@@ -167,7 +167,7 @@ A single suite can also be run directly, with Catch2's options, for example
 It builds `watt.exe` in Release, then creates:
 
 - `dist\watt-<version>-windows-x64\` with `watt.exe`, the DLLs it needs, `README.txt`,
-  `CHANGELOG.txt` and `THIRD-PARTY-NOTICES.txt`;
+  `CHANGELOG.txt`, `LICENSE.txt` and `THIRD-PARTY-NOTICES.txt`;
 - `dist\watt-<version>-windows-x64.zip`, the same folder zipped;
 - `dist\watt-<version>-windows-x64.zip.sha256`, its SHA-256 checksum.
 
