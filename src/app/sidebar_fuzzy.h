@@ -36,4 +36,12 @@ std::string url_search_text(std::string_view url);
 // Natural, case-insensitive order: digit runs compare by value ("endpoint 2" < "endpoint 10").
 bool natural_less(std::string_view a, std::string_view b);
 
+// The sidebar filter's context match. ctx is a request's "<folder path> <method>" (lower-case):
+// the query (lower-case words) names only its method ("patch"), only its folder ("bulk 07"), or a
+// folder and a method ("svc33 get", "orders delete": each word is the method or starts a word of
+// the folder path, one of them the method).
+bool context_only_match(std::string_view q, std::string_view ctx);
+// Some word of q is the method of ctx (as above): a context hit came from the method.
+bool names_method(std::string_view q, std::string_view ctx);
+
 }  // namespace watt::app::sidebar

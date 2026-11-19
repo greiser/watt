@@ -885,6 +885,7 @@ void MainFrame::workspace_opened(std::unique_ptr<Workspace> ws, const std::strin
     sidebar_->set_workspace(ws_.get());
     startup::mark("sidebar_workspace_set");
     restore_session();
+    restore_special_later();  // runner / mock tabs a session restored before the workspace opened
     vars_changed();  // tabs restored before the workspace opened showed {{vars}} unresolved
     if (auto* t = current_tab()) sidebar_->select_file(t->file());
     startup::mark("session_restored");
@@ -1306,6 +1307,42 @@ void MainFrame::restore_session() {
   apply_session(*s);
 }
 
+void MainFrame::restore_special_later() {
+  if (specials_.empty()) return;
+  if (!specials_timer_) {
+    specials_timer_ = new wxTimer(this);
+    Bind(wxEVT_TIMER, [this](wxTimerEvent&) { restore_special_step(); }, specials_timer_->GetId());
+  }
+  // A timer, not CallAfter: CallAfter events, even posted from one another, all run in one pass.
+  if (!specials_timer_->IsRunning()) specials_timer_->StartOnce(1);
+}
+
+void MainFrame::restore_special_step() {
+  if (closing_) return specials_.clear();
+  if (!ws_) {  // start-up: workspace_opened calls restore_special_later
+    if (ws_failed_) specials_.clear();
+    return;
+  }
+  if (specials_expect_ && nb_->GetPageCount() < specials_expect_ && ++specials_waits_ < 50) {
+    specials_timer_->StartOnce(10);  // the last mock's page goes in on its next turn
+    return;
+  }
+  specials_expect_ = 0;
+  specials_waits_ = 0;
+  while (!specials_.empty()) {
+    SpecialTab t = std::move(specials_.front());
+    specials_.pop_front();
+    if (t.root != ws_->root()) continue;
+    const size_t before = nb_->GetPageCount();
+    FrameLaps laps("restore_special");
+    t.open();
+    laps.lap(t.mock ? "mock" : "runner");
+    if (t.mock) specials_expect_ = before + 1;
+    break;
+  }
+  if (!specials_.empty()) specials_timer_->StartOnce(1);
+}
+
 // Restores the tabs of s. Before the window shows (from the constructor, no start tab yet) the
 // active tab is built complete and the rest lazily; later, the start tab takes the active one if
 // the user has not touched it yet, else the restored tabs go after the user's, which stays
@@ -1323,26 +1360,31 @@ void MainFrame::apply_session(Session& s) {
   // Mock server tabs come back after the window shows, on their port, running if they ran (on
   // loopback); routes are read and the listener started on workers (mock_view.cpp). Runner and
   // mock tabs go in by place (both lists ascend), so each lands where it was.
-  for (size_t i = 0, mi = 0; i < s.runners.size() || mi < s.mocks.size();) {
-    if (i == s.runners.size() || (mi < s.mocks.size() && s.mocks[mi].pos < s.runners[i].pos)) {
-      CallAfter([this, m = s.mocks[mi++], at = base] {
-        auto open = [this, m, at] {
-          if (ws_)
-            open_mock(this, [this] { return ws_.get(); }, m.folder, [this] { vars_changed(); session_changed(); },
-                      m.running, m.port, /*select=*/false, at + m.pos);
-        };
-        if (!when_workspace(open)) open();
-      });
-      continue;
+  // One tab per timer step (restore_special_step; all at once they were one 140-185 ms step),
+  // the selected runner first: it goes in at its place among the request tabs, and the tabs
+  // before it then go in ascending, each pushing it one place on to where it was.
+  {
+    std::vector<SpecialTab> q;
+    size_t sel = SIZE_MAX;
+    for (size_t i = 0, mi = 0; i < s.runners.size() || mi < s.mocks.size();) {
+      if (i == s.runners.size() || (mi < s.mocks.size() && s.mocks[mi].pos < s.runners[i].pos)) {
+        q.push_back({s.root, [this, m = s.mocks[mi++], at = base] {
+          open_mock(this, [this] { return ws_.get(); }, m.folder, [this] { vars_changed(); session_changed(); },
+                    m.running, m.port, /*select=*/false, at + m.pos);
+        }, true});
+        continue;
+      }
+      const bool select = static_cast<int>(i) == s.active_runner && (early || reuse);
+      if (select) sel = q.size();
+      const int at = base + s.runners[i].pos - (select ? static_cast<int>(q.size()) : 0);
+      q.push_back({s.root, [this, folder = s.runners[i].folder, at, select] {
+        open_runner(this, [this] { return ws_.get(); }, folder, &MainFrame::grpc, select, at);
+      }, false});
+      ++i;
     }
-    CallAfter([this, folder = s.runners[i].folder, at = base + s.runners[i].pos,
-               select = static_cast<int>(i) == s.active_runner && (early || reuse)] {
-      auto open = [this, folder, at, select] {
-        if (ws_) open_runner(this, [this] { return ws_.get(); }, folder, &MainFrame::grpc, select, at);
-      };
-      if (!when_workspace(open)) open();  // before the workspace has opened: when it has
-    });
-    ++i;
+    if (sel != SIZE_MAX) std::rotate(q.begin(), q.begin() + static_cast<std::ptrdiff_t>(sel), q.begin() + static_cast<std::ptrdiff_t>(sel) + 1);
+    for (auto& t : q) specials_.push_back(std::move(t));
+    restore_special_later();  // before the workspace has opened: when it has (workspace_opened)
   }
   if (s.tabs.empty()) return;
   const int active = s.active;
@@ -1898,6 +1940,7 @@ void MainFrame::open_impl(const std::filesystem::path& file, SavedRequest* loade
         if (t->request_kind() != r->kind && replace_with_spare(i, *r, true, defer)) return;
         t->set_request(std::move(*r), true);
         nb_->SetSelection(i);
+        sidebar_->select_file(t->file());  // no page change event when the preview tab is the current one
         laps.lap("preview_set");
         return;
       }

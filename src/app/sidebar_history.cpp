@@ -733,6 +733,22 @@ void HistoryList::OnDrawItem(wxDC& dc, const wxRect& rect, size_t n) const {
   const size_t slash = h.kind == RequestKind::Http ? t.find('/') : std::string::npos;
   const std::string path = slash == std::string::npos ? t : t.substr(slash);
   const std::string host = slash == std::string::npos ? std::string() : t.substr(0, slash);
+  // A host that does not fit after the path on line 2 goes on line 1, right of a short name
+  // (left of the status), where there is room: "Track by id      127.0.0.1:18994   200".
+  bool host_on_top = false;
+  int host_top_x = 0;
+  const wxString host_s = wxString::FromUTF8(host);
+  if (!l.name.empty() && path.size() > 1 && !host.empty()) {
+    const int hw = dc.GetTextExtent(host_s).x;
+    const int pw = dc.GetTextExtent(wxString::FromUTF8(path)).x;
+    if (pw + FromDIP(6) + hw > tailx - FromDIP(8) - tx) {
+      dc.SetFont(base);
+      const int nw = dc.GetTextExtent(wxString::FromUTF8(l.name)).x;
+      dc.SetFont(small);
+      host_top_x = stx - FromDIP(10) - hw;
+      host_on_top = host_top_x >= tx + nw + FromDIP(12);
+    }
+  }
   auto draw_target = [&](int x, int y, int avail, const wxColour& path_col) {
     if (avail <= FromDIP(12)) return;
     dc.SetTextForeground(path_col);
@@ -740,7 +756,10 @@ void HistoryList::OnDrawItem(wxDC& dc, const wxRect& rect, size_t n) const {
         wxControl::Ellipsize(wxString::FromUTF8(path.size() > 1 || host.empty() ? path : t), dc, wxELLIPSIZE_END, avail, wxELLIPSIZE_FLAGS_EXPAND_TABS);
     dc.DrawText(ps, x, y);
     const int used = dc.GetTextExtent(ps).x + FromDIP(6);
-    if (path.size() > 1 && !host.empty() && avail - used > FromDIP(28)) {
+    if (host_on_top) {
+      dc.SetTextForeground(dim_colour());
+      dc.DrawText(host_s, host_top_x, y1 + (h1 - h2) / 2 + FromDIP(1));
+    } else if (path.size() > 1 && !host.empty() && avail - used > FromDIP(28)) {
       dc.SetTextForeground(dim_colour());
       dc.DrawText(wxControl::Ellipsize(wxString::FromUTF8(host), dc, wxELLIPSIZE_END, avail - used, wxELLIPSIZE_FLAGS_EXPAND_TABS), x + used, y);
     }

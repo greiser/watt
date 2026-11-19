@@ -42,6 +42,14 @@ struct FolderSettings {
 inline constexpr int kFolderRun = 7001;
 int folder_settings(wxWindow* parent, FolderSettings& s);
 
+// Define variables that are used but not defined (after an import): one row per name, its key
+// shown and its value field ready (the first one focused). `where` names the folder the values
+// are saved to. Returns wxID_OK (values in *values, same order as names), wxID_CANCEL, or
+// kDefineVarsSettings (open the full folder settings instead).
+inline constexpr int kDefineVarsSettings = 7002;
+int define_vars(wxWindow* parent, const wxString& where, const std::vector<std::string>& names,
+                std::vector<std::string>* values);
+
 }  // namespace watt::app::sidebar
 
 namespace watt::app::sidebar {

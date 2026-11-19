@@ -10,6 +10,7 @@
 #include <wx/vlbox.h>
 
 #include <algorithm>
+#include <cctype>
 #include <numeric>
 
 #include "app/sidebar_fuzzy.h"
@@ -340,8 +341,30 @@ class QuickOpenDialog : public wxDialog {
           std::vector<uint16_t> pos;
           if (!q.match(targets_[i], ns, &s, &pos)) continue;
           n.row.score += s;
-          n.row.pos.insert(n.row.pos.end(), pos.begin(), pos.end());
           n.dropped += dropped;
+          // The dropped tail found later in the target ("op4712": "12" in "op 47-012") wins it
+          // back, most when it ends a word there.
+          std::string lower_t = targets_[i];
+          for (char& ch : lower_t) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+          const std::string_view t = lower_t;
+          const size_t after = pos.empty() ? ns : static_cast<size_t>(*std::max_element(pos.begin(), pos.end())) + 1;
+          const std::string_view tail = std::string_view(words[w]).substr(words[w].size() - dropped);
+          for (size_t l = tail.size(); l > 0 && after < t.size(); --l) {
+            const std::string_view piece = tail.substr(tail.size() - l);
+            size_t best = std::string_view::npos;
+            for (size_t at = t.find(piece, after); at != std::string_view::npos; at = t.find(piece, at + 1)) {
+              best = at;
+              const size_t end = at + l;
+              if (end == t.size() || !std::isalnum(static_cast<unsigned char>(t[end]))) break;
+            }
+            if (best == std::string_view::npos) continue;
+            const size_t end = best + l;
+            n.dropped -= l;
+            n.row.score += end == t.size() || !std::isalnum(static_cast<unsigned char>(t[end])) ? 40 : 10;
+            for (size_t k = best; k < end; ++k) pos.push_back(static_cast<uint16_t>(k));
+            break;
+          }
+          n.row.pos.insert(n.row.pos.end(), pos.begin(), pos.end());
           ok = true;
           break;
         }

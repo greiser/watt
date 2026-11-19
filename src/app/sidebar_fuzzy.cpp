@@ -216,4 +216,53 @@ bool natural_less(std::string_view a, std::string_view b) {
   return a < b;  // equal ignoring case: a stable tie-break
 }
 
+// Whether w starts a word of the folder path ("ord" in "shop/orders", "svc33" in "svc33/..."),
+// a segment or a word inside one.
+static bool starts_folder_word(std::string_view folder, std::string_view w) {
+  for (size_t at = folder.find(w); at != std::string_view::npos; at = folder.find(w, at + 1)) {
+    if (at == 0) return true;
+    const char c = folder[at - 1];
+    if (c == '/' || c == ' ' || c == '-' || c == '_' || c == '.') return true;
+  }
+  return false;
+}
+
+// A query that names only the method ("patch", "grpc"), only a folder ("bulk 07") or a folder and
+// a method ("svc33 get", "orders delete") matches on those fields alone: every word is the
+// request's method, or the whole query is in its folder path, or each word is the method or
+// starts a word of the folder path (and one of them is the method).
+bool context_only_match(std::string_view q, std::string_view ctx) {
+  const size_t sp = ctx.rfind(' ');
+  const std::string_view method = sp == std::string_view::npos ? std::string_view() : ctx.substr(sp + 1);
+  const std::string_view folder = sp == std::string_view::npos ? ctx : ctx.substr(0, sp);
+  if (!folder.empty() && folder.find(q) != std::string_view::npos) return true;
+  if (method.empty()) return false;
+  bool named_method = false;
+  for (size_t p = 0; p < q.size();) {
+    size_t e = q.find(' ', p);
+    if (e == std::string_view::npos) e = q.size();
+    if (e > p) {
+      const std::string_view w = q.substr(p, e - p);
+      if (w == method) named_method = true;
+      else if (folder.empty() || !starts_folder_word(folder, w)) return false;
+    }
+    p = e + 1;
+  }
+  return named_method;
+}
+
+// The query names q's method among its words (a context_only_match hit came from the method).
+bool names_method(std::string_view q, std::string_view ctx) {
+  const size_t sp = ctx.rfind(' ');
+  if (sp == std::string_view::npos) return false;
+  const std::string_view method = ctx.substr(sp + 1);
+  for (size_t p = 0; p < q.size();) {
+    size_t e = q.find(' ', p);
+    if (e == std::string_view::npos) e = q.size();
+    if (e > p && q.substr(p, e - p) == method) return true;
+    p = e + 1;
+  }
+  return false;
+}
+
 }  // namespace watt::app::sidebar

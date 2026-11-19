@@ -1284,6 +1284,23 @@ TEST_CASE("quick open: a number in the query matches unbroken", "[sidebar][fuzzy
   CHECK(numbers_present("a1b2", "x"));  // single digits may still be scattered
 }
 
+TEST_CASE("filter: a folder word plus a method word lists that folder's requests of that method", "[sidebar][filter]") {
+  // ctx as build_keys writes it: "<folder path>/ <method>", lower-case.
+  CHECK(context_only_match("svc33 get", "big/svc33/ get"));
+  CHECK(context_only_match("get svc33", "big/svc33/ get"));
+  CHECK(context_only_match("orders get", "shop api/orders/ get"));
+  CHECK(context_only_match("ord delete", "shop api/orders/ delete"));
+  CHECK_FALSE(context_only_match("svc33 get", "big/svc33/ delete"));  // other method
+  CHECK_FALSE(context_only_match("svc33 get", "big/svc34/ get"));     // other folder
+  CHECK_FALSE(context_only_match("rders get", "shop api/orders/ get"));  // not a word start
+  CHECK_FALSE(context_only_match("orders users", "shop api/orders/ get"));  // no method word
+  CHECK(context_only_match("patch", "shop api/orders/ patch"));  // method alone
+  CHECK(context_only_match("bulk 07", "load/bulk 07/ get"));     // folder alone
+  CHECK(names_method("delete", "shop api/orders/ delete"));
+  CHECK(names_method("orders get", "shop api/orders/ get"));
+  CHECK_FALSE(names_method("orders", "shop api/orders/ get"));
+}
+
 TEST_CASE("filter: a numeric URL host and its port are not searched", "[sidebar][fuzzy]") {
   CHECK(url_search_text("http://127.0.0.1:18080/echo") == "http:///echo");
   CHECK(url_search_text("https://[::1]:8443/v1/users?id=7") == "https:///v1/users?id=7");

@@ -262,6 +262,55 @@ int folder_settings(wxWindow* parent, FolderSettings& s) {
   return rc;
 }
 
+int define_vars(wxWindow* parent, const wxString& where, const std::vector<std::string>& names,
+                std::vector<std::string>* values) {
+  Base dlg(parent, "Define variables");
+  auto* head = text(&dlg,
+                    wxString::Format("%zu variable%s used by the imported requests %s not defined. The values are saved "
+                                     "as variables of the folder %s (they apply under any environment; an "
+                                     "environment value of the same name wins).",
+                                     names.size(), names.size() == 1 ? "" : "s", names.size() == 1 ? "is" : "are", where),
+                    dlg.FromDIP(460));
+  head->SetForegroundColour(mix(window_colour(), text_colour(), 0.8));
+  dlg.body_->Add(head, 0, wxBOTTOM, dlg.FromDIP(12));
+  auto* grid = new wxFlexGridSizer(2, dlg.FromDIP(6), dlg.FromDIP(10));
+  grid->AddGrowableCol(1, 1);
+  std::vector<wxTextCtrl*> fields;
+  wxFont mono(wxFontInfo(9).Family(wxFONTFAMILY_TELETYPE).FaceName("Consolas"));
+  for (size_t i = 0; i < names.size() && i < 24; ++i) {
+    auto* k = new wxStaticText(&dlg, wxID_ANY, wxString::FromUTF8(names[i]));
+    k->SetFont(mono);
+    k->SetForegroundColour(text_colour());
+    grid->Add(k, 0, wxALIGN_CENTER_VERTICAL);
+    auto* v = new wxTextCtrl(&dlg, wxID_ANY, "", wxDefaultPosition, wxDefaultSize, wxBORDER_SIMPLE);
+    v->SetBackgroundColour(window_colour());
+    v->SetForegroundColour(text_colour());
+    v->SetFont(mono);
+    v->SetHint(names[i] == "base" || names[i].find("url") != std::string::npos || names[i].find("host") != std::string::npos
+                   ? wxString("e.g. http://127.0.0.1:8080")
+                   : wxString("value"));
+    grid->Add(v, 1, wxEXPAND);
+    fields.push_back(v);
+  }
+  dlg.body_->Add(grid, 0, wxEXPAND);
+  if (names.size() > 24) dlg.body_->Add(text(&dlg, wxString::Format("and %zu more: in the folder settings", names.size() - 24), 400), 0, wxTOP, dlg.FromDIP(6));
+  wxButton* more = make_button(&dlg, kDefineVarsSettings, wxString::FromUTF8("Folder settings\xE2\x80\xA6"), false, false);
+  more->SetToolTip("Open every setting of the folder (headers, auth, variables, scripts) instead");
+  dlg.buttons_->Insert(0, more, 0, wxRIGHT, dlg.FromDIP(8));
+  more->Bind(wxEVT_BUTTON, [&dlg](wxCommandEvent&) { dlg.EndModal(kDefineVarsSettings); });
+  dlg.add_button(wxID_CANCEL, "Cancel", false);
+  dlg.add_button(wxID_OK, "Save", true);
+  dlg.SetEscapeId(wxID_CANCEL);
+  dlg.finish(480);
+  if (!fields.empty()) fields.front()->SetFocus();
+  const int rc = dlg.ShowModal();
+  if (rc != wxID_OK) return rc;
+  values->clear();
+  for (size_t i = 0; i < names.size(); ++i)
+    values->push_back(i < fields.size() ? fields[i]->GetValue().Strip(wxString::both).utf8_string() : std::string());
+  return rc;
+}
+
 }  // namespace watt::app::sidebar
 
 // ------------------------------------------------------------------ OS file dialog on a thread

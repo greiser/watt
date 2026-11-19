@@ -8,6 +8,7 @@
 #include <wx/frame.h>
 #include <wx/timer.h>
 
+#include <deque>
 #include <functional>
 #include <map>
 #include <memory>
@@ -101,6 +102,20 @@ class MainFrame : public wxFrame, public SidebarHost {
   std::shared_ptr<SessionSnapshot> snapshot_session();  // null without a workspace
   void session_changed();  // writes the session ~1.5 s later, off the UI thread
   void apply_session(Session& s);
+  // Runner and mock tabs a session restores, in the order they are built: one tab per timer
+  // step (restore_special_step), so no single UI step builds them all. A mock adds its page a
+  // turn later; the next tab waits for it so each lands at its saved place.
+  struct SpecialTab {
+    std::filesystem::path root;  // skipped once another workspace is open
+    std::function<void()> open;
+    bool mock = false;
+  };
+  std::deque<SpecialTab> specials_;
+  wxTimer* specials_timer_ = nullptr;
+  size_t specials_expect_ = 0;  // page count the last mock's page brings the notebook to
+  int specials_waits_ = 0;
+  void restore_special_later();
+  void restore_special_step();
   void on_close(wxCloseEvent& e);
   // After the window was closed (hidden): one tab destroyed per turn of the message loop, then the
   // frame, so no single UI step tears down every editor and response view at once.

@@ -197,7 +197,7 @@ using SearchKeys = std::unordered_map<const CollectionNode*, std::string>;
 
 // A request's key is "<own text>\x01<context>": its name, URL and file name, then its folder
 // path and method. Every filter word must be in one of them, and at least one in its own text,
-// so "get user" lists "Get user" but not "List admins" in Users/ (method and folder only).
+// unless the words name only its method and folder (context_only_match: "orders get").
 void build_keys(const CollectionNode& n, const std::string& prefix, const MetaMap& meta, SearchKeys& out) {
   if (!n.is_folder) {
     std::string t = n.name;
@@ -233,25 +233,6 @@ bool any_word_in(std::string_view q, std::string_view t) {
     p = e + 1;
   }
   return false;
-}
-
-// A query that names only the method ("patch", "grpc") or only a folder ("bulk 07") matches on
-// those fields alone: every word is the request's method, or the whole query is in its folder
-// path. A mix of a method word and a folder word ("get user") still needs a name / URL hit, so it
-// does not list every GET request of a Users folder.
-bool context_only_match(std::string_view q, std::string_view ctx) {
-  const size_t sp = ctx.rfind(' ');
-  const std::string_view method = sp == std::string_view::npos ? std::string_view() : ctx.substr(sp + 1);
-  const std::string_view folder = sp == std::string_view::npos ? ctx : ctx.substr(0, sp);
-  if (!folder.empty() && folder.find(q) != std::string_view::npos) return true;
-  if (method.empty()) return false;
-  for (size_t p = 0; p < q.size();) {
-    size_t e = q.find(' ', p);
-    if (e == std::string_view::npos) e = q.size();
-    if (e > p && q.substr(p, e - p) != method) return false;
-    p = e + 1;
-  }
-  return true;
 }
 
 // The last path segment of a folder key ("users/admin" -> "admin").
@@ -959,21 +940,19 @@ class Sidebar : public wxPanel, public SidebarPanel {
         nb->Bind(wxEVT_AUINOTEBOOK_PAGE_CHANGED, mute);
         nb->Bind(wxEVT_AUINOTEBOOK_PAGE_CHANGING, mute);
         // A runner, mock or spec tab shown: no request row is the active one (a request tab
-        // reaches select_file() through the frame).
+        // reaches select_file() through the frame). The tree marks the folder a mock or runner
+        // tab is about (what the user is looking at), else nothing: a folder right-clicked
+        // earlier must not keep the mark.
         nb->Bind(wxEVT_AUINOTEBOOK_PAGE_CHANGED, [this, nb](wxAuiNotebookEvent& e) {
           e.Skip();
-          if (mute_page_events_ || active_file_.empty()) return;
+          if (mute_page_events_) return;
           const int i = e.GetSelection();
           wxWindow* page = i >= 0 && static_cast<size_t>(i) < nb->GetPageCount() ? nb->GetPage(static_cast<size_t>(i)) : nullptr;
           if (!page || dynamic_cast<RequestTab*>(page)) return;
           active_file_.clear();
-          // As for an unsaved tab (select_file()): no request row stays highlighted.
-          if (const auto* d = data(tree_->GetSelection()); d && !d->node->is_folder) {
-            syncing_ = true;
-            tree_->Unselect();
-            syncing_ = false;
-          }
-          tree_->Refresh(false);
+          fs::path folder;
+          if (!mock_tab_info(page, &folder, nullptr, nullptr) && !runner_folder(page, &folder)) folder.clear();
+          mark_tab_folder(folder);
         });
       }
       dormant_timer_.Bind(wxEVT_TIMER, [this](wxTimerEvent&) { dormant_tick(); });
@@ -1387,6 +1366,19 @@ class Sidebar : public wxPanel, public SidebarPanel {
         const fs::path orders = st_find("Get order v2").parent_path();
         st_log_ += "# orders: " + rows(orders) + "\n# users: " + rows(orders.parent_path() / "users") + "\n";
       }, 50);
+      return;
+    }
+    // WATT_SIDEBAR_SELFTEST_QUERY="q1|q2|...": each query in the filter box, logging the
+    // COLLECTION line (hits and where they came from); the last one stays (for a screenshot).
+    if (wxString qs; only == "query" && wxGetEnv("WATT_SIDEBAR_SELFTEST_QUERY", &qs)) {
+      for (const wxString& q : wxSplit(qs, '|')) {
+        add("query " + q.utf8_string(), [this, q] {
+          focus_filter();
+          filter_->ChangeValue(q);
+          apply_filter();
+        }, 1500);
+        add("label", [this] { st_log_ += "# " + coll_label_->GetLabel().utf8_string() + "\n"; }, 50);
+      }
       return;
     }
     // A broad filter on a big workspace (2000 requests): typing, narrowing, widening, clearing.
@@ -2626,7 +2618,7 @@ class Sidebar : public wxPanel, public SidebarPanel {
     split_ = new wxSplitterWindow(p, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxSP_LIVE_UPDATE | wxSP_NOBORDER);
     split_->SetBackgroundColour(window_colour());
     split_->SetSashGravity(1.0);  // the tree takes what the window gains; history keeps its height
-    split_->SetMinimumPaneSize(FromDIP(64));
+    split_->SetMinimumPaneSize(FromDIP(28));  // the history folds to its header row
 
     auto* top = new wxPanel(split_);
     top->SetBackgroundColour(window_colour());
@@ -2781,10 +2773,21 @@ class Sidebar : public wxPanel, public SidebarPanel {
     sep->SetBackgroundColour(mix(window_colour(), text_colour(), 0.14));
     bsz->Add(sep, 0, wxEXPAND);
     hist_label_ = section_label(bottom, "HISTORY");
-    // Expand: history takes the sidebar's full height (Postman's History tab), and back.
-    hist_expand_ = flat_button(bottom, "Expand", "Show history at full height (double-click HISTORY)");
-    hist_expand_->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) { toggle_history_full(); });
-    hist_label_->Bind(wxEVT_LEFT_DCLICK, [this](wxMouseEvent&) { toggle_history_full(); });
+    {
+      long c = 0;
+      if (wxConfigBase* cfg = wxConfigBase::Get(); cfg && cfg->Read("Sidebar/HistoryCollapsed", &c)) hist_collapsed_ = c != 0;
+    }
+    // A click on HISTORY folds it to its header (as API SPECS / MOCK SERVERS): the tree gets
+    // the height. Expand: history takes the sidebar's full height (Postman's History tab).
+    hist_label_->SetToolTip("Click to fold the history to this header (the collection gets the height)");
+    hist_label_->SetCursor(wxCursor(wxCURSOR_HAND));
+    hist_label_->Bind(wxEVT_LEFT_DOWN, [this](wxMouseEvent&) { set_history_collapsed(!hist_collapsed_); });
+    hist_label_->Bind(wxEVT_LEFT_DCLICK, [this](wxMouseEvent&) { set_history_collapsed(!hist_collapsed_); });
+    hist_expand_ = flat_button(bottom, "Expand", "Show history at full height");
+    hist_expand_->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) {
+      if (hist_collapsed_ && !hist_full_) set_history_collapsed(false);
+      toggle_history_full();
+    });
     auto* hhead = new wxBoxSizer(wxHORIZONTAL);
     hhead->Add(hist_label_, 1, wxALIGN_CENTER_VERTICAL);
     hhead->Add(hist_expand_, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, FromDIP(4));
@@ -2813,7 +2816,7 @@ class Sidebar : public wxPanel, public SidebarPanel {
     top_pane_ = top;
     split_->Bind(wxEVT_SIZE, [this](wxSizeEvent& e) {
       e.Skip();
-      if (sash_set_ && !user_sash_) CallAfter([this] { update_history_pane(); });
+      if (sash_set_ && (!user_sash_ || hist_collapsed_)) CallAfter([this] { update_history_pane(); });
     });
     {
       long hh = 0;
@@ -2836,9 +2839,22 @@ class Sidebar : public wxPanel, public SidebarPanel {
       // The user dragged the sash: keep the history height they chose. (Resizes and
       // SetSashPosition() can report here too; only a drag has the button down.)
       if (wxGetMouseState().LeftIsDown() && !hist_full_) {
+        const int dragged = split_->GetClientSize().y - e.GetSashPosition() - split_->GetSashSize();
+        const bool was_collapsed = hist_collapsed_;
+        if (was_collapsed) {
+          // Dragging the folded header up opens the history at that height; a small drag
+          // snaps back to the header.
+          if (dragged <= history_header_h() + FromDIP(24)) {
+            CallAfter([this] { update_history_pane(); });
+            return;
+          }
+          hist_collapsed_ = false;
+          if (wxConfigBase* c = wxConfigBase::Get()) c->Write("Sidebar/HistoryCollapsed", 0L);
+        }
         user_sash_ = true;
-        user_hist_h_ = split_->GetClientSize().y - e.GetSashPosition() - split_->GetSashSize();
+        user_hist_h_ = dragged;
         if (wxConfigBase* c = wxConfigBase::Get()) c->Write("Sidebar/HistoryHeight", static_cast<long>(ToDIP(user_hist_h_)));
+        if (was_collapsed) CallAfter([this] { update_history_pane(); });
       }
     });
     sz->Add(split_, 1, wxEXPAND | wxTOP, FromDIP(6));
@@ -3506,20 +3522,60 @@ class Sidebar : public wxPanel, public SidebarPanel {
 
   // History pane height follows its content (an empty one is small), up to 5 rows and 30% of the
   // sidebar, until the user drags the sash.
+  // Height of the history pane's header row (separator, HISTORY, Expand): the pane's height
+  // when it is folded.
+  int history_header_h() const {
+    const int bottom = std::max(hist_label_->GetRect().GetBottom(), hist_expand_->GetRect().GetBottom());
+    return bottom > FromDIP(8) ? bottom + FromDIP(5) : FromDIP(34);
+  }
+
+  // "v HISTORY  12" / "> HISTORY  12" (folded: the count says what is behind it), "3 of 12"
+  // while a filter hides some.
+  void update_history_label() {
+    wxString l = wxString::FromUTF8(hist_collapsed_ && !hist_full_ ? "\xE2\x96\xB8  HISTORY" : "\xE2\x96\xBE  HISTORY");
+    if (history_ && history_->total()) {
+      if (history_->shown() == history_->total()) l += wxString::Format("   %zu", history_->total());
+      else l += wxString::Format("   %zu of %zu", history_->shown(), history_->total());
+    }
+    if (hist_label_->GetLabel() != l) {
+      hist_label_->SetLabel(l);
+      hist_label_->SetToolTip(hist_collapsed_ ? "Click to show the history" : "Click to fold the history to this header (the collection gets the height)");
+      hist_label_->GetParent()->Layout();
+    }
+  }
+
+  void set_history_collapsed(bool c) {
+    if (hist_full_) {  // folding the full-height history: back to the collection, folded
+      toggle_history_full();
+      c = true;
+    }
+    if (c == hist_collapsed_) return;
+    hist_collapsed_ = c;
+    if (wxConfigBase* cfg = wxConfigBase::Get()) cfg->Write("Sidebar/HistoryCollapsed", c ? 1L : 0L);
+    update_history_pane();
+  }
+
   void update_history_pane() {
+    update_history_label();
+    const bool folded = hist_collapsed_ && !hist_full_;
     const bool empty = history_->shown() == 0;
     const wxString hint = history_->total() ? "No history entry matches the filter." : "Sent requests appear here.";
     if (hist_empty_->GetLabel() != hint) hist_empty_->SetLabel(hint);
-    if (hist_empty_->IsShown() != empty || history_->IsShown() == empty) {
-      hist_empty_->Show(empty);
-      history_->Show(!empty);
+    if (hist_empty_->IsShown() != (empty && !folded) || history_->IsShown() != (!empty && !folded)) {
+      hist_empty_->Show(empty && !folded);
+      history_->Show(!empty && !folded);
       hist_empty_->GetParent()->Layout();
     }
     if (!sash_set_ || !split_->IsSplit()) return;
     const int h = split_->GetClientSize().y;
     if (h < FromDIP(160)) return;
     int want;
-    if (user_sash_) {
+    if (folded) {
+      want = history_header_h();
+    } else if (history_->total() == 0 && (!user_sash_ || user_hist_h_ <= 0)) {
+      // Nothing sent yet: the header and its one-line hint, the rest is the tree's.
+      want = history_header_h() + hist_empty_->GetBestSize().y + FromDIP(14);
+    } else if (user_sash_) {
       // The height the user dragged it to (kept across restarts), within the sidebar.
       if (user_hist_h_ <= 0) return;
       want = std::clamp(user_hist_h_, FromDIP(64), h - FromDIP(64));
@@ -4092,8 +4148,16 @@ class Sidebar : public wxPanel, public SidebarPanel {
       // Requests that match only by their URL, file or folder (not a word of their name): the
       // count says so, or 'echo' showing 7 rows named otherwise looks like a broken filter.
       filter_not_name_ = 0;
-      for (const CollectionNode* h : hits)
-        if (!any_word_in(filter_q_, ascii_lower(h->name))) ++filter_not_name_;
+      filter_by_method_ = 0;
+      for (const CollectionNode* h : hits) {
+        if (any_word_in(filter_q_, ascii_lower(h->name))) continue;
+        ++filter_not_name_;
+        if (auto k = search_keys_.find(h); k != search_keys_.end()) {
+          const size_t sep = k->second.find('\x01');
+          if (sep != std::string::npos && names_method(filter_q_, std::string_view(k->second).substr(sep + 1)))
+            ++filter_by_method_;
+        }
+      }
       view_root_.name = tree_root_.name;
       view_root_.path = tree_root_.path;
       view_root_.is_folder = true;
@@ -4779,18 +4843,16 @@ class Sidebar : public wxPanel, public SidebarPanel {
       else c += wxString::Format("   %zu of %zu", count_requests(view_root_), n);
       if (!filter_q_.empty() && filter_not_name_) {
         const size_t shown = count_requests(view_root_);
-        c += filter_not_name_ >= shown ? wxString::FromUTF8("  \xC2\xB7  by URL / folder")
-                                       : wxString::Format(wxString::FromUTF8("  \xC2\xB7  %zu by URL / folder"),
-                                                          filter_not_name_);
+        // Where those hits came from: the method ('delete'), else the URL / folder.
+        const char* by = filter_by_method_ >= filter_not_name_ ? "method"
+                         : filter_by_method_ ? "method / URL / folder" : "URL / folder";
+        c += filter_not_name_ >= shown ? wxString::FromUTF8("  \xC2\xB7  by ") + by
+                                       : wxString::Format(wxString::FromUTF8("  \xC2\xB7  %zu by %s"),
+                                                          filter_not_name_, by);
       }
     }
     if (coll_label_->GetLabel() != c) coll_label_->SetLabel(c);
-    wxString h = "HISTORY";
-    if (history_->total()) {
-      if (history_->shown() == history_->total()) h += wxString::Format("   %zu", history_->total());
-      else h += wxString::Format("   %zu of %zu", history_->shown(), history_->total());
-    }
-    if (hist_label_->GetLabel() != h) hist_label_->SetLabel(h);
+    update_history_label();
   }
 
   void apply_filter() {
@@ -5410,7 +5472,10 @@ class Sidebar : public wxPanel, public SidebarPanel {
     if (!d || d->root != ws_->root() || !is_under(d->path, ws_->root())) return;
     hide_note();
     std::weak_ptr<int> alive = alive_;
-    std::thread([this, d, alive] {
+    // Ctrl+Z in the tree: the keyboard stays there (on the restored row) when the tabs come
+    // back; a letter typed next is type-ahead, not a key that overwrites the reopened URL.
+    const bool from_tree = wxWindow::FindFocus() == tree_;
+    std::thread([this, d, alive, from_tree] {
       size_t written = 0, kept = 0;
       std::error_code ec;
       for (const auto& dir : d->dirs)
@@ -5424,7 +5489,7 @@ class Sidebar : public wxPanel, public SidebarPanel {
         out.write(body.data(), static_cast<std::streamsize>(body.size()));
         written += static_cast<bool>(out);
       }
-      if (wxAppConsole* app = wxTheApp) app->CallAfter([this, d, alive, written, kept] {
+      if (wxAppConsole* app = wxTheApp) app->CallAfter([this, d, alive, written, kept, from_tree] {
         if (alive.expired() || !ws_) return;
         pending_select_ = d->path;
         sticky_sel_ = d->path;
@@ -5439,6 +5504,7 @@ class Sidebar : public wxPanel, public SidebarPanel {
               if (f == d->active) pinned = pin;
             host_->open_request(d->active, !pinned);
           }
+          if (from_tree) keep_tree_focus();
         }
         const wxString what = wxString::FromUTF8(d->name);
         if (kept)
@@ -6186,6 +6252,94 @@ class Sidebar : public wxPanel, public SidebarPanel {
                       switch_workspace(dir, true);
                     },
                     start);
+  }
+
+  // A mock / runner tab is shown: its folder is the tree's marked row (none for the whole
+  // collection, a spec tab, or a folder that is not in the tree).
+  void mark_tab_folder(const fs::path& folder) {
+    wxTreeItemId id = folder.empty() ? wxTreeItemId() : item_for(folder, false);
+    if (id.IsOk() && id == tree_->GetRootItem()) id = wxTreeItemId();
+    syncing_ = true;
+    if (id.IsOk()) {
+      // The tree stays where it is (Bruno too): selecting an expanded folder scrolled it to the
+      // top, its children into view, and the rows above it out.
+      if (tree_->GetSelection() != id) {
+        const wxTreeItemId top = tree_->GetFirstVisibleItem();
+        const bool seen = row_in_view(id);
+        tree_->SelectItem(id);
+        if (seen && top.IsOk() && tree_->GetFirstVisibleItem() != top) set_first_visible(top);
+      }
+    } else if (tree_->GetSelection().IsOk()) {
+      tree_->Unselect();
+    }
+    syncing_ = false;
+    tree_->Refresh(false);
+  }
+
+  // The import notice "{{base}} undefined": a dialog with one value field per undefined name
+  // (keys filled in, the first value focused); the values become variables of the imported
+  // folder (written on a worker). "Folder settings..." opens the full dialog instead.
+  void define_undefined(const fs::path& folder, const std::vector<std::string>& names) {
+    if (!ws_ || names.empty()) return;
+    std::vector<std::string> values;
+    const int rc = define_vars(wxGetTopLevelParent(this), wxString::FromUTF8(u8(folder.filename())), names, &values);
+    if (rc == kDefineVarsSettings) {
+      open_folder_settings(folder);
+      return;
+    }
+    if (rc != wxID_OK) return;
+    std::vector<std::pair<std::string, std::string>> set;
+    std::vector<std::string> left;
+    for (size_t i = 0; i < names.size(); ++i) {
+      if (i < values.size() && !values[i].empty()) set.emplace_back(names[i], values[i]);
+      else left.push_back(names[i]);
+    }
+    if (set.empty()) return;
+    auto copy = std::make_shared<Workspace>(*ws_);
+    std::weak_ptr<int> alive = alive_;
+    std::thread([this, copy, folder, set, left, alive] {
+      std::string err;
+      std::optional<watt::FolderSettings> s = copy->folder_settings(folder, &err);
+      bool ok = false;
+      if (s) {
+        for (const auto& [k, v] : set) {
+          auto it = std::find_if(s->vars.begin(), s->vars.end(), [&](const SettingsRow& r) { return r.name == k; });
+          if (it == s->vars.end()) {
+            SettingsRow r;
+            r.name = k;
+            r.value = v;
+            s->vars.push_back(std::move(r));
+          } else {
+            it->value = v;
+            it->enabled = true;
+          }
+        }
+        ok = copy->save_folder_settings(folder, *s, &err);
+      }
+      if (wxAppConsole* app = wxTheApp) app->CallAfter([this, folder, set, left, alive, ok, err] {
+        if (alive.expired()) return;
+        if (!ok) {
+          notify(wxGetTopLevelParent(this), "Variables not saved", wxString::FromUTF8(err));
+          return;
+        }
+        refresh_inherit_tabs(folder);
+        inh_saved_ = folder;
+        inh_saved_at_ = std::chrono::steady_clock::now();
+        if (host_) host_->folder_settings_changed();
+        std::string names;
+        for (size_t i = 0; i < set.size() && i < 3; ++i) names += (i ? ", {{" : "{{") + set[i].first + "}}";
+        if (set.size() > 3) names += ", ...";
+        if (left.empty()) {
+          show_note(wxString::FromUTF8("\xE2\x9C\x93 Defined " + names + " in " + u8(folder.filename())),
+                    "Saved as variables of the folder (Folder settings > Variables).", 5000);
+        } else {
+          const std::string l = left.size() == 1 ? "{{" + left[0] + "}} still undefined" : std::to_string(left.size()) + " still undefined";
+          show_note(wxString::FromUTF8("\xE2\x9A\xA0 " + l + ": click to define"),
+                    wxString::FromUTF8("Defined " + names + " in " + u8(folder.filename()) + "."), 0,
+                    [this, folder, left] { define_undefined(folder, left); });
+        }
+      });
+    }).detach();
   }
 
   // A folder's (the workspace root: the collection's) settings dialog; a save refreshes open tabs.
@@ -8204,8 +8358,14 @@ class Sidebar : public wxPanel, public SidebarPanel {
     }
     if (name->empty())
       if (auto it = name_by_key_.find(history_key(e)); it != name_by_key_.end()) *name = it->second;
-    if (name->empty()) *name = history_name(e);
+    const std::string sent_name = history_name(e);
+    if (name->empty()) *name = sent_name;
     if (e.kind == RequestKind::Grpc) *name = grpc_display_name(*name, grpc_method_of(e));
+    // Renamed since: the row says what it was called when it was sent, too ("status (sent as
+    // Track shipment)"), so the history reads as it happened.
+    if (!sent_name.empty() && sent_name != "Untitled" && !name->empty() && *name != sent_name &&
+        (e.kind != RequestKind::Grpc || *name != grpc_display_name(sent_name, grpc_method_of(e))))
+      *name += " (sent as " + sent_name + ")";
     // Where it went, as recorded at send time (history_summary.h), without the scheme. Never
     // re-expanded with the environment that is active now: after switching local -> staging a
     // row sent to 127.0.0.1:18971 must still say so. Entries older than that record show their
@@ -8649,6 +8809,32 @@ class Sidebar : public wxPanel, public SidebarPanel {
 
   // A modal OS dialog hands the focus back to the first control of the frame (the sidebar's
   // hide button: Space / Enter would then collapse the sidebar). The tree takes it instead.
+  // Tabs are being (re)opened from a tree action: an opened editor focuses its URL field a step
+  // or two later (with the URL selected). For the next ~400 ms the keyboard is handed back to the
+  // tree when it lands in a tab, unless the user moved it (a click, or another focus request).
+  void keep_tree_focus() {
+    ++tree_focus_req_;
+    if (tree_->IsShownOnScreen()) tree_->SetFocus();
+    refocus_req_ = tree_focus_req_;
+    refocus_until_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(400);
+    if (!refocus_bound_) {
+      refocus_bound_ = true;
+      refocus_timer_.Bind(wxEVT_TIMER, [this](wxTimerEvent&) {
+        const wxMouseState ms = wxGetMouseState();
+        if (refocus_req_ != tree_focus_req_ || ms.LeftIsDown() || ms.RightIsDown() ||
+            std::chrono::steady_clock::now() > refocus_until_) {
+          refocus_timer_.Stop();
+          return;
+        }
+        wxWindow* f = wxWindow::FindFocus();
+        if (f && f != tree_ && !IsDescendant(f) && wxGetTopLevelParent(f) == wxGetTopLevelParent(this) &&
+            tree_->IsShownOnScreen())
+          tree_->SetFocus();
+      });
+    }
+    refocus_timer_.Start(30);
+  }
+
   void focus_tree_after_dialog() {
     ++tree_focus_req_;
     tree_->SetFocus();
@@ -8865,11 +9051,18 @@ class Sidebar : public wxPanel, public SidebarPanel {
         return;
       }
       if (!undef_line.empty()) {
-        // The warning first (the header row ellipsizes the end), the count after it. It stays
-        // until clicked or replaced (a send would stop at it); a click opens the variables.
-        show_note(wxString::FromUTF8("\xE2\x9A\xA0 " + undef_line + ": click to define \xC2\xB7 " + line + t),
-                  wxString::FromUTF8(msg + "\n\nClick to open the folder settings of " + u8(w.top.filename()) + "."), 0,
-                  [this, top_dir = w.top] { open_folder_settings(top_dir); });
+        // Short enough for the header row at the default width: the warning, the request count
+        // and the time ("⚠ {{base}} undefined · 2000 req · 41 ms"). It stays until clicked or
+        // replaced (a send would stop at it); a click asks for the values, keys filled in.
+        const std::string shortw = w.undefined.size() == 1 ? "{{" + w.undefined[0] + "}} undefined"
+                                                            : std::to_string(w.undefined.size()) + " vars undefined";
+        char cnt[64];
+        std::snprintf(cnt, sizeof cnt, " \xC2\xB7 %zu req \xC2\xB7 %.0f ms", w.requests, ms);
+        show_note(wxString::FromUTF8("\xE2\x9A\xA0 " + shortw + cnt),
+                  wxString::FromUTF8(msg + "\n\nClick to define " +
+                                     (w.undefined.size() == 1 ? std::string("it") : std::string("them")) +
+                                     " (saved as variables of " + u8(w.top.filename()) + ")."),
+                  0, [this, top_dir = w.top, names = w.undefined] { define_undefined(top_dir, names); });
         return;
       }
       // The time first: at the sidebar's width the end of the line is ellipsized (the full
@@ -9128,6 +9321,7 @@ class Sidebar : public wxPanel, public SidebarPanel {
   CollectionNode view_root_;  // what the tree shows (tree_root_ or its filtered copy)
   std::set<fs::path> expanded_;
   size_t filter_not_name_ = 0;  // filter hits whose name holds no word of the query
+  size_t filter_by_method_ = 0;  // ... of which the query names the method
   std::map<const void*, fs::path> snap_seen_;  // refresh_snapshot_tabs(): origin each snapshot tab last read
   std::string filter_q_;
   std::string rebuilt_q_;  // the filter the tree's rows were last built for
@@ -9154,6 +9348,10 @@ class Sidebar : public wxPanel, public SidebarPanel {
   wxTreeItemId hover_item_;
   bool more_hot_ = false;
   unsigned tree_focus_req_ = 0;  // bumped when the keyboard moves to the tree on purpose
+  wxTimer refocus_timer_;        // keep_tree_focus()
+  bool refocus_bound_ = false;
+  unsigned refocus_req_ = 0;
+  std::chrono::steady_clock::time_point refocus_until_;
   bool reveal_active_ = false;  // the active tab's file was not in the tree yet
   bool sync_ok_ = false;  // the next rebuild() may update the rows in place (sync_tree)
   uint64_t rebuild_gen_ = 0;  // bumped by every rebuild (cancels expand_more)
@@ -9294,6 +9492,7 @@ class Sidebar : public wxPanel, public SidebarPanel {
   wxStaticText* hist_label_ = nullptr;
   wxButton* hist_expand_ = nullptr;
   bool hist_full_ = false;
+  bool hist_collapsed_ = false;  // history folded to its header (kept across restarts)
   int hist_saved_sash_ = 0;
   wxWindow* top_pane_ = nullptr;
   bool hist_saved_user_ = false;
