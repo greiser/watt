@@ -224,4 +224,4 @@ without installing the Visual C++ Redistributable. The licence texts come from v
 | `resources\icon` | Application icon and the script that draws it |
 | `packaging` | `package.ps1`, the README for the zip, extra licence texts |
 | `vcpkg` | Overlay port and triplet for the pinned libcurl |
-| `docs` | This guide; `docs\dev` holds development notes |
+| `docs` | This guide |

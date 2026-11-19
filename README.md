@@ -89,7 +89,7 @@ vcpkg set up:
 | `resources/icon` | Application icon and the script that draws it |
 | `packaging` | Windows distribution script, the end-user README and extra licence texts |
 | `vcpkg` | vcpkg overlay port and triplet for the pinned libcurl build |
-| `docs` | Build guide, plus development notes in `docs/dev` |
+| `docs` | Build guide |
 
 ## Licence
 
