@@ -82,6 +82,8 @@ class KvGrid : public wxGrid {
   std::function<std::optional<Preview>(const std::string& var)> preview;
 
   void set_rows(const std::vector<KvRow>& rows);  // does not call on_change
+  // Takes down a hover tooltip now (a send: it must not stay over the grid until the mouse moves).
+  void hide_tip();
   std::vector<KvRow> rows() const;               // filled rows only, with the live editor text
   // The cell being typed into: its index in rows() and its column (-1 when no cell editor is
   // open). A lint under the table waits until that edit ends instead of flashing per keystroke.
@@ -164,6 +166,7 @@ class KvGrid : public wxGrid {
 
   Kind kind_;
   PickPopup* pick_ = nullptr;
+  PickPopup* op_pick_ = nullptr;  // the Assert operator list, kept hidden between opens (a child: freed with the grid)
   int pick_row_ = -1;
   int key_c_ = 1, type_c_ = -1, value_c_ = 2, desc_c_ = -1, del_c_ = 3;
   PickPopup* suggest_ = nullptr;

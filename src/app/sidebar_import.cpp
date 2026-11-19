@@ -562,7 +562,8 @@ void pm_item(const Value& it, ImportFolder& out, const AuthSpec& auth, const std
     ImportFolder f;
     f.name = name.empty() ? "Folder" : name;
     AuthSpec a = auth;
-    if (const Value* fa = mem(it, "auth")) {
+    // No "auth" (or {"type": "inherit"}) on a folder: its requests take the parent's, as in Postman.
+    if (const Value* fa = mem(it, "auth"); fa && fa->IsObject() && !pm_auth(fa).type.empty() && pm_auth(fa).type != "inherit") {
       a = pm_auth(fa);
       if (!pm_descendant_auth(it) && folder_auth(a, f, c.res)) a = AuthSpec{"inherit", {}};  // its requests inherit it
     }
@@ -609,7 +610,7 @@ void pm_item(const Value& it, ImportFolder& out, const AuthSpec& auth, const std
     AuthSpec a = auth;
     if (const Value* ra = mem(req, "auth")) {
       AuthSpec own = pm_auth(ra);
-      if (own.type != "inherit") a = own;
+      if (!own.type.empty() && own.type != "inherit") a = own;  // only an explicit type (noauth too) replaces it
     }
     if (a.type == "inherit") r.auth.type = HttpAuth::Type::Inherit;  // a folder's / the collection's
     else apply_auth(r, a, c.res);
@@ -633,6 +634,9 @@ std::optional<ImportResult> parse_postman(const Document& d, std::string* err) {
   pm_variables(d, res.root);
   AuthSpec auth = pm_auth(mem(d, "auth"));
   if (!pm_descendant_auth(d) && folder_auth(auth, res.root, res)) auth = AuthSpec{"inherit", {}};  // the collection folder's
+  // No collection auth: requests without their own inherit (from the collection's folder.json, which
+  // the user may fill in later), as Postman does. Only an explicit {"type": "noauth"} means none.
+  if (auth.type.empty() || auth.type == "inherit") auth = AuthSpec{"inherit", {}};
   std::string pre, post;
   pm_events(d, pre, post);
   const Value* items = arr(d, "item");
@@ -782,7 +786,8 @@ std::optional<ImportResult> parse_insomnia(const Document& d, std::string* err) 
               AuthSpec own = insomnia_auth(av);
               if (own.type != "inherit") a = own;
             }
-            apply_auth(r, a, res);
+            if (a.type.empty() || a.type == "inherit") r.auth.type = HttpAuth::Type::Inherit;  // nothing above sets one
+            else apply_auth(r, a, res);
             auto script = [](std::string s) {
               if (s.find("insomnia.") != std::string::npos) s = "var insomnia = pm;\n" + s;
               return s;
@@ -1495,7 +1500,8 @@ std::optional<SavedRequest> bru_request(const std::vector<BruBlock>& bs, const B
   }
   AuthSpec a = bru_auth(bs, bru_kv(m, "auth"));
   if (a.type == "inherit" || a.type.empty()) a = lvl.auth;
-  apply_auth(r, a, res);
+  if (a.type.empty() || a.type == "inherit") r.auth.type = HttpAuth::Type::Inherit;  // nothing above sets one
+  else apply_auth(r, a, res);
   std::string pre = lvl.pre;
   if (const BruBlock* s = bru_find(bs, "script:pre-request"); s && !trim(s->text).empty())
     pre += (pre.empty() ? "" : "\n\n") + s->text;
@@ -2311,6 +2317,150 @@ ImportWritten write_import(Workspace& ws, const fs::path& dest_in, ImportResult&
     (*j.order)[j.slot] = j.r->file.filename().native();
   }
   for (auto& [dir, names] : w.order) std::erase_if(names, [](const std::wstring& x) { return x.empty(); });
+  // The collection's order (Postman item order, Insomnia sortKey, Bruno seq) goes into each
+  // folder's folder.json, so a clone, a teammate and the runner see it too.
+  // A folder whose items are in natural name order anyway (subfolders first) gets none.
+  for (const auto& [dir, names] : w.order) {
+    if (names.size() < 2) continue;
+    std::vector<std::string> u;
+    u.reserve(names.size());
+    for (const auto& x : names) u.push_back(u8s(fs::path(x)));
+    auto stem = [](const std::string& n) {
+      const bool req = n.ends_with(".req.json");
+      return std::pair<bool, std::string_view>(req, std::string_view(n).substr(0, req ? n.size() - 9 : n.size()));
+    };
+    if (std::is_sorted(u.begin(), u.end(), [&](const std::string& a, const std::string& b) {
+          const auto x = stem(a), y = stem(b);
+          if (x.first != y.first) return !x.first;
+          return natural_less(x.second, y.second);
+        }))
+      continue;
+    std::string err;
+    if (!ws.save_folder_order(dir, u, &err)) w.skipped.push_back(u8s(dir.filename()) + " order: " + err);
+  }
+  return w;
+}
+
+namespace {
+
+std::string sync_key(const SavedRequest& r) {
+  if (r.kind != RequestKind::Http) return "#" + lower_ascii(r.name);
+  std::string url = r.http.url;
+  while (!url.empty() && std::isspace(static_cast<unsigned char>(url.back()))) url.pop_back();
+  return upper(r.http.method.empty() ? std::string("GET") : r.http.method) + " " + url;
+}
+
+struct SyncPlan {
+  std::set<std::string>* existing_keys;
+  std::set<std::string>* matched;
+  const std::map<fs::path, std::string>* by_file;  // existing request file -> its key
+  SyncWritten* w;
+  std::vector<WriteJob> jobs;
+  std::vector<VarsJob> vars;
+  std::map<fs::path, std::vector<std::wstring>> order;  // unused slots for WriteJob
+};
+
+void plan_sync(const fs::path& dir, ImportFolder& f, SyncPlan& p, int depth) {
+  std::error_code ec;
+  if (!fs::create_directories(dir, ec) && ec) {
+    p.w->skipped.push_back(f.name + ": the folder could not be created (" + ec.message() + ")");
+    return;
+  }
+  if (f.has_settings() && !fs::exists(dir / L"folder.json", ec)) p.vars.emplace_back(dir, &f);
+  std::vector<std::wstring>& order = p.order[dir];
+  std::set<std::string> used;
+  for (auto& sub : f.folders) {
+    if (depth > kMaxDepth) break;
+    const std::string base = folder_name(sub.name);
+    std::string n = base;
+    for (int k = 2; used.count(lower_ascii(n)) && k < 100000; ++k) n = base + " " + std::to_string(k);
+    used.insert(lower_ascii(n));
+    plan_sync(dir / from_u8s(n), sub, p, depth + 1);
+  }
+  for (auto& r : f.requests) {
+    std::string n = r.name;
+    std::string file = slug(n) + ".req.json";
+    for (int k = 2; used.count(lower_ascii(file)) && k < 100000; ++k) {
+      n = r.name + " " + std::to_string(k);
+      file = slug(n) + ".req.json";
+    }
+    used.insert(lower_ascii(file));
+    const std::string key = sync_key(r);
+    const fs::path target = dir / from_u8s(file);
+    p.matched->insert(key);
+    if (auto it = p.by_file->find(target.lexically_normal()); it != p.by_file->end()) {
+      p.matched->insert(it->second);  // the same file, its URL edited: kept, not stale
+      ++p.w->kept;
+      continue;
+    }
+    if (p.existing_keys->count(key) || fs::exists(target, ec)) {
+      ++p.w->kept;
+      continue;
+    }
+    p.existing_keys->insert(key);  // the same operation twice in one document: once
+    r.name = n;
+    r.file = target;
+    r.id.clear();
+    p.jobs.push_back(WriteJob{&r, &order, order.size()});
+    order.emplace_back();
+  }
+}
+
+}  // namespace
+
+SyncWritten sync_import(Workspace& ws, const fs::path& top_in, ImportResult& r) {
+  SyncWritten w;
+  w.skipped = r.skipped;
+  const fs::path root = ws.root().lexically_normal();
+  const fs::path top = top_in.lexically_normal();
+  if (top.empty() || !inside(top, root)) {
+    w.skipped.push_back("everything: the folder is outside the workspace");
+    return w;
+  }
+  // What is there now: every request under top, by method + URL.
+  std::set<std::string> existing, matched;
+  std::vector<std::pair<std::string, std::string>> have;  // key, name
+  std::map<fs::path, std::string> by_file;
+  std::error_code ec;
+  for (fs::recursive_directory_iterator it(top, fs::directory_options::skip_permission_denied, ec), end;
+       !ec && it != end; it.increment(ec)) {
+    std::error_code ec2;
+    if (it->is_symlink(ec2)) {
+      if (it->is_directory(ec2)) it.disable_recursion_pending();
+      continue;
+    }
+    const std::wstring& name = it->path().native();
+    if (name.size() < 9 || _wcsicmp(name.c_str() + name.size() - 9, L".req.json") != 0) continue;
+    if (auto req = ws.load_request(it->path())) {
+      const std::string key = sync_key(*req);
+      existing.insert(key);
+      have.emplace_back(key, req->name);
+      by_file[it->path().lexically_normal()] = key;
+    }
+  }
+  SyncPlan p{&existing, &matched, &by_file, &w, {}, {}, {}};
+  plan_sync(top, r.root, p, 1);
+  write_jobs(ws, p.jobs);
+  for (const auto& [dir, f] : p.vars) {
+    FolderSettings fs_;
+    fs_.vars = f->vars;
+    fs_.headers = f->headers;
+    fs_.auth = f->auth;
+    fs_.basic_auth = f->basic_auth;
+    std::string err;
+    if (!ws.save_folder_settings(dir, fs_, &err))
+      w.skipped.push_back(f->name + " settings: " + (err.empty() ? std::string("folder.json could not be written") : err));
+  }
+  for (auto& j : p.jobs) {
+    if (!j.ok) {
+      w.skipped.push_back(j.r->name + ": " + j.err);
+      continue;
+    }
+    ++w.added;
+    if (w.first_added.empty()) w.first_added = j.r->file;
+  }
+  for (const auto& [key, name] : have)
+    if (!matched.count(key)) w.stale.push_back(key[0] == '#' ? name : key);
   return w;
 }
 
@@ -2424,7 +2574,7 @@ std::string new_id() {
   return buf;
 }
 
-void request_files(const fs::path& dir, const std::map<fs::path, std::vector<std::wstring>>* order,
+void request_files(const Workspace& ws, const fs::path& dir, const std::map<fs::path, std::vector<std::wstring>>* order,
                    std::vector<fs::path>& dirs, std::vector<fs::path>& files) {
   std::error_code ec;
   for (fs::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
@@ -2437,12 +2587,18 @@ void request_files(const fs::path& dir, const std::map<fs::path, std::vector<std
       files.push_back(p);
     }
   }
+  // The sidebar's order (what it shows, maybe not saved yet), else the folder's stored one.
+  std::vector<std::wstring> stored;
+  const std::vector<std::wstring>* list = nullptr;
+  if (order)
+    if (auto it = order->find(dir); it != order->end()) list = &it->second;
+  if (!list) {
+    for (const auto& n : ws.folder_order(dir)) stored.push_back(from_u8s(n).native());
+    list = &stored;
+  }
   auto rank = [&](const fs::path& p) -> size_t {
-    if (!order) return SIZE_MAX;
-    auto it = order->find(dir);
-    if (it == order->end()) return SIZE_MAX;
-    for (size_t i = 0; i < it->second.size(); ++i)
-      if (it->second[i] == p.filename().native()) return i;
+    for (size_t i = 0; i < list->size(); ++i)
+      if (_wcsicmp((*list)[i].c_str(), p.filename().c_str()) == 0) return i;
     return SIZE_MAX;
   };
   auto less = [&](const fs::path& a, const fs::path& b) {
@@ -2608,7 +2764,7 @@ Value pm_request_item(const SavedRequest& r, Document::AllocatorType& al) {
 void export_dir(const Workspace& ws, const fs::path& dir, const std::map<fs::path, std::vector<std::wstring>>* order,
                 Value& items, Document::AllocatorType& al, ExportResult& res, int depth) {
   std::vector<fs::path> dirs, files;
-  request_files(dir, order, dirs, files);
+  request_files(ws, dir, order, dirs, files);
   for (const auto& d : dirs) {
     if (depth > kMaxDepth) break;
     Value sub(rapidjson::kArrayType);
@@ -2663,7 +2819,7 @@ ExportResult export_curl(const Workspace& ws, const fs::path& folder, CurlShell 
   std::function<void(const fs::path&, const std::string&, int)> walk = [&](const fs::path& dir, const std::string& prefix,
                                                                             int depth) {
     std::vector<fs::path> dirs, files;
-    request_files(dir, order, dirs, files);
+    request_files(ws, dir, order, dirs, files);
     for (const auto& p : files) {
       std::string err;
       auto r = ws.load_request(p, &err);

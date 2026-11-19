@@ -8,6 +8,7 @@
 #include <wx/simplebook.h>
 #include <wx/sizer.h>
 #include <wx/stattext.h>
+#include <wx/stc/stc.h>
 #include <wx/textctrl.h>
 #include <wx/weakref.h>
 #include <wx/wupdlock.h>
@@ -195,6 +196,16 @@ class FolderDialog : public wxDialog {
       if (e.ControlDown() && (k == 'S' || k == WXK_RETURN || k == WXK_NUMPAD_ENTER)) {
         finish();
         return;
+      }
+      // Esc cancels, like the Cancel button (a FlatButton, not a wxID_CANCEL button the default
+      // handling would find). Open lists and grid edits take their Esc first (their own hooks);
+      // a script editor's completion list or call tip closes before the dialog does.
+      if (k == WXK_ESCAPE && !e.HasAnyModifiers()) {
+        auto* stc = wxDynamicCast(wxWindow::FindFocus(), wxStyledTextCtrl);
+        if (!stc || (!stc->AutoCompActive() && !stc->CallTipActive())) {
+          EndModal(wxID_CANCEL);
+          return;
+        }
       }
       e.Skip();
     });

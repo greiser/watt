@@ -11,11 +11,16 @@
 #include <wx/splitter.h>
 #include <wx/stattext.h>
 #include <wx/textctrl.h>
+#include <wx/timer.h>
 #include <wx/toplevel.h>
+#include <wx/utils.h>
 #include <wx/weakref.h>
 
 #include <algorithm>
 #include <chrono>
+#include <share.h>
+
+#include <cstdio>
 #include <ctime>
 #include <deque>
 #include <map>
@@ -33,6 +38,44 @@ namespace watt::app {
 namespace fs = std::filesystem;
 
 namespace {
+
+// WATT_FRAME_TRACE=<file>: "mock.<step> ms" lines for the tab's UI-thread steps (as main_frame).
+FILE* trace_file() {
+  static FILE* f = []() -> FILE* {
+    wxString p;
+    FILE* out = nullptr;
+    if (wxGetEnv("WATT_FRAME_TRACE", &p) && !p.empty()) out = _wfsopen(p.wc_str(), L"a", _SH_DENYNO);
+    return out;
+  }();
+  return f;
+}
+struct Laps {
+  const char* what;
+  std::chrono::steady_clock::time_point t = std::chrono::steady_clock::now();
+  explicit Laps(const char* w) : what(w) {}
+  void lap(const char* part) {
+    if (FILE* f = trace_file()) {
+      const auto now = std::chrono::steady_clock::now();
+      const long long wall = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                 std::chrono::system_clock::now().time_since_epoch()).count();
+      std::fprintf(f, "%s.%s %.2f @%lld\n", what, part, std::chrono::duration<double, std::milli>(now - t).count(), wall);
+      std::fflush(f);
+      t = now;
+    }
+  }
+};
+
+// Runs f on a later turn of the message loop (a one-shot timer), after the window messages
+// already queued: CallAfter events posted from CallAfter run back to back in one go (as
+// runner_view.cpp's next_turn).
+void next_turn(std::function<void()> f) {
+  auto* t = new wxTimer();
+  t->Bind(wxEVT_TIMER, [t, f = std::move(f)](wxTimerEvent&) {
+    f();
+    wxTheApp->CallAfter([t] { delete t; });
+  });
+  t->StartOnce(1);
+}
 
 constexpr size_t kMaxLogRows = 20000;
 constexpr size_t kMaxExamplesPerRoute = 20;
@@ -119,18 +162,47 @@ class MockFrame : public wxPanel {
  public:
   MockFrame(wxWindow* parent, std::function<Workspace*()> workspace, const Workspace& ws, fs::path folder,
             std::function<void()> vars_changed)
-      : wxPanel(parent, wxID_ANY),
-        workspace_(std::move(workspace)),
+      : workspace_(std::move(workspace)),
         vars_changed_(std::move(vars_changed)),
         root_(ws.root()),
         folder_(std::move(folder)),
         server_(std::make_shared<mock::MockServer>()) {
+    // Created hidden: child controls made under a shown window cost several ms each (the
+    // notebook shows the page when it is selected).
+    Hide();
+    Create(parent, wxID_ANY);
     link_ = std::make_shared<Link>();
     link_->frame = this;
     key_ = mock_key(root_, folder_);
     const fs::path& p = folder_.empty() || key_ == mock_key(root_, {}) ? root_ : folder_;
     name_ = u8(p.filename());
-    build();
+    build_bar();
+  }
+
+  // The rest of the tab, one step per turn of the message loop (each native control costs
+  // 0.5-2 ms, each list several; built at once with the bar they were one 50-80 ms step): the
+  // page goes into the notebook (add_page), the Address / Port / Delay fields (then start()
+  // when start), the routes list, the log list, the splitter, then done() (the selection).
+  void build_body(std::function<void()> add_page, bool start, std::function<void()> done) {
+    auto steps = std::make_shared<std::vector<std::pair<const char*, std::function<void()>>>>();
+    steps->emplace_back("add_page", [this, add_page = std::move(add_page)] {
+      add_page();
+      adding_ = false;
+    });
+    steps->emplace_back("fields", [this, start] {
+      build_fields();
+      if (start) this->start();
+    });
+    steps->emplace_back("routes", [this] { build_routes(); });
+    steps->emplace_back("log", [this] { build_log(); });
+    steps->emplace_back("split", [this] {
+      split_->SplitHorizontally(routes_pane_, log_pane_, FromDIP(190));
+      GetSizer()->Add(split_, 1, wxEXPAND | wxALL, FromDIP(10));
+      split_->Show();
+      show();
+    });
+    if (done) steps->emplace_back("select", std::move(done));
+    run_step(std::move(steps), 0);
   }
 
   ~MockFrame() override {
@@ -141,18 +213,24 @@ class MockFrame : public wxPanel {
     std::thread([s = std::move(server_)] { s->stop(); }).detach();
   }
 
+  bool adding() const { return adding_; }  // not in the notebook yet (build_body's first step)
   wxString tab_title() const { return U("Mock: " + name_); }
   const fs::path& folder() const { return folder_; }
   bool running() const { return running_; }
   // The port to keep for a restart: the one it listens on, else the Port field (0: any).
   unsigned port() const {
+    if (!port_) return pending_port_;  // the fields come a turn after the tab (build_body)
     unsigned long p = 0;
     if (!port_->GetValue().Trim().ToULong(&p) || p > 65535) p = 0;
     return static_cast<unsigned>(p);
   }
-  void set_port(unsigned p) { port_->ChangeValue(wxString::Format("%u", p)); }
+  void set_port(unsigned p) {
+    if (port_) port_->ChangeValue(wxString::Format("%u", p));
+    else pending_port_ = p;
+  }
   // Only a loopback mock comes back running after a restart (any other address asked first).
   bool loopback() const {
+    if (!addr_) return true;  // not built yet: the default, 127.0.0.1
     std::string a = addr_->GetValue().Trim().Trim(false).utf8_string();
     return a.empty() || mock::is_loopback_address(a);
   }
@@ -164,7 +242,7 @@ class MockFrame : public wxPanel {
 
   void start() {
     Workspace* ws = workspace_ ? workspace_() : nullptr;
-    if (!ws || busy_) return;
+    if (!ws || busy_ || !addr_) return;
     std::string addr = addr_->GetValue().Trim().Trim(false).utf8_string();
     if (addr.empty()) addr = "127.0.0.1";
     unsigned long port = 0;
@@ -190,7 +268,9 @@ class MockFrame : public wxPanel {
     }
     busy_ = true;
     set_state("Starting\xE2\x80\xA6", false);
+    Laps laps("mock");
     auto copy = std::make_shared<Workspace>(*ws);
+    laps.lap("ws_copy");
     run_worker([copy, folder = folder_, srv = server_, link = link_, addr, port, delay, allow] {
       std::vector<std::string> errors;
       auto routes = collect_mock_routes(*copy, folder, &errors);
@@ -281,10 +361,11 @@ class MockFrame : public wxPanel {
       link_->posted = false;
     }
     if (got.empty()) return;
-    const long count = log_->GetItemCount();
+    const long count = log_ ? log_->GetItemCount() : 0;
     const bool at_end = count == 0 || log_->GetTopItem() + log_->GetCountPerPage() >= count;
     for (auto& e : got) rows_.push_back(std::move(e));
     while (rows_.size() > kMaxLogRows) rows_.pop_front();
+    if (!log_) return;  // the log list is not built yet: it shows rows_ when it is
     log_->SetItemCount(static_cast<long>(rows_.size()));
     if (at_end) log_->EnsureVisible(static_cast<long>(rows_.size()) - 1);
     log_->Refresh(false);
@@ -292,6 +373,18 @@ class MockFrame : public wxPanel {
   }
 
  private:
+  void run_step(std::shared_ptr<std::vector<std::pair<const char*, std::function<void()>>>> steps, size_t i) {
+    if (i >= steps->size()) return;
+    wxWeakRef<wxWindow> self(this);
+    next_turn([this, self, steps = std::move(steps), i]() mutable {
+      if (!self) return;
+      Laps laps("mock");
+      (*steps)[i].second();
+      laps.lap((*steps)[i].first);
+      run_step(std::move(steps), i + 1);
+    });
+  }
+
   template <class F>
   void run_worker(F&& f) {
     std::thread(std::forward<F>(f)).detach();
@@ -310,8 +403,17 @@ class MockFrame : public wxPanel {
     // The port it really listens on (0 picks one): shown, and kept for the next Start / restart.
     if (const size_t c = base_.rfind(':'); c != std::string::npos && c + 1 < base_.size())
       port_->ChangeValue(U(base_.substr(c + 1)));
-    set_var();
+    Laps laps("mock");
     show();
+    laps.lap("started_show");
+    // {{mock}} recolours every editor (MainFrame::vars_changed): a turn of its own.
+    wxWeakRef<wxWindow> self(this);
+    next_turn([this, self] {
+      if (!self || !running_) return;
+      Laps laps2("mock");
+      set_var();
+      laps2.lap("set_var");
+    });
   }
 
   // {{mock}}: the newest running mock server's base URL (runtime variables are never saved).
@@ -344,7 +446,7 @@ class MockFrame : public wxPanel {
     Layout();
   }
 
-  void build() {
+  void build_bar() {
     const auto& th = rv::Theme::get();
     SetBackgroundColour(th.bg);
     SetForegroundColour(th.fg);
@@ -378,49 +480,63 @@ class MockFrame : public wxPanel {
     reload_->SetToolTip("Read the requests and their saved examples again (Save as example reloads by itself)");
     reload_->on_click = [this] { reload(); };
     bar->Add(reload_, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, FromDIP(14));
-    auto label = [this](const char* t) {
-      auto* s = new wxStaticText(this, wxID_ANY, t);
-      s->SetForegroundColour(rv::Theme::get().dim);
-      return s;
-    };
-    bar->Add(label("Address"), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, FromDIP(4));
-    addr_ = new wxTextCtrl(this, wxID_ANY, "127.0.0.1", wxDefaultPosition, wxSize(FromDIP(96), -1));
-    addr_->SetToolTip("127.0.0.1 only by default; any other address asks first (stored per user)");
-    bar->Add(addr_, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
-    bar->Add(label("Port"), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, FromDIP(4));
-    port_ = new wxTextCtrl(this, wxID_ANY, "0", wxDefaultPosition, wxSize(FromDIP(54), -1));
-    port_->SetToolTip("0 picks a free port");
-    bar->Add(port_, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
-    bar->Add(label("Delay"), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, FromDIP(4));
-    delay_ = new wxTextCtrl(this, wxID_ANY, "0", wxDefaultPosition, wxSize(FromDIP(54), -1));
-    delay_->SetToolTip("Milliseconds before each response (?__delay=ms or X-Mock-Delay: ms per request)");
-    bar->Add(delay_, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, FromDIP(4));
-    bar->Add(label("ms"), 0, wxALIGN_CENTER_VERTICAL);
+    bar_ = bar;
     top->Add(bar, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, FromDIP(10));
-
     hint_ = new wxStaticText(this, wxID_ANY, "");
     hint_->SetForegroundColour(th.dim);
     top->Add(hint_, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, FromDIP(8));
     state_ = new wxStaticText(this, wxID_ANY, "");
     state_->SetForegroundColour(th.dim);
     top->Add(state_, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, FromDIP(4));
+    SetSizer(top);
+    show();
+  }
 
+  // Address, Port, Delay: the bar's right end (build_body's first step).
+  void build_fields() {
+    const int gap = FromDIP(6);
+    auto label = [this](const char* t) {
+      auto* s = new wxStaticText(this, wxID_ANY, t);
+      s->SetForegroundColour(rv::Theme::get().dim);
+      return s;
+    };
+    bar_->Add(label("Address"), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, FromDIP(4));
+    addr_ = new wxTextCtrl(this, wxID_ANY, "127.0.0.1", wxDefaultPosition, wxSize(FromDIP(96), -1));
+    addr_->SetToolTip("127.0.0.1 only by default; any other address asks first (stored per user)");
+    bar_->Add(addr_, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
+    bar_->Add(label("Port"), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, FromDIP(4));
+    port_ = new wxTextCtrl(this, wxID_ANY, wxString::Format("%u", pending_port_), wxDefaultPosition, wxSize(FromDIP(54), -1));
+    port_->SetToolTip("0 picks a free port");
+    bar_->Add(port_, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
+    bar_->Add(label("Delay"), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, FromDIP(4));
+    delay_ = new wxTextCtrl(this, wxID_ANY, "0", wxDefaultPosition, wxSize(FromDIP(54), -1));
+    delay_->SetToolTip("Milliseconds before each response (?__delay=ms or X-Mock-Delay: ms per request)");
+    bar_->Add(delay_, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, FromDIP(4));
+    bar_->Add(label("ms"), 0, wxALIGN_CENTER_VERTICAL);
+    show();
+  }
+
+  wxPanel* pane(wxWindow* parent, wxStaticText** title_out, const wxString& text) {
+    const auto& th = rv::Theme::get();
+    auto* p = new wxPanel(parent);
+    p->SetBackgroundColour(th.bg);
+    auto* s = new wxBoxSizer(wxVERTICAL);
+    auto* t = new wxStaticText(p, wxID_ANY, text);
+    t->SetFont(p->GetFont().Bold());
+    s->Add(t, 0, wxLEFT | wxTOP | wxBOTTOM, FromDIP(4));
+    *title_out = t;
+    p->SetSizer(s);
+    return p;
+  }
+
+  void build_routes() {
     auto* split = new wxSplitterWindow(this, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxSP_LIVE_UPDATE | wxSP_THIN_SASH);
-    split->SetBackgroundColour(th.bg);
+    split_ = split;
+    split->SetBackgroundColour(rv::Theme::get().bg);
     split->SetMinimumPaneSize(FromDIP(60));
     split->SetSashGravity(0.0);
-    auto pane = [&](wxWindow* parent, wxStaticText** title_out, const char* text) {
-      auto* p = new wxPanel(parent);
-      p->SetBackgroundColour(th.bg);
-      auto* s = new wxBoxSizer(wxVERTICAL);
-      auto* t = new wxStaticText(p, wxID_ANY, text);
-      t->SetFont(p->GetFont().Bold());
-      s->Add(t, 0, wxLEFT | wxTOP | wxBOTTOM, FromDIP(4));
-      *title_out = t;
-      p->SetSizer(s);
-      return p;
-    };
     auto* rp = pane(split, &routes_title_, "Routes");
+    routes_pane_ = rp;
     routes_ = new wxListCtrl(rp, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxLC_REPORT | wxLC_SINGLE_SEL | wxBORDER_NONE);
     routes_->AppendColumn("Method", wxLIST_FORMAT_LEFT, FromDIP(64));
     routes_->AppendColumn("Path", wxLIST_FORMAT_LEFT, FromDIP(330));
@@ -437,8 +553,14 @@ class MockFrame : public wxPanel {
       set_state("Copied " + u, false);
     });
     rp->GetSizer()->Add(routes_, 1, wxEXPAND);
-    auto* lp = pane(split, &log_title_, "Request log  (0)");
+    split->Hide();  // shown with both panes (build_body's last step)
+  }
+
+  void build_log() {
+    auto* lp = pane(split_, &log_title_, wxString::Format("Request log  (%zu)", rows_.size()));
+    log_pane_ = lp;
     log_ = new LogList(lp, &rows_);
+    log_->SetItemCount(static_cast<long>(rows_.size()));
     lp->GetSizer()->Add(log_, 1, wxEXPAND);
     auto* clear = new http_editor::FlatButton(lp, "Clear log", http_editor::FlatButton::Style::Outline);
     clear->on_click = [this] {
@@ -448,10 +570,6 @@ class MockFrame : public wxPanel {
       log_title_->SetLabel("Request log  (0)");
     };
     lp->GetSizer()->Add(clear, 0, wxALIGN_RIGHT | wxTOP, FromDIP(4));
-    split->SplitHorizontally(rp, lp, FromDIP(190));
-    top->Add(split, 1, wxEXPAND | wxALL, FromDIP(10));
-    SetSizer(top);
-    show();
   }
 
   void show() {
@@ -462,18 +580,20 @@ class MockFrame : public wxPanel {
     url_->ChangeValue(U(base_));
     toggle_->SetLabel(running_ ? "Stop" : "Start");
     copy_->Enable(running_);
-    addr_->Enable(!running_);
-    port_->Enable(!running_);
+    if (addr_) addr_->Enable(!running_);
+    if (port_) port_->Enable(!running_);
     hint_->SetLabel(U(running_ ? "{{mock}} = " + base_ +
                                      "   \xC2\xB7   pick an example with ?__example=<name> or X-Mock-Example: <name>   "
                                      "\xC2\xB7   unmatched paths return 404 with the route list"
                                : "Serves the saved examples (Save as example in the response view) of the HTTP requests in " +
                                      name_ + ". While running, {{mock}} is its base URL."));
     auto rt = server_->routes();
-    routes_->Freeze();
-    routes_->DeleteAllItems();
     size_t with = 0;
-    if (running_ && rt) {
+    if (routes_) {
+      routes_->Freeze();
+      routes_->DeleteAllItems();
+    }
+    if (routes_ && running_ && rt) {
       long i = 0;
       for (const auto& r : *rt) {
         routes_->InsertItem(i, U(r.method));
@@ -495,9 +615,11 @@ class MockFrame : public wxPanel {
         ++i;
       }
     }
-    routes_->Thaw();
-    routes_title_->SetLabel(rt && running_ ? wxString::Format("Routes  (%zu, %zu with examples)", rt->size(), with)
-                                           : wxString("Routes"));
+    if (routes_) {  // built a few turns after the bar (build_body)
+      routes_->Thaw();
+      routes_title_->SetLabel(rt && running_ ? wxString::Format("Routes  (%zu, %zu with examples)", rt->size(), with)
+                                             : wxString("Routes"));
+    }
     std::string st;
     if (!errors_.empty()) {
       st = std::to_string(errors_.size()) + " request(s) could not be read: " + errors_.front();
@@ -535,6 +657,11 @@ class MockFrame : public wxPanel {
   http_editor::FlatButton *copy_ = nullptr, *toggle_ = nullptr, *reload_ = nullptr;
   wxListCtrl* routes_ = nullptr;
   LogList* log_ = nullptr;
+  wxSplitterWindow* split_ = nullptr;
+  wxBoxSizer* bar_ = nullptr;
+  unsigned pending_port_ = 0;
+  bool adding_ = true;
+  wxPanel *routes_pane_ = nullptr, *log_pane_ = nullptr;
 };
 
 }  // namespace
@@ -575,7 +702,8 @@ std::vector<mock::Route> collect_mock_routes(const Workspace& ws, const fs::path
 }
 
 void open_mock(wxWindow* parent, std::function<Workspace*()> workspace, const fs::path& folder,
-               std::function<void()> vars_changed, bool start, unsigned port, bool select) {
+               std::function<void()> vars_changed, bool start, unsigned port, bool select, int at) {
+  Laps laps("mock");
   Workspace* ws = workspace ? workspace() : nullptr;
   if (!ws) return;
   std::function<wxAuiNotebook*(wxWindow*)> find_nb = [&](wxWindow* w) -> wxAuiNotebook* {
@@ -593,20 +721,33 @@ void open_mock(wxWindow* parent, std::function<Workspace*()> workspace, const fs
       nb->SetSelection(static_cast<size_t>(i));
       return;
     }
+    if (auto* f = dynamic_cast<MockFrame*>(it->second); f && f->adding()) return;  // added on the next turn
     open.erase(it);
   }
+  laps.lap("find");
+  // One step per turn of the message loop: the page with its bar (title, URL, Start) first, then
+  // the tab, the Address / Port fields, the routes list, the log list and the splitter
+  // (build_body), then the selection.
   auto* f = new MockFrame(nb, std::move(workspace), *ws, folder, std::move(vars_changed));
   open[key] = f;
-  nb->AddPage(f, f->tab_title(), false);
+  laps.lap("frame");
   if (port) f->set_port(port);
-  if (start) f->start();
-  if (!select) return;  // restored after a restart: the user's tab stays selected
   wxWeakRef<wxAuiNotebook> book(nb);
   wxWeakRef<wxWindow> page(f);
-  nb->CallAfter([book, page] {
-    if (!book || !page) return;
-    if (const int i = book->GetPageIndex(page.get()); i != wxNOT_FOUND) book->SetSelection(static_cast<size_t>(i));
-  });
+  auto add = [book, f, at] {
+    if (!book) return;
+    if (at >= 0 && static_cast<size_t>(at) < book->GetPageCount())
+      book->InsertPage(static_cast<size_t>(at), f, f->tab_title(), false);
+    else
+      book->AddPage(f, f->tab_title(), false);
+  };
+  std::function<void()> sel;  // restored after a restart: the user's tab stays selected
+  if (select)
+    sel = [book, page] {
+      if (!book || !page) return;
+      if (const int i = book->GetPageIndex(page.get()); i != wxNOT_FOUND) book->SetSelection(static_cast<size_t>(i));
+    };
+  f->build_body(std::move(add), start, std::move(sel));
 }
 
 bool mock_tab_info(wxWindow* w, fs::path* folder, unsigned* port, bool* running) {

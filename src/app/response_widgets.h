@@ -151,6 +151,9 @@ class Waterfall : public wxWindow {
   ~Waterfall() override;
   // Re-reads the global collapsed choice and re-lays out the parent.
   void relayout();
+  // The response pane's height, from its size handler before it lays out: a short pane (under
+  // ~760 px: a 768 px screen, request over response) shows the one-line bar.
+  void pane_height(int h);
   // prev: the previous run of this tab (same kind) for the delta column; nullptr = none.
   void set(const TimingModel& cur, const TimingModel* prev);
   // keep_reserve: keep the reserved height (a request is about to run); false: the empty state.
@@ -198,6 +201,11 @@ class Waterfall : public wxWindow {
   bool stale_ = false;
   bool reserved_ = false;
   mutable bool laid_collapsed_ = false;  // the collapsed state the last layout used
+  // A short response pane (a 768 px screen, request over response): the one-line bar whatever
+  // the remembered choice, so the body keeps its room; a click on the header still opens it
+  // (short_open_, this view only).
+  bool short_ = false, short_open_ = false;
+  bool collapsed() const;
   int reserve_rows_ = 10;
   std::vector<std::pair<wxRect, std::string>> tips_;
   int hover_ = -2;
@@ -243,10 +251,15 @@ class TabStrip : public wxWindow {
     Tone tone = Tone::Plain;
   };
   void on_paint();
+  void more_menu();
   std::vector<Tab> tabs_;
   int sel_ = 0;
   std::string note_;
   std::function<void(int)> on_select_;
+  // The "»" button: shown tabs that do not fit (never the selected one) are listed in its menu
+  // instead of running past the strip's edge. Empty when every tab fits.
+  wxRect more_rect_;
+  bool more_hover_ = false;
 };
 
 // ------------------------------------------------------------------ chip bar
@@ -280,9 +293,14 @@ class ChipBar : public wxWindow {
   void set_note(const std::string& note, Tone tone = Tone::Dim);
   // Draw the tab strip's bottom rule too (a chip bar that sits at the end of a TabStrip row).
   void set_bottom_rule(bool on) { bottom_rule_ = on; Refresh(false); }
+  // The bar's minimum width follows its visible chips (none: no width), so a bar next to a tab
+  // strip takes only the room it needs and the parent is laid out again when that changes.
+  void set_fit_width(bool on) { fit_ = on; refit(); }
   wxSize DoGetBestClientSize() const override;
 
  private:
+  void refit();
+  bool fit_ = false;
   bool bottom_rule_ = false;
   struct Chip {
     int id;

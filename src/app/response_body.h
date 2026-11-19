@@ -147,6 +147,7 @@ class BodyView : public wxPanel {
   void setup_stc();
   void apply_styles(int lexer);
   void release_docs();
+  void release_hidden(int shown);  // heavy documents of the views not on screen
   void request_mode(int mode);
   void choose_mode(int mode);  // a mode chip: remembered for this kind of body (chosen_mode_)
   void build(int k);  // starts building docs_[k] (inline for small bodies, else on the worker)

@@ -65,39 +65,10 @@ const CollectionNode* find_node(const CollectionNode& n, const std::wstring& key
 
 // A folder's own requests first, then its subfolders (a login request at the top of a folder
 // runs before the flows below it), each in the sidebar's order.
-// Natural, case-insensitive order ("endpoint 2" < "endpoint 10"), as the sidebar sorts names.
-bool natural_less(std::string_view a, std::string_view b) {
-  auto digit = [](char c) { return c >= '0' && c <= '9'; };
-  auto low = [](char c) { return c >= 'A' && c <= 'Z' ? static_cast<char>(c - 'A' + 'a') : c; };
-  size_t i = 0, j = 0;
-  while (i < a.size() && j < b.size()) {
-    if (digit(a[i]) && digit(b[j])) {
-      size_t ie = i, je = j;
-      while (ie < a.size() && digit(a[ie])) ++ie;
-      while (je < b.size() && digit(b[je])) ++je;
-      size_t is = i, js = j;
-      while (is + 1 < ie && a[is] == '0') ++is;
-      while (js + 1 < je && b[js] == '0') ++js;
-      if (ie - is != je - js) return ie - is < je - js;
-      if (int c = a.substr(is, ie - is).compare(b.substr(js, je - js)); c != 0) return c < 0;
-      if (ie - i != je - j) return ie - i < je - j;
-      i = ie;
-      j = je;
-      continue;
-    }
-    const char x = low(a[i]), y = low(b[j]);
-    if (x != y) return static_cast<unsigned char>(x) < static_cast<unsigned char>(y);
-    ++i;
-    ++j;
-  }
-  if (a.size() - i != b.size() - j) return a.size() - i < b.size() - j;
-  return a < b;
-}
-
 // Depth first. `saved`: path_key(folder) -> the runner's saved order (run-order.json): its
 // names first, folders and requests interleaved. The rest (and folders without a saved list) as
 // the sidebar sorts: subfolders first, then the dragged order (`order`, see FolderOrder), then
-// natural name order (so "Run folder" runs what the sidebar lists, top to bottom).
+// tree()'s order (folder.json "order", so "Run folder" runs what the sidebar lists, top to bottom).
 using KeyedOrder = std::map<std::wstring, std::vector<std::wstring>>;
 void flatten(const CollectionNode& n, std::vector<const CollectionNode*>& out, const KeyedOrder* order = nullptr,
              const KeyedOrder* saved = nullptr) {
@@ -125,8 +96,8 @@ void flatten(const CollectionNode& n, std::vector<const CollectionNode*>& out, c
   std::stable_sort(kids.begin(), kids.end(), [](const Kid& a, const Kid& b) {
     if (a.saved != b.saved) return a.saved < b.saved;
     if (a.c->is_folder != b.c->is_folder) return a.c->is_folder;
-    if (a.rank != b.rank) return a.rank < b.rank;
-    return natural_less(a.c->name, b.c->name);
+    // tree() already lists children in the stored folder.json order: keep it (stable_sort).
+    return a.rank < b.rank;
   });
   for (const Kid& k : kids) {
     if (k.c->is_folder) flatten(*k.c, out, order, saved);
@@ -400,6 +371,17 @@ void script_phase_front(StepResult& s, const char* name, double ms) {
   s.phases.insert(s.phases.begin(), Phase{name, ms});
 }
 
+// The OAuth token step (a cache lookup when the token is still valid) was measured inside Queue:
+// its own phase, still setup (prep_ms, setup_phases_out), never script time: a request without
+// scripts shows no Script time.
+void setup_phase_front(StepResult& s, const char* name, double ms) {
+  if (ms <= 0) return;
+  for (auto& p : s.phases)
+    if (std::strcmp(p.name, "Queue") == 0) p.ms = std::max(0.0, p.ms - ms);
+  s.timing.queue_ms = std::max(0.0, s.timing.queue_ms - ms);
+  s.phases.insert(s.phases.begin(), Phase{name, ms});
+}
+
 // The runner's own setup (expansion, files, consent checks), watt's request setup and the
 // client's queue before the first I/O (Prepare, Queue): out of total_ms into prep_ms, so the
 // Time column and every percentile measure the server and the network, not watt (Newman and
@@ -416,12 +398,14 @@ void setup_phases_out(StepResult& s) {
 }  // namespace
 
 bool is_script_phase(const Phase& p) {
-  for (const char* n : {"Pre-request vars", "Pre-request script", "Auth / token", "Post-response script"})
+  for (const char* n : {"Pre-request vars", "Pre-request script", "Post-response script"})
     if (std::strcmp(p.name, n) == 0) return true;
   return false;
 }
 
-bool is_setup_phase(const Phase& p) { return std::strcmp(p.name, "Prepare") == 0 || std::strcmp(p.name, "Queue") == 0; }
+bool is_setup_phase(const Phase& p) {
+  return std::strcmp(p.name, "Prepare") == 0 || std::strcmp(p.name, "Queue") == 0 || std::strcmp(p.name, "Auth / token") == 0;
+}
 
 std::string strip_ext(std::string s) {
   static const std::string ext = ".req.json";
@@ -1377,9 +1361,9 @@ void run_http(const SavedRequest& saved, Workspace& ws, Engines& eng, RunControl
   resp.timing.total_ms += setup;
   s.timing = resp.timing;
   http_phases(s, resp);
-  script_phase_front(s, "Auth / token", token_ms);
   script_phase_front(s, "Pre-request script", pre_ms);
   script_phase_front(s, "Pre-request vars", pre_vars_ms);
+  setup_phase_front(s, "Auth / token", token_ms);
   setup_phases_out(s);
   s.transport_ok = resp.ok;
   s.status = resp.status;

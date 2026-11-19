@@ -7,6 +7,8 @@
 #include <wx/choice.h>
 #include <wx/dialog.h>
 #include <wx/display.h>
+#include <wx/vlbox.h>
+#include <wx/menu.h>
 #include <wx/msgdlg.h>
 #include <wx/sizer.h>
 #include <wx/stattext.h>
@@ -19,12 +21,14 @@
 #include <chrono>
 #include <cstdio>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <set>
 #include <thread>
 
 #include "app/history_summary.h"
+#include "app/http_editor_widgets.h"  // themed field, dropdown and buttons of the Save dialog
 #include "app/request_tab.h"
 #include "app/response_widgets.h"  // rv::Theme (the "+" button)
 #include "app/runner_view.h"
@@ -55,6 +59,16 @@ enum {
   ID_FOCUS_FILTER,
   ID_NEW_WS_TAB,
 };
+
+// Closed tabs parked for teardown at most (beyond that the oldest is destroyed at once), and the
+// USER object count above which no spare is built (Windows' limit is 10,000 per process; past it
+// every CreateWindow fails and wx crashes on the null window).
+constexpr size_t kMaxParked = 8;
+constexpr DWORD kUserBusy = 7500;
+// A spare taken is refilled after this long without input: one slice is at most ~30 ms, so a key
+// pressed during it still shows well inside 50 ms, and tabs opened every 300 ms each find one.
+constexpr int kRefillQuietMs = 60;
+DWORD user_objects() { return ::GetGuiResources(::GetCurrentProcess(), GR_USEROBJECTS); }
 
 // The frame, for background threads that finish after it is gone (cleared in ~MainFrame).
 std::atomic<MainFrame*> g_frame{nullptr};
@@ -110,6 +124,8 @@ void gather(const CollectionNode& n, const std::string& folder, std::vector<side
 // custom buttons only through its art provider, which knows just its own bitmaps.
 constexpr int kPlusButton = 0x6E01;
 
+int tab_list(wxWindow* wnd, const wxAuiNotebookPageArray& items, int active);
+
 class PlusTabArt : public wxAuiFlatTabArt {
  public:
   wxAuiTabArt* Clone() override { return new PlusTabArt(); }
@@ -149,6 +165,12 @@ class PlusTabArt : public wxAuiFlatTabArt {
     Italic it(this, page);
     return wxAuiFlatTabArt::GetPageTabSize(dc, wnd, page, x_extent);
   }
+  // The window-list button: with many tabs a filterable list of at most ~18 rows instead of a
+  // menu taller than the screen (150 tabs were a 150-row menu).
+  int ShowDropDown(wxWindow* wnd, const wxAuiNotebookPageArray& items, int active) override {
+    if (items.size() <= 16) return wxAuiFlatTabArt::ShowDropDown(wnd, items, active);
+    return tab_list(wnd, items, active);
+  }
 
  private:
   struct Italic {
@@ -172,6 +194,124 @@ class PlusTabArt : public wxAuiFlatTabArt {
     return orientation == wxLEFT ? wxRect(in.x, y, w, h) : wxRect(in.x + in.width - w, y, w, h);
   }
 };
+
+// The window list for many tabs: a type-to-filter box over a list of the tabs' titles. Returns
+// the chosen index into items, or -1.
+class TabListBox : public wxVListBox {
+ public:
+  explicit TabListBox(wxWindow* parent) : wxVListBox(parent, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxBORDER_NONE) {
+    SetBackgroundColour(rv::Theme::get().bg);
+  }
+  std::vector<wxString> rows;
+  void set_rows(std::vector<wxString> r) {
+    rows = std::move(r);
+    SetItemCount(rows.size());
+    Refresh();
+  }
+
+ private:
+  void OnDrawItem(wxDC& dc, const wxRect& rect, size_t n) const override {
+    const auto& th = rv::Theme::get();
+    dc.SetFont(GetFont());
+    dc.SetTextForeground(IsSelected(n) ? th.fg : th.dim);
+    dc.DrawText(rows[n], rect.x + FromDIP(8), rect.y + (rect.height - dc.GetCharHeight()) / 2);
+  }
+  void OnDrawBackground(wxDC& dc, const wxRect& rect, size_t n) const override {
+    if (!IsSelected(n)) return;
+    dc.SetPen(*wxTRANSPARENT_PEN);
+    dc.SetBrush(wxBrush(rv::Theme::get().grid));
+    dc.DrawRectangle(rect);
+  }
+  wxCoord OnMeasureItem(size_t) const override { return GetCharHeight() + FromDIP(8); }
+};
+
+int tab_list(wxWindow* wnd, const wxAuiNotebookPageArray& items, int active) {
+  const auto& th = rv::Theme::get();
+  wxDialog dlg(wnd, wxID_ANY, "Tabs", wxDefaultPosition, wxDefaultSize, wxBORDER_SIMPLE);
+  dlg.SetBackgroundColour(th.bg);
+  auto* sz = new wxBoxSizer(wxVERTICAL);
+  auto* filter = new wxTextCtrl(&dlg, wxID_ANY, "", wxDefaultPosition, wxDefaultSize, wxTE_PROCESS_ENTER);
+  filter->SetHint(wxString::Format("Filter %zu tabs", items.size()));
+  filter->SetBackgroundColour(th.bg);
+  filter->SetForegroundColour(th.fg);
+  auto* list = new TabListBox(&dlg);
+  sz->Add(filter, 0, wxEXPAND | wxALL, dlg.FromDIP(6));
+  sz->Add(list, 1, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, dlg.FromDIP(6));
+  std::vector<int> shown;  // list row -> index into items
+  auto fill = [&] {
+    const wxString f = filter->GetValue().Lower();
+    std::vector<wxString> rows;
+    shown.clear();
+    int sel = 0;
+    for (size_t i = 0; i < items.size(); ++i) {
+      wxString c = items[i].caption;
+      if (!f.empty() && c.Lower().Find(f) == wxNOT_FOUND) continue;
+      if (static_cast<int>(i) == active) sel = static_cast<int>(shown.size());
+      shown.push_back(static_cast<int>(i));
+      rows.push_back(c);
+    }
+    list->set_rows(std::move(rows));
+    if (!shown.empty()) {
+      list->SetSelection(f.empty() ? sel : 0);
+      list->ScrollToRow(static_cast<size_t>(list->GetSelection()));
+    }
+  };
+  fill();
+  int chosen = -1;
+  auto pick = [&] {
+    const int r = list->GetSelection();
+    if (r >= 0 && r < static_cast<int>(shown.size())) chosen = shown[static_cast<size_t>(r)];
+    dlg.EndModal(chosen >= 0 ? wxID_OK : wxID_CANCEL);
+  };
+  filter->Bind(wxEVT_TEXT, [&](wxCommandEvent&) { fill(); });
+  filter->Bind(wxEVT_TEXT_ENTER, [&](wxCommandEvent&) { pick(); });
+  list->Bind(wxEVT_LISTBOX_DCLICK, [&](wxCommandEvent&) { pick(); });
+  list->Bind(wxEVT_LEFT_UP, [&](wxMouseEvent& e) {  // one click picks, as in a menu
+    e.Skip();
+    list->CallAfter([&] { pick(); });
+  });
+  dlg.Bind(wxEVT_CHAR_HOOK, [&](wxKeyEvent& e) {
+    const int k = e.GetKeyCode();
+    if (k == WXK_ESCAPE) {
+      dlg.EndModal(wxID_CANCEL);
+      return;
+    }
+    if ((k == WXK_DOWN || k == WXK_UP || k == WXK_PAGEDOWN || k == WXK_PAGEUP) && list->GetItemCount() > 0) {
+      const int n = static_cast<int>(list->GetItemCount());
+      const int step = k == WXK_DOWN ? 1 : k == WXK_UP ? -1 : k == WXK_PAGEDOWN ? 10 : -10;
+      list->SetSelection(std::clamp(list->GetSelection() + step, 0, n - 1));
+      list->ScrollToRow(static_cast<size_t>(list->GetSelection()));
+      return;
+    }
+    if (k == WXK_RETURN || k == WXK_NUMPAD_ENTER) {
+      pick();
+      return;
+    }
+    e.Skip();
+  });
+  // Clicked outside: closed, as a menu would be.
+  dlg.Bind(wxEVT_ACTIVATE, [&](wxActivateEvent& e) {
+    e.Skip();
+    if (!e.GetActive() && dlg.IsModal()) dlg.CallAfter([&dlg] {
+        if (dlg.IsModal()) dlg.EndModal(wxID_CANCEL);
+      });
+  });
+  dlg.SetSizer(sz);
+  const int row = list->GetCharHeight() + dlg.FromDIP(8);
+  dlg.SetSize(dlg.FromDIP(360), filter->GetBestSize().y + row * 18 + dlg.FromDIP(18));
+  // Under the button (the right end of the tab strip), kept on the display.
+  const wxRect strip = wnd->GetScreenRect();
+  wxPoint at(strip.GetRight() - dlg.GetSize().x, strip.GetBottom());
+  if (const int d = wxDisplay::GetFromWindow(wnd); d != wxNOT_FOUND) {
+    const wxRect area = wxDisplay(static_cast<unsigned>(d)).GetClientArea();
+    at.x = std::clamp(at.x, area.x, std::max(area.x, area.GetRight() - dlg.GetSize().x));
+    at.y = std::clamp(at.y, area.y, std::max(area.y, area.GetBottom() - dlg.GetSize().y));
+  }
+  dlg.Move(at);
+  filter->SetFocus();
+  dlg.ShowModal();
+  return chosen;
+}
 
 // Scrolls the tab strip to the selected page: wxAuiNotebook does that only when a page is
 // selected through it, so a restored active tab (the 20th) stayed out of view.
@@ -205,15 +345,20 @@ void type_text(const std::wstring& s, std::function<void()> done, size_t i = 0) 
 
 // "Save changes?" for closing a tab with unsaved changes, in the app's theme (wxMessageBox is
 // the system's light task dialog). wxID_YES (save), wxID_NO (discard) or wxID_CANCEL.
-int ask_save(wxWindow* parent, const wxString& what) {
+// count > 1: one question for a batch of tabs (what: their names), Save saves each.
+int ask_save(wxWindow* parent, const wxString& what, size_t count = 1) {
   const auto& th = rv::Theme::get();
   wxDialog dlg(parent, wxID_ANY, "watt", wxDefaultPosition, wxDefaultSize, wxCAPTION | wxCLOSE_BOX);
   dlg.SetBackgroundColour(th.bg);
   auto* sz = new wxBoxSizer(wxVERTICAL);
-  auto* head = new wxStaticText(&dlg, wxID_ANY, wxString::Format(L"Save changes to “%s”?", what));
+  auto* head = new wxStaticText(&dlg, wxID_ANY,
+                                count > 1 ? wxString::Format(L"Save changes to %zu requests?", count)
+                                          : wxString::Format(L"Save changes to “%s”?", what));
   head->SetForegroundColour(th.fg);
   head->SetFont(head->GetFont().Bold().Scaled(1.1f));
-  auto* body = new wxStaticText(&dlg, wxID_ANY, "Your changes are lost if you close the tab without saving.");
+  auto* body = new wxStaticText(&dlg, wxID_ANY,
+                                count > 1 ? what + L"\n\nTheir changes are lost if you close the tabs without saving."
+                                          : wxString("Your changes are lost if you close the tab without saving."));
   body->SetForegroundColour(th.dim);
   sz->Add(head, 0, wxLEFT | wxRIGHT | wxTOP, dlg.FromDIP(18));
   sz->AddSpacer(dlg.FromDIP(6));
@@ -270,43 +415,62 @@ bool ask_save_target(wxWindow* parent, const Workspace& ws, const std::string& s
     sz->AddSpacer(dlg.FromDIP(4));
   };
   label("Name");
+  // The editor's themed controls (a flat field, its dropdown and buttons): native ones draw light
+  // outlines inside the dark theme.
+  const auto& et = http_editor::Theme::get();
   auto* edit = new wxTextCtrl(&dlg, wxID_ANY, wxString::FromUTF8(suggested), wxDefaultPosition,
-                              wxSize(dlg.FromDIP(360), -1), wxTE_PROCESS_ENTER);
+                              wxSize(dlg.FromDIP(360), -1), wxTE_PROCESS_ENTER | wxBORDER_SIMPLE);
+  edit->SetBackgroundColour(et.field);
+  edit->SetForegroundColour(et.fg);
   sz->Add(edit, 0, wxEXPAND | wxLEFT | wxRIGHT, dlg.FromDIP(18));
   label("Folder");
   std::vector<std::pair<std::string, std::filesystem::path>> folders{{"Collection root", ws.root()}};
   gather_folders(ws.tree(0), "", folders);
-  auto* pick = new wxChoice(&dlg, wxID_ANY);
+  std::vector<wxString> names;
   int sel = 0;
   for (size_t i = 0; i < folders.size(); ++i) {
-    pick->Append(wxString::FromUTF8(folders[i].first));
+    names.push_back(wxString::FromUTF8(folders[i].first));
     std::error_code ec;
     if (!folder.empty() && std::filesystem::equivalent(folders[i].second, folder, ec)) sel = static_cast<int>(i);
   }
-  pick->SetSelection(sel);
+  auto* pick = new http_editor::ChoiceButton(&dlg, names);
+  pick->set_field_look(true);
+  pick->set_selection(sel);
   sz->Add(pick, 0, wxEXPAND | wxLEFT | wxRIGHT, dlg.FromDIP(18));
   auto* row = new wxBoxSizer(wxHORIZONTAL);
-  auto* save = new wxButton(&dlg, wxID_OK, "Save");
-  auto* cancel = new wxButton(&dlg, wxID_CANCEL, "Cancel");
+  auto* save = new http_editor::FlatButton(&dlg, "Save", http_editor::FlatButton::Style::Primary);
+  auto* cancel = new http_editor::FlatButton(&dlg, "Cancel", http_editor::FlatButton::Style::Subtle);
   row->AddStretchSpacer();
-  row->Add(save, 0, wxRIGHT, dlg.FromDIP(8));
-  row->Add(cancel);
+  row->Add(cancel, 0, wxRIGHT, dlg.FromDIP(8));
+  row->Add(save);
   sz->Add(row, 0, wxEXPAND | wxALL, dlg.FromDIP(18));
   auto valid = [edit] { return !edit->GetValue().Strip(wxString::both).empty(); };
-  save->Bind(wxEVT_UPDATE_UI, [valid](wxUpdateUIEvent& e) { e.Enable(valid()); });
-  save->Bind(wxEVT_BUTTON, [&dlg](wxCommandEvent&) { dlg.EndModal(wxID_OK); });
+  edit->Bind(wxEVT_TEXT, [save, valid](wxCommandEvent& e) {
+    e.Skip();
+    save->Enable(valid());
+  });
+  save->Enable(valid());
+  save->on_click = [&dlg, valid] {
+    if (valid()) dlg.EndModal(wxID_OK);
+  };
+  cancel->on_click = [&dlg] { dlg.EndModal(wxID_CANCEL); };
   edit->Bind(wxEVT_TEXT_ENTER, [&dlg, valid](wxCommandEvent&) {
     if (valid()) dlg.EndModal(wxID_OK);
   });
-  save->SetDefault();
   dlg.SetEscapeId(wxID_CANCEL);
+  // Esc cancels (Cancel is a FlatButton, not a wxID_CANCEL button the default handling finds);
+  // the folder list takes its own Esc first.
+  dlg.Bind(wxEVT_CHAR_HOOK, [&dlg](wxKeyEvent& e) {
+    if (e.GetKeyCode() == WXK_ESCAPE && !e.HasAnyModifiers()) return dlg.EndModal(wxID_CANCEL);
+    e.Skip();
+  });
   dlg.SetSizerAndFit(sz);
   dlg.CentreOnParent();
   edit->SetFocus();
   edit->SelectAll();
   if (dlg.ShowModal() != wxID_OK) return false;
   *name = edit->GetValue().Strip(wxString::both).utf8_string();
-  const int s = pick->GetSelection();
+  const int s = pick->selection();
   *chosen = folders[static_cast<size_t>(s < 0 ? 0 : s)].second;
   return true;
 }
@@ -502,6 +666,17 @@ MainFrame::MainFrame(std::filesystem::path workspace_dir)
     session_changed();  // tabs reordered
   });
   nb_->Bind(wxEVT_AUINOTEBOOK_TAB_MIDDLE_UP, [this](wxAuiNotebookEvent& e) { close_tab(e.GetSelection()); });
+  // Right click on a tab: Close / Close others / to the right / all, Duplicate, Reveal in sidebar.
+  // After the notebook's own handling of the click (CallAfter), so the menu is not shown from
+  // inside wxAuiTabCtrl's mouse handler.
+  nb_->Bind(wxEVT_AUINOTEBOOK_TAB_RIGHT_UP, [this](wxAuiNotebookEvent& e) {
+    const int sel = e.GetSelection();
+    wxWindow* pg = sel >= 0 && sel < static_cast<int>(nb_->GetPageCount()) ? nb_->GetPage(static_cast<size_t>(sel)) : nullptr;
+    if (!pg) return;
+    CallAfter([this, pg] {
+      if (const int i = nb_->GetPageIndex(pg); i != wxNOT_FOUND) tab_menu(i);
+    });
+  });
   // Double click on the empty tab strip: new tab (like browsers).
   nb_->Bind(wxEVT_AUINOTEBOOK_BG_DCLICK, [this](wxAuiNotebookEvent&) { new_request(RequestKind::Http, {}); });
   Bind(wxEVT_CLOSE_WINDOW, &MainFrame::on_close, this);
@@ -1016,6 +1191,7 @@ struct MainFrame::Session {
     std::filesystem::path folder;
     unsigned port = 0;
     bool running = false;
+    int pos = 0;  // as Runner::pos
   };
   std::vector<Mock> mocks;
 };
@@ -1061,7 +1237,7 @@ std::shared_ptr<MainFrame::Session> read_session(const Workspace& ws) {
       std::error_code ec;
       const fs::path p = rel.empty() ? fs::path() : ws.root() / rel;
       const unsigned port = v.HasMember("port") && v["port"].IsUint() && v["port"].GetUint() <= 65535 ? v["port"].GetUint() : 0;
-      if (ok && (p.empty() || fs::exists(p, ec))) out->mocks.push_back({p, port, flag("running")});
+      if (ok && (p.empty() || fs::exists(p, ec))) out->mocks.push_back({p, port, flag("running"), pos++});
       continue;
     }
     const fs::path file = session_file_path(ws, str("file"));
@@ -1144,7 +1320,21 @@ void MainFrame::apply_session(Session& s) {
   // after the window shows (each builds its whole panel), and never start a run. Behind the
   // user's own tabs when those stay.
   const int base = early || reuse ? 0 : static_cast<int>(nb_->GetPageCount());
-  for (size_t i = 0; i < s.runners.size(); ++i)
+  // Mock server tabs come back after the window shows, on their port, running if they ran (on
+  // loopback); routes are read and the listener started on workers (mock_view.cpp). Runner and
+  // mock tabs go in by place (both lists ascend), so each lands where it was.
+  for (size_t i = 0, mi = 0; i < s.runners.size() || mi < s.mocks.size();) {
+    if (i == s.runners.size() || (mi < s.mocks.size() && s.mocks[mi].pos < s.runners[i].pos)) {
+      CallAfter([this, m = s.mocks[mi++], at = base] {
+        auto open = [this, m, at] {
+          if (ws_)
+            open_mock(this, [this] { return ws_.get(); }, m.folder, [this] { vars_changed(); session_changed(); },
+                      m.running, m.port, /*select=*/false, at + m.pos);
+        };
+        if (!when_workspace(open)) open();
+      });
+      continue;
+    }
     CallAfter([this, folder = s.runners[i].folder, at = base + s.runners[i].pos,
                select = static_cast<int>(i) == s.active_runner && (early || reuse)] {
       auto open = [this, folder, at, select] {
@@ -1152,17 +1342,8 @@ void MainFrame::apply_session(Session& s) {
       };
       if (!when_workspace(open)) open();  // before the workspace has opened: when it has
     });
-  // Mock server tabs come back after the window shows, on their port, running if they ran (on
-  // loopback); routes are read and the listener started on workers (mock_view.cpp).
-  for (const auto& m : s.mocks)
-    CallAfter([this, m] {
-      auto open = [this, m] {
-        if (ws_)
-          open_mock(this, [this] { return ws_.get(); }, m.folder, [this] { vars_changed(); session_changed(); },
-                    m.running, m.port, /*select=*/false);
-      };
-      if (!when_workspace(open)) open();
-    });
+    ++i;
+  }
   if (s.tabs.empty()) return;
   const int active = s.active;
   wxWindowUpdateLocker lock(nb_);
@@ -1302,6 +1483,9 @@ bool MainFrame::close_tab(int idx) {
     }
   }
   forget_tab_hover(nb_);
+  // The last page: its successor first. A notebook left without pages drops its tab strip, and
+  // the strip made for the next page has no "+" button.
+  if (nb_->GetPageCount() == 1) new_request(RequestKind::Http, {});
   if (t && t->request_kind() == RequestKind::Http) {
     // Hidden and parked now, torn down in slices in quiet moments (prebuild_step): deleting a tab
     // that holds a 12 MB body and response took 50-65 ms in one UI step.
@@ -1311,14 +1495,229 @@ bool MainFrame::close_tab(int idx) {
       t->Hide();
       t->Reparent(spare_park_);
     }
-    closed_.push_back(t);
-    prebuild_later(kQuietMs);
+    park_closed(t);
   } else {
     nb_->DeletePage(idx);
   }
   if (nb_->GetPageCount() == 0) add_tab(SavedRequest{}, false);
   session_changed();
   return true;
+}
+
+// A closed HTTP tab, already out of the notebook, hidden in spare_park_. A pristine built tab
+// (Ctrl+T then Ctrl+W, nothing typed or sent) becomes the spare or reserve again, so opening and
+// closing tabs in a row builds nothing and frees nothing. Any other tab stops its timers and idle
+// work now (its editor would go on building pages while parked) and waits in closed_ for the
+// reaper (reap_slice), which runs whether or not the user is typing; beyond kMaxParked the oldest
+// is destroyed right away.
+void MainFrame::park_closed(RequestTab* t) {
+  FrameLaps laps("park_closed");
+  if (t->request_kind() == RequestKind::Http && t->pristine() && !t->last_response() && t->realized() &&
+      t->has_response_view() && !t->in_flight() && !t->hibernated() && (!spare_[0] || !reserve_[0]) && !closing_) {
+    SavedRequest r;
+    r.kind = RequestKind::Http;
+    t->set_request(std::move(r), false);
+    t->set_save_folder({});
+    (spare_[0] ? reserve_[0] : spare_[0]) = t;  // a refill under way pauses (spare_slice)
+    laps.lap("recycled");
+    prebuild_later(kQuietMs);
+    return;
+  }
+  if (!t->realized() || t->hibernated()) {  // no editor, no response view: a few windows
+    delete t;
+    laps.lap("delete_light");
+    return;
+  }
+  t->teardown_step();  // the first step only stops things (in flight, timers, the editor's prebuild)
+  closed_.push_back(t);
+  if (closed_.size() > kMaxParked) {
+    RequestTab* o = closed_.front();
+    closed_.erase(closed_.begin());
+    while (o->teardown_step()) {
+    }
+    delete o;
+    laps.lap("delete_oldest");
+  }
+  reap_later();
+}
+
+void MainFrame::reap_later() {
+  if (!reap_timer_) {
+    reap_timer_ = new wxTimer(this);
+    Bind(wxEVT_TIMER, [this](wxTimerEvent&) {
+      if (closing_) return;  // close_slice tears everything down now
+      if (reap_slice()) reap_timer_->StartOnce(16);
+      else prebuild_later(kQuietMs);  // the spares paused while tabs waited for teardown
+    }, reap_timer_->GetId());
+  }
+  if (!reap_timer_->IsRunning()) reap_timer_->StartOnce(16);
+}
+
+// One slice: teardown steps and deletes of parked tabs, oldest first, until ~6 ms are used (a
+// step frees one heavy part: big documents on workers, the response view, then the tab).
+bool MainFrame::reap_slice() {
+  FrameLaps laps("reap");
+  // Tabs replaced by a spare beyond the two that may become spares again: torn down too.
+  while (retired_.size() > 2) {
+    wxWindow* w = retired_.front();
+    retired_.erase(retired_.begin());
+    if (auto* t = dynamic_cast<RequestTab*>(w)) {
+      t->teardown_step();
+      closed_.push_back(t);
+    } else {
+      w->Destroy();
+    }
+  }
+  const auto t0 = std::chrono::steady_clock::now();
+  while (!closed_.empty()) {
+    RequestTab* t = closed_.front();
+    if (t->teardown_step()) {
+      laps.lap("teardown_step");
+    } else {
+      closed_.erase(closed_.begin());
+      delete t;
+      laps.lap("delete");
+    }
+    if (std::chrono::steady_clock::now() - t0 > std::chrono::milliseconds(6)) break;
+  }
+  return !closed_.empty();
+}
+
+// The tab strip's context menu (right click on a tab), as in Postman, Insomnia and Bruno.
+void MainFrame::tab_menu(int idx) {
+  finish_swap();
+  const int n = static_cast<int>(nb_->GetPageCount());
+  if (idx < 0 || idx >= n) return;
+  wxWindow* const pg = nb_->GetPage(static_cast<size_t>(idx));
+  auto* t = dynamic_cast<RequestTab*>(pg);
+  enum { M_CLOSE = wxID_HIGHEST + 900, M_OTHERS, M_RIGHT, M_ALL, M_SAVED, M_DUP, M_REVEAL };
+  wxMenu m;
+  m.Append(M_CLOSE, "Close\tCtrl+W");
+  m.Append(M_OTHERS, "Close others")->Enable(n > 1);
+  m.Append(M_RIGHT, "Close to the right")->Enable(idx < n - 1);
+  m.Append(M_SAVED, "Close unchanged tabs");
+  m.Append(M_ALL, "Close all");
+  m.AppendSeparator();
+  m.Append(M_DUP, "Duplicate")->Enable(t != nullptr);
+  m.Append(M_REVEAL, "Reveal in sidebar")->Enable(t && !t->file().empty());
+  const int c = nb_->GetPopupMenuSelectionFromUser(m);
+  // The page may be gone by now (a send finished, the file was deleted): found by pointer again.
+  const int at = nb_->GetPageIndex(pg);
+  if (c == wxID_NONE || at == wxNOT_FOUND) return;
+  std::vector<int> close;
+  const int count = static_cast<int>(nb_->GetPageCount());
+  switch (c) {
+    case M_CLOSE: close_tab(at); return;
+    case M_OTHERS:
+      for (int i = 0; i < count; ++i)
+        if (i != at) close.push_back(i);
+      break;
+    case M_RIGHT:
+      for (int i = at + 1; i < count; ++i) close.push_back(i);
+      break;
+    case M_ALL:
+      for (int i = 0; i < count; ++i) close.push_back(i);
+      break;
+    case M_SAVED:
+      for (int i = 0; i < count; ++i)
+        if (auto* rt = dynamic_cast<RequestTab*>(nb_->GetPage(static_cast<size_t>(i))); rt && !rt->dirty() && !rt->in_flight())
+          close.push_back(i);
+      break;
+    case M_DUP:
+      if (t) {
+        SavedRequest r = t->request();
+        r.file.clear();  // a copy: saving it makes a new file
+        if (RequestTab* d = add_tab(std::move(r), false, false, at + 1)) {
+          d->set_save_folder(t->save_folder());
+          d->mark_dirty();
+        }
+      }
+      return;
+    case M_REVEAL:
+      if (t) sidebar_->select_file(t->file());
+      return;
+    default: return;
+  }
+  close_tabs(std::move(close));
+}
+
+// Several pages closed as one batch: one question for all the dirty ones, one notebook update.
+void MainFrame::close_tabs(std::vector<int> idx) {
+  finish_swap();
+  std::vector<wxWindow*> pages;
+  std::vector<RequestTab*> dirty;
+  for (int i : idx) {
+    if (i < 0 || i >= static_cast<int>(nb_->GetPageCount())) continue;
+    wxWindow* w = nb_->GetPage(static_cast<size_t>(i));
+    pages.push_back(w);
+    if (auto* t = dynamic_cast<RequestTab*>(w); t && t->dirty()) dirty.push_back(t);
+  }
+  if (pages.empty()) return;
+  if (!dirty.empty()) {
+    wxString names;
+    for (size_t i = 0; i < dirty.size() && i < 8; ++i) {
+      wxString what = dirty[i]->title();
+      what.Replace(L" \u25CF", "");
+      names += (i ? wxString(L"\n") : wxString()) + L"\u2022 " + what;
+    }
+    if (dirty.size() > 8) names += wxString::Format(L"\n\u2026 and %zu more", dirty.size() - 8);
+    if (dirty.size() == 1) {
+      names = dirty[0]->title();
+      names.Replace(L" \u25CF", "");
+    }
+    const int a = ask_save(this, names, dirty.size());
+    if (a == wxID_CANCEL) return;
+    if (a == wxID_YES)
+      for (RequestTab* t : dirty) {
+        const int i = nb_->GetPageIndex(t);
+        if (i == wxNOT_FOUND) continue;
+        nb_->SetSelection(static_cast<size_t>(i));
+        save_current();
+        if (t->dirty()) return;  // a save failed or was cancelled: stop, the rest stays open
+      }
+  }
+  FrameLaps laps("close_tabs");
+  forget_tab_hover(nb_);
+  if (pages.size() >= nb_->GetPageCount()) new_request(RequestKind::Http, {});  // see close_tab
+  std::vector<RequestTab*> parked;
+  {
+    wxWindowUpdateLocker lock(nb_);
+    // The selected page last: removing it first would select (show, lay out) another one each time.
+    const int sel = nb_->GetSelection();
+    wxWindow* const sel_pg = sel >= 0 ? nb_->GetPage(static_cast<size_t>(sel)) : nullptr;
+    std::stable_partition(pages.begin(), pages.end(), [sel_pg](wxWindow* w) { return w != sel_pg; });
+    for (wxWindow* w : pages) {
+      const int i = nb_->GetPageIndex(w);
+      if (i == wxNOT_FOUND) continue;
+      auto* t = dynamic_cast<RequestTab*>(w);
+      if (t && t->request_kind() == RequestKind::Http) {
+        nb_->RemovePage(static_cast<size_t>(i));
+        t->Hide();
+        t->Reparent(spare_park_);
+        parked.push_back(t);
+      } else {
+        if (t)
+          while (t->teardown_step()) {
+          }
+        nb_->DeletePage(static_cast<size_t>(i));
+      }
+    }
+  }
+  laps.lap("remove");
+  // Parked for the reaper without the cap: these tabs held their windows a moment ago, so the
+  // count does not grow, and destroying dozens inside this click would stall it.
+  for (RequestTab* t : parked) {
+    if (!t->realized() || t->hibernated()) {
+      delete t;
+      continue;
+    }
+    t->teardown_step();
+    closed_.push_back(t);
+  }
+  laps.lap("park");
+  if (!closed_.empty()) reap_later();
+  if (nb_->GetPageCount() == 0) add_tab(SavedRequest{}, false);
+  session_changed();
 }
 
 void MainFrame::save_current() {
@@ -1593,6 +1992,47 @@ WXLRESULT MainFrame::MSWWindowProc(WXUINT msg, WXWPARAM wp, WXLPARAM lp) {
     finish_swap();
     return 0;
   }
+  // A resize step lays the notebook out once but painted the tab's windows two or three times:
+  // wxAuiTabCtrl::DoApplyRect calls Update() in the middle of the layout, and the moves that
+  // follow invalidate them again. With the notebook's drawing off for the layout, everything in
+  // it is painted once, afterwards (WM_SETREDRAW directly: a wx Freeze() would make the
+  // notebook skip sizing its pages).
+  if (msg == WM_SIZE && wp != SIZE_MINIMIZED && nb_ && !nb_->IsFrozen()) {
+    // The notebook sizes every page, the hidden ones too. A request tab only notes it (see
+    // RequestTab::realize); the other tabs (runner, mock server) get the same: a hidden one is
+    // laid out when it is shown again, not at every resize step.
+    static std::set<wxWindow*> gated;
+    for (size_t i = 0, n = nb_->GetPageCount(); i < n; ++i) {
+      wxWindow* const pg = nb_->GetPage(i);
+      if (!pg || dynamic_cast<RequestTab*>(pg) || !gated.insert(pg).second) continue;
+      auto pending = std::make_shared<bool>(false);
+      pg->Bind(wxEVT_SIZE, [pg, pending](wxSizeEvent& e) {
+        if (!pg->IsShown()) {
+          *pending = true;
+          return;  // no Skip: no Layout() now
+        }
+        e.Skip();
+      });
+      pg->Bind(wxEVT_SHOW, [pg, pending](wxShowEvent& e) {
+        e.Skip();
+        if (!e.IsShown() || !*pending) return;
+        *pending = false;
+        pg->SendSizeEvent();  // its own size handlers too, not only Layout()
+      });
+      pg->Bind(wxEVT_DESTROY, [pg](wxWindowDestroyEvent& e) {
+        e.Skip();
+        if (e.GetEventObject() == pg) gated.erase(pg);
+      });
+    }
+    const HWND nb = static_cast<HWND>(nb_->GetHWND());
+    if (nb && ::IsWindowVisible(nb)) {
+      ::SendMessageW(nb, WM_SETREDRAW, FALSE, 0);
+      const WXLRESULT r = wxFrame::MSWWindowProc(msg, wp, lp);
+      ::SendMessageW(nb, WM_SETREDRAW, TRUE, 0);
+      ::RedrawWindow(nb, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN);
+      return r;
+    }
+  }
   return wxFrame::MSWWindowProc(msg, wp, lp);
 }
 
@@ -1621,6 +2061,14 @@ void MainFrame::new_request(RequestKind kind, const std::filesystem::path& folde
   }
   promote_reserve(kind);
   FrameLaps laps(kind == RequestKind::Grpc ? "new_grpc" : "new_tab");
+  // No finished spare, but one being built (tabs opened faster than the refill): its last slice
+  // or two now cost less than a whole tab built inline (~55 ms).
+  if (const int k = spare_slot(kind); k < 2 && !spare_[k] && building_[k]) {
+    RequestTab* b = std::exchange(building_[k], nullptr);
+    if (!b->has_response_view()) b->build_response_view();
+    spare_[k] = b;
+    laps.lap("finish_building");
+  }
   RequestTab*& spare = spare_[spare_slot(kind)];
   RequestTab* t;
   if (spare) {
@@ -1666,7 +2114,7 @@ void MainFrame::prebuild_later(int ms) {
   for (int k = 0; k < 2; ++k) {
     if (!spare_[k] && reserve_[k]) spare_[k] = std::exchange(reserve_[k], nullptr);
     if (spare_built_[k] && spare_slice(k, false)) {
-      prebuild_timer_->StartOnce(std::min(ms, kQuietShortMs));
+      prebuild_timer_->StartOnce(std::min(ms, kRefillQuietMs));
       return;
     }
   }
@@ -1693,6 +2141,9 @@ bool MainFrame::spare_ready(RequestTab* t) const {
 // here. run=false: only says whether there is a slice to do.
 bool MainFrame::spare_slice(int k, bool run) {
   if (k == 1 && !spare_built_[1]) return false;  // see above
+  // Not while closed tabs wait for the reaper, nor close to the window quota: a spare is ~76 USER
+  // objects (refilled once the reaper is done: reap_later).
+  if (!closed_.empty() || user_objects() > kUserBusy) return false;
   const wxSize ps = page_size();
   const bool sized = ps.x > 0 && ps.y > 0;
   if (!spare_[k] && reserve_[k]) spare_[k] = std::exchange(reserve_[k], nullptr);
@@ -1703,7 +2154,11 @@ bool MainFrame::spare_slice(int k, bool run) {
       return true;
     }
   if (!building_[k] && spare_[k] && (reserve_[k] || !spare_built_[k])) return false;
+  // Both slots refilled meanwhile (closed tabs recycled): a half-built tab waits, finished when
+  // a slot is free again instead of built and thrown away.
+  if (building_[k] && spare_[k] && reserve_[k]) return false;
   if (!run) return true;
+  FrameLaps laps("spare_slice");
   if (!building_[k]) {
     SavedRequest r;
     r.kind = k == 0 ? RequestKind::Http : RequestKind::Grpc;
@@ -1713,17 +2168,25 @@ bool MainFrame::spare_slice(int k, bool run) {
     if (k == 1) t->park_grpc();  // its engine waits until it is used
     t->realize();
     building_[k] = t;
+    laps.lap("tab");
     return true;
   }
   if (!building_[k]->has_response_view()) {
     building_[k]->build_response_view();
+    laps.lap("response_view");
     return true;
   }
   if (sized && !building_[k]->laid_out_at(ps)) {
     building_[k]->prelayout(ps);
-    return true;
+    laps.lap("layout");
   }
   RequestTab* t = std::exchange(building_[k], nullptr);
+  if (spare_[k] && reserve_[k]) {  // both refilled meanwhile (closed tabs recycled): not needed
+    t->teardown_step();
+    closed_.push_back(t);
+    reap_later();
+    return true;
+  }
   (spare_[k] ? reserve_[k] : spare_[k]) = t;
   spare_built_[k] = true;  // from now on a spare taken is refilled after a short pause
   return true;
@@ -1737,7 +2200,7 @@ void MainFrame::prebuild_step() {
   if (IsShown() && !IsIconized())
     for (int k = 0; k < 2; ++k) {
       if (!spare_slice(k, false)) continue;
-      if (const int w = input_quiet_wait(spare_built_[k] ? kQuietShortMs - 50 : kQuietMs); w > 0) {
+      if (const int w = input_quiet_wait(spare_built_[k] ? kRefillQuietMs : kQuietMs); w > 0) {
         prebuild_later(w);
         return;
       }
@@ -1755,6 +2218,11 @@ void MainFrame::prebuild_step() {
   }
   // Between slices: let paints, timers and the tabs' own deferred events run first.
   constexpr int kNext = 30;
+  if (user_objects() > kUserBusy) {  // nothing built speculatively close to the window quota
+    if (!closed_.empty()) reap_later();
+    prebuild_later(2000);
+    return;
+  }
   if (!closed_.empty()) {  // closed tabs: one heavy part per slice, then the (light) tab itself
     RequestTab* t = closed_.back();
     if (!t->teardown_step()) {
@@ -1782,7 +2250,9 @@ void MainFrame::prebuild_step() {
       if (!spare_[k]) spare_[k] = t;
       else reserve_[k] = t;
     } else if (t) {
+      t->teardown_step();
       closed_.push_back(t);  // torn down in slices like a closed tab
+      reap_later();
     } else {
       delete w;
     }

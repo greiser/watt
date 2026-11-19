@@ -6,10 +6,13 @@
 #endif
 #include <wx/dcbuffer.h>
 #include <wx/display.h>
+#include <wx/arrstr.h>
 #include <wx/menu.h>
 #include <wx/settings.h>
 
 #include <algorithm>
+
+#include "app/http_editor_util.h"
 
 namespace watt::app::http_editor {
 
@@ -334,6 +337,13 @@ void CheckButton::set_value(bool on) {
   Refresh();
 }
 
+void CheckButton::set_label(const wxString& label) {
+  if (label == label_) return;
+  label_ = label;
+  InvalidateBestSize();
+  Refresh();
+}
+
 void CheckButton::toggle() {
   on_ = !on_;
   Refresh();
@@ -380,14 +390,29 @@ void CheckButton::paint() {
 TabStrip::TabStrip(wxWindow* parent)
     : wxControl(parent, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxBORDER_NONE) {
   SetBackgroundStyle(wxBG_STYLE_PAINT);
+  // Shrinks with the pane (the tabs that do not fit go under the overflow button), so the
+  // controls next to it ("Copy as") keep their room instead of being drawn over the tabs.
+  SetMinSize(wxSize(FromDIP(48), -1));
   Bind(wxEVT_PAINT, [this](wxPaintEvent&) { paint(); });
+  Bind(wxEVT_SIZE, [this](wxSizeEvent& e) {
+    Refresh(false);
+    e.Skip();
+  });
   Bind(wxEVT_MOTION, [this](wxMouseEvent& e) {
-    int h = -1;
+    int h = more_rect_.Contains(e.GetPosition()) ? -2 : -1;
     for (size_t i = 0; i < tabs_.size(); ++i)
       if (tabs_[i].rect.Contains(e.GetPosition())) h = static_cast<int>(i);
     if (h != hover_) {
       hover_ = h;
-      SetCursor(h >= 0 ? wxCursor(wxCURSOR_HAND) : wxNullCursor);
+      SetCursor(h != -1 ? wxCursor(wxCURSOR_HAND) : wxNullCursor);
+      if (h == -2) {
+        wxString hidden;
+        for (const auto& t : tabs_)
+          if (t.rect.IsEmpty()) hidden += (hidden.empty() ? "" : ", ") + t.label;
+        SetToolTip("More tabs: " + hidden);
+      } else {
+        UnsetToolTip();
+      }
       Refresh();
     }
   });
@@ -396,12 +421,29 @@ TabStrip::TabStrip(wxWindow* parent)
     Refresh();
   });
   Bind(wxEVT_LEFT_DOWN, [this](wxMouseEvent& e) {
+    if (more_rect_.Contains(e.GetPosition())) return more_menu();
     for (size_t i = 0; i < tabs_.size(); ++i)
       if (tabs_[i].rect.Contains(e.GetPosition())) {
         select(i);
         if (on_select) on_select(i);
+        return;
       }
   });
+}
+
+void TabStrip::more_menu() {
+  wxMenu menu;
+  for (size_t i = 0; i < tabs_.size(); ++i) {
+    if (!tabs_[i].rect.IsEmpty()) continue;
+    const wxString l = tabs_[i].badge.empty() ? tabs_[i].label : tabs_[i].label + "   " + tabs_[i].badge;
+    menu.Append(static_cast<int>(1000 + i), l);
+  }
+  if (!menu.GetMenuItemCount()) return;
+  const int id = GetPopupMenuSelectionFromUser(menu, more_rect_.GetBottomLeft());
+  if (id < 1000 || static_cast<size_t>(id - 1000) >= tabs_.size()) return;
+  const size_t i = static_cast<size_t>(id - 1000);
+  select(i);
+  if (on_select) on_select(i);
 }
 
 void TabStrip::set_tabs(const std::vector<wxString>& labels) {
@@ -446,14 +488,35 @@ void TabStrip::layout_tabs(wxDC& dc) {
     widths.push_back(w);
     sum += w;
   }
-  // Narrow (badges shown, a narrow window): less space between the tabs before any label is cut.
+  // Narrow (badges shown, a narrow window): less space between the tabs first; when even that
+  // does not fit, the selected tab and the ones before it that fit stay, the rest go under a
+  // "»" button at the end (never a label cut or drawn past the strip).
+  const int n = static_cast<int>(tabs_.size());
   pad_ = FromDIP(20);
-  if (!tabs_.empty() && sum + pad_ * static_cast<int>(tabs_.size()) > cs.x)
-    pad_ = std::max(FromDIP(8), (cs.x - sum) / static_cast<int>(tabs_.size()));
+  if (n && sum + pad_ * n > cs.x) pad_ = std::max(FromDIP(8), (cs.x - sum) / n);
+  std::vector<char> shown(tabs_.size(), 1);
+  more_rect_ = wxRect();
+  if (n && sum + pad_ * n > cs.x) {
+    pad_ = FromDIP(12);
+    const int more_w = FromDIP(28);
+    int used = sel_ < tabs_.size() ? widths[sel_] + pad_ : 0;
+    bool full = false;
+    for (size_t i = 0; i < tabs_.size(); ++i) {
+      if (i == sel_) continue;
+      if (!full && used + widths[i] + pad_ <= cs.x - more_w) used += widths[i] + pad_;
+      else full = true, shown[i] = 0;
+    }
+  }
   for (size_t i = 0; i < tabs_.size(); ++i) {
+    if (!shown[i]) {
+      tabs_[i].rect = wxRect();
+      continue;
+    }
     tabs_[i].rect = wxRect(x, 0, widths[i] + pad_, cs.y);
     x += tabs_[i].rect.width;
   }
+  if (std::find(shown.begin(), shown.end(), 0) != shown.end())
+    more_rect_ = wxRect(std::min(x, cs.x - FromDIP(28)), 0, FromDIP(28), cs.y);
 }
 
 void TabStrip::paint() {
@@ -463,8 +526,24 @@ void TabStrip::paint() {
   dc.Clear();
   layout_tabs(dc);
   const wxSize sz = GetClientSize();
+  if (!more_rect_.IsEmpty()) {
+    // The overflow button; in the warning colour when a hidden tab has a warning badge.
+    bool warn = false;
+    for (const auto& t : tabs_) warn = warn || (t.rect.IsEmpty() && t.warn);
+    if (hover_ == -2) {
+      dc.SetPen(*wxTRANSPARENT_PEN);
+      dc.SetBrush(wxBrush(th.hover));
+      dc.DrawRoundedRectangle(more_rect_.Deflate(FromDIP(2), FromDIP(5)), FromDIP(3));
+    }
+    dc.SetFont(GetFont().Bold());
+    dc.SetTextForeground(warn ? th.var_bad : hover_ == -2 ? th.fg : th.dim);
+    const wxString m = wxString::FromUTF8("\xC2\xBB");
+    const wxSize e = dc.GetTextExtent(m);
+    dc.DrawText(m, more_rect_.x + (more_rect_.width - e.x) / 2, (sz.y - e.y) / 2);
+  }
   for (size_t i = 0; i < tabs_.size(); ++i) {
     const auto& t = tabs_[i];
+    if (t.rect.IsEmpty()) continue;
     const bool sel = i == sel_;
     dc.SetFont(sel ? GetFont().Bold() : GetFont());
     dc.SetTextForeground(sel || static_cast<int>(i) == hover_ ? th.fg : th.dim);
@@ -674,15 +753,14 @@ void PickPopup::rebuild() {
       rows_.push_back({static_cast<int>(i), items_[i].group});
     }
   } else {
-    // a prefix of the value first, then inside the value, then in the description
-    for (int pass = 0; pass < 3; ++pass)
-      for (size_t i = 0; i < items_.size(); ++i) {
-        const wxString v = items_[i].value.Lower();
-        const bool pre = v.StartsWith(f), in = v.Find(f) != wxNOT_FOUND;
-        const bool desc = items_[i].desc.Lower().Find(f) != wxNOT_FOUND;
-        if ((pass == 0 && pre) || (pass == 1 && !pre && in) || (pass == 2 && !in && desc))
-          rows_.push_back({static_cast<int>(i), items_[i].group});
-      }
+    // an exact value or alias first ("<" is lt, not neq through its "<>"), then a prefix, then
+    // inside the value, then in the description (rank_pick_matches, tested on its own)
+    std::vector<PickMatch> m;
+    m.reserve(items_.size());
+    for (const auto& it : items_)
+      m.push_back({it.value.utf8_string(), it.alias.utf8_string(), it.desc.utf8_string()});
+    for (const size_t i : rank_pick_matches(m, filter_.utf8_string()))
+      rows_.push_back({static_cast<int>(i), items_[i].group});
   }
   sel_ = -1;
   hover_ = -1;
@@ -714,14 +792,16 @@ void PickPopup::ensure_visible() {
 void PickPopup::show_below(const wxRect& cell) {
   if (closed_) return;  // closed (destroyed at the next idle time): never shown again
   anchor_ = cell;
-  wxClientDC dc(this);
-  dc.SetFont(GetFont());
-  int w = cell.width;
-  // room for "value  description · group" (the group is added while filtering)
-  for (const auto& it : items_)
-    w = std::max(w, dc.GetTextExtent(it.value).x + dc.GetTextExtent(it.desc).x +
-                        (it.group.empty() ? 0 : dc.GetTextExtent(it.group).x + FromDIP(14)) + FromDIP(52));
-  w = std::max(w, FromDIP(220));
+  if (width_ < 0) {  // measured once per item list (a filter keystroke re-shows it)
+    wxClientDC dc(this);
+    dc.SetFont(GetFont());
+    width_ = FromDIP(220);
+    // room for "value  description · group" (the group is added while filtering)
+    for (const auto& it : items_)
+      width_ = std::max(width_, dc.GetTextExtent(it.value).x + dc.GetTextExtent(it.desc).x +
+                                    (it.group.empty() ? 0 : dc.GetTextExtent(it.group).x + FromDIP(14)) + FromDIP(52));
+  }
+  const int w = std::max(cell.width, width_);
   const int rows = std::max(1, std::min<int>(static_cast<int>(rows_.size()), compact ? 10 : 16));
   const int h = header_h() + rows * row_h() + FromDIP(4);
   const int di = wxDisplay::GetFromPoint(cell.GetBottomLeft());
@@ -755,6 +835,16 @@ WXLRESULT PickPopup::MSWWindowProc(WXUINT msg, WXWPARAM wp, WXLPARAM lp) {
 void PickPopup::set_items(std::vector<PickItem> items, const wxString& current) {
   items_ = std::move(items);
   current_ = current;
+  width_ = -1;
+  rebuild();
+}
+
+void PickPopup::reopen(const wxString& current) {
+  closed_ = false;
+  picked_with = 0;
+  filter_.clear();
+  current_ = current;
+  anchor_ = {};
   rebuild();
 }
 
@@ -839,6 +929,7 @@ void PickPopup::close() {
   on_close = nullptr;
   on_pick = nullptr;
   if (cb) cb();
+  if (keep) return;  // hidden, ready for reopen()
   // Deleted at the next idle time, not here: a popup is not a wxTopLevelWindow, so Destroy()
   // would delete it at once, and close() can run inside one of its own calls (a pick, a resize
   // that moved the focus) whose caller still uses it.

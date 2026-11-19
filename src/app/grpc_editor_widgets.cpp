@@ -286,14 +286,19 @@ void ChoiceButton::SetSelection(int i) {
 
 TabStrip::TabStrip(wxWindow* parent) : wxControl(parent, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxBORDER_NONE) {
   SetBackgroundStyle(wxBG_STYLE_PAINT);
+  SetMinSize(wxSize(FromDIP(48), -1));  // shrinks with the pane; the rest goes under "»"
   Bind(wxEVT_PAINT, [this](wxPaintEvent&) { paint(); });
+  Bind(wxEVT_SIZE, [this](wxSizeEvent& e) {
+    Refresh(false);
+    e.Skip();
+  });
   Bind(wxEVT_MOTION, [this](wxMouseEvent& e) {
-    int h = -1;
+    int h = more_rect_.Contains(e.GetPosition()) ? -2 : -1;
     for (size_t i = 0; i < tabs_.size(); ++i)
       if (tabs_[i].rect.Contains(e.GetPosition())) h = static_cast<int>(i);
     if (h != hover_) {
       hover_ = h;
-      SetCursor(h >= 0 ? wxCursor(wxCURSOR_HAND) : wxNullCursor);
+      SetCursor(h != -1 ? wxCursor(wxCURSOR_HAND) : wxNullCursor);
       Refresh();
     }
   });
@@ -302,12 +307,27 @@ TabStrip::TabStrip(wxWindow* parent) : wxControl(parent, wxID_ANY, wxDefaultPosi
     Refresh();
   });
   Bind(wxEVT_LEFT_DOWN, [this](wxMouseEvent& e) {
+    if (more_rect_.Contains(e.GetPosition())) return more_menu();
     for (size_t i = 0; i < tabs_.size(); ++i)
       if (tabs_[i].rect.Contains(e.GetPosition())) {
         select(i);
         if (on_select) on_select(i);
+        return;
       }
   });
+}
+
+void TabStrip::more_menu() {
+  wxMenu menu;
+  for (size_t i = 0; i < tabs_.size(); ++i)
+    if (tabs_[i].rect.IsEmpty())
+      menu.Append(static_cast<int>(1000 + i),
+                  tabs_[i].badge.empty() ? tabs_[i].label : tabs_[i].label + "   " + tabs_[i].badge);
+  if (!menu.GetMenuItemCount()) return;
+  const int id = GetPopupMenuSelectionFromUser(menu, more_rect_.GetBottomLeft());
+  if (id < 1000 || static_cast<size_t>(id - 1000) >= tabs_.size()) return;
+  select(static_cast<size_t>(id - 1000));
+  if (on_select) on_select(static_cast<size_t>(id - 1000));
 }
 
 void TabStrip::set_tabs(const std::vector<wxString>& labels) {
@@ -338,8 +358,11 @@ wxSize TabStrip::DoGetBestClientSize() const {
 
 void TabStrip::layout_tabs(wxDC& dc) {
   int x = 0;
-  const int h = GetClientSize().y;
+  const wxSize cs = GetClientSize();
+  const int h = cs.y;
   const wxFont bold = GetFont().Bold();
+  std::vector<int> widths;
+  int sum = 0;
   for (auto& t : tabs_) {
     dc.SetFont(bold);
     int w = dc.GetTextExtent(t.label).x;
@@ -347,9 +370,32 @@ void TabStrip::layout_tabs(wxDC& dc) {
       dc.SetFont(GetFont().Smaller());
       w += FromDIP(5) + dc.GetTextExtent(t.badge).x;
     }
-    t.rect = wxRect(x, 0, w + FromDIP(20), h);
-    x += t.rect.width;
+    widths.push_back(w + FromDIP(20));
+    sum += w + FromDIP(20);
   }
+  // Too narrow for all: the selected tab and the ones before it that fit, the rest under "»".
+  std::vector<char> shown(tabs_.size(), 1);
+  const int more_w = FromDIP(28);
+  if (sum > cs.x) {
+    int used = sel_ < tabs_.size() ? widths[sel_] : 0;
+    bool full = false;
+    for (size_t i = 0; i < tabs_.size(); ++i) {
+      if (i == sel_) continue;
+      if (!full && used + widths[i] <= cs.x - more_w) used += widths[i];
+      else full = true, shown[i] = 0;
+    }
+  }
+  more_rect_ = wxRect();
+  for (size_t i = 0; i < tabs_.size(); ++i) {
+    if (!shown[i]) {
+      tabs_[i].rect = wxRect();
+      continue;
+    }
+    tabs_[i].rect = wxRect(x, 0, widths[i], h);
+    x += widths[i];
+  }
+  if (std::find(shown.begin(), shown.end(), 0) != shown.end())
+    more_rect_ = wxRect(std::min(x, cs.x - more_w), 0, more_w, h);
 }
 
 void TabStrip::paint() {
@@ -361,8 +407,16 @@ void TabStrip::paint() {
   const wxSize sz = GetClientSize();
   dc.SetPen(wxPen(th.border, 1));
   dc.DrawLine(0, sz.y - 1, sz.x, sz.y - 1);
+  if (!more_rect_.IsEmpty()) {
+    dc.SetFont(GetFont().Bold());
+    dc.SetTextForeground(hover_ == -2 ? th.fg : th.muted);
+    const wxString m = wxString::FromUTF8("\xC2\xBB");
+    const wxSize e = dc.GetTextExtent(m);
+    dc.DrawText(m, more_rect_.x + (more_rect_.width - e.x) / 2, (sz.y - e.y) / 2);
+  }
   for (size_t i = 0; i < tabs_.size(); ++i) {
     const auto& t = tabs_[i];
+    if (t.rect.IsEmpty()) continue;
     const bool sel = i == sel_;
     dc.SetFont(sel ? GetFont().Bold() : GetFont());
     dc.SetTextForeground(sel || static_cast<int>(i) == hover_ ? th.fg : th.muted);

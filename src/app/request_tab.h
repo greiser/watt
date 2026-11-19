@@ -206,6 +206,9 @@ class RequestTab : public wxPanel, public EditorHost {
   void on_idle(wxIdleEvent& e);
   void on_resp_timer();
   void center_sash();
+  // Request over response (stacked) when the tab is too narrow for two usable side-by-side
+  // panes and tall enough for two stacked ones; side by side otherwise. True when it changed.
+  bool update_split_mode(const wxSize& sz);
   void send_now(Clock::time_point click);
   void restore_focus();
   void on_resp_focus(wxChildFocusEvent& e);
@@ -255,6 +258,7 @@ class RequestTab : public wxPanel, public EditorHost {
   bool user_sash_ = false;  // the user dragged the sash: stop keeping it at 50%
   bool layout_pending_ = false;  // resized while hidden: Layout() when shown again
   bool hibernated_ = false;      // see hibernate()
+  bool torn_resp_cleared_ = false;  // teardown_step: the response view was cleared (a step of its own)
   bool size_bound_ = false;      // realize()'s size / show handlers (bound once, also across hibernate())
   std::filesystem::path save_folder_;
   std::string save_name_;

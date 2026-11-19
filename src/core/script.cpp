@@ -826,6 +826,14 @@ void set_error(JSContext* ctx, Host& h, JSValue exc, const std::string& file) {
 
 // ------------------------------------------------------------------ request data
 
+// The URL / body without the editor's encode marks ({{name|q}} -> {{name}}, model.h): a script
+// reads the template it would read in Bruno; read_req() keeps the marks when it is left as read.
+bool has_var_marks(const std::string& s) {
+  return s.find("|q}}") != std::string::npos || s.find("|f}}") != std::string::npos ||
+         s.find("|p}}") != std::string::npos;
+}
+std::string as_script_sees(const std::string& s) { return has_var_marks(s) ? strip_var_marks(s) : s; }
+
 JSValue make_req(JSContext* ctx, const SavedRequest& r) {
   JSValue o = JS_NewObject(ctx);
   const bool grpc = r.kind == RequestKind::Grpc;
@@ -840,12 +848,12 @@ JSValue make_req(JSContext* ctx, const SavedRequest& r) {
     set_num(ctx, o, "timeout", static_cast<double>(r.grpc_opts.deadline_ms));
   } else {
     set_str(ctx, o, "method", r.http.method);
-    set_str(ctx, o, "url", r.http.url);
+    set_str(ctx, o, "url", as_script_sees(r.http.url));
     std::vector<Header> on;
     for (size_t k = 0; k < r.http.headers.size(); ++k)
       if (!r.disabled_headers.count(k)) on.push_back(r.http.headers[k]);
     JS_SetPropertyStr(ctx, o, "headers", pairs_array(ctx, on));
-    set_str(ctx, o, "body", r.http.body);
+    set_str(ctx, o, "body", as_script_sees(r.http.body));
     set_num(ctx, o, "timeout", static_cast<double>(r.http.timeout_ms));
   }
   return o;
@@ -926,11 +934,13 @@ bool read_req(JSContext* ctx, JSValueConst o, SavedRequest& r, bool& changed, st
     r.http.method = std::move(method);
     changed = true;
   }
-  if (url != r.http.url) {
-    r.http.url = std::move(url);
+  if (url != r.http.url && !(has_var_marks(r.http.url) && url == strip_var_marks(r.http.url))) {
+    // The editor marked its variables (encode on substitution): a rewritten URL gets the marks
+    // back by where each {{name}} now sits, so a value is still encoded for the path / query.
+    r.http.url = has_var_marks(r.http.url) ? mark_url_vars(url) : std::move(url);
     changed = true;
   }
-  if (body != r.http.body) {
+  if (body != r.http.body && !(has_var_marks(r.http.body) && body == strip_var_marks(r.http.body))) {
     r.http.body = std::move(body);
     changed = true;
   }

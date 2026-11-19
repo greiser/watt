@@ -61,7 +61,9 @@
 #include "app/env_editor.h"
 #include "app/history_summary.h"
 #include "app/http_editor_folder.h"
+#include "app/http_editor_widgets.h"  // FlatButton (a mock tab's Start / Stop)
 #include "app/main_frame.h"
+#include "app/mock_view.h"
 #include "app/panels.h"
 #include "app/request_tab.h"
 #include "app/sidebar_cookies.h"
@@ -74,6 +76,9 @@
 #include "app/sidebar_names.h"
 #include "app/sidebar_probe.h"
 #include "app/sidebar_quickopen.h"
+#include "app/runner_view.h"  // runner_folder(): a runner tab goes with its workspace
+#include "app/sidebar_sections.h"
+#include "app/sidebar_specs.h"
 #include "app/sidebar_style.h"
 #include "app/ws_watch.h"
 #include "core/http_client.h"
@@ -627,6 +632,9 @@ class CollectionTree : public wxTreeCtrl {
   // follow at 4 levels) and the selected row's accent bar at its left edge (the theme's grey
   // band alone was hard to see on a folder row).
   wxColour guide_colour, accent_colour;
+  // Which row is the active tab's (its accent bar); unset: the caret row. The selection can be
+  // elsewhere (a neighbour after a delete, a row the arrows moved to), the bar stays on the tab.
+  std::function<bool(const wxTreeItemId&, bool caret)> is_active;
   // The sidebar filter (lower-case, space separated words; empty: none): the characters of each
   // row's name that a word matches are underlined, so it is plain why a row is listed.
   std::function<const std::string&()> filter_query;
@@ -751,7 +759,7 @@ class CollectionTree : public wxTreeCtrl {
           ::FillRect(dc, &line, guide);
         }
       }
-      if (item == caret && accent_colour.IsOk()) {
+      if ((is_active ? is_active(wxTreeItemId(item), item == caret) : item == caret) && accent_colour.IsOk()) {
         RECT full{};
         *reinterpret_cast<HTREEITEM*>(&full) = item;
         if (SendMessage(hw, TVM_GETITEMRECT, FALSE, reinterpret_cast<LPARAM>(&full))) {
@@ -870,6 +878,14 @@ class Sidebar : public wxPanel, public SidebarPanel {
           quick_open_dialog();
           return;
         }
+        // Ctrl+Shift+E (VS Code's Explorer): the sidebar filter from anywhere. Ctrl+Shift+F is
+        // the response body's JSON filter while the body has the focus (after Ctrl+Enter).
+        if (!alive.expired() && e.GetModifiers() == (wxMOD_CONTROL | wxMOD_SHIFT) &&
+            (e.GetKeyCode() == 'E' || e.GetKeyCode() == 'e')) {
+          if (collapsed_) set_collapsed(false);
+          focus_filter();
+          return;
+        }
         // Ctrl+B: hide / show the sidebar (as in VS Code, Bruno, Insomnia).
         if (!alive.expired() && e.GetModifiers() == wxMOD_CONTROL && (e.GetKeyCode() == 'B' || e.GetKeyCode() == 'b')) {
           set_collapsed(!collapsed_);
@@ -942,9 +958,35 @@ class Sidebar : public wxPanel, public SidebarPanel {
         };
         nb->Bind(wxEVT_AUINOTEBOOK_PAGE_CHANGED, mute);
         nb->Bind(wxEVT_AUINOTEBOOK_PAGE_CHANGING, mute);
+        // A runner, mock or spec tab shown: no request row is the active one (a request tab
+        // reaches select_file() through the frame).
+        nb->Bind(wxEVT_AUINOTEBOOK_PAGE_CHANGED, [this, nb](wxAuiNotebookEvent& e) {
+          e.Skip();
+          if (mute_page_events_ || active_file_.empty()) return;
+          const int i = e.GetSelection();
+          wxWindow* page = i >= 0 && static_cast<size_t>(i) < nb->GetPageCount() ? nb->GetPage(static_cast<size_t>(i)) : nullptr;
+          if (!page || dynamic_cast<RequestTab*>(page)) return;
+          active_file_.clear();
+          // As for an unsaved tab (select_file()): no request row stays highlighted.
+          if (const auto* d = data(tree_->GetSelection()); d && !d->node->is_folder) {
+            syncing_ = true;
+            tree_->Unselect();
+            syncing_ = false;
+          }
+          tree_->Refresh(false);
+        });
       }
       dormant_timer_.Bind(wxEVT_TIMER, [this](wxTimerEvent&) { dormant_tick(); });
       dormant_timer_.Start(400);
+      // Both polls slow down while nothing changes (every wake-up is an idle pass over all the
+      // open tabs' windows, ~1 ms each with a dozen tabs); a tab switch speeds them up again.
+      if (wxAuiNotebook* nb = notebook())
+        nb->Bind(wxEVT_AUINOTEBOOK_PAGE_CHANGED, [this](wxAuiNotebookEvent& e) {
+          e.Skip();
+          dormant_quiet_ = 0;
+          if (dormant_timer_.IsRunning() && dormant_timer_.GetInterval() != 400) dormant_timer_.Start(400);
+          if (mocks_timer_.IsRunning() && mocks_timer_.GetInterval() != 500) mocks_timer_.Start(500);
+        });
       restore_width();
       width_restored_ = true;
       selftest_start();
@@ -1064,6 +1106,13 @@ class Sidebar : public wxPanel, public SidebarPanel {
     }
     // The critic's round 28 crash loop: workspace round trips (WATT_SIDEBAR_SELFTEST_WS2), then
     // single-click previews and double-click opens from the tree, repeated.
+    if (only == "mock") {  // MOCK SERVERS "+" / folder menu > Start mock server
+      add("start mock folder", [this] {
+        if (fs::path p = st_find("list-orders"); !p.empty()) host_->start_mock(p.parent_path());
+      }, 2500);
+      add("start mock root", [this] { host_->start_mock(fs::path()); }, 2500);
+      return;
+    }
     if (only == "none") return;  // just the crash log and the probe (a manual session)
     if (only == "stress") {
       st_build_stress();
@@ -1237,7 +1286,11 @@ class Sidebar : public wxPanel, public SidebarPanel {
     // cancelled with Esc: no file stays behind.
     if (only == "newreq") {
       auto folder = std::make_shared<fs::path>();
-      add("find folder", [this, folder] { *folder = st_find("Refund order v2").parent_path(); }, 50);
+      add("find folder", [this, folder] {
+        fs::path p = st_find("Refund order v2");
+        if (p.empty()) p = st_find("List orders");
+        *folder = p.parent_path();
+      }, 50);
       for (int i = 0; i < 2; ++i) {
         add("new request", [this, folder] { st_timed("new_request_in", [&] { new_request_in(RequestKind::Http, *folder); }); }, 1500);
         add("enter", [this] {
@@ -1250,6 +1303,21 @@ class Sidebar : public wxPanel, public SidebarPanel {
         st_esc_ = true;  // the Esc key, as far as the end-edit handler can tell
         if (tree_->GetEditControl()) tree_->EndEditLabel(tree_->GetFocusedItem(), true);
         else st_log_ += "# no rename editor\n";
+        st_esc_ = false;
+      }, 1500);
+      add("notice", [this] {
+        st_log_ += "# notice: " + (note_ && note_->IsShown() ? note_->GetLabel().utf8_string() : std::string("<none>")) + "\n";
+      }, 50);
+      add("click notice", [this] {
+        if (auto act = std::exchange(note_action_, nullptr)) {
+          hide_note();
+          act();
+        }
+      }, 1500);
+      add("editor again", [this] { st_log_ += std::string("# editor again: ") + (tree_->GetEditControl() ? "yes" : "NO") + "\n"; }, 50);
+      add("esc again", [this] {
+        st_esc_ = true;
+        if (tree_->GetEditControl()) tree_->EndEditLabel(tree_->GetFocusedItem(), true);
         st_esc_ = false;
       }, 1500);
       add("files", [this, folder] {
@@ -1438,6 +1506,135 @@ class Sidebar : public wxPanel, public SidebarPanel {
         add("parked", [this] { st_log_ += "# " + st_tab_state() + "\n# order2 " + st_tab_order() + "\n"; }, 50);
         add("switch back", [this, a] { switch_workspace(a, true); }, 1500);
         add("back", [this] { st_log_ += "# " + st_tab_state() + "\n# order " + st_tab_order() + "\n"; }, 50);
+      }
+      return;
+    }
+    // Spec preview and mock tabs go with their workspace (WATT_SIDEBAR_SELFTEST_WS2=<other
+    // workspace>, WATT_SIDEBAR_SELFTEST_SPEC=<an OpenAPI file in this one>): after a switch
+    // neither is a page, the MOCK SERVERS rows are empty and a sync from the old tab writes nothing.
+    if (wxString ws2, spec; only == "specswitch" && wxGetEnv("WATT_SIDEBAR_SELFTEST_WS2", &ws2) &&
+                             wxGetEnv("WATT_SIDEBAR_SELFTEST_SPEC", &spec)) {
+      const fs::path a = ws_->root(), b = fs::path(ws2.ToStdWstring()), sp = fs::path(spec.ToStdWstring());
+      auto pages = [this](const char* when) {
+        wxAuiNotebook* nb = notebook();
+        size_t specs = 0, mocks = 0;
+        for (size_t i = 0; nb && i < nb->GetPageCount(); ++i) {
+          specs += is_spec_preview(nb->GetPage(i));
+          mocks += mock_tab_info(nb->GetPage(i), nullptr, nullptr, nullptr);
+        }
+        poll_mocks();
+        st_log_ += std::string("# ") + when + ": spec pages " + std::to_string(specs) + ", mock pages " +
+                   std::to_string(mocks) + ", mock rows " + std::to_string(mock_rows_.size()) + ", order " +
+                   st_tab_order() + "\n";
+      };
+      auto entries = [](const fs::path& root) {
+        size_t n = 0;
+        std::error_code ec;
+        for (auto it = fs::recursive_directory_iterator(root, ec); !ec && it != fs::recursive_directory_iterator(); it.increment(ec))
+          if (it->path().filename() != ".watt" ) ++n;
+          else it.disable_recursion_pending();
+        return n;
+      };
+      auto before = std::make_shared<size_t>(0);
+      add("open spec", [this, sp] { show_spec_tab(open_spec_tab(sp)); }, 1500);
+      if (wxGetEnv("WATT_SIDEBAR_SELFTEST_SPECONLY", nullptr)) {  // the spec tab shown (a screenshot)
+        add("sync", [this, sp, a] { sync_spec(sp, a); }, 2500);
+        for (const char* op : {"GET /pets/{id}", "POST /pets", "GET /nope"})
+          add(std::string("open op ") + op, [this, sp, a, op] {
+            const std::string s(op);
+            const size_t sp_at = s.find(' ');
+            open_spec_op(sp, a, s.substr(0, sp_at), s.substr(sp_at + 1));
+          }, 900);
+        add("opened", [this] {
+          st_log_ += "# tabs " + st_tab_order() + "\n# note " +
+                     (note_ && note_->IsShown() ? note_->GetLabel().utf8_string() : std::string("<none>")) + "\n";
+        }, 50);
+        add("back to spec", [this, sp] { show_spec_tab(spec_preview_for(sp)); }, 1500);
+        return;
+      }
+      add("start mock", [this] { host_->start_mock(fs::path()); }, 2500);
+      add("opened", [pages] { pages("ws1"); }, 50);
+      add("switch to ws2", [this, b] { switch_workspace(b, true); }, 2000);
+      add("in ws2", [pages] { pages("ws2"); }, 50);
+      add("count ws2", [before, entries, b] { *before = entries(b); }, 50);
+      add("sync old spec", [this, sp, a] {
+        if (wxWindow* pv = spec_preview_for(sp))
+          st_log_ += std::string("# preview parked: ") + (notebook()->GetPageIndex(pv) >= 0 ? "NO" : "yes") + "\n";
+        sync_spec(sp, a);  // what the parked tab's Sync button calls
+      }, 2500);
+      add("ws2 unchanged", [this, before, entries, b] {
+        const size_t now = entries(b);
+        st_log_ += "# ws2 entries " + std::to_string(*before) + " -> " + std::to_string(now) + ", refused " +
+                   std::to_string(spec_sync_refused_) + (now == *before && spec_sync_refused_ ? " OK" : " LEAK") + "\n";
+      }, 50);
+      if (wxGetEnv("WATT_SIDEBAR_SELFTEST_NOBACK", nullptr)) return;  // stays in ws2 (a screenshot)
+      add("switch back", [this, a] { switch_workspace(a, true); }, 2500);
+      add("back in ws1", [pages] { pages("ws1 again"); }, 50);
+      return;
+    }
+    // The critic's round 32 carrier case: every tab is a workspace page (request tabs, a history
+    // snapshot with its response, a runner), then a brand-new empty workspace
+    // (WATT_SIDEBAR_SELFTEST_WS2) and back. The tab order, the selected tab, every response and
+    // the absence of an Untitled tab must be as they were; done with a request tab and then the
+    // snapshot tab selected (each is the tab lent to the empty workspace).
+    if (wxString ws2; only == "wsback" && wxGetEnv("WATT_SIDEBAR_SELFTEST_WS2", &ws2)) {
+      const fs::path a = ws_->root(), b = fs::path(ws2.ToStdWstring());
+      auto reqs = std::make_shared<std::vector<fs::path>>();
+      auto sig = [this] {
+        wxAuiNotebook* nb = notebook();
+        std::string out;
+        for (size_t i = 0; nb && i < nb->GetPageCount(); ++i) {
+          wxWindow* pg = nb->GetPage(i);
+          std::string t = nb->GetPageText(i).utf8_string();
+          if (auto* rt = dynamic_cast<RequestTab*>(pg)) t += rt->pristine() ? "(UNTITLED)" : rt->last_response() ? "(r)" : "(-)";
+          else if (runner_folder(pg, nullptr)) t += "(runner)";
+          out += (static_cast<int>(i) == nb->GetSelection() ? "[" + t + "]" : t) + "; ";
+        }
+        return out;
+      };
+      add("open 4", [this, reqs] {
+        std::vector<fs::path> all;
+        collect_requests(tree_root_, all);
+        for (const auto& p : all) {
+          if (reqs->size() >= 4) break;
+          const auto r = ws_->load_request(p);
+          if (!r || r->kind != RequestKind::Http || r->http.url.empty() || u8(p).find("Big") != std::string::npos) continue;
+          reqs->push_back(p);
+          open_tab(p);
+        }
+      }, 2500);
+      add("send 3rd", [this, reqs] {
+        if (reqs->size() < 3) return;
+        host_->open_request((*reqs)[2], false);
+        if (RequestTab* t = tab_for((*reqs)[2])) t->send();
+      }, 2500);
+      add("snapshot", [this] {
+        if (!history_->entries().empty()) open_history_entry(history_->entries().front(), true, false);
+      }, 2500);
+      add("runner", [this] { host_->run_folder(fs::path()); }, 2500);
+      for (int round = 0; round < 2; ++round) {
+        auto before = std::make_shared<std::string>();
+        add(round ? "select snapshot" : "select 3rd", [this, reqs, round] {
+          wxAuiNotebook* nb = notebook();
+          if (round == 0) {
+            if (reqs->size() >= 3) host_->open_request((*reqs)[2], false);
+            return;
+          }
+          for (size_t i = 0; nb && i < nb->GetPageCount(); ++i)
+            if (auto* t = dynamic_cast<RequestTab*>(nb->GetPage(i)); t && u8(t->file()).find(".watt") != std::string::npos)
+              nb->SetSelection(i);
+        }, 1500);
+        add("before", [this, before, sig] {
+          *before = sig();
+          st_log_ += "# before " + *before + "\n";
+        }, 50);
+        add("switch to new ws", [this, b] { switch_workspace(b, true); }, 2500);
+        add("in new ws", [this, sig] { st_log_ += "# new ws " + sig() + "\n"; }, 50);
+        add("switch back", [this, a] { switch_workspace(a, true); }, 3000);
+        add("after", [this, before, sig] {
+          const std::string now = sig();
+          st_log_ += "# after  " + now + "\n# round trip " + (now == *before ? "OK" : "MISMATCH") + "\n";
+        }, 50);
       }
       return;
     }
@@ -2163,6 +2360,7 @@ class Sidebar : public wxPanel, public SidebarPanel {
     learn_later(file_in);
     if (file_in != active_file_) {
       sticky_sel_.clear();
+      user_sel_ = false;
       if (!file_in.empty()) vars_timer_.StartOnce(200);
     }
     // Ctrl+P opened a request the filter hides: clear the filter so the tree can show it.
@@ -2176,11 +2374,10 @@ class Sidebar : public wxPanel, public SidebarPanel {
       history_->select_entry(it->second.first, it->second.second);
     else
       history_->select_entry({}, {});
-    if (is_snapshot(file)) {  // a history snapshot: its saved request, if any
-      auto it = snapshot_origin_.find(file);
-      file = it == snapshot_origin_.end() ? fs::path() : it->second;
-      if (!file.empty() && !find_node(tree_root_, file)) file.clear();  // sent unsaved from a folder
-    }
+    // A history snapshot is not its saved request (that one may have changed since): no tree
+    // row is marked, the history list marks its entry.
+    if (is_snapshot(file)) file.clear();
+    if (file != active_file_) tree_->Refresh(false);  // the accent bar moves
     active_file_ = file;
     if (file.empty()) {
       // An unsaved tab is active: no request row is its own (a folder selection stays, it is
@@ -2264,7 +2461,7 @@ class Sidebar : public wxPanel, public SidebarPanel {
         rs->Add(b, 0, wxALIGN_CENTER_HORIZONTAL | wxTOP, FromDIP(10));
       };
       rail_btn("\xF0\x9F\x97\x80", "Collection (Ctrl+B)", [this] { tree_->SetFocus(); });
-      rail_btn("\xF0\x9F\x94\x8D", "Filter requests and history (Ctrl+Shift+F)", [this] { focus_filter(); });
+      rail_btn("\xF0\x9F\x94\x8D", "Filter requests and history (Ctrl+Shift+E)", [this] { focus_filter(); });
       rail_btn("\xE2\x8F\xB1", "History", [this] {
         if (history_->IsShown()) history_->SetFocus();
       });
@@ -2303,6 +2500,28 @@ class Sidebar : public wxPanel, public SidebarPanel {
     }
     hide->SetForegroundColour(dim_colour());
     hide->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) { set_collapsed(true); });
+    // A narrow window (a Windows Snap half of a 1920 screen) gives the request and the response
+    // the room: the sidebar folds to its rail when the window gets narrower than ~1200 px and
+    // comes back when it is widened again (if it was folded for that). Only on crossing the
+    // line, so Ctrl+B still shows it in a narrow window.
+    if (wxWindow* tlw = wxGetTopLevelParent(this))
+      tlw->Bind(wxEVT_SIZE, [this, tlw](wxSizeEvent& e) {
+        e.Skip();
+        if (static_cast<wxTopLevelWindow*>(tlw)->IsIconized()) return;
+        const bool narrow = e.GetSize().x < FromDIP(1200);
+        if (narrow == narrow_window_) return;
+        narrow_window_ = narrow;
+        CallAfter([this, narrow] {
+          if (narrow != narrow_window_) return;
+          if (narrow && !collapsed_) {
+            auto_collapsed_ = true;
+            set_collapsed(true);
+          } else if (!narrow && auto_collapsed_) {
+            auto_collapsed_ = false;
+            if (collapsed_) set_collapsed(false, false);
+          }
+        });
+      });
     head->Add(ws_btn_, 1, wxALIGN_CENTER_VERTICAL);
     head->Add(import, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, FromDIP(2));
     head->Add(hide, 0, wxALIGN_CENTER_VERTICAL);
@@ -2349,7 +2568,8 @@ class Sidebar : public wxPanel, public SidebarPanel {
     filter_ = new wxTextCtrl(p, wxID_ANY, "", wxDefaultPosition, wxDefaultSize, wxTE_PROCESS_ENTER);
     filter_->SetHint("Filter by name, folder, method or URL");
     filter_->SetToolTip(
-        "Filter requests and history (Ctrl+Shift+F). Down: best match, Enter: open it, Esc: clear.\n"
+        "Filter requests and history (Ctrl+Shift+E from anywhere; Ctrl+Shift+F outside the response body).\n"
+        "Down: best match, Enter: open it, Esc: clear.\n"
         "Ctrl+P opens any saved request by fuzzy name.");
     sz->Add(filter_, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, pad);
     filter_timer_.Bind(wxEVT_TIMER, [this](wxTimerEvent&) { apply_filter(); });
@@ -2466,6 +2686,14 @@ class Sidebar : public wxPanel, public SidebarPanel {
       SetWindowLongPtr(hw, GWL_STYLE, GetWindowLongPtr(hw, GWL_STYLE) | TVS_NOHSCROLL);
     }
     set_label_edits(false);  // only while edit_label() opens the editor
+    ctree_->is_active = [this](const wxTreeItemId& id, bool caret) {
+      const auto* d = data(id);
+      if (!d) return false;
+      // No request tab of this tree is active (an unsaved one, a snapshot): a selected folder
+      // keeps its bar (where "+" creates things), no request row gets one.
+      if (active_file_.empty()) return caret && d->node->is_folder;
+      return !d->node->is_folder && d->node->path == active_file_;
+    };
     ctree_->folder_count = [this](const wxTreeItemId& id) -> size_t {
       const auto* d = data(id);
       return d && d->node->is_folder ? count_requests(*d->node) : 0;
@@ -2482,6 +2710,19 @@ class Sidebar : public wxPanel, public SidebarPanel {
       return true;
     }));
     tsz->Add(tree_, 1, wxEXPAND | wxTOP, FromDIP(2));
+    // The sections below growing (a second mock row) shrink the tree: its last row is never left
+    // cut in half at the bottom edge, the tree scrolls it into view instead.
+    tree_->Bind(wxEVT_SIZE, [this](wxSizeEvent& e) {
+      e.Skip();
+      if (!uncut_queued_) {
+        uncut_queued_ = true;
+        later([this, alive = std::weak_ptr<int>(alive_)] {
+          if (alive.expired()) return;
+          uncut_queued_ = false;
+          uncut_last_row();
+        });
+      }
+    });
     // Empty collection: a short note and the first steps as buttons (Bruno's Create / Open /
     // Import, Postman's "Create a Collection").
     empty_box_ = new wxPanel(top);
@@ -2528,6 +2769,9 @@ class Sidebar : public wxPanel, public SidebarPanel {
     }
     tsz->Add(empty_box_, 1, wxEXPAND | wxALL, FromDIP(12));
     empty_box_->Hide();
+    // API SPECS and MOCK SERVERS (Bruno's pinned sections), under the tree: each collapses to
+    // its 22 px header.
+    build_sections(top, tsz);
     top->SetSizer(tsz);
 
     auto* bottom = new wxPanel(split_);
@@ -2578,7 +2822,7 @@ class Sidebar : public wxPanel, public SidebarPanel {
         user_hist_h_ = FromDIP(static_cast<int>(hh));
       }
     }
-    // Double click on the divider: back to sizing the history to its rows.
+    // Double click on the divider: back to the default history height.
     split_->Bind(wxEVT_SPLITTER_DOUBLECLICKED, [this](wxSplitterEvent& e) {
       e.Veto();  // no unsplit
       user_sash_ = false;
@@ -2586,7 +2830,7 @@ class Sidebar : public wxPanel, public SidebarPanel {
       if (wxConfigBase* c = wxConfigBase::Get()) c->DeleteEntry("Sidebar/HistoryHeight");
       update_history_pane();
     });
-    split_->SetToolTip("Drag to size the history; double-click to fit it to its rows again");
+    split_->SetToolTip("Drag to size the history (kept); double-click for its default height");
     split_->Bind(wxEVT_SPLITTER_SASH_POS_CHANGED, [this](wxSplitterEvent& e) {
       e.Skip();
       // The user dragged the sash: keep the history height they chose. (Resizes and
@@ -2621,6 +2865,598 @@ class Sidebar : public wxPanel, public SidebarPanel {
     });
   }
 
+  // ---------------------------------------------------------------- API specs / mock servers
+
+  void build_sections(wxWindow* top, wxSizer* tsz) {
+    specs_pane_ = new SectionPane(top, "API SPECS", "Add an OpenAPI / Swagger file (copied into specs/)",
+                                  "none: + adds an OpenAPI file");
+    mocks_pane_ = new SectionPane(top, "MOCK SERVERS", "Start a mock server for the selected folder or the collection",
+                                  "none running: + starts one");
+    tsz->Add(specs_pane_, 0, wxEXPAND);
+    tsz->Add(mocks_pane_, 0, wxEXPAND);
+    load_section_state();
+    specs_pane_->on_toggle = [this] { save_section_state(specs_pane_, "Specs", &specs_explicit_); };
+    mocks_pane_->on_toggle = [this] { save_section_state(mocks_pane_, "Mocks", &mocks_explicit_); };
+    specs_pane_->on_click = [this](size_t i) { open_spec(i); };
+    specs_pane_->on_dclick = [this](size_t i) { open_spec(i); };
+    specs_pane_->on_menu = [this](size_t i) { spec_menu(i); };
+    specs_pane_->on_add = [this](const wxPoint&) { add_spec(); };
+    mocks_pane_->on_click = [this](size_t i) { raise_mock(i); };
+    mocks_pane_->on_dclick = [this](size_t i) { raise_mock(i); };
+    mocks_pane_->on_menu = [this](size_t i) { mock_menu(i); };
+    mocks_pane_->on_add = [this](const wxPoint& at) { add_mock(at); };
+    mocks_timer_.Bind(wxEVT_TIMER, [this](wxTimerEvent&) { poll_mocks(); });
+    mocks_timer_.Start(500);
+  }
+
+  // Collapsed or not: what the user chose last (per user), else collapsed while empty, so an
+  // empty section is a 22 px header and the tree keeps its rows.
+  void load_section_state() {
+    wxConfigBase* c = wxConfigBase::Get();
+    long v = -1;
+    if (c && c->Read("Sidebar/Section/Specs", &v) && v >= 0) {
+      specs_explicit_ = true;
+      specs_pane_->set_collapsed(v != 0);
+    } else {
+      specs_pane_->set_collapsed(true);
+    }
+    v = -1;
+    if (c && c->Read("Sidebar/Section/Mocks", &v) && v >= 0) {
+      mocks_explicit_ = true;
+      mocks_pane_->set_collapsed(v != 0);
+    } else {
+      mocks_pane_->set_collapsed(true);
+    }
+  }
+
+  void save_section_state(SectionPane* p, const char* name, bool* expl) {
+    *expl = true;
+    if (wxConfigBase* c = wxConfigBase::Get()) c->Write(wxString("Sidebar/Section/") + name, p->collapsed() ? 1L : 0L);
+    // The header click changed the pane's height: the tree above takes the difference.
+    p->GetParent()->Layout();
+  }
+
+  void section_rows(SectionPane* p, std::vector<SectionRow> rows, bool expl) {
+    const bool was_empty = p->rows().empty();
+    p->set_rows(std::move(rows));
+    // Not chosen by the user: open while it has rows (the first mock started shows up).
+    if (!expl && was_empty != p->rows().empty()) p->set_collapsed(p->rows().empty());
+  }
+
+  // "api/users" for a folder under the root; the root (or empty): "Collection".
+  std::string folder_label(const fs::path& folder) const {
+    if (!ws_ || folder.empty() || same_path(folder, ws_->root())) return "Collection";
+    if (is_under(folder, ws_->root())) return u8(folder.lexically_relative(ws_->root()).generic_wstring());
+    return u8(folder.filename());
+  }
+
+  // ---- mock servers
+
+  struct MockRow {
+    fs::path folder;
+    unsigned port = 0;
+    bool running = false;
+    wxString url;
+    wxWeakRef<wxWindow> page;
+  };
+
+  // The mock tab's Start / Stop button and its read-only URL field (direct children of the tab).
+  static http_editor::FlatButton* mock_toggle(wxWindow* page) {
+    for (wxWindow* c : page->GetChildren())
+      if (auto* b = dynamic_cast<http_editor::FlatButton*>(c); b && (b->GetLabel() == "Stop" || b->GetLabel() == "Start"))
+        return b;
+    return nullptr;
+  }
+  static wxString mock_url(wxWindow* page) {
+    for (wxWindow* c : page->GetChildren())
+      if (auto* t = dynamic_cast<wxTextCtrl*>(c); t && !t->IsEditable()) return t->GetValue();
+    return {};
+  }
+
+  // Which mock tabs are open and running (a walk over the notebook's pages, every 500 ms: well
+  // under 0.1 ms); the rows change only when something did.
+  void poll_mocks() {
+    wxAuiNotebook* nb = notebook();
+    if (!nb || !mocks_pane_) return;
+    std::vector<MockRow> rows;
+    for (size_t i = 0; i < nb->GetPageCount(); ++i) {
+      wxWindow* page = nb->GetPage(i);
+      fs::path folder;
+      unsigned port = 0;
+      bool run = false;
+      if (!mock_tab_info(page, &folder, &port, &run)) continue;
+      // Only this workspace's mocks (another one's are parked with its tabs, see swap_tabs()).
+      if (!folder.empty() && (!ws_ || !in_workspace(folder, ws_->root()))) continue;
+      MockRow r;
+      r.folder = folder;
+      r.port = port;
+      const auto* b = mock_toggle(page);
+      r.running = b ? b->GetLabel() == "Stop" : run;
+      if (r.running) r.url = mock_url(page);
+      r.page = page;
+      rows.push_back(std::move(r));
+    }
+    const bool same = rows.size() == mock_rows_.size() &&
+                      std::equal(rows.begin(), rows.end(), mock_rows_.begin(), [](const MockRow& a, const MockRow& b) {
+                        return a.folder == b.folder && a.port == b.port && a.running == b.running && a.url == b.url &&
+                               a.page.get() == b.page.get();
+                      });
+    // No mock tab: look less often (starting one opens its tab, which speeds this up again).
+    if (const int want = rows.empty() ? 2000 : 500; mocks_timer_.GetInterval() != want) mocks_timer_.Start(want);
+    if (same) return;
+    mock_rows_ = std::move(rows);
+    const wxColour on = is_dark() ? wxColour(0x3F, 0xB9, 0x50) : wxColour(0x1A, 0x7F, 0x37);
+    const wxColour off = mix(window_colour(), text_colour(), 0.35);
+    std::vector<SectionRow> out;
+    for (const auto& m : mock_rows_) {
+      SectionRow s;
+      s.label = folder_label(m.folder);
+      s.chip = m.port ? ":" + std::to_string(m.port) : std::string("any port");
+      s.detail = m.running ? "" : "stopped";
+      s.dot = m.running ? on : off;
+      s.dim = !m.running;
+      s.tip = "Mock server for " + s.label + (m.running ? " at " + m.url.utf8_string() : std::string(", stopped")) +
+              "\nClick: show its tab. Right-click: stop, copy URL, reveal folder.";
+      out.push_back(std::move(s));
+    }
+    section_rows(mocks_pane_, std::move(out), mocks_explicit_);
+  }
+
+  void raise_mock(size_t i) {
+    wxAuiNotebook* nb = notebook();
+    if (!nb || i >= mock_rows_.size() || !mock_rows_[i].page) return;
+    if (const int k = nb->GetPageIndex(mock_rows_[i].page.get()); k != wxNOT_FOUND) nb->SetSelection(static_cast<size_t>(k));
+  }
+
+  void mock_menu(size_t i) {
+    if (!ws_) return;
+    if (i >= mock_rows_.size()) {
+      add_mock(mocks_pane_->ScreenToClient(wxGetMousePosition()));
+      return;
+    }
+    const MockRow m = mock_rows_[i];
+    enum { kShow = 1, kToggle, kCopy, kReveal, kNew };
+    wxMenu menu;
+    menu.Append(kShow, "&Show mock tab");
+    menu.Append(kToggle, m.running ? "S&top" : "S&tart");
+    menu.Append(kCopy, "&Copy URL")->Enable(m.running && !m.url.empty());
+    menu.Append(kReveal, "&Reveal folder in Explorer");
+    menu.AppendSeparator();
+    menu.Append(kNew, wxString::FromUTF8("Start another mock\xE2\x80\xA6"));
+    const int id = mocks_pane_->GetPopupMenuSelectionFromUser(menu, mocks_pane_->ScreenToClient(wxGetMousePosition()));
+    switch (id) {
+      case kShow: raise_mock(i); break;
+      case kToggle:
+        if (m.page)
+          if (auto* b = mock_toggle(m.page.get()); b && b->on_click) b->on_click();
+        later([this] { poll_mocks(); });
+        break;
+      case kCopy: copy_text(m.url); break;
+      case kReveal: {
+        const fs::path f = m.folder.empty() ? ws_->root() : m.folder;
+        wxExecute(wxString::Format("explorer.exe \"%s\"", f.wstring()), wxEXEC_ASYNC);
+        break;
+      }
+      case kNew: add_mock(mocks_pane_->ScreenToClient(wxGetMousePosition())); break;
+      default: break;
+    }
+  }
+
+  // "+": the selected folder (a selected request: its folder) or the collection. With a folder
+  // selected a small menu offers both; otherwise the collection's mock starts at once.
+  void add_mock(const wxPoint& at) {
+    if (!ws_ || !host_) return;
+    fs::path folder;
+    if (const auto* d = data(tree_->GetSelection())) folder = d->node->is_folder ? d->node->path : d->node->path.parent_path();
+    if (!folder.empty() && same_path(folder, ws_->root())) folder.clear();
+    if (folder.empty()) {
+      host_->start_mock(fs::path());
+      later([this] { poll_mocks(); });
+      return;
+    }
+    wxMenu menu;
+    menu.Append(1, wxString::FromUTF8("Mock \xE2\x80\x9C" + folder_label(folder) + "\xE2\x80\x9D"));
+    menu.Append(2, "Mock the whole collection");
+    const int id = mocks_pane_->GetPopupMenuSelectionFromUser(menu, at);
+    if (id == 1) host_->start_mock(folder);
+    else if (id == 2) host_->start_mock(fs::path());
+    if (id == 1 || id == 2) later([this] { poll_mocks(); });
+  }
+
+  // ---- API specs
+
+  // Spec file -> the folder its requests went to (empty: not imported yet). Per user, per
+  // workspace (never in the workspace: a cloned workspace cannot point the app at other files).
+  void load_spec_targets() {
+    spec_targets_.clear();
+    wxConfigBase* c = wxConfigBase::Get();
+    wxString s;
+    if (!c || !ws_ || !c->Read("Sidebar/Specs/" + ws_key(ws_->root()), &s)) return;
+    wxStringTokenizer lines(s, "\n");
+    while (lines.HasMoreTokens()) {
+      const wxString line = lines.GetNextToken();
+      const int tab = line.Find('\t');
+      const wxString a = tab == wxNOT_FOUND ? line : line.Left(tab);
+      const wxString b = tab == wxNOT_FOUND ? wxString() : line.Mid(tab + 1);
+      if (a.empty()) continue;
+      fs::path spec(a.ToStdWstring());
+      if (spec.is_relative()) spec = (ws_->root() / spec).lexically_normal();
+      fs::path target;
+      if (!b.empty()) {
+        target = (ws_->root() / fs::path(b.ToStdWstring())).lexically_normal();
+        if (!is_under(target, ws_->root())) target.clear();  // only folders of this workspace
+      }
+      spec_targets_[spec] = target;
+    }
+  }
+
+  void save_spec_targets() {
+    wxConfigBase* c = wxConfigBase::Get();
+    if (!c || !ws_) return;
+    wxString s;
+    for (const auto& [spec, target] : spec_targets_) {
+      s += is_under(spec, ws_->root()) ? wxString(spec.lexically_relative(ws_->root()).wstring()) : wxString(spec.wstring());
+      s += "\t";
+      if (!target.empty()) s += wxString(target.lexically_relative(ws_->root()).wstring());
+      s += "\n";
+    }
+    c->Write("Sidebar/Specs/" + ws_key(ws_->root()), s);
+  }
+
+  // Lists the specs on a worker (<ws>/specs and the recorded ones), then shows them.
+  void refresh_specs() {
+    if (!specs_pane_) return;
+    if (!ws_) {
+      specs_.clear();
+      section_rows(specs_pane_, {}, specs_explicit_);
+      return;
+    }
+    if (specs_busy_) {
+      specs_again_ = true;
+      return;
+    }
+    specs_busy_ = true;
+    std::vector<fs::path> rec;
+    for (const auto& [f, t] : spec_targets_) rec.push_back(f);
+    std::weak_ptr<int> alive = alive_;
+    std::thread([this, alive, root = ws_->root(), rec = std::move(rec)] {
+      auto v = std::make_shared<std::vector<SpecInfo>>(scan_specs(root, rec));
+      if (wxTheApp) wxTheApp->CallAfter([this, alive, root, v] {
+        if (alive.expired()) return;
+        specs_busy_ = false;
+        if (ws_ && ws_->root() == root) show_specs(std::move(*v));
+        if (specs_again_) {
+          specs_again_ = false;
+          refresh_specs();
+        }
+      });
+    }).detach();
+  }
+
+  fs::path spec_target(const fs::path& spec) const {
+    auto it = spec_targets_.find(spec);
+    if (it == spec_targets_.end() || it->second.empty()) return {};
+    std::error_code ec;
+    return fs::is_directory(it->second, ec) ? it->second : fs::path();
+  }
+
+  std::string spec_target_text(const fs::path& spec) const {
+    const fs::path t = spec_target(spec);
+    return t.empty() ? std::string("Not imported yet: Sync requests imports its operations into a new folder")
+                     : "Requests in " + folder_label(t) + "  \xC2\xB7  Sync adds new operations and keeps edited requests";
+  }
+
+  void show_specs(std::vector<SpecInfo> v) {
+    specs_ = std::move(v);
+    std::vector<SectionRow> out;
+    for (const auto& s : specs_) {
+      SectionRow r;
+      r.label = u8(s.file.filename());
+      r.detail = s.missing ? std::string("file not found") : s.title;
+      r.chip = s.version.empty() ? std::string() : s.version;
+      r.dim = s.missing;
+      const fs::path t = spec_target(s.file);
+      if (!t.empty()) r.detail = (r.detail.empty() ? "" : r.detail + " \xC2\xB7 ") + "\xE2\x86\x92 " + folder_label(t);
+      r.tip = u8(s.file.wstring()) + "\n" + (s.missing ? std::string("The file is gone (Forget removes the row)") : s.kind) + "\n" +
+              spec_target_text(s.file) + "\nClick: preview. Right-click: sync requests, reveal, forget.";
+      out.push_back(std::move(r));
+    }
+    section_rows(specs_pane_, std::move(out), specs_explicit_);
+  }
+
+  void open_spec(size_t i) {
+    if (i >= specs_.size()) return;
+    const fs::path f = specs_[i].file;
+    if (specs_[i].missing) {
+      show_note(wxString::FromUTF8("\xE2\x9A\xA0 " + u8(f.filename()) + " is not there any more"), wxString(f.wstring()));
+      return;
+    }
+    show_spec_tab(open_spec_tab(f));
+  }
+
+  // The preview tab of spec, for this workspace: its Sync refuses to write once another workspace
+  // is open (the tab is parked with its own one, see swap_tabs(); this holds even if it was not).
+  wxWindow* open_spec_tab(const fs::path& spec) {
+    if (!ws_) return nullptr;
+    std::weak_ptr<int> alive = alive_;
+    const fs::path root = ws_->root();
+    wxWindow* page = open_spec_preview(notebook(), spec, spec_target_text(spec),
+                                       [this, alive, spec, root] {
+                                         if (!alive.expired()) sync_spec(spec, root);
+                                       },
+                                       [this, alive, spec] {
+                                         if (!alive.expired()) reveal_in_explorer(spec);
+                                       });
+    spec_preview_set_open_op(page, [this, alive, spec, root](const std::string& method, const std::string& path) {
+      if (!alive.expired()) open_spec_op(spec, root, method, path);
+    });
+    return page;
+  }
+
+  // An operation of a spec preview was double-clicked: its request in the spec's folder opens (a
+  // permanent tab), found by method and path from the tree and the URL index (no file read).
+  void open_spec_op(const fs::path& spec, const fs::path& root, const std::string& method, const std::string& path) {
+    if (!ws_ || ws_->root() != root) return;
+    const std::string what = method + " " + path;
+    const fs::path target = spec_target(spec);
+    if (target.empty()) {
+      show_note(wxString::FromUTF8("\xE2\x9A\xA0 " + what + ": Sync requests first"),
+                "The spec's operations become requests in a folder with Sync requests; then a double-click opens one.");
+      return;
+    }
+    const CollectionNode* folder = find_node(tree_root_, target);
+    fs::path hit;
+    std::function<void(const CollectionNode&)> walk = [&](const CollectionNode& n) {
+      for (const auto& c : n.children) {
+        if (!hit.empty()) return;
+        if (c.is_folder) {
+          walk(c);
+          continue;
+        }
+        if (c.kind != RequestKind::Http) continue;
+        const std::string m = c.method.empty() ? std::string("GET") : c.method;
+        if (_stricmp(m.c_str(), method.c_str()) != 0) continue;
+        auto it = meta_.find(c.path);
+        if (it != meta_.end() && sidebar::spec_op_path(it->second.url) == path) hit = c.path;
+      }
+    };
+    if (folder) walk(*folder);
+    if (hit.empty()) {
+      show_note(wxString::FromUTF8("\xE2\x9A\xA0 No request for " + what + " in " + folder_label(target)),
+                "Sync requests adds the operations the folder does not have yet.");
+      return;
+    }
+    host_->open_request(hit, false);
+    select_file(hit);
+  }
+
+  // Selects a spec preview tab in a UI step of its own (the notebook lays the page out then).
+  void show_spec_tab(wxWindow* page) {
+    if (!page) return;
+    later([this, page = wxWeakRef<wxWindow>(page)] {
+      wxAuiNotebook* nb = notebook();
+      if (!nb || !page) return;
+      if (const int i = nb->GetPageIndex(page.get()); i != wxNOT_FOUND) nb->SetSelection(static_cast<size_t>(i));
+    });
+  }
+
+  void spec_menu(size_t i) {
+    if (!ws_) return;
+    enum { kOpen = 1, kSync, kShow, kReveal, kCopy, kForget, kAdd, kFolder };
+    wxMenu menu;
+    const bool row = i < specs_.size();
+    if (row) {
+      const SpecInfo& s = specs_[i];
+      menu.Append(kOpen, "&Open preview")->Enable(!s.missing);
+      menu.Append(kSync, "S&ync requests from spec")->Enable(!s.missing);
+      menu.Append(kShow, "Show requests in the &tree")->Enable(!spec_target(s.file).empty());
+      menu.AppendSeparator();
+      menu.Append(kReveal, "&Reveal in Explorer")->Enable(!s.missing);
+      menu.Append(kCopy, "&Copy path");
+      if (spec_targets_.count(s.file) && (s.imported || s.missing)) menu.Append(kForget, "&Forget this spec");
+      menu.AppendSeparator();
+    }
+    menu.Append(kAdd, wxString::FromUTF8("&Add an OpenAPI file\xE2\x80\xA6"));
+    std::error_code ec;
+    if (fs::is_directory(specs_dir(ws_->root()), ec)) menu.Append(kFolder, "Open the &specs folder");
+    const int id = specs_pane_->GetPopupMenuSelectionFromUser(menu, specs_pane_->ScreenToClient(wxGetMousePosition()));
+    const fs::path f = row ? specs_[i].file : fs::path();
+    switch (id) {
+      case kOpen: open_spec(i); break;
+      case kSync: sync_spec(f); break;
+      case kShow:
+        if (const fs::path t = spec_target(f); !t.empty()) {
+          if (hist_full_) toggle_history_full();
+          expanded_.insert(t);
+          pending_select_ = t;
+          rescan_then_select();
+        }
+        break;
+      case kReveal: reveal_in_explorer(f); break;
+      case kCopy: copy_text(wxString(f.wstring())); break;
+      case kForget:
+        spec_targets_.erase(f);
+        save_spec_targets();
+        refresh_specs();
+        break;
+      case kAdd: add_spec(); break;
+      case kFolder: wxExecute(wxString::Format("explorer.exe \"%s\"", specs_dir(ws_->root()).wstring()), wxEXEC_ASYNC); break;
+      default: break;
+    }
+  }
+
+  // "+": an OpenAPI file from anywhere, copied into <ws>/specs (one inside the workspace stays
+  // where it is), then previewed; its Sync requests imports the operations.
+  void add_spec() {
+    if (!ws_ || picking_) return;
+    picking_ = true;
+    std::weak_ptr<int> alive = alive_;
+    const fs::path root = ws_->root();
+    fs::path start = root;
+    if (wxConfigBase* c = wxConfigBase::Get())
+      if (wxString last; c->Read("Sidebar/ImportDir", &last) && !last.empty()) start = fs::path(last.ToStdWstring());
+    pick_file_async(wxGetTopLevelParent(this), L"Add an OpenAPI / Swagger document",
+                    {{L"OpenAPI (*.yaml;*.yml;*.json)", L"*.yaml;*.yml;*.json"}, {L"All files (*.*)", L"*.*"}}, false,
+                    [this, alive, root](const fs::path& src) {
+                      if (alive.expired()) return;
+                      picking_ = false;
+                      focus_tree_after_dialog();
+                      if (src.empty() || !ws_ || ws_->root() != root) return;
+                      if (wxConfigBase* c = wxConfigBase::Get())
+                        c->Write("Sidebar/ImportDir", wxString(src.parent_path().wstring()));
+                      std::thread([this, alive, root, src] {
+                        const SpecInfo info = peek_spec(src);
+                        fs::path dest;
+                        std::string err;
+                        if (info.kind.empty()) {
+                          err = u8(src.filename()) + " is not an OpenAPI / Swagger document (no openapi or swagger key).";
+                        } else if (is_under(src, root)) {
+                          dest = src;
+                        } else {
+                          std::error_code ec;
+                          const fs::path dir = specs_dir(root);
+                          fs::create_directories(dir, ec);
+                          dest = dir / src.filename();
+                          for (int k = 2; fs::exists(dest, ec) && k < 1000; ++k)
+                            dest = dir / (src.stem().wstring() + L" " + std::to_wstring(k) + src.extension().wstring());
+                          if (!fs::copy_file(src, dest, ec)) err = "Could not copy it into specs/: " + ec.message();
+                        }
+                        if (wxTheApp) wxTheApp->CallAfter([this, alive, root, dest, err] {
+                          if (alive.expired() || !ws_ || ws_->root() != root) return;
+                          if (!err.empty()) {
+                            notify(wxGetTopLevelParent(this), "Not added", wxString::FromUTF8(err));
+                            return;
+                          }
+                          if (!spec_targets_.count(dest)) spec_targets_[dest] = fs::path();
+                          save_spec_targets();
+                          if (!specs_explicit_) specs_pane_->set_collapsed(false);
+                          refresh_specs();
+                          show_spec_tab(open_spec_tab(dest));
+                        });
+                      }).detach();
+                    },
+                    start);
+  }
+
+  // "Sync requests from spec": parses the spec again on a worker and writes the operations that
+  // are new into its folder (sync_import keeps every request that is there, edited or not); the
+  // first sync imports it into a new folder at the root, as Import does.
+  // for_root: the workspace the request came from (a spec tab's); empty: the current one.
+  void sync_spec(const fs::path& spec, const fs::path& for_root = {}) {
+    if (!ws_ || spec.empty()) return;
+    if (!spec_sync_allowed(spec, for_root)) {
+      ++spec_sync_refused_;
+      show_note(wxString::FromUTF8("\xE2\x9A\xA0 Not synced: " + u8(spec.filename()) + " belongs to " +
+                                   u8((for_root.empty() ? spec.parent_path() : for_root).filename())),
+                wxString::FromUTF8("Its requests go only into the workspace it was opened in, never into " +
+                                   u8(ws_->root().filename()) + ". Switch to that workspace to sync it."),
+                8000);
+      return;
+    }
+    if (importing_) {
+      notify(wxGetTopLevelParent(this), "An import is running", "Wait for it to finish, then sync the spec.");
+      return;
+    }
+    importing_ = true;
+    show_note(wxString::FromUTF8("Syncing " + u8(spec.filename()) + "\xE2\x80\xA6"), wxString(spec.wstring()), 0);
+    auto copy = std::make_shared<Workspace>(*ws_);
+    std::weak_ptr<int> alive = alive_;
+    const fs::path root = ws_->root();
+    const fs::path target = spec_target(spec);
+    std::thread([this, copy, alive, root, spec, target] {
+      const auto t0 = std::chrono::steady_clock::now();
+      auto res = std::make_shared<SpecSync>();
+      res->target = target;
+      std::string err;
+      auto parsed = parse_collection_file(spec, &err);
+      if (parsed && parsed->format.rfind("OpenAPI", 0) != 0 && parsed->format.rfind("Swagger", 0) != 0) {
+        err = u8(spec.filename()) + " is a " + parsed->format + " file, not an OpenAPI document";
+        parsed.reset();
+      }
+      if (!parsed) {
+        res->err = err.empty() ? std::string("could not read it") : err;
+      } else if (!target.empty()) {
+        SyncWritten w = sync_import(*copy, target, *parsed);
+        res->added = w.added;
+        res->kept = w.kept;
+        res->stale = std::move(w.stale);
+        res->skipped = std::move(w.skipped);
+        res->first = w.first_added;
+      } else {
+        ImportWritten w = write_import(*copy, root, *parsed);
+        res->target = w.top;
+        res->added = w.requests;
+        res->skipped = std::move(w.skipped);
+        res->first = w.first_file;
+        res->order = std::move(w.order);
+        res->fresh = true;
+      }
+      res->ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+      if (wxTheApp) wxTheApp->CallAfter([this, alive, root, spec, res] {
+        if (alive.expired()) return;
+        spec_synced(root, spec, *res);
+      });
+    }).detach();
+  }
+
+  // A spec is synced only into the workspace it was opened for, and only when it is this
+  // workspace's (in it, or recorded for it).
+  bool spec_sync_allowed(const fs::path& spec, const fs::path& for_root) const {
+    return ws_ && sidebar::spec_sync_allowed(spec, for_root, ws_->root(), spec_targets_.count(spec) != 0);
+  }
+
+  struct SpecSync {
+    fs::path target, first;
+    size_t added = 0, kept = 0;
+    std::vector<std::string> stale, skipped;
+    std::map<fs::path, std::vector<std::wstring>> order;
+    bool fresh = false;
+    double ms = 0;
+    std::string err;
+  };
+
+  void spec_synced(const fs::path& root, const fs::path& spec, SpecSync& s) {
+    importing_ = false;
+    hide_note();
+    if (!ws_ || ws_->root() != root) return;
+    if (!s.err.empty()) {
+      notify(wxGetTopLevelParent(this), "Could not sync the spec", wxString::FromUTF8(s.err));
+      return;
+    }
+    if (!s.target.empty()) {
+      spec_targets_[spec] = s.target;
+      save_spec_targets();
+      if (s.fresh) {
+        for (auto& [dir, names] : s.order)
+          if (!names.empty()) order_[dir] = std::move(names);
+        append_to_order(root, s.target);
+        save_order();
+      }
+      expanded_.insert(s.target);
+      save_expanded();
+      if (hist_full_) toggle_history_full();
+      pending_select_ = s.target;
+      rescan_then_select();
+    }
+    refresh_specs();
+    if (wxWindow* pv = spec_preview_for(spec)) spec_preview_set_target(pv, spec_target_text(spec));
+    char t[48];
+    std::snprintf(t, sizeof t, " \xC2\xB7 %.0f ms", s.ms);
+    std::string line = "\xE2\x9C\x93 " + std::string(s.fresh ? "Imported " : "Synced ") + u8(spec.filename()) + ": " +
+                       std::to_string(s.added) + " added";
+    if (!s.fresh) line += ", " + std::to_string(s.kept) + " kept";
+    if (!s.stale.empty()) line += ", " + std::to_string(s.stale.size()) + " not in the spec";
+    line += t;
+    std::string tip = line.substr(4) + "\nInto " + folder_label(s.target) + ".";
+    if (!s.fresh) tip += "\nRequests already there (edited or not) were kept as they are.";
+    for (size_t i = 0; i < s.stale.size() && i < 10; ++i)
+      tip += (i ? "\n" : "\n\nNo longer in the spec (kept, delete them by hand if they are gone):\n") +
+             std::string("\xE2\x80\xA2 ") + s.stale[i];
+    for (size_t i = 0; i < s.skipped.size() && i < 8; ++i)
+      tip += (i ? "\n" : "\n\nSkipped:\n") + std::string("\xE2\x80\xA2 ") + s.skipped[i];
+    show_note(wxString::FromUTF8(line), wxString::FromUTF8(tip), 12000);
+  }
+
   void toggle_history_full() {
     hist_full_ = !hist_full_;
     hist_expand_->SetLabel(hist_full_ ? "Restore" : "Expand");
@@ -2630,6 +3466,11 @@ class Sidebar : public wxPanel, public SidebarPanel {
     // search): its hint says so.
     filter_->SetHint(hist_full_ ? "Filter history by request, URL or method" : "Filter by name, folder, method or URL");
     if (hist_full_) {
+      // The tree's scroll position, by the row at its top: the pane is hidden (and the tree
+      // resized to nothing) meanwhile, so the native scroll position does not survive.
+      hist_saved_top_.clear();
+      if (wxTreeItemId v = tree_->GetFirstVisibleItem(); v.IsOk())
+        if (const auto* d = data(v)) hist_saved_top_ = d->node->path;
       hist_saved_sash_ = split_->GetSashPosition();
       hist_saved_user_ = user_sash_;
       hist_saved_filter_ = filter_->GetValue();
@@ -2646,6 +3487,20 @@ class Sidebar : public wxPanel, public SidebarPanel {
       split_->SplitHorizontally(top_pane_, split_->GetWindow1(),
                                 hist_saved_sash_ > 0 ? hist_saved_sash_ : split_->GetClientSize().y / 2);
       update_history_pane();
+      // Only the entry the shown tab holds stays marked (none when it is not a history tab).
+      {
+        wxAuiNotebook* nb = notebook();
+        auto* t = nb ? dynamic_cast<RequestTab*>(nb->GetCurrentPage()) : nullptr;
+        auto it = t ? snapshot_entry_.find(t->file()) : snapshot_entry_.end();
+        if (it != snapshot_entry_.end()) history_->select_entry(it->second.first, it->second.second);
+        else history_->select_entry({}, {});
+      }
+      // Back where it was (after the pane's layout has given the tree its height again).
+      if (!hist_saved_top_.empty())
+        later([this, top = hist_saved_top_] {
+          if (hist_full_) return;
+          if (wxTreeItemId id = item_for(top, false); id.IsOk()) set_first_visible(id);
+        });
     }
   }
 
@@ -2668,14 +3523,12 @@ class Sidebar : public wxPanel, public SidebarPanel {
       // The height the user dragged it to (kept across restarts), within the sidebar.
       if (user_hist_h_ <= 0) return;
       want = std::clamp(user_hist_h_, FromDIP(64), h - FromDIP(64));
-    } else if (history_->total() == 0) {
-      want = FromDIP(64);
     } else {
-      // The rows it shows (day headers included) plus its header, no empty space under them,
-      // at most 5 rows (the list scrolls; Expand or a drag of the divider shows more) and 30% of
-      // the sidebar: the collection keeps the rest of the column, as in Bruno.
-      want = FromDIP(34) + history_->content_height(5) + FromDIP(4);
-      want = std::clamp(want, FromDIP(96), std::max(FromDIP(96), h * 30 / 100));
+      // A fixed height (its header, a day heading and five entries; the list scrolls, Expand
+      // or a drag of the divider shows more), at most 35% of the sidebar. It never grows with
+      // the entries: a send must not move the tree's rows under the pointer.
+      want = FromDIP(34) + FromDIP(24) + 5 * FromDIP(38) + FromDIP(4);
+      want = std::clamp(want, FromDIP(96), std::max(FromDIP(96), h * 35 / 100));
     }
     const int pos = h - want - split_->GetSashSize();
     if (std::abs(split_->GetSashPosition() - pos) > 2) split_->SetSashPosition(pos);
@@ -2706,8 +3559,9 @@ class Sidebar : public wxPanel, public SidebarPanel {
   }
 
   // Hides everything but a narrow rail with a "show" button and shrinks the AUI pane.
-  void set_collapsed(bool c) {
+  void set_collapsed(bool c, bool take_focus = true) {
     if (c == collapsed_) return;
+    if (!c) auto_collapsed_ = false;  // shown (by the user, or the window grew): theirs again
     wxAuiManager* m = wxAuiManager::GetManager(this);
     if (!m) return;
     wxAuiPaneInfo& pane = m->GetPane(this);
@@ -2727,7 +3581,8 @@ class Sidebar : public wxPanel, public SidebarPanel {
     st_timed("collapse: aui", [&] { set_pane_width(w, c ? wxSize(w, -1) : (saved_min_.IsFullySpecified() ? saved_min_ : wxSize(FromDIP(160), -1))); });
     // Shown again: the keyboard goes to the tree (the filter while it holds a query), so the arrow
     // keys work at once instead of landing on the frame.
-    if (!c) {
+    if (!c && !take_focus) later([this] { update_history_pane(); });
+    if (!c && take_focus) {
       auto focus_in = [this] {
         if (!filter_->GetValue().empty()) filter_->SetFocus();
         else tree_->SetFocus();
@@ -2815,11 +3670,20 @@ class Sidebar : public wxPanel, public SidebarPanel {
     tree_->Bind(wxEVT_TREE_SEL_CHANGED, [this](wxTreeEvent& e) {
       if (syncing_ || rebuilding_) return;
       sticky_sel_.clear();
+      user_sel_ = true;  // a rescan landing now keeps this row (its preview may still be pending)
       // The user picked a row here: the history list no longer marks a current entry (the
       // preview tab is reused without a page change, so no select_file clears it).
       history_->select_entry({}, {});
       const auto* d = data(e.GetItem());
+      preview_timer_.Stop();
       if (!d || d->node->is_folder) return;
+      // Arrow keys, Home / End, PageUp / PageDown: the preview opens once the keyboard rests
+      // (120 ms), not on every row passed (each was a tab load of 5-40 ms).
+      if (std::chrono::steady_clock::now() - tree_key_at_ < std::chrono::milliseconds(250)) {
+        preview_path_ = d->node->path;
+        preview_timer_.StartOnce(120);
+        return;
+      }
       host_->open_request(d->node->path, true);
       learn_later(d->node->path);
       // A preview keeps the keyboard in the tree (arrows, F2, Del), as in VS Code; the tab may
@@ -2829,6 +3693,7 @@ class Sidebar : public wxPanel, public SidebarPanel {
       });
     });
     tree_->Bind(wxEVT_TREE_ITEM_ACTIVATED, [this](wxTreeEvent& e) {
+      preview_timer_.Stop();  // Enter opens it for good now
       const auto* d = data(e.GetItem());
       if (!d) return;
       if (d->node->is_folder) {
@@ -2874,7 +3739,22 @@ class Sidebar : public wxPanel, public SidebarPanel {
       e.Skip();
     });
     build_hover_button();
+    preview_timer_.Bind(wxEVT_TIMER, [this](wxTimerEvent&) {
+      const auto* d = data(tree_->GetSelection());
+      if (!d || d->node->is_folder || d->node->path != preview_path_ || !host_) return;
+      // Still moving (a key held down): wait for it to rest.
+      if (std::chrono::steady_clock::now() - tree_key_at_ < std::chrono::milliseconds(100)) {
+        preview_timer_.StartOnce(120);
+        return;
+      }
+      host_->open_request(preview_path_, true);
+      learn_later(preview_path_);
+      CallAfter([this] {
+        if (tree_->IsShownOnScreen()) tree_->SetFocus();
+      });
+    });
     tree_->Bind(wxEVT_TREE_KEY_DOWN, [this](wxTreeEvent& e) {
+      tree_key_at_ = std::chrono::steady_clock::now();
       const wxTreeItemId sel = tree_->GetSelection();
       switch (e.GetKeyCode()) {
         case WXK_F2:
@@ -2987,6 +3867,11 @@ class Sidebar : public wxPanel, public SidebarPanel {
       // before they create anything): no file named "New request" is left behind.
       if (discard) {
         later([this, from] { discard_fresh(from); });
+        // Said, not silent: Esc dropped the item, a click makes it again (named once more).
+        if (auto redo = std::exchange(discard_redo_, nullptr))
+          show_note(wxString::FromUTF8(discard_what_ + " discarded (Esc). Click to make it again"),
+                    "Esc while naming a new request or a copy cancels it, so no unnamed file is left behind.", 6000,
+                    [this, redo] { later(redo); });
         return;
       }
       if (!d || name.empty() || name == d->node->name) {
@@ -3178,7 +4063,10 @@ class Sidebar : public wxPanel, public SidebarPanel {
     }
     // The highlight follows the active tab (after a save, delete or move the old row's
     // neighbour must not stay selected); a selected folder stays.
-    if (!active_file_.empty() && (!sel_folder || reveal_active_)) sel_path = active_file_;
+    // Not while the user is moving through the rows: Down x3 then a rescan (a git pull, another
+    // editor saving) put the highlight back on the previewed row, one short of where the keys went.
+    if (!active_file_.empty() && (!sel_folder || reveal_active_) && !(user_sel_ && !sel_path.empty()))
+      sel_path = active_file_;
     // A row just moved or reordered stays selected through the rescans that follow.
     if (!sticky_sel_.empty()) sel_path = sticky_sel_;
     if (const auto* d = data(tree_->GetFirstVisibleItem())) top_path = d->node->path;
@@ -4052,6 +4940,7 @@ class Sidebar : public wxPanel, public SidebarPanel {
     auto names = name_cache_;
     const uint64_t gen = ++scan_gen_;
     scanning_ = true;
+    scan_order_done_ = order_done_;
     std::weak_ptr<int> alive = alive_;
     std::thread([this, copy, names, gen, alive] {
       auto deliver = [this, gen, alive](CollectionNode node, MetaMap meta, bool final) {
@@ -4106,8 +4995,16 @@ class Sidebar : public wxPanel, public SidebarPanel {
     }
     auto old = std::make_shared<std::pair<CollectionNode, MetaMap>>(std::move(tree_root_), std::move(meta_));
     tree_root_ = std::move(root);
+    // <ws>/specs holds the API SPECS section's files: no empty folder row for it in the tree
+    // (one with requests in it stays).
+    std::erase_if(tree_root_.children, [&](const CollectionNode& c) {
+      return c.is_folder && ws_ && _wcsicmp(c.path.filename().c_str(), L"specs") == 0 &&
+             same_path(c.path.parent_path(), ws_->root()) && count_requests(c) == 0;
+    });
     meta_ = std::move(meta);
+    sync_order(final);
     if (final) scanning_ = false;
+    if (final) refresh_specs();  // a file added to or removed from specs/ rescans too
     meta_changed(idx);
     std::thread([o = std::move(old)] {}).detach();
     sync_ok_ = true;
@@ -4208,6 +5105,8 @@ class Sidebar : public wxPanel, public SidebarPanel {
     }
     name_then_open(r->file);
     discard_on_esc_ = r->file;
+    discard_redo_ = [this, kind, folder] { new_request_in(kind, folder); };
+    discard_what_ = "New request";
   }
 
   void new_folder_in(const fs::path& folder) {
@@ -4258,7 +5157,9 @@ class Sidebar : public wxPanel, public SidebarPanel {
     std::string err;
     const auto to = sidebar::rename_item(*ws_, from, name, &err);
     if (!to) {
-      notify(wxGetTopLevelParent(this), "Could not rename", wxString::FromUTF8("\"" + name + "\": " + err));
+      // In the notice band under the tree, not a modal box (Bruno shows it inline too).
+      show_note(wxString::FromUTF8("\xE2\x9A\xA0 Not renamed to \"" + name + "\": " + err),
+                wxString::FromUTF8("Pick another name (F2)."), 8000);
       return {};
     }
     for (const auto& f : files) {
@@ -4460,6 +5361,10 @@ class Sidebar : public wxPanel, public SidebarPanel {
     std::string name;
     std::vector<fs::path> dirs;
     std::vector<std::pair<fs::path, std::string>> files;
+    // The tabs the delete closed (pinned = not the preview tab), in tab order, and the active one:
+    // Ctrl+Z opens them again.
+    std::vector<std::pair<fs::path, bool>> tabs;
+    fs::path active;
   };
 
   // Reads what is about to be deleted (worker thread). Too big (over 16 MB or 5000 files): no
@@ -4524,6 +5429,17 @@ class Sidebar : public wxPanel, public SidebarPanel {
         pending_select_ = d->path;
         sticky_sel_ = d->path;
         rescan_then_select();
+        // The tabs Del closed come back too (the active one last, so it is the one shown).
+        if (host_ && !d->tabs.empty()) {
+          for (const auto& [f, pinned] : d->tabs)
+            if (f != d->active && fs::exists(f)) host_->open_request(f, !pinned);
+          if (!d->active.empty() && fs::exists(d->active)) {
+            bool pinned = true;
+            for (const auto& [f, pin] : d->tabs)
+              if (f == d->active) pinned = pin;
+            host_->open_request(d->active, !pinned);
+          }
+        }
         const wxString what = wxString::FromUTF8(d->name);
         if (kept)
           show_note(wxString::Format("Restored \"%s\" (%zu kept: a file of that name is there now)", what, kept),
@@ -4572,9 +5488,23 @@ class Sidebar : public wxPanel, public SidebarPanel {
     std::string shown_name;
     if (const CollectionNode* n = find_node(tree_root_, p)) shown_name = n->name;
     if (shown_name.empty()) shown_name = u8(p.filename());
-    std::thread([this, p, files, alive, back_to, neighbour, active_deleted, root = ws_->root(), shown_name] {
+    // The tabs this delete closes, for Ctrl+Z (one pass over the notebook).
+    std::vector<std::pair<fs::path, bool>> closed_tabs;
+    if (wxAuiNotebook* nb = notebook()) {
+      const std::set<fs::path> gone(files.begin(), files.end());
+      for (size_t i = 0; i < nb->GetPageCount(); ++i)
+        if (auto* t = dynamic_cast<RequestTab*>(nb->GetPage(i)); t && gone.count(t->file()))
+          closed_tabs.emplace_back(t->file(), !t->preview());
+    }
+    const fs::path closed_active = active_deleted ? active_file_ : fs::path();
+    std::thread([this, p, files, alive, back_to, neighbour, active_deleted, root = ws_->root(), shown_name,
+                 closed_tabs = std::move(closed_tabs), closed_active] {
       std::shared_ptr<Deleted> undo = snapshot_for_undo(root, p);
-      if (undo) undo->name = shown_name;
+      if (undo) {
+        undo->name = shown_name;
+        undo->tabs = closed_tabs;
+        undo->active = closed_active;
+      }
       const HRESULT co = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
       const bool ok = recycle(p);
       if (SUCCEEDED(co)) CoUninitialize();
@@ -4604,13 +5534,10 @@ class Sidebar : public wxPanel, public SidebarPanel {
         // The neighbour always wins, as in Bruno and VS Code: the tree keeps the place where the
         // user deleted (the tab that was active before could be far up the tree). It opens in
         // the preview tab, or in the frame's spare tab (built in a quiet moment).
+        // The neighbour row is selected but not opened (a preview tab of it was clutter the user
+        // did not ask for): the tab that was active before comes back, if it is still open.
         fs::path show;
-        if (active_deleted) {
-          const bool neighbour_req = !neighbour.empty() && is_request_file(neighbour);
-          const bool have_back = !back_to.empty() && tab_for(back_to);
-          if (neighbour_req) show = neighbour;
-          else if (have_back) show = back_to;
-        }
+        if (active_deleted && !back_to.empty() && tab_for(back_to)) show = back_to;
         if (!show.empty()) st_timed("show neighbour", [&] { host_->open_request(show, true); });
         later([this, files, show, neighbour, active_deleted] {
           st_timed("close tab", [&] {
@@ -4625,7 +5552,7 @@ class Sidebar : public wxPanel, public SidebarPanel {
           if (wxAuiNotebook* nb = notebook(); nb && nb->GetSelection() != wxNOT_FOUND)
             if (auto* t = dynamic_cast<RequestTab*>(nb->GetPage(static_cast<size_t>(nb->GetSelection()))))
               shown = t->file();
-          if (active_deleted && (!shown.empty() || !show.empty())) {
+          if (active_deleted && !shown.empty() && neighbour.empty()) {
             select_file(shown);
           } else if (!neighbour.empty()) {
             // Another row than the active tab's went: the selection stays on its neighbour (the
@@ -4674,6 +5601,11 @@ class Sidebar : public wxPanel, public SidebarPanel {
     place_after(r->file, p);
     name_then_open(r->file);
     discard_on_esc_ = r->file;
+    discard_redo_ = [this, p] {
+      std::error_code ec;
+      if (ws_ && fs::exists(p, ec)) duplicate_item(p);
+    };
+    discard_what_ = "Copy";
   }
 
   // The copy goes directly under its original (as in Bruno and Postman), not at the end of a
@@ -4748,6 +5680,8 @@ class Sidebar : public wxPanel, public SidebarPanel {
     std::error_code ec;
     const fs::path dir = into.empty() ? p.parent_path() : into;
     fs::path to = dir / (into.empty() ? p.filename().wstring() + L" copy" : p.filename().wstring());
+    // Taken: "<name> copy", then "<name> copy 2", ... (a paste next to the original starts at "copy").
+    if (fs::exists(to, ec) && !into.empty()) to = dir / (p.filename().wstring() + L" copy");
     for (int n = 2; fs::exists(to, ec); ++n) to = dir / (p.filename().wstring() + L" copy " + std::to_wstring(n));
     auto copy = std::make_shared<Workspace>(*ws_);
     std::weak_ptr<int> alive = alive_;
@@ -4949,7 +5883,16 @@ class Sidebar : public wxPanel, public SidebarPanel {
     hover_item_ = id;
     const wxSize cs = tree_->GetClientSize();
     const int h = std::min(r.height, FromDIP(16));
-    more_->SetSize(cs.x - FromDIP(26), r.y + (r.height - h) / 2, FromDIP(22), h);
+    // A folder row's count (painted at the right edge, see paint_counts) stays readable: the
+    // button goes to its left ("2000" read as "2 ..." when the button covered it).
+    int x = cs.x - FromDIP(26);
+    if (const size_t n = ctree_->folder_count ? ctree_->folder_count(id) : 0) {
+      wxClientDC dc(tree_);
+      dc.SetFont(tree_->GetFont());
+      const int w = dc.GetTextExtent(wxString::Format("%zu", n)).x;
+      x = cs.x - FromDIP(8) - w - FromDIP(4) - FromDIP(22);
+    }
+    more_->SetSize(x, r.y + (r.height - h) / 2, FromDIP(22), h);
     more_hot_ = false;
     more_->Show();
     more_->Refresh();
@@ -5376,6 +6319,7 @@ class Sidebar : public wxPanel, public SidebarPanel {
           else restore_top_.clear();
         }
         *ws_ = std::move(*w);
+        if (other && note_root_ != ws_->root()) hide_note();  // the old workspace's notice
         if (other) {
           st_timed("  swap_tabs", [&] { swap_tabs(old_root, ws_->root()); });
           if (!filter_->IsEmpty()) {  // a filter typed for the old collection
@@ -5422,6 +6366,14 @@ class Sidebar : public wxPanel, public SidebarPanel {
     std::vector<LostTab> lost;  // files whose tab was reused for the other workspace
   };
 
+  // A notebook page that goes with its workspace on a switch: a request tab that is not an empty
+  // start tab, a spec preview, a mock server tab or a runner (it runs its workspace's requests).
+  static bool workspace_page(wxWindow* page) {
+    if (auto* t = dynamic_cast<RequestTab*>(page)) return !t->pristine();
+    return page && (is_spec_preview(page) || mock_tab_info(page, nullptr, nullptr, nullptr) ||
+                    runner_folder(page, nullptr));
+  }
+
   // A tab may be lent only when it holds nothing a reload would lose: realized (an unrealized
   // tab keeps its pending restored response through set_request), clean and idle.
   static bool lendable(RequestTab* t) { return t->realized() && !t->dirty() && !t->in_flight(); }
@@ -5447,10 +6399,11 @@ class Sidebar : public wxPanel, public SidebarPanel {
     std::map<wxWindow*, int> old_index;  // their positions in the old workspace
     wxWindow* next_selected = nullptr;
     Unpark up;
-    std::vector<fs::path> reopen;
+    std::vector<std::pair<LostTab, SavedRequest>> reopen;  // no tab to lend: opened again, in place
     std::vector<std::pair<RequestTab*, int>> placed;  // lent tabs and the position they go to
     RequestTab* lent_selected = nullptr;
     bool blanked = false;  // the shown tab stayed but holds another request now
+    bool has_own = false;  // the workspace switched to brings tabs of its own back
   };
 
   // Hides the tabs of old_root (every tab that is not an empty start tab) and shows the ones
@@ -5473,11 +6426,13 @@ class Sidebar : public wxPanel, public SidebarPanel {
     TabSet& old = sw->old;
     const int sel = nb->GetSelection();
     for (size_t i = 0; i < nb->GetPageCount(); ++i) {
-      auto* t = dynamic_cast<RequestTab*>(nb->GetPage(i));
-      if (!t || t->pristine()) continue;
-      old.pages.emplace_back(t, nb->GetPageText(i));
-      sw->old_index[t] = static_cast<int>(i);
-      if (static_cast<int>(i) == sel) old.selected = t;
+      wxWindow* const page = nb->GetPage(i);
+      // Spec previews and mock tabs belong to their workspace too (their Sync writes into it, a
+      // mock serves its folders): parked with its request tabs, back only with it.
+      if (!workspace_page(page)) continue;
+      old.pages.emplace_back(page, nb->GetPageText(i));
+      sw->old_index[page] = static_cast<int>(i);
+      if (static_cast<int>(i) == sel) old.selected = page;
     }
     TabSet next;
     if (auto it = tab_sets_.find(new_root); it != tab_sets_.end()) {
@@ -5502,10 +6457,14 @@ class Sidebar : public wxPanel, public SidebarPanel {
           nb->AddPage(w, title, false);
         }
     });
+    sw->has_own = !next.pages.empty() || !next.lost.empty();
     // Select the tab coming back before the old ones go: removing the selected page makes the
-    // notebook show (and lay out) a neighbour first, ~25 ms for nothing.
+    // notebook show (and lay out) a neighbour first, ~25 ms for nothing. Not when the selected
+    // tab is a lent one (shown once it holds its request again, below).
+    const bool lent_shown = !next.selected && std::any_of(next.lost.begin(), next.lost.end(),
+                                                          [](const LostTab& l) { return l.selected; });
     st_timed("   select", [&] {
-      if (first)
+      if (first && !lent_shown)
         if (const int i = nb->GetPageIndex(first); i >= 0) nb->SetSelection(static_cast<size_t>(i));
     });
     const auto st_lend0 = std::chrono::steady_clock::now();
@@ -5518,19 +6477,25 @@ class Sidebar : public wxPanel, public SidebarPanel {
     for (auto& lost : next.lost) {
       std::error_code ec;
       if (!fs::exists(lost.file, ec)) continue;
+      std::optional<SavedRequest> r = ws_->load_request(lost.file);
+      if (!r) continue;  // unreadable now: opening it again would fail too
       RequestTab* loan = nullptr;
+      // First an empty start tab in the notebook (the tab this workspace lent when the other one
+      // had none, blanked since): of the request's kind, so no other editor is built for it.
+      for (size_t i = 0; i < nb->GetPageCount() && !loan; ++i) {
+        auto* t = dynamic_cast<RequestTab*>(nb->GetPage(i));
+        if (t && t->pristine() && lendable(t) && !t->preview() && t->request_kind() == r->kind) loan = t;
+      }
       for (int pass = 0; pass < 2 && !loan; ++pass)
         for (auto& pg : old.pages) {
-          auto* t = static_cast<RequestTab*>(pg.first);
-          if (lendable(t) && (pass == 1 || pg.first != old.selected)) {
+          auto* t = dynamic_cast<RequestTab*>(pg.first);
+          if (t && lendable(t) && (pass == 1 || pg.first != old.selected)) {
             loan = t;
             break;
           }
         }
-      std::optional<SavedRequest> r;
-      if (loan) r = ws_->load_request(lost.file);
-      if (!r) {
-        sw->reopen.push_back(lost.file);
+      if (!loan) {
+        sw->reopen.emplace_back(std::move(lost), std::move(*r));
         continue;
       }
       remember_lent(old, loan, sw->old_index.count(loan) ? sw->old_index[loan] : -1, loan == old.selected);
@@ -5556,8 +6521,8 @@ class Sidebar : public wxPanel, public SidebarPanel {
     if (nb->GetPageCount() == old.pages.size()) {
       RequestTab* carrier = nullptr;
       for (auto it = old.pages.rbegin(); it != old.pages.rend(); ++it) {
-        auto* t = static_cast<RequestTab*>(it->first);
-        if (lendable(t) && (it->first == old.selected || !carrier)) carrier = t;
+        auto* t = dynamic_cast<RequestTab*>(it->first);
+        if (t && lendable(t) && (it->first == old.selected || !carrier)) carrier = t;
       }
       if (carrier) {
         sw->blanked = true;
@@ -5631,6 +6596,27 @@ class Sidebar : public wxPanel, public SidebarPanel {
       nb->RemovePage(static_cast<size_t>(cur));
       nb->InsertPage(static_cast<size_t>(to), t, text, false);
     }
+    // The workspace coming back has tabs of its own: an empty start tab left from the one it
+    // leaves (made or blanked when that one had none) goes, it would stay first for good.
+    if (sw->has_own) {
+      std::vector<RequestTab*> spare;
+      bool own = false;
+      for (size_t i = 0; i < nb->GetPageCount(); ++i) {
+        auto* t = dynamic_cast<RequestTab*>(nb->GetPage(i));
+        if (t && t->pristine() && !t->in_flight()) spare.push_back(t);
+        else own = true;
+      }
+      for (RequestTab* t : spare) {
+        const int i = nb->GetPageIndex(t);
+        if (!own || i < 0 || nb->GetPageCount() < 2) break;
+        nb->RemovePage(static_cast<size_t>(i));
+        t->Hide();
+        if (park) t->Reparent(park);
+        later([w = wxWeakRef<wxWindow>(t)] {  // ~170 windows: destroyed in a step of their own
+          if (w) w->Destroy();
+        });
+      }
+    }
     mute_page_events_ = false;
     if ((sw->blanked || nb->GetCurrentPage() != shown_before) && nb->GetSelection() >= 0) {
       wxAuiNotebookEvent ev(wxEVT_AUINOTEBOOK_PAGE_CHANGED, nb->GetId());
@@ -5654,6 +6640,8 @@ class Sidebar : public wxPanel, public SidebarPanel {
       later([this, alive = std::weak_ptr<int>(alive_)] {
         if (!alive.expired()) park_slice();
       });
+    // Where the tabs opened again below go (with the tabs coming back, in their final order).
+    auto order = std::make_shared<std::vector<wxWeakRef<wxWindow>>>(up.order);
     if (!up.pending.empty()) {
       unpark_ = std::move(up);
       later([this, alive = std::weak_ptr<int>(alive_)] {
@@ -5662,16 +6650,78 @@ class Sidebar : public wxPanel, public SidebarPanel {
     }
     if (!old.pages.empty() || !old.lost.empty()) tab_sets_[sw->old_root] = std::move(old);
     if (nb->GetPageCount() == 0) host_->new_request(RequestKind::Http, {});
-    // No clean tab to lend: open them (one per turn).
-    for (const auto& f : sw->reopen)
-      CallAfter([this, f, root = sw->new_root] {
-        std::error_code ec;
-        if (ws_ && ws_->root() == root && fs::exists(f, ec)) host_->open_request(f, false);
+    // No clean tab to lend: open them (one per turn), each where it stood, with the response it
+    // showed, selected only if it was.
+    for (auto& [lost, r] : sw->reopen)
+      later([this, alive = std::weak_ptr<int>(alive_), lost = std::move(lost), r = std::move(r), root = sw->new_root,
+             order]() mutable {
+        if (alive.expired() || !ws_ || ws_->root() != root) return;
+        wxAuiNotebook* nb = notebook();
+        if (!nb || tab_for(lost.file)) return;
+        wxWeakRef<wxWindow> shown(nb->GetCurrentPage());
+        host_->open_loaded(std::move(r), false);
+        reopened_in_place(alive, std::move(lost), root, order, shown, 0);
       });
     st_timed("   select_file", [&] {
       if (auto* t = dynamic_cast<RequestTab*>(nb->GetCurrentPage())) select_file(t->file());
     });
     if (up.pending.empty() && unpark_.pending.empty()) strip_check_ = 2;
+  }
+
+  // A tab swap_tabs() opened again (open_loaded() may add it in the next UI step): moved to the
+  // place it had, its response back, and the tab shown before selected again unless it was this.
+  void reopened_in_place(const std::weak_ptr<int>& alive, LostTab lost, const fs::path& root,
+                         const std::shared_ptr<std::vector<wxWeakRef<wxWindow>>>& order,
+                         const wxWeakRef<wxWindow>& shown, int tries) {
+    if (alive.expired() || !ws_ || ws_->root() != root) return;
+    wxAuiNotebook* nb = notebook();
+    RequestTab* t = nb ? tab_for(lost.file) : nullptr;
+    if (!t) {
+      if (tries < 3)
+        later([this, alive, lost = std::move(lost), root, order, shown, tries]() mutable {
+          reopened_in_place(alive, std::move(lost), root, order, shown, tries + 1);
+        });
+      return;
+    }
+    auto place = [&](std::vector<wxWeakRef<wxWindow>>& o) {
+      std::erase_if(o, [&](const wxWeakRef<wxWindow>& w) { return w.get() == t; });
+      const size_t at = lost.index < 0 ? o.size() : std::min(static_cast<size_t>(lost.index), o.size());
+      o.insert(o.begin() + static_cast<std::ptrdiff_t>(at), wxWeakRef<wxWindow>(t));
+    };
+    place(*order);
+    if (unpark_.root == root && !unpark_.pending.empty()) place(unpark_.order);  // the rest go around it
+    const int cur = nb->GetPageIndex(t);
+    const int to = std::min(unpark_index(nb, *order, t), static_cast<int>(nb->GetPageCount()) - 1);
+    if (cur >= 0 && cur != to) {
+      const bool was_sel = nb->GetSelection() == cur;
+      const wxString text = nb->GetPageText(static_cast<size_t>(cur));
+      mute_page_events_ = true;
+      forget_tab_hover(nb);
+      nb->RemovePage(static_cast<size_t>(cur));
+      nb->InsertPage(static_cast<size_t>(to), t, text, was_sel);
+      mute_page_events_ = false;
+    }
+    if (!lost.selected && shown && shown.get() != t)
+      if (const int i = nb->GetPageIndex(shown.get()); i >= 0) nb->SetSelection(static_cast<size_t>(i));
+    if (lost.selected)
+      if (const int i = nb->GetPageIndex(t); i >= 0 && i != nb->GetSelection()) nb->SetSelection(static_cast<size_t>(i));
+    if (lost.last)
+      later([alive, w = wxWeakRef<RequestTab>(t), file = lost.file, last = std::move(lost.last)]() mutable {
+        if (!alive.expired() && w && w->file() == file && !w->in_flight() && !w->last_response())
+          w->restore_response(std::move(last));
+      });
+  }
+
+  // The tree's last row half under the sections below it: scrolled up one row so it shows whole.
+  void uncut_last_row() {
+    if (!tree_ || !tree_->IsShownOnScreen() || tree_->GetEditControl()) return;
+    const HWND hw = static_cast<HWND>(tree_->GetHWND());
+    const HTREEITEM last = TreeView_GetLastVisible(hw);
+    if (!last) return;
+    RECT rc{}, cl{};
+    *reinterpret_cast<HTREEITEM*>(&rc) = last;
+    if (!::SendMessageW(hw, TVM_GETITEMRECT, FALSE, reinterpret_cast<LPARAM>(&rc)) || !::GetClientRect(hw, &cl)) return;
+    if (rc.top < cl.bottom && rc.bottom > cl.bottom && rc.top > cl.top) TreeView_EnsureVisible(hw, last);
   }
 
   // The tab strip shows the selected tab (not the first ones) after tabs were put back. From
@@ -5880,14 +6930,16 @@ class Sidebar : public wxPanel, public SidebarPanel {
     unpark_all();  // tabs still on their way back belong to this workspace's session
     size_t dirty = 0;
     for (const auto& [root, set] : tab_sets_)
-      for (const auto& p : set.pages) dirty += static_cast<RequestTab*>(p.first)->dirty();
+      for (const auto& p : set.pages)
+        if (auto* t = dynamic_cast<RequestTab*>(p.first)) dirty += t->dirty();
     if (dirty && e.CanVeto()) {
       // Names the workspaces, in the app's colours (a native message box stays light in dark mode).
       std::string where;
       size_t n = 0;
       for (const auto& [root, set] : tab_sets_) {
         size_t k = 0;
-        for (const auto& p : set.pages) k += static_cast<RequestTab*>(p.first)->dirty();
+        for (const auto& p : set.pages)
+          if (auto* t = dynamic_cast<RequestTab*>(p.first)) k += t->dirty();
         if (!k) continue;
         if (n++ < 3) where += (where.empty() ? "" : ", ") + u8(root.filename()) + " (" + std::to_string(k) + ")";
       }
@@ -6011,6 +7063,9 @@ class Sidebar : public wxPanel, public SidebarPanel {
     name_cache_ = std::make_shared<NameCache>(ws_->root());
     load_expanded();
     load_order();
+    load_spec_targets();
+    refresh_specs();
+    poll_mocks();  // the mock rows of this workspace now, not on the next 500 ms tick
     history_->set_entries({});
     load_grpc_kinds();
     auto_select_env();
@@ -7005,6 +8060,20 @@ class Sidebar : public wxPanel, public SidebarPanel {
     wxAuiNotebook* nb = notebook();
     if (!nb) return;
     if (wxWindow* c = nb->GetCurrentPage()) shown_at_[c] = ++shown_clock_;
+    // Quiet (nothing frozen, no strip check, not shedding) for 2 s: every 2 s until a tab
+    // switch (see the PAGE_CHANGED handler) or something to do.
+    const size_t frozen_before = dormant_.size();
+    const bool busy = strip_check_ > 0 || shedding_;
+    struct Pace {
+      Sidebar* s;
+      size_t before;
+      bool busy;
+      ~Pace() {
+        if (busy || s->dormant_.size() != before) s->dormant_quiet_ = 0;
+        const int want = ++s->dormant_quiet_ > 5 ? 2000 : 400;
+        if (s->dormant_timer_.GetInterval() != want) s->dormant_timer_.Start(want);
+      }
+    } pace{this, frozen_before, busy};
     if (strip_check_ > 0 && --strip_check_ < 2) show_active_tab();
     hibernate_tick();
     const auto t0 = std::chrono::steady_clock::now();
@@ -7235,13 +8304,14 @@ class Sidebar : public wxPanel, public SidebarPanel {
     order_[folder] = std::move(names);
     save_order();
     rebuild();
+    // The moved row is shown; the selection stays with the active tab's row (the tab shown in
+    // the editor), so the tree never marks a row whose request is not the one on screen.
+    const fs::path keep = !active_file_.empty() && find_node(tree_root_, active_file_) ? active_file_ : from;
     syncing_ = true;
-    if (wxTreeItemId id = item_for(from, true); id.IsOk()) {
-      tree_->SelectItem(id);
-      centre_item(id);
-    }
+    if (wxTreeItemId id = item_for(keep, true); id.IsOk()) tree_->SelectItem(id);
+    if (wxTreeItemId id = item_for(from, true); id.IsOk()) centre_item(id);
     syncing_ = false;
-    sticky_sel_ = from;
+    sticky_sel_ = keep;
   }
 
   static const CollectionNode* find_folder(const CollectionNode& n, const fs::path& p) {
@@ -7272,25 +8342,84 @@ class Sidebar : public wxPanel, public SidebarPanel {
       }
     }
     order_ = std::move(next);
+    auto move_keys = [&](auto& m) {
+      std::remove_reference_t<decltype(m)> out;
+      for (auto& [k, v] : m) out[k == from || is_under(k, from) ? to / k.lexically_relative(from) : k] = std::move(v);
+      m = std::move(out);
+    };
+    if (from != to) {
+      move_keys(disk_order_);
+      move_keys(order_pending_);
+    }
     if (changed) save_order();
+  }
+
+  // The order lives in the workspace: each folder's folder.json ("order", see
+  // Workspace::folder_order()), so a clone, a teammate, the runner and the exports see it.
+  // order_ is what the tree shows: the orders the last scan read (disk_order_), with the ones
+  // written since on top (order_pending_) until a scan that started after the write lands.
+  // save_order() writes the folders whose order_ differs from that, on a worker.
+  static std::vector<std::wstring> wide_names(const std::vector<std::string>& v) {
+    std::vector<std::wstring> out;
+    out.reserve(v.size());
+    for (const auto& n : v) out.push_back(wxString::FromUTF8(n).ToStdWstring());
+    return out;
   }
 
   void save_order() {
     rank_keys_.clear();  // tree order changed
-    wxConfigBase* c = wxConfigBase::Get();
-    if (!c || !ws_) return;
-    wxString s;
-    for (const auto& [folder, names] : order_) {
-      if (names.empty() || !(folder == ws_->root() || is_under(folder, ws_->root()))) continue;
-      s += folder == ws_->root() ? wxString(".") : wxString(folder.lexically_relative(ws_->root()).wstring());
-      for (const auto& n : names) s += "\t" + wxString(n);
-      s += "\n";
-    }
-    c->Write("Sidebar/Order/" + ws_key(ws_->root()), s);
+    if (!ws_) return;
+    static const std::vector<std::wstring> none;
+    auto known = [&](const fs::path& f) -> const std::vector<std::wstring>& {
+      if (auto it = order_pending_.find(f); it != order_pending_.end()) return it->second.names;
+      if (auto it = disk_order_.find(f); it != disk_order_.end()) return it->second;
+      return none;
+    };
+    const uint64_t seq = ++order_seq_;
+    auto writes = std::make_shared<std::vector<std::pair<fs::path, std::vector<std::string>>>>();
+    auto want = [&](const fs::path& f, const std::vector<std::wstring>& names) {
+      if (!(same_path(f, ws_->root()) || is_under(f, ws_->root())) || known(f) == names) return;
+      order_pending_[f] = PendingOrder{names, seq};
+      std::vector<std::string> u;
+      u.reserve(names.size());
+      for (const auto& n : names) u.push_back(wxString(n).utf8_string());
+      writes->emplace_back(f, std::move(u));
+    };
+    for (const auto& [f, names] : order_) want(f, names);
+    std::vector<fs::path> dropped;
+    for (const auto& kv : disk_order_)
+      if (!order_.count(kv.first)) dropped.push_back(kv.first);
+    for (const auto& kv : order_pending_)
+      if (!order_.count(kv.first)) dropped.push_back(kv.first);
+    for (const auto& f : dropped) want(f, none);
+    if (writes->empty()) return;
+    auto copy = std::make_shared<Workspace>(*ws_);
+    std::weak_ptr<int> alive = alive_;
+    const uint64_t ws_gen = ws_gen_;
+    std::thread([this, copy, writes, seq, ws_gen, alive] {
+      std::string errs;
+      for (const auto& [f, names] : *writes) {
+        std::string err;
+        if (!copy->save_folder_order(f, names, &err) && !err.empty()) errs = err;
+      }
+      if (wxAppConsole* app = wxTheApp) app->CallAfter([this, seq, ws_gen, errs, alive] {
+        if (alive.expired() || ws_gen != ws_gen_) return;
+        order_done_ = std::max(order_done_, seq);
+        if (!errs.empty())
+          show_note(wxString::FromUTF8("\xE2\x9A\xA0 The order was not saved: " + errs),
+                    wxString::FromUTF8("Fix folder.json, then drag again."), 8000);
+      });
+    }).detach();
   }
 
+  // On opening a workspace: the order an earlier watt kept in the registry
+  // (Sidebar/Order/<hash of the path>) is read once, moved into the workspace by the first full
+  // scan (sync_order()) and removed from the registry.
   void load_order() {
     order_.clear();
+    disk_order_.clear();
+    order_pending_.clear();
+    order_migrate_.clear();
     wxConfigBase* c = wxConfigBase::Get();
     wxString s;
     if (!c || !ws_ || !c->Read("Sidebar/Order/" + ws_key(ws_->root()), &s)) return;
@@ -7302,8 +8431,62 @@ class Sidebar : public wxPanel, public SidebarPanel {
       const fs::path folder = rel == "." ? ws_->root() : (ws_->root() / fs::path(rel.ToStdWstring())).lexically_normal();
       std::vector<std::wstring> names;
       while (f.HasMoreTokens()) names.push_back(f.GetNextToken().ToStdWstring());
-      order_[folder] = std::move(names);
+      if (!names.empty()) order_migrate_[folder] = names;
+      order_[folder] = std::move(names);  // shown right away; written by the first full scan
     }
+  }
+
+  // A scan landed: order_ follows the folder.json files it read.
+  void sync_order(bool final) {
+    disk_order_.clear();
+    auto walk = [&](auto& self, const CollectionNode& n) -> void {
+      if (!n.order.empty()) disk_order_[n.path] = wide_names(n.order);
+      for (const auto& c : n.children)
+        if (c.is_folder) self(self, c);
+    };
+    walk(walk, tree_root_);
+    auto next = disk_order_;
+    for (auto it = order_pending_.begin(); it != order_pending_.end();) {
+      if (it->second.seq <= scan_order_done_) {  // written before this scan started: it is on disk
+        it = order_pending_.erase(it);
+        continue;
+      }
+      if (it->second.names.empty()) next.erase(it->first);
+      else next[it->first] = it->second.names;
+      ++it;
+    }
+    if (!order_migrate_.empty()) {
+      for (const auto& [f, names] : order_migrate_)
+        if (!disk_order_.count(f) && !order_pending_.count(f) && find_folder(tree_root_, f)) next[f] = names;  // the workspace's own order wins
+      if (final) {
+        order_migrate_.clear();
+        if (wxConfigBase* c = wxConfigBase::Get(); c && ws_) c->DeleteEntry("Sidebar/Order/" + ws_key(ws_->root()));
+        order_ = std::move(next);
+        rank_keys_.clear();
+        save_order();
+        return;
+      }
+    }
+    if (next != order_) rank_keys_.clear();
+    order_ = std::move(next);
+  }
+
+  // A new item at the end of `folder`'s order. A folder with no order yet gets one from what it
+  // shows now (the root's collections: a later import goes below the earlier ones, not by name).
+  void append_to_order(const fs::path& folder, const fs::path& item) {
+    std::vector<std::wstring> names;
+    if (auto it = order_.find(folder); it != order_.end()) {
+      names = it->second;
+    } else if (const CollectionNode* parent = find_folder(tree_root_, folder)) {
+      std::vector<const CollectionNode*> kids;
+      for (const auto& c : parent->children) kids.push_back(&c);
+      sort_kids(folder, kids);
+      for (const CollectionNode* k : kids) names.push_back(k->path.filename().wstring());
+    }
+    const std::wstring n = item.filename().wstring();
+    std::erase(names, n);
+    names.push_back(n);
+    order_[folder] = std::move(names);
   }
 
   // ---------------------------------------------------------------- expansion state
@@ -7535,6 +8718,7 @@ class Sidebar : public wxPanel, public SidebarPanel {
   }
 
   void start_import(const fs::path& src, const fs::path& dest) {
+    if (!importing_) import_src_ = src;
     start_import_with(dest, [src](std::string* err) {
       return parse_collection_file(src, err);
     });
@@ -7584,6 +8768,7 @@ class Sidebar : public wxPanel, public SidebarPanel {
   void import_done(const fs::path& root, const fs::path& dest, std::optional<ImportResult>& parsed, ImportWritten& w,
                    const std::string& err, double ms) {
     importing_ = false;
+    const fs::path src = std::exchange(import_src_, fs::path());
     if (import_btn_) {
       import_btn_->SetLabel("Import");
       import_btn_->Enable();
@@ -7596,6 +8781,13 @@ class Sidebar : public wxPanel, public SidebarPanel {
     }
     if (!ws_ || ws_->root() != root) return;  // the window switched workspaces meanwhile
     const ImportResult& r = *parsed;
+    // An imported OpenAPI document is listed under API SPECS, with the folder it went to (its
+    // Sync requests updates that folder).
+    if (!src.empty() && !w.top.empty() && (r.format.rfind("OpenAPI", 0) == 0 || r.format.rfind("Swagger", 0) == 0)) {
+      spec_targets_[src.lexically_normal()] = w.top;
+      save_spec_targets();
+      refresh_specs();
+    }
     // Collection variables went into the imported folder's folder.json (they resolve under any
     // environment); r.envs are real environments (a Postman environment file, Insomnia
     // sub-environments, Bruno environments/*.bru). With none active the first one is switched
@@ -7613,7 +8805,7 @@ class Sidebar : public wxPanel, public SidebarPanel {
     if (!w.top.empty()) {
       for (auto& [dir, names] : w.order)
         if (!names.empty()) order_[dir] = std::move(names);
-      if (auto it = order_.find(dest); it != order_.end()) it->second.push_back(w.top.filename().wstring());
+      append_to_order(dest, w.top);
       save_order();
       expanded_.insert(w.top);
       if (dest != root) expanded_.insert(dest);
@@ -7680,7 +8872,10 @@ class Sidebar : public wxPanel, public SidebarPanel {
                   [this, top_dir = w.top] { open_folder_settings(top_dir); });
         return;
       }
-      show_note(wxString::FromUTF8("\xE2\x9C\x93 " + line + t), wxString::FromUTF8(msg));
+      // The time first: at the sidebar's width the end of the line is ellipsized (the full
+      // summary is the tooltip).
+      std::snprintf(t, sizeof t, "%.0f ms", ms);
+      show_note(wxString::FromUTF8("\xE2\x9C\x93 " + std::string(t) + " \xC2\xB7 " + line), wxString::FromUTF8(msg));
       return;
     }
     if (!inactive_env.empty()) {
@@ -7695,6 +8890,13 @@ class Sidebar : public wxPanel, public SidebarPanel {
   // `action`: what a click on the notice does (then it is dismissed); none: a click dismisses it.
   void show_note(const wxString& text, const wxString& tip, int ms = 8000, std::function<void()> action = {}) {
     if (!note_) return;
+    // The notice belongs to this workspace: it is hidden when another one opens, and a click
+    // that still reaches an old action (a posted event) does nothing.
+    note_root_ = ws_ ? ws_->root() : fs::path{};
+    if (action)
+      action = [this, root = note_root_, act = std::move(action)] {
+        if (ws_ && ws_->root() == root) act();
+      };
     note_action_ = std::move(action);
     // A tinted band in bold, green for done and amber for a warning: plain green text in place
     // of the COLLECTION label went unnoticed.
@@ -7935,6 +9137,20 @@ class Sidebar : public wxPanel, public SidebarPanel {
   bool edit_ok_ = false;
   bool rebuild_after_edit_ = false;
   wxWindow* more_ = nullptr;  // the hover "..." button
+  SectionPane* specs_pane_ = nullptr;  // API SPECS
+  SectionPane* mocks_pane_ = nullptr;  // MOCK SERVERS
+  bool specs_explicit_ = false, mocks_explicit_ = false;  // collapsed / open chosen by the user
+  std::vector<MockRow> mock_rows_;
+  size_t spec_sync_refused_ = 0;  // syncs refused for another workspace's spec (self test)
+  wxTimer mocks_timer_;
+  fs::path hist_saved_top_;  // the tree's top row while history is at full height
+  wxTimer preview_timer_;  // the preview of a row reached by the keyboard, once it rests
+  fs::path preview_path_;
+  std::chrono::steady_clock::time_point tree_key_at_{};  // last key in the tree
+  std::vector<SpecInfo> specs_;
+  std::map<fs::path, fs::path> spec_targets_;  // spec file -> folder its requests are in
+  bool specs_busy_ = false, specs_again_ = false;
+  fs::path import_src_;  // the file of the import in flight (an OpenAPI one is recorded as a spec)
   wxTreeItemId hover_item_;
   bool more_hot_ = false;
   unsigned tree_focus_req_ = 0;  // bumped when the keyboard moves to the tree on purpose
@@ -7964,6 +9180,9 @@ class Sidebar : public wxPanel, public SidebarPanel {
   fs::path restore_top_;                 // that row for the workspace just switched to (rebuild)
   int strip_check_ = 0;                  // dormant ticks left that bring the active tab into the strip
   fs::path discard_on_esc_;  // a new request / copy being named: Esc removes it again
+  bool uncut_queued_ = false;  // uncut_last_row() posted for a tree resize
+  std::function<void()> discard_redo_;  // makes that item again (the notice after an Esc)
+  std::string discard_what_;            // "Copy" / "New request"
   struct HistMeta {
     std::string name, id;
     fs::path file;  // the file the entry was sent as (its folder's settings applied)
@@ -7985,6 +9204,7 @@ class Sidebar : public wxPanel, public SidebarPanel {
   std::map<fs::path, fs::file_time_type> own_writes_;  // see note_own_write()
   bool mute_page_events_ = false;           // see swap_tabs()
   wxTimer dormant_timer_;                   // see dormant_tick()
+  int dormant_quiet_ = 0;                   // dormant ticks in a row with nothing to do
   std::set<wxWindow*> dormant_;             // hidden tabs frozen by dormant_tick()
   std::unordered_map<wxWindow*, uint64_t> shown_at_;  // when each tab was last the shown one (hibernate_tick)
   uint64_t shown_clock_ = 0;
@@ -8006,6 +9226,13 @@ class Sidebar : public wxPanel, public SidebarPanel {
   bool picking_ = false;  // an import file dialog is open (pick_file_async)  // open pending_select_ in the preview tab too (a paste)
   fs::path drag_from_, pending_edit_, pending_select_;
   std::map<fs::path, std::vector<std::wstring>> order_;  // folder -> file names in the dragged order
+  std::map<fs::path, std::vector<std::wstring>> disk_order_, order_migrate_;  // see save_order()
+  struct PendingOrder {
+    std::vector<std::wstring> names;
+    uint64_t seq = 0;
+  };
+  std::map<fs::path, PendingOrder> order_pending_;
+  uint64_t order_seq_ = 0, order_done_ = 0, scan_order_done_ = 0;
   std::deque<fs::path> recent_files_;
   std::vector<std::string> env_names_;
   fs::path active_file_;
@@ -8038,8 +9265,11 @@ class Sidebar : public wxPanel, public SidebarPanel {
   fs::path learn_file_;
   int learn_tries_ = 0;
   fs::path sticky_sel_;                            // a moved row: stays selected over rescans
+  bool user_sel_ = false;  // the selection was moved in the tree since the active tab last changed
   wxTreeItemId best_item_;                         // the filter's Enter target (bold)
   bool collapsed_ = false, user_sash_ = false;
+  bool narrow_window_ = false;   // the window is narrower than the auto-fold width
+  bool auto_collapsed_ = false;  // folded because the window got narrow (not by the user)
   int expanded_width_ = 0;
   wxSize saved_min_ = wxDefaultSize;
 
@@ -8054,6 +9284,7 @@ class Sidebar : public wxPanel, public SidebarPanel {
   wxStaticText* env_warn_ = nullptr;
   wxStaticText* note_ = nullptr;  // show_note()
   std::function<void()> note_action_;
+  fs::path note_root_;  // the workspace the notice was shown for
   wxTimer note_timer_;
   std::vector<sidebar::UnreadableEnv> env_bad_;  // environment files the workspace skipped
   wxTextCtrl* filter_ = nullptr;

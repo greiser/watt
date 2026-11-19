@@ -18,6 +18,7 @@
 #include "app/sidebar_fuzzy.cpp"
 #include "app/sidebar_import.cpp"
 #include "app/sidebar_names.cpp"
+#include "app/sidebar_specs.cpp"
 #include "../tools/httpserver/http_server.h"
 #include "core/http_client.h"
 
@@ -107,9 +108,23 @@ TEST_CASE("rename never overwrites another request", "[sidebar]") {
   saved(t.ws, t.dir / "a.req.json", "A");
   saved(t.ws, t.dir / "b.req.json", "B");
   std::string err;
-  CHECK(!rename_item(t.ws, t.dir / "a.req.json", "b", &err));
-  CHECK(!err.empty());
+  // The name is taken as typed (duplicates allowed, as in Postman); the file gets a suffix.
+  const auto to = rename_item(t.ws, t.dir / "a.req.json", "b", &err);
+  REQUIRE(to);
+  CHECK(to->filename() == "b-2.req.json");
+  CHECK(t.ws.load_request(*to)->name == "b");
+  CHECK(!fs::exists(t.dir / "a.req.json"));
   CHECK(t.ws.load_request(t.dir / "b.req.json")->name == "B");
+  // Renaming it to the same name again keeps its file (no b-3).
+  const auto again = rename_item(t.ws, *to, "b", &err);
+  REQUIRE(again);
+  CHECK(again->filename() == "b-2.req.json");
+  // A folder name that is taken still fails (folders are paths), without touching either.
+  fs::create_directories(t.dir / "f1");
+  fs::create_directories(t.dir / "f2");
+  CHECK(!rename_item(t.ws, t.dir / "f1", "f2", &err));
+  CHECK(!err.empty());
+  CHECK(fs::exists(t.dir / "f1"));
 }
 
 TEST_CASE("folder rename", "[sidebar]") {
@@ -922,8 +937,13 @@ TEST_CASE("import: a 2000-request Postman collection parses fast", "[sidebar][im
   CHECK(w.order[f0][0] == L"req-0.req.json");
   CHECK(w.order[f0][99] == L"req-99.req.json");
   size_t files = 0;
-  for (fs::recursive_directory_iterator it(w.top), end; it != end; ++it) files += it->path().extension() == ".json";
+  size_t orders = 0;
+  for (fs::recursive_directory_iterator it(w.top), end; it != end; ++it) {
+    files += it->path().filename().string().ends_with(".req.json");
+    orders += it->path().filename() == "folder.json";
+  }
   CHECK(files == 2000);
+  CHECK(orders == 0);  // in natural name order already: no folder.json needed for it
 }
 
 TEST_CASE("import: YAML subset", "[sidebar][import]") {
@@ -1393,4 +1413,368 @@ TEST_CASE("names: overlapping scans after a 2000-request import end with the req
   CHECK(m.size() == 2000);
   CHECK(slug_named(tree) == 0);
   CHECK(std::all_of(m.begin(), m.end(), [](const auto& kv) { return !kv.second.id.empty(); }));
+}
+
+// The critic's folder-auth case: Basic auth set on a folder after the fact reaches a request the
+// sidebar creates there and a Postman request imported without its own auth (both start on
+// Inherit, as in Postman / Insomnia / Bruno); only an explicit "noauth" stays without auth.
+TEST_CASE("folder auth: Basic on a folder reaches sidebar-created and imported requests", "[sidebar][folders][auth]") {
+  static httpserver::Server srv;
+  static const bool up = srv.start(0);
+  REQUIRE(up);
+  const std::string base = "http://127.0.0.1:" + std::to_string(srv.port());
+  const std::string pm = R"PM({
+  "info": { "name": "Shop", "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json" },
+  "item": [
+    { "name": "users", "item": [
+        { "name": "List users", "request": { "method": "GET", "url": ")PM" + base + R"PM(/echo" } },
+        { "name": "Public", "request": { "method": "GET", "url": ")PM" + base + R"PM(/echo", "auth": { "type": "noauth" } } }
+      ] }
+  ]
+})PM";
+  std::string err;
+  auto imp = parse_collection_text(pm, &err);
+  REQUIRE(imp);
+  const SavedRequest* list = find_req(imp->root, "List users");
+  REQUIRE(list);
+  CHECK(list->auth.type == HttpAuth::Type::Inherit);
+  const SavedRequest* pub = find_req(imp->root, "Public");
+  REQUIRE(pub);
+  CHECK(pub->auth.type == HttpAuth::Type::None);
+
+  TempWs t;
+  auto w = write_import(t.ws, t.dir, *imp);
+  REQUIRE(w.requests == 2);
+  const fs::path users = w.top / "users";
+  FolderSettings fs_users;
+  if (auto s = t.ws.folder_settings(users)) fs_users = *s;
+  fs_users.auth.type = HttpAuth::Type::None;  // None + basic_auth.enabled: Basic at this level
+  fs_users.basic_auth = BasicAuth{true, "alice", "pw"};
+  REQUIRE(t.ws.save_folder_settings(users, fs_users, &err));
+
+  auto created = create_request(t.ws, users, RequestKind::Http, "New request", &err);
+  REQUIRE(created);
+  CHECK(created->auth.type == HttpAuth::Type::Inherit);
+  for (RequestKind k : {RequestKind::Grpc, RequestKind::WebSocket}) {
+    auto other = create_request(t.ws, users, k, "Other", &err);
+    REQUIRE(other);
+    CHECK(other->auth.type == HttpAuth::Type::Inherit);
+  }
+  created->http.url = base + "/echo";
+  REQUIRE(t.ws.save_request(*created, &err));
+
+  Workspace ws = *Workspace::open(t.dir, &err);  // as after a restart: everything from disk
+  HttpClient c;
+  auto sent_auth = [&](const fs::path& file, bool expect_basic) {
+    INFO(file.string());
+    auto r = ws.load_request(file, &err);
+    REQUIRE(r);
+    const EffectiveSettings eff = ws.effective_settings(*r);
+    CHECK(eff.basic_auth.enabled == expect_basic);
+    if (expect_basic) {
+      CHECK(eff.basic_auth.user == "alice");
+      CHECK(eff.auth_from.level == SettingsOrigin::Level::Folder);
+    }
+    auto req = ws.http_to_send(*r, &err);
+    REQUIRE(req);
+    const HttpResponse resp = c.send(*req);
+    REQUIRE(resp.ok);
+    const bool has = std::string(resp.body).find("Basic YWxpY2U6cHc=") != std::string::npos;  // alice:pw
+    CHECK(has == expect_basic);
+  };
+  sent_auth(created->file, true);
+  sent_auth(users / "list-users.req.json", true);
+  sent_auth(users / "public.req.json", false);
+}
+
+TEST_CASE("import: Insomnia and Bruno requests without auth inherit", "[sidebar][import][auth]") {
+  const std::string ins = R"({"_type":"export","__export_format":4,"resources":[
+    {"_id":"wrk_1","name":"W","_type":"workspace"},
+    {"_id":"fld_1","parentId":"wrk_1","name":"users","_type":"request_group"},
+    {"_id":"req_1","parentId":"fld_1","name":"List","method":"GET","url":"http://127.0.0.1:1/x","_type":"request"},
+    {"_id":"req_2","parentId":"fld_1","name":"Own","method":"GET","url":"http://127.0.0.1:1/y",
+     "authentication":{"type":"bearer","token":"t"},"_type":"request"}]})";
+  std::string err;
+  auto r = parse_collection_text(ins, &err);
+  REQUIRE(r);
+  const SavedRequest* l = find_req(r->root, "List");
+  REQUIRE(l);
+  CHECK(l->auth.type == HttpAuth::Type::Inherit);
+  const SavedRequest* o = find_req(r->root, "Own");
+  REQUIRE(o);
+  CHECK(o->auth.type == HttpAuth::Type::None);
+  CHECK(header(*o, "Authorization") == "Bearer t");
+}
+
+namespace {
+void write_file(const fs::path& p, const std::string& text) {
+  fs::create_directories(p.parent_path());
+  std::ofstream(p, std::ios::binary) << text;
+}
+
+const char* kSpecV1 = R"(openapi: 3.0.3
+info:
+  title: Shop API
+  version: "1.0"
+servers:
+  - url: https://shop.example.com
+paths:
+  /orders:
+    get:
+      tags: [orders]
+      summary: List orders
+      responses: { '200': { description: OK } }
+    post:
+      tags: [orders]
+      summary: Create order
+      responses: { '201': { description: Created } }
+  /orders/{id}:
+    get:
+      tags: [orders]
+      summary: Get order
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses: { '200': { description: OK } }
+)";
+}  // namespace
+
+TEST_CASE("specs: peek finds OpenAPI / Swagger, title and version; scan lists specs/ only", "[sidebar][specs]") {
+  TempWs t;
+  write_file(t.dir / "specs" / "shop.yaml", kSpecV1);
+  write_file(t.dir / "specs" / "pets.json",
+             R"({"swagger": "2.0", "info": {"version": "1", "title": "Pet \"Store\""}, "paths": {}})");
+  write_file(t.dir / "specs" / "package.json", R"({"name": "not a spec"})");
+  write_file(t.dir / "specs" / "notes.txt", "openapi: 3.0.0\n");
+  const SpecInfo y = peek_spec(t.dir / "specs" / "shop.yaml");
+  CHECK(y.kind == "OpenAPI 3.0.3");
+  CHECK(y.version == "3.0.3");
+  CHECK(y.title == "Shop API");
+  const SpecInfo j = peek_spec(t.dir / "specs" / "pets.json");
+  CHECK(j.kind == "Swagger 2.0");
+  CHECK(j.title == "Pet \"Store\"");
+  CHECK(peek_spec(t.dir / "specs" / "package.json").kind.empty());
+  CHECK(peek_spec(t.dir / "nope.yaml").missing);
+
+  const fs::path outside = t.dir / "elsewhere.yaml";
+  const auto list = scan_specs(t.dir, {t.dir / "specs" / "shop.yaml", outside});
+  REQUIRE(list.size() == 3);  // pets.json, shop.yaml, then the recorded (missing) one; no duplicate
+  CHECK(list[0].file.filename() == "pets.json");
+  CHECK(list[1].file.filename() == "shop.yaml");
+  CHECK(!list[1].imported);
+  CHECK(list[2].imported);
+  CHECK(list[2].missing);
+}
+
+TEST_CASE("specs: sync adds new operations and keeps edited requests", "[sidebar][specs][import]") {
+  TempWs t;
+  std::string err;
+  auto r1 = parse_collection_text(kSpecV1, &err);
+  REQUIRE(r1);
+  ImportWritten w = write_import(t.ws, t.dir, *r1);
+  REQUIRE(w.requests == 3);
+  const fs::path top = w.top;
+  CHECK(top.filename() == "Shop API");
+  // The user edits one request (a header and a new name) and moves another into a sub-folder.
+  fs::path edited;
+  for (const auto& e : fs::recursive_directory_iterator(top))
+    if (e.path().filename() == "list-orders.req.json") edited = e.path();
+  REQUIRE(!edited.empty());
+  auto req = t.ws.load_request(edited);
+  REQUIRE(req);
+  req->name = "All orders (mine)";
+  req->http.headers.push_back({"X-Mine", "1"});
+  REQUIRE(t.ws.save_request(*req));
+  // Same operations again plus one new one and one removed (POST /orders).
+  std::string v2 = kSpecV1;
+  const size_t post = v2.find("    post:");
+  const size_t post_end = v2.find("  /orders/{id}:");
+  v2.erase(post, post_end - post);
+  v2 += R"(  /orders/{id}/cancel:
+    post:
+      tags: [orders]
+      summary: Cancel order
+      responses: { '200': { description: OK } }
+)";
+  auto r2 = parse_collection_text(v2, &err);
+  REQUIRE(r2);
+  SyncWritten s = sync_import(t.ws, top, *r2);
+  CHECK(s.added == 1);
+  CHECK(s.kept == 2);
+  REQUIRE(s.stale.size() == 1);
+  CHECK(s.stale[0].rfind("POST ", 0) == 0);
+  CHECK(s.first_added.filename() == "cancel-order.req.json");
+  CHECK(request_files(top) == 4);  // nothing deleted
+  auto after = t.ws.load_request(edited);
+  REQUIRE(after);
+  CHECK(after->name == "All orders (mine)");
+  REQUIRE(!after->http.headers.empty());
+  CHECK(after->http.headers.back().first == "X-Mine");
+  // A second sync of the same document adds nothing.
+  auto r3 = parse_collection_text(v2, &err);
+  REQUIRE(r3);
+  SyncWritten s2 = sync_import(t.ws, top, *r3);
+  CHECK(s2.added == 0);
+  CHECK(s2.kept == 3);
+  // Never outside the workspace.
+  auto r4 = parse_collection_text(v2, &err);
+  SyncWritten bad = sync_import(t.ws, t.dir.parent_path(), *r4);
+  CHECK(bad.added == 0);
+  CHECK(!bad.skipped.empty());
+}
+
+TEST_CASE("specs: an operation row finds the request synced from it", "[sidebar][specs]") {
+  // What a double-click on an operation of the spec preview matches against request URLs.
+  CHECK(spec_op_path("{{base}}/pets/:petId?x=1") == "/pets/{petId}");
+  CHECK(spec_op_path("{{baseUrl}}/pets/{{petId}}") == "/pets/{petId}");
+  CHECK(spec_op_path("https://api.example.com/v1/orders/") == "/v1/orders");
+  CHECK(spec_op_path("http://127.0.0.1:8080") == "/");
+  CHECK(spec_op_path("{{base}}") == "/");
+  CHECK(spec_op_path("/orders/{id}#frag") == "/orders/{id}");
+  // Every operation of a document, once imported, maps back to its own path.
+  TempWs t;
+  std::string err;
+  auto parsed = parse_collection_text(kSpecV1, &err);
+  REQUIRE(parsed);
+  const fs::path top = t.dir / "Shop API";
+  sync_import(t.ws, top, *parsed);
+  std::set<std::string> paths;
+  for (fs::recursive_directory_iterator it(top), end; it != end; ++it)
+    if (it->path().string().ends_with(".req.json"))
+      if (auto r = t.ws.load_request(it->path())) paths.insert(r->http.method + " " + spec_op_path(r->http.url));
+  CHECK(paths == std::set<std::string>{"GET /orders", "POST /orders", "GET /orders/{id}"});
+}
+
+TEST_CASE("specs: a spec tab opened in one workspace never syncs into another", "[sidebar][specs][workspace]") {
+  TempWs ws1, ws2;
+  write_file(ws2.dir / "specs" / "petstore.yaml", kSpecV1);
+  const fs::path spec = ws2.dir / "specs" / "petstore.yaml";
+  // Its own workspace: allowed.
+  CHECK(spec_sync_allowed(spec, ws2.dir, ws2.dir, false));
+  CHECK(spec_sync_allowed(spec, {}, ws2.dir, false));
+  // The tab was opened in ws2 and ws1 is open now (the critic's repro): refused, whatever is
+  // recorded, and ws1 gets no file.
+  CHECK_FALSE(spec_sync_allowed(spec, ws2.dir, ws1.dir, false));
+  CHECK_FALSE(spec_sync_allowed(spec, ws2.dir, ws1.dir, true));
+  // A spec of another workspace that ws1 never recorded: refused even without a tab root.
+  CHECK_FALSE(spec_sync_allowed(spec, {}, ws1.dir, false));
+  CHECK(spec_sync_allowed(fs::path("C:/elsewhere/api.yaml"), ws1.dir, ws1.dir, true));  // recorded import
+  const size_t before = request_files(ws1.dir);
+  if (spec_sync_allowed(spec, ws2.dir, ws1.dir, false)) {  // what the sidebar's sync path does
+    std::string err;
+    auto parsed = parse_collection_file(spec, &err);
+    REQUIRE(parsed);
+    write_import(ws1.ws, ws1.dir, *parsed);
+  }
+  CHECK(request_files(ws1.dir) == before);
+  CHECK_FALSE(fs::exists(ws1.dir / "Shop API"));
+
+  // Mock rows: only folders under the open workspace.
+  CHECK(in_workspace(ws1.dir, ws1.dir));
+  CHECK(in_workspace(ws1.dir / "Pet Store", ws1.dir));
+  CHECK_FALSE(in_workspace(ws2.dir / "Pet Store", ws1.dir));
+  CHECK_FALSE(in_workspace(fs::path(ws1.dir.native() + L"0") / "x", ws1.dir));  // ws1 vs ws10
+  CHECK_FALSE(in_workspace(ws1.dir / ".." / ws2.dir.filename() / "Pet Store", ws1.dir));
+  CHECK(in_workspace(fs::path(ws1.dir.generic_wstring() + L"/A/b"), ws1.dir));
+  CHECK_FALSE(in_workspace({}, ws1.dir));
+}
+
+// The collection's order is kept in the workspace (folder.json "order"), not on this machine:
+// a copy (a git clone, a teammate, a moved folder) lists it as imported, and so does every
+// reader of Workspace::tree() (the runner flattens it depth-first).
+TEST_CASE("import order is stored in the workspace and survives a copy", "[sidebar][order]") {
+  const std::string coll = R"({
+    "info": { "name": "Shop API", "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json" },
+    "item": [
+      { "name": "auth", "item": [ { "name": "Login", "request": { "method": "POST", "url": "https://x.test/login" } } ] },
+      { "name": "users", "item": [ { "name": "List users", "request": { "method": "GET", "url": "https://x.test/users" } } ] },
+      { "name": "orders", "item": [
+        { "name": "List orders", "request": { "method": "GET", "url": "https://x.test/orders" } },
+        { "name": "Get order", "request": { "method": "GET", "url": "https://x.test/orders/1" } },
+        { "name": "Create order", "request": { "method": "POST", "url": "https://x.test/orders" } },
+        { "name": "Cancel order", "request": { "method": "POST", "url": "https://x.test/orders/1/cancel" } },
+        { "name": "Refund order", "request": { "method": "POST", "url": "https://x.test/orders/1/refund" } },
+        { "name": "Ship order", "request": { "method": "POST", "url": "https://x.test/orders/1/ship" } } ] },
+      { "name": "catalog", "item": [ { "name": "Products", "request": { "method": "GET", "url": "https://x.test/p" } } ] }
+    ] })";
+  std::string err;
+  auto r = parse_collection_text(coll, &err);
+  REQUIRE(r);
+  TempWs t;
+  auto w = write_import(t.ws, t.dir, *r);
+  REQUIRE(w.requests == 9);
+  CHECK(w.skipped.empty());
+  const fs::path top = t.dir / "Shop API";
+  CHECK(fs::exists(top / "folder.json"));
+  CHECK(t.ws.folder_order(top) == std::vector<std::string>{"auth", "users", "orders", "catalog"});
+  // Settings saved later keep the order; the order alone is not inherited settings.
+  FolderSettings fs_;
+  fs_.headers.push_back(SettingsRow{"X-Team", "core"});
+  REQUIRE(t.ws.save_folder_settings(top / "orders", fs_));
+  CHECK(t.ws.folder_order(top / "orders").size() == 6);
+  REQUIRE(t.ws.save_folder_settings(top / "orders", FolderSettings{}));
+  CHECK(fs::exists(top / "orders" / "folder.json"));
+  CHECK(t.ws.folder_order(top / "orders").size() == 6);
+  SavedRequest probe;
+  probe.file = top / "users" / "list-users.req.json";
+  CHECK_FALSE(t.ws.has_inherited_settings(probe));
+
+  // A copy elsewhere, opened fresh.
+  const fs::path dir2 = t.dir.parent_path() / (t.dir.filename().string() + "_copy");
+  fs::remove_all(dir2);
+  fs::copy(t.dir, dir2, fs::copy_options::recursive);
+  std::error_code ec;
+  fs::remove_all(dir2 / ".watt", ec);  // what git does not carry
+  {
+    auto ws2 = Workspace::open(dir2);
+    REQUIRE(ws2);
+    const CollectionNode root = ws2->tree(-1);
+    const CollectionNode* shop = nullptr;
+    for (const auto& c : root.children)
+      if (c.name == "Shop API") shop = &c;
+    REQUIRE(shop);
+    std::vector<std::string> folders;
+    for (const auto& c : shop->children) folders.push_back(c.name);
+    CHECK(folders == std::vector<std::string>{"auth", "users", "orders", "catalog"});
+    const CollectionNode* orders = &shop->children[2];
+    std::vector<std::string> names;
+    for (const auto& c : orders->children) names.push_back(c.name);
+    CHECK(names == std::vector<std::string>{"list-orders", "get-order", "create-order", "cancel-order", "refund-order",
+                                            "ship-order"});
+    // Depth first over tree() (what Run folder does): the tree's order.
+    std::vector<std::string> run;
+    auto flat = [&](auto& self, const CollectionNode& n) -> void {
+      for (const auto& c : n.children)
+        if (c.is_folder) self(self, c);
+        else run.push_back(c.name);
+    };
+    flat(flat, *shop);
+    CHECK(run == std::vector<std::string>{"login", "list-users", "list-orders", "get-order", "create-order", "cancel-order",
+                                          "refund-order", "ship-order", "products"});
+    // The export follows it too (no sidebar order handed in).
+    const ExportResult ex = export_postman(*ws2, dir2 / "Shop API", "Shop API", nullptr);
+    CHECK(ex.text.find("\"auth\"") < ex.text.find("\"users\""));
+    CHECK(ex.text.find("\"users\"") < ex.text.find("\"orders\""));
+    CHECK(ex.text.find("\"orders\"") < ex.text.find("\"catalog\""));
+    CHECK(ex.text.find("List orders") < ex.text.find("Cancel order"));
+
+    // A dragged order saved into the copy is read back; names that are paths are refused.
+    REQUIRE(ws2->save_folder_order(dir2 / "Shop API" / "orders",
+                                   {"ship-order.req.json", "..\\evil", "a/b", "..", "list-orders.req.json"}));
+    CHECK(ws2->folder_order(dir2 / "Shop API" / "orders") ==
+          std::vector<std::string>{"ship-order.req.json", "list-orders.req.json"});
+    const CollectionNode again = ws2->tree(-1);
+    for (const auto& c : again.children)
+      if (c.name == "Shop API") {
+        REQUIRE(c.children.size() == 4);
+        REQUIRE(c.children[2].children.size() == 6);
+        CHECK(c.children[2].children[0].name == "ship-order");
+        CHECK(c.children[2].children[1].name == "list-orders");
+        CHECK(c.children[2].children[2].name == "cancel-order");  // the rest by name
+      }
+    // An order of a folder that is gone does not re-create it.
+    CHECK_FALSE(ws2->save_folder_order(dir2 / "nope", {"x.req.json"}));
+    CHECK_FALSE(fs::exists(dir2 / "nope"));
+    CHECK(ws2->save_folder_order(dir2 / "nope", {}));
+  }
+  fs::remove_all(dir2, ec);
 }

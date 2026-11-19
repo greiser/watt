@@ -8,6 +8,7 @@
 
 #include <chrono>
 #include <filesystem>
+#include <functional>
 #include <fstream>
 #include <string>
 #include <thread>
@@ -2132,4 +2133,38 @@ TEST_CASE("failure causes count the steps sent with unresolved variables", "[run
   CHECK(g[0].unresolved == 3);
   REQUIRE(g[0].unresolved_names.size() == 1);
   CHECK(g[0].unresolved_names[0] == "firstId");
+}
+
+TEST_CASE("collect runs a folder in the tree's stored order, not by name", "[runner]") {
+  TempWs t;
+  const std::vector<std::string> names = {"List orders", "Track shipment", "Get order", "Create order",
+                                          "Cancel order", "Refund order", "Ship order", "Track by id"};
+  for (const auto& n : names) {
+    SavedRequest r = http(n, "GET", base() + "/echo");
+    t.add(r, "Shop API/orders");
+  }
+  SavedRequest sub = http("Nested", "GET", base() + "/echo");
+  t.add(sub, "Shop API/orders/sub");
+  std::vector<std::string> order;
+  for (const auto& n : names) order.push_back(n + ".req.json");
+  REQUIRE(t.ws.save_folder_order(t.dir / "Shop API/orders", order));
+  // The tree's depth-first order is what Run folder must run.
+  std::vector<std::string> expect;
+  std::function<void(const CollectionNode&)> walk = [&](const CollectionNode& n) {
+    for (const auto& c : n.children) {
+      if (c.is_folder) walk(c);
+      else expect.push_back(fs::relative(c.path, t.dir / "Shop API/orders").generic_string());
+    }
+  };
+  const CollectionNode tree = t.ws.tree(-1);
+  const CollectionNode* orders = find_node(tree, path_key(t.dir / "Shop API/orders"));
+  REQUIRE(orders);
+  walk(*orders);
+  auto items = collect(t.ws, t.dir / "Shop API/orders");
+  REQUIRE(items.size() == expect.size());
+  for (size_t i = 0; i < items.size(); ++i) CHECK(items[i].rel == strip_ext(expect[i]));
+  // And that order is the stored one (folders first), not alphabetical.
+  REQUIRE(items.size() == 9);
+  CHECK(items[0].rel == "sub/Nested");
+  for (size_t i = 0; i < names.size(); ++i) CHECK(items[i + 1].rel == names[i]);
 }

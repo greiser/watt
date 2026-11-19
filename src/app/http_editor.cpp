@@ -500,6 +500,7 @@ class HttpEditor : public wxPanel, public HttpEditorPanel, public wxEventFilter 
   // One "{{name}}" span as sent: runtime vars, this request's folder / collection vars, then the
   // environment and globals (Workspace::expand).
   std::string expand_span(const Workspace& ws, const std::string& span) const;
+  VarExpander send_expander(const Workspace& ws) const;
   // {{names}} the request uses (URL, headers, auth, form fields) that resolve nowhere.
   std::vector<std::string> unresolved_vars(bool* in_url) const;
   // Braces of a {{var}} typed wrong ("{{user", "Id}}") in the URL, a path variable, a header or a
@@ -690,6 +691,8 @@ class HttpEditor : public wxPanel, public HttpEditorPanel, public wxEventFilter 
   wxPanel* body_page_panel_ = nullptr;
   bool body_tools_wrapped_ = false;
   void fit_body_tools();
+  // "Send as pasted" while an unedited one-line paste is kept byte for byte, else "Send compact".
+  void sync_minify_label();
   FlatButton* beautify_ = nullptr;
   ChoiceButton* text_kind_ = nullptr;  // the Text body's kind (sets the Content-Type)
   void sync_text_kind();
@@ -844,6 +847,8 @@ class HttpEditor : public wxPanel, public HttpEditorPanel, public wxEventFilter 
   InheritView inh_;
   uint64_t inh_gen_ = 0;
   uint64_t inh_done_gen_ = 0;  // inh_ is current when it equals inh_gen_
+  bool inh_reading_ = false;    // a worker is reading inh_ (refresh_inherited)
+  bool send_after_inh_ = false; // Send pressed while it was: sent when it arrives
   wxStaticText* inh_title_ = nullptr;
   wxStaticText* inh_detail_ = nullptr;
   wxStaticText* inh_errors_ = nullptr;
@@ -987,6 +992,13 @@ class HttpEditor : public wxPanel, public HttpEditorPanel, public wxEventFilter 
   static std::vector<PreVar> to_pre_vars(const std::vector<PreRow>& rows);
   std::set<std::string> pre_names_;  // enabled rows' names: they count as defined {{vars}}
   void update_pre_names();
+  // Names the request's own pre-request script sets (script_set_names), and whether it may set
+  // any name: they count as defined {{vars}}, as do those of the folders' scripts (inh_).
+  std::vector<std::string> script_names_;
+  bool script_dynamic_ = false;
+  void update_script_names();
+  bool set_by_script(const std::string& name) const;
+  void rehighlight_vars();
   std::map<std::string, KvGrid::Preview> pre_preview_;
   wxTimer pre_timer_;
   uint64_t pre_gen_ = 0, pre_send_gen_ = 0;
@@ -1097,6 +1109,7 @@ class HttpEditor : public wxPanel, public HttpEditorPanel, public wxEventFilter 
   bool redo_minify_ = false;
   std::shared_ptr<const std::string> redo_raw_;
   void drop_redo_doc();
+  void update_body_wrap();  // the body wraps its long lines unless it is big
   // Ctrl+Z / Ctrl+Y past the start / end of the document's own history.
   bool undo_swap();
   bool redo_swap();
@@ -1121,8 +1134,18 @@ class HttpEditor : public wxPanel, public HttpEditorPanel, public wxEventFilter 
 
 // ------------------------------------------------------------------ construction
 
+namespace {
+// Every live editor (UI thread only): a trust decision one of them reads (after the shell's
+// trust prompt, or its own Trust scripts button) is shown by all of the same workspace at once.
+std::vector<HttpEditor*>& live_editors() {
+  static std::vector<HttpEditor*> v;
+  return v;
+}
+}  // namespace
+
 HttpEditor::HttpEditor(wxWindow* parent, EditorHost* host) : wxPanel(parent, wxID_ANY), host_(host) {
   alive_->target = this;
+  live_editors().push_back(this);
   const Theme& t = Theme::get();
   SetBackgroundColour(t.bg);
   const auto c0 = Clock::now();
@@ -1180,6 +1203,8 @@ HttpEditor::HttpEditor(wxWindow* parent, EditorHost* host) : wxPanel(parent, wxI
   tabs_->on_select = [this](size_t strip) {
     if (strip == kStripScripts || strip == kStripTests) {
       show_script_side(strip == kStripTests ? 1 : 0);
+      // another tab or the send's trust prompt may have changed it since (a small read on a worker)
+      if (trust_state_ >= 0) refresh_trust();
       return;
     }
     const size_t i = page_of(strip);
@@ -1247,7 +1272,12 @@ HttpEditor::HttpEditor(wxWindow* parent, EditorHost* host) : wxPanel(parent, wxI
 
 int HttpEditor::FilterEvent(wxEvent& e) {
   if (e.GetEventType() != wxEVT_MENU || !IsShownOnScreen()) return Event_Skip;
-  if (!wxGetKeyState(WXK_CONTROL) || !(wxGetKeyState(WXK_RETURN) || wxGetKeyState(WXK_NUMPAD_ENTER))) return Event_Skip;
+  // The frame's Send command (its Ctrl+Enter accelerator), or Ctrl+Enter itself. The command id
+  // alone also catches a Ctrl+Enter whose keys are already up when the accelerator fires (a quick
+  // tap, synthesized input), which would otherwise send without do_send().
+  const bool send_cmd = e.GetId() == MainFrame::kSendCommand;
+  if (!send_cmd && (!wxGetKeyState(WXK_CONTROL) || !(wxGetKeyState(WXK_RETURN) || wxGetKeyState(WXK_NUMPAD_ENTER))))
+    return Event_Skip;
   auto* top = dynamic_cast<wxTopLevelWindow*>(wxGetTopLevelParent(this));
   if (!top || !top->IsActive()) return Event_Skip;
   do_send();
@@ -1256,6 +1286,7 @@ int HttpEditor::FilterEvent(wxEvent& e) {
 
 HttpEditor::~HttpEditor() {
   wxEvtHandler::RemoveFilter(this);
+  std::erase(live_editors(), this);
   std::lock_guard lk(alive_->m);
   alive_->target = nullptr;
   for (void* doc : alive_->docs) body_->ReleaseDocument(doc);  // built but never swapped in
@@ -1979,7 +2010,11 @@ void HttpEditor::setup_body_stc() {
   s->SetIndent(2);
   s->SetTabIndents(true);
   s->SetBackSpaceUnIndents(true);
-  s->SetWrapMode(wxSTC_WRAP_NONE);
+  // Long lines wrap (a one-line JSON body stays in view while typing, like Bruno and Postman);
+  // a big body does not (update_body_wrap): wrapping megabytes is layout work on every resize.
+  s->SetWrapMode(wxSTC_WRAP_WORD);
+  s->SetWrapVisualFlags(wxSTC_WRAPVISUALFLAG_END);
+  s->SetWrapIndentMode(wxSTC_WRAPINDENT_INDENT);
   s->SetEOLMode(wxSTC_EOL_LF);
   s->SetCaretForeground(t.fg);
   s->SetSelBackground(true, t.dark ? wxColour(0x26, 0x4F, 0x78) : wxColour(0xAD, 0xD6, 0xFF));
@@ -2000,6 +2035,7 @@ void HttpEditor::setup_body_stc() {
     e.Skip();
     ++body_edits_;
     update_line_margin();
+    update_body_wrap();
     if (loading_) return;
     // The first edit of a pasted / loaded one-line JSON: it no longer goes out byte for byte.
     if (raw_body_ && raw_edits_ + 1 == body_edits_ && minify_ && minify_->value())
@@ -3446,6 +3482,7 @@ void HttpEditor::load(const SavedRequest& r) {
   raw_body_.reset();
   raw_pending_.reset();
   raw_on_load_.reset();
+  sync_minify_label();
   if (prev_doc_) {
     release_doc_async(prev_doc_);
     prev_doc_ = nullptr;
@@ -3628,8 +3665,9 @@ void HttpEditor::store(SavedRequest& r) const {
   if (sending_) r.http.url = with_path(r.http.url);
   const Workspace* send_ws = sending_ ? host_->workspace() : nullptr;
   // While inh_ is being re-read (a folder.json just changed), its folder variables may be stale:
-  // the core expands the URL from the files itself then.
-  if (send_ws && inh_done_gen_ == inh_gen_ && r.http.url.find("{{") != std::string::npos) {
+  // the core expands the URL from the files itself then (send_expander keeps those {{names}},
+  // and still marks the ones a pre-request script sets, so their values are encoded).
+  if (send_ws && r.http.url.find("{{") != std::string::npos) {
     // The shell expands {{vars}} without knowing where they stand; when that would send a
     // different URL (a value with a space or '&' in the query), hand it the URL as sent.
     if (std::string u = sent_url(); u != send_ws->expand(r.http.url)) r.http.url = std::move(u);
@@ -3799,7 +3837,24 @@ void HttpEditor::recheck_banner() {
     hide_banner();
 }
 
+void HttpEditor::sync_minify_label() {
+  if (!minify_) return;
+  const bool raw = raw_body_ && raw_edits_ == body_edits_;
+  const wxString want = raw ? "Send as pasted" : "Send compact";
+  if (minify_->label() == want) return;
+  minify_->set_label(want);
+  minify_->SetToolTip(raw ? "On: the pasted bytes are sent as they were (the view is formatted). Off: sent as shown, "
+                            "formatted. An edit sends it compact instead"
+                          : "The body is shown and edited formatted. On: sent on one line, without the whitespace "
+                            "between tokens. Off: sent as shown");
+  if (minify_->IsShown()) {
+    fit_body_tools();
+    if (minify_->GetParent()) minify_->GetParent()->Layout();
+  }
+}
+
 void HttpEditor::touched() {
+  sync_minify_label();
   recheck_banner();
   update_badges();
   if (body_mode_ == BodyMode::Text) sync_text_kind();  // a Content-Type typed on the Headers tab
@@ -3838,15 +3893,17 @@ void HttpEditor::update_badges() {
                                  ? wxString()
                                  : wxString::FromUTF8("\xE2\x97\x8F"));
   {
-    size_t npre = 0, npost = 0;
+    // The badge counts checks, as the response's "tests n/m" does; captures are no checks (a
+    // tab with captures only shows a dot).
+    size_t npre = 0, npost = 0, ncap = 0;
     if (asserts_) {
       npost = asserts_->enabled_count();
-      if (captures_) npost += captures_->enabled_count();
+      if (captures_) ncap = captures_->enabled_count();
       else
-        for (const auto& c : capture_vals_) npost += c.enabled && !c.var.empty();
+        for (const auto& c : capture_vals_) ncap += c.enabled && !c.var.empty();
     } else {
       for (const auto& a : assert_vals_) npost += a.enabled && !a.target.empty();
-      for (const auto& c : capture_vals_) npost += c.enabled && !c.var.empty();
+      for (const auto& c : capture_vals_) ncap += c.enabled && !c.var.empty();
     }
     if (pre_) {
       npre = pre_->enabled_count();
@@ -3858,7 +3915,9 @@ void HttpEditor::update_badges() {
     npre += pre_js_ ? pre_js_->GetLength() > 0 : !base_.pre_script.empty();
     npost += post_js_ ? post_js_->GetLength() > 0 : !base_.post_script.empty();
     tabs_->set_badge(kStripScripts, npre ? wxString::Format("%zu", npre) : wxString());
-    tabs_->set_badge(kStripTests, npost || bad ? wxString::Format("%zu", npost) : wxString(), bad);
+    tabs_->set_badge(kStripTests,
+                     npost || bad ? wxString::Format("%zu", npost) : ncap ? wxString::FromUTF8("\xE2\x97\x8F") : wxString(),
+                     bad);
   }
   {
     size_t nc = base_.cookie_files.size();
@@ -4299,6 +4358,10 @@ std::vector<std::string> HttpEditor::var_names() const {
   for (const char* d : {"$guid", "$timestamp", "$isoTimestamp", "$randomInt"}) out.emplace_back(d);
   for (const auto& n : pre_names_)
     if (!names.count(n)) out.push_back(n);
+  for (const auto* list : {&script_names_, &inh_.script_vars})
+    for (const auto& n : *list)
+      if (!names.count(n) && !pre_names_.count(n) && std::find(out.begin(), out.end(), n) == out.end())
+        out.push_back(n);
   return out;
 }
 
@@ -4319,17 +4382,37 @@ std::string HttpEditor::sent_url() const {
   const std::string t = enc ? normalize_url(with_path(url_text())) : minimal_url(with_path(url_text()));
   const Workspace* ws = host_->workspace();
   if (!ws || t.find("{{") == std::string::npos) return t;
-  return expand_url(t, [this, ws](const std::string& span) { return expand_span(*ws, span); }, enc);
+  return expand_url(t, send_expander(*ws), enc);
+}
+
+// sent_url() / sent_form(): while the request to send is built (sending_) for a request with a
+// pre-request script (its own or a folder's), every {{name}} is left for the core
+// (keep_script_vars): the script reads the URL / body as written ({{base}}/echo?u={{user}}, as in
+// Bruno and Postman), any variable it sets is used fresh, and a value in the query / a form body
+// is still encoded (the {{name|q}} / {{name|f}} marks), wherever the value came from. The same
+// when the folders' variables are not read yet: the core reads them from the files.
+VarExpander HttpEditor::send_expander(const Workspace& ws) const {
+  VarExpander e = [this, &ws](const std::string& span) { return expand_span(ws, span); };
+  if (!sending_) return e;
+  const bool own_pre = pre_js_ ? pre_js_->GetLength() > 0 : !base_.pre_script.empty();
+  const bool any_pre = own_pre || !script_names_.empty() || script_dynamic_ || !inh_.script_vars.empty() ||
+                       inh_.script_vars_dynamic;
+  if (any_pre || inh_done_gen_ != inh_gen_) return keep_script_vars(std::move(e), {}, true);
+  return e;
 }
 
 std::string HttpEditor::sent_form(const std::string& body) const {
   const Workspace* ws = host_->workspace();
   if (!ws) return body;
-  return expand_form(body, [this, ws](const std::string& span) { return expand_span(*ws, span); });
+  return expand_form(body, send_expander(*ws));
 }
 
 std::vector<std::string> HttpEditor::unresolved_vars(bool* in_url) const {
   std::vector<std::string> out;
+  if (in_url) *in_url = false;
+  // A pre-request script that computes the names it sets may define any of them: nothing is
+  // known to be missing (the send path does not check them either then).
+  if (script_dynamic_ || inh_.script_vars_dynamic) return out;
   auto scan = [&](const std::string& s) {
     bool any = false;
     for (const auto& v : find_vars(s))
@@ -4513,7 +4596,27 @@ void HttpEditor::import_curl(const std::string& cmd, CmdBackslashes bs) {
   host_->changed();
   std::string msg = r.http.method + " " + r.http.url;
   for (const auto& w : imp->warnings) msg += "\n\xE2\x80\xA2 " + w;
-  if (imp->browser_doubled_backslashes > 0 && bs == CmdBackslashes::AsCurlExe) {
+  // curl -d '{"k":1}' without -H sends the JSON as a form (curl's implied Content-Type): kept,
+  // so the bytes stay curl's, but said, with the header most people meant one click away.
+  bool implied_form = false;
+  if (body_mode_ == BodyMode::Json) {
+    std::string lower = cmd;
+    for (char& c : lower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    if (lower.find("content-type") == std::string::npos)
+      for (const auto& [k, v] : r.http.headers)
+        implied_form = implied_form || (iequals(k, "Content-Type") && v.find("x-www-form-urlencoded") != std::string::npos);
+  }
+  if (implied_form && !(imp->browser_doubled_backslashes > 0 && bs == CmdBackslashes::AsCurlExe)) {
+    msg += "\n\xE2\x80\xA2 the body is JSON, but curl sends it as application/x-www-form-urlencoded (its default for "
+           "-d without -H 'Content-Type'): kept as curl sends it";
+    show_info("Imported curl command", wxString::FromUTF8(msg), "Use application/json", [this] {
+      hide_banner();
+      set_content_type("application/json");
+      host_->changed();
+      update_auto_headers();
+      note("Content-Type: application/json (was curl's implied application/x-www-form-urlencoded)");
+    });
+  } else if (imp->browser_doubled_backslashes > 0 && bs == CmdBackslashes::AsCurlExe) {
     show_info("Imported curl command", wxString::FromUTF8(msg), "Read backslashes as the browser meant",
               [this, cmd] { import_curl(cmd, CmdBackslashes::AsBrowserMeant); });
   } else if (!imp->warnings.empty()) {
@@ -4699,6 +4802,7 @@ std::filesystem::path HttpEditor::own_folder() const {
 void HttpEditor::refresh_inherited() {
   const Workspace* ws = host_->workspace();
   const uint64_t gen = ++inh_gen_;
+  inh_reading_ = ws != nullptr;
   if (!ws) return;  // opened before the workspace (start-up): read when the Auth / Headers tab shows
   SavedRequest probe;  // only what decides the inheritance: the file (its folders), an inheriting auth
   probe.kind = RequestKind::Http;
@@ -4714,10 +4818,9 @@ void HttpEditor::refresh_inherited() {
       if (gen != ed->inh_gen_) return;
       ed->inh_ = std::move(v);
       ed->inh_done_gen_ = gen;
+      ed->inh_reading_ = false;
       // Folder variables just became known (a restored tab, a saved folder.json): repaint them.
-      if (ed->url_) ed->highlight_vars(ed->url_, 0, ed->url_->GetLength());
-      for (auto& f : ed->var_fields_)
-        if (wxStyledTextCtrl* s = f.get()) ed->highlight_vars(s, 0, s->GetLength());
+      ed->rehighlight_vars();
       ed->show_inherited();
       if (ed->net_panel_) {
         ed->net_panel_->set_inherited(wxString::FromUTF8(ed->inh_.network));
@@ -4727,6 +4830,10 @@ void HttpEditor::refresh_inherited() {
       ed->show_inherited_asserts();
       ed->update_badges();
       ed->update_auto_headers();
+      if (ed->send_after_inh_) {
+        ed->send_after_inh_ = false;
+        ed->do_send();
+      }
     });
   }).detach();
 }
@@ -5063,6 +5170,7 @@ void HttpEditor::lint() {
         ed->minified_edits_ = edits;
         if (same_as_raw && raw == ed->raw_body_ && ed->raw_edits_ != edits) {
           ed->raw_edits_ = edits;
+          ed->sync_minify_label();  // the checkbox says what the note says: "Send as pasted"
           ed->note("Body back to the pasted JSON: sent as pasted.");
         }
       }
@@ -6102,8 +6210,9 @@ void HttpEditor::swap_body_doc(void* doc, bool reindent, uint64_t gen, uint64_t 
       fit_body_tools();
     }
     note(wxString::Format("One-line JSON body (%s) shown formatted (%.0f ms on a worker); sent and saved as it was "
-                          "(Send compact).",
+                          "(Send as pasted).",
                           human_size(raw_body_->size()), worker_ms));
+    sync_minify_label();
   }
   if (reindent) {
     ++body_edits_;
@@ -6118,6 +6227,7 @@ void HttpEditor::swap_body_doc(void* doc, bool reindent, uint64_t gen, uint64_t 
       note(wxString::Format("Pasted %s of one-line JSON: shown formatted (%s, %.0f ms on a worker, UI %.1f ms); "
                             "sent as pasted. Ctrl+Z undoes.",
                             human_size(raw_body_->size()), human_size(bytes), worker_ms, ms_between(t0, Clock::now())));
+      sync_minify_label();
     } else if (!swap_note_.empty() && swap_note_gen_ == gen) {
       note(swap_note_);
       if (swap_caret_ >= 0) body_->GotoPos(std::min(swap_caret_, body_->GetLength()));
@@ -6289,6 +6399,12 @@ void HttpEditor::prebuild_step() {
   LASTINPUTINFO li{sizeof(li), 0};
   const bool typing = ::GetLastInputInfo(&li) && ::GetTickCount() - li.dwTime < 300;
   if (!IsShownOnScreen() && !parked()) return;  // on_idle starts again once the tab is shown (no polling)
+  // Close to Windows' 10,000 USER objects per process (past it CreateWindow fails and wx crashes on
+  // the null window): the pages are built later, when tabs have been closed or hibernated.
+  if (::GetGuiResources(::GetCurrentProcess(), GR_USEROBJECTS) > 8000) {
+    schedule_prebuild(2000);
+    return;
+  }
   if (typing || fill_src_ || !fold_ops_.empty() || wxGetMouseState().LeftIsDown()) {
     schedule_prebuild(250);
     return;
@@ -6448,6 +6564,15 @@ bool HttpEditor::redo_swap() {
   return true;
 }
 
+void HttpEditor::update_body_wrap() {
+  // Wrapped up to 512 KB, unwrapped from 1 MB (between: as it was, so typing at the edge does
+  // not flip it back and forth).
+  const int len = body_->GetLength();
+  const int now = body_->GetWrapMode();
+  const int want = len < 512 * 1024 ? wxSTC_WRAP_WORD : len >= 1024 * 1024 ? wxSTC_WRAP_NONE : now;
+  if (want != now) body_->SetWrapMode(want);
+}
+
 void HttpEditor::drop_redo_doc() {
   if (!redo_doc_) return;
   release_doc_async(redo_doc_);
@@ -6461,6 +6586,7 @@ void HttpEditor::install_doc(void* doc, bool fresh) {
   loading_ = true;
   body_->SetReadOnly(false);
   body_->SetDocPointer(doc);
+  update_body_wrap();
   body_->SetScrollWidth(1);
   if (fresh) {
     // A loader-built document has undo collection off: typing into it would leave nothing to
@@ -6572,8 +6698,40 @@ std::optional<std::string> HttpEditor::resolve(const std::string& name) const {
   if (!ws) return std::nullopt;
   const std::string ph = "{{" + name + "}}";
   std::string v = expand_span(*ws, ph);
-  if (v == ph) return std::nullopt;
+  if (v == ph) {
+    // Set by a pre-request script (this request's or a folder's) before the request is built.
+    if (set_by_script(name)) return std::string("(set by pre-request script)");
+    // A script that computes the names it sets (bru.setVar(k, ...)) may set this one: not
+    // marked undefined (the send does not refuse it either, see unresolved_vars).
+    if (script_dynamic_ || inh_.script_vars_dynamic) return std::string("(may be set by the pre-request script)");
+    return std::nullopt;
+  }
   return v;
+}
+
+bool HttpEditor::set_by_script(const std::string& name) const {
+  return std::find(script_names_.begin(), script_names_.end(), name) != script_names_.end() ||
+         std::find(inh_.script_vars.begin(), inh_.script_vars.end(), name) != inh_.script_vars.end();
+}
+
+void HttpEditor::rehighlight_vars() {
+  if (url_) highlight_vars(url_, 0, url_->GetLength());
+  for (auto& f : var_fields_)
+    if (wxStyledTextCtrl* s = f.get()) highlight_vars(s, 0, s->GetLength());
+  for (KvGrid* g : {params_, headers_})
+    if (g) g->Refresh();
+}
+
+void HttpEditor::update_script_names() {
+  std::string js;
+  if (pre_js_) js.assign(pre_js_->GetCharacterPointer(), static_cast<size_t>(pre_js_->GetLength()));
+  else js = base_.pre_script;
+  bool dyn = false;
+  std::vector<std::string> names = js.empty() ? std::vector<std::string>{} : script_set_names(js, &dyn);
+  if (names == script_names_ && dyn == script_dynamic_) return;
+  script_names_ = std::move(names);
+  script_dynamic_ = dyn;
+  rehighlight_vars();
 }
 
 // '}' / ']' / '"' typed right before the same character that this editor inserted: step over it.
@@ -6692,6 +6850,7 @@ void HttpEditor::show_var_list(wxStyledTextCtrl* s, const std::string& typed) {
       if (!ws->active_env.empty() && e.name == ws->active_env) env = &e;
   auto scope_of = [&](const std::string& n) -> std::string {
     if (pre_names_.count(n)) return "pre-request";
+    if (set_by_script(n) && (!ws || !ws->runtime_vars.count(n))) return "pre-request script";
     if (!n.empty() && n[0] == '$') return "dynamic";
     if (!ws) return {};
     if (ws->runtime_vars.count(n)) return "runtime";
@@ -6884,7 +7043,14 @@ void HttpEditor::do_send() {
     host_->cancel();
     return;
   }
-  if (pre_busy_ || minify_busy_) return;  // the send is on its way
+  if (pre_busy_ || minify_busy_ || send_after_inh_) return;  // the send is on its way
+  // Sent right after the request opened, before its folders' variables were read (a few ms, on a
+  // worker): wait for them, so the URL is encoded as the "Sent as" line shows ({{who}} = "ann
+  // marie" in the query is ann%20marie, not a space curl refuses).
+  if (inh_reading_ && inh_done_gen_ != inh_gen_ && url_text().find("{{") != std::string::npos) {
+    send_after_inh_ = true;
+    return;
+  }
   // A curl command typed (not pasted) into the URL bar: import it first, then send what it
   // describes (a paste imports at once, see url_inserted).
   if (const std::string typed = url_text(); looks_like_curl(typed)) {
@@ -6913,6 +7079,8 @@ void HttpEditor::do_send() {
   if (const wxString lint = script_lint_summary(); !lint.empty()) note(lint, true);
   url_->CallTipCancel();
   body_->CallTipCancel();
+  for (KvGrid* g : {params_, path_, headers_, urlenc_, multipart_, asserts_, captures_, pre_})
+    if (g) g->hide_tip();
   // An edited big JSON body shown formatted is sent minified: minify it on a worker first (the
   // send follows when it is done), never 10 MB here.
   if (body_mode_ == BodyMode::Json && minify_ && minify_->value() && !pending_body_ &&
@@ -7528,8 +7696,20 @@ void HttpEditor::refresh_trust(bool after_send) {
     auto* ed = static_cast<HttpEditor*>(alive->target);
     ed->CallAfter([ed, gen, trusted, after_send] {
       if (gen != ed->trust_gen_) return;
-      ed->trust_state_ = trusted ? 1 : 0;
+      const int state = trusted ? 1 : 0;
+      ed->trust_state_ = state;
       ed->show_trust();
+      // The other editors of this workspace (Ctrl+T, a prebuilt spare, tabs that have not sent
+      // since) say the same at once, not only after their own next send.
+      const Workspace* mine = ed->host_->workspace();
+      for (HttpEditor* o : live_editors()) {
+        if (o == ed || o->trust_state_ == state) continue;
+        const Workspace* w = o->host_->workspace();
+        if (!mine || !w || w->root() != mine->root()) continue;
+        ++o->trust_gen_;  // a read of theirs still on its way is older than this one
+        o->trust_state_ = state;
+        o->show_trust();
+      }
       if (after_send && !trusted && ed->has_scripts())
         ed->note("Scripts not run: this workspace's scripts are not trusted (Scripts tab: Trust scripts)", true);
     });
@@ -7648,11 +7828,12 @@ wxStyledTextCtrl* HttpEditor::make_script_editor(wxWindow* parent, const char* p
   s->StyleSetItalic(kStylePlaceholder, true);
   s->EOLAnnotationSetVisible(wxSTC_EOLANNOTATION_STANDARD);
   show_placeholder();
-  s->Bind(wxEVT_STC_CHANGE, [this, show_placeholder](wxStyledTextEvent& e) {
+  s->Bind(wxEVT_STC_CHANGE, [this, s, show_placeholder](wxStyledTextEvent& e) {
     e.Skip();
     show_placeholder();
     if (loading_) return;
     update_script_badges();
+    if (s == pre_js_) update_script_names();
     touched();
   });
   // Enter keeps the indentation of the line (Ctrl+Enter still sends).
@@ -8253,9 +8434,23 @@ void HttpEditor::refresh_jar() {
 std::optional<size_t> HttpEditor::sent_body_size() const {
   const Workspace* ws = host_->workspace();
   constexpr size_t kMax = 1 << 20;  // above this the size is the template's (no expansion here)
+  // Expanded as the send expands it: folder / collection variables too (inh_), and unknown
+  // while a pre-request script of this send may still set one of its names.
+  bool unknown = false;
   auto expanded = [&](std::string_view b) -> size_t {
     if (!ws || b.size() > kMax || b.find("{{") == std::string_view::npos) return b.size();
-    return ws->expand(std::string(b)).size();
+    const bool dyn = script_dynamic_ || inh_.script_vars_dynamic;
+    return expand_text(b, [&](const std::string& span) {
+             if (span.size() > 4) {
+               const std::string name(trim(std::string_view(span).substr(2, span.size() - 4)));
+               if (dyn || set_by_script(name) || pre_names_.count(name)) unknown = true;
+             }
+             return expand_span(*ws, span);
+           }).size();
+  };
+  auto known = [&](size_t n) -> std::optional<size_t> {
+    if (unknown || (inh_reading_ && inh_done_gen_ != inh_gen_)) return std::nullopt;
+    return n;
   };
   switch (body_mode_) {
     case BodyMode::None:
@@ -8266,12 +8461,12 @@ std::optional<size_t> HttpEditor::sent_body_size() const {
       if (pending_body_) return pending_body_->size();
       const std::string_view shown(body_->GetCharacterPointer(), static_cast<size_t>(body_->GetLength()));
       if (body_mode_ == BodyMode::Json && minify_->value()) {
-        if (raw_body_ && raw_edits_ == body_edits_) return expanded(*raw_body_);
-        if (minified_current()) return expanded(*minified_);
+        if (raw_body_ && raw_edits_ == body_edits_) return known(expanded(*raw_body_));
+        if (minified_current()) return known(expanded(*minified_));
         if (shown.size() > kMax) return std::nullopt;
-        return expanded(minify_json(shown));
+        return known(expanded(minify_json(shown)));
       }
-      return expanded(shown);
+      return known(expanded(shown));
     }
     case BodyMode::UrlEncoded: {
       std::vector<KvItem> items;
@@ -8317,6 +8512,7 @@ void HttpEditor::update_pre_names() {
   pre_names_.clear();
   for (const auto& x : pre_now())
     if (x.enabled && !x.var.empty() && !trim(x.expr).empty()) pre_names_.insert(x.var);
+  update_script_names();
 }
 
 SavedRequest HttpEditor::eval_request(bool with_body, bool sending) const {
@@ -8348,6 +8544,9 @@ SavedRequest HttpEditor::export_request(std::string* warning) const {
     r = ws->resolved(r);  // the folders' / collection's headers and auth, {{vars}} kept
   } else if (resolve_vars_in_curl_ && ws) {
     if (pre_names_.empty()) {
+      // The URL as Send builds it ("Sent as"): a value with a space, '&' or non-ASCII is encoded
+      // where it stands, so the copied command sends what watt sends.
+      if (r.http.url.find("{{") != std::string::npos) r.http.url = sent_url();
       r = ws->expanded(r);
     } else {
       // The pre-request values as last computed for the Value column (a timestamp or a nonce is
@@ -8375,6 +8574,13 @@ SavedRequest HttpEditor::export_request(std::string* warning) const {
     r.http.tls_min_version = eo.tls_min_version;
   }
   drop_shadowed_basic(r);  // an Authorization header that is sent beats Basic: never -H and -u both
+  // Copy as runs no script: what a pre-request script adds (a header, a signature) is missing,
+  // and its {{vars}} are the values the last send left.
+  const bool own_pre = pre_js_ ? pre_js_->GetLength() > 0 : !base_.pre_script.empty();
+  if (warn.empty() && (own_pre || !inh_.script_vars.empty() || inh_.script_vars_dynamic))
+    warn = resolve_vars_in_curl_
+               ? "pre-request scripts were not run: their headers are missing and script variables have the last send's values"
+               : "pre-request scripts were not run: headers they add are missing";
   if (warning) *warning = std::move(warn);
   r.file = own_file;
   return r;
@@ -8395,6 +8601,7 @@ void HttpEditor::preview_pre() {
   const bool wants_body = std::any_of(rows.begin(), rows.end(), [](const PreVar& v) { return v.expr.find("req.body") != std::string::npos; });
   const bool body = wants_body && (!text_mode(body_mode_) || body_->GetLength() < 1024 * 1024);
   auto req = std::make_shared<SavedRequest>(eval_request(body, false));
+  if (std::filesystem::path f = inherit_from(); !f.empty()) req->file = f;  // its folders' {{vars}}
   auto wsc = std::make_shared<Workspace>(*ws);
   std::thread([alive = alive_, rows = std::move(rows), req, wsc, gen, wants_body, body] {
     auto res = evaluate_pre_vars(rows, *req, *wsc);
@@ -8421,6 +8628,7 @@ void HttpEditor::run_pre_then_send(std::vector<PreVar> rows) {
   if (!ws) return;
   const bool body = std::any_of(rows.begin(), rows.end(), [](const PreVar& v) { return v.expr.find("req.body") != std::string::npos; });
   auto req = std::make_shared<SavedRequest>(eval_request(body, true));  // as sent: path values, minified body
+  if (std::filesystem::path f = inherit_from(); !f.empty()) req->file = f;  // its folders' {{vars}}
   auto wsc = std::make_shared<Workspace>(*ws);
   const uint64_t gen = ++pre_send_gen_;
   pre_busy_ = true;

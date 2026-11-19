@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstring>
+#include <initializer_list>
 
 #include <emmintrin.h>
 #include <intrin.h>
@@ -942,12 +943,16 @@ std::string substitute(std::string_view tmpl, const VarExpander& expand_var, boo
   std::string out;
   out.reserve(tmpl.size() + 32);
   bool in_query = false, in_fragment = false;
+  // Where a span sits (track_query): 'q' in the query, 'p' in the path or fragment, 0 before
+  // the path (scheme / host, e.g. {{base}}).
+  const size_t from = track_query ? path_start(tmpl) : std::string_view::npos;
   for (size_t i = 0; i < tmpl.size();) {
     if (const size_t e = var_end(tmpl, i); e != std::string_view::npos) {
       const std::string span(tmpl.substr(i, e - i));
       const std::string v = expand_var(span);
+      const char zone = in_query ? 'q' : (from != std::string_view::npos && i >= from) ? 'p' : 0;
       if (v == span) out += span;  // not defined: kept as written
-      else encode(out, v, in_query);
+      else encode(out, v, zone);
       i = e;
       continue;
     }
@@ -968,23 +973,70 @@ std::string substitute(std::string_view tmpl, const VarExpander& expand_var, boo
 
 }  // namespace
 
+namespace {
+
+// keep_script_vars() returns a kept span as kKept + "{{name}}"; the expanders below write it
+// back as "{{name}}", or with the core's encode-on-substitution mark where the value needs one.
+constexpr char kKept = '\x01';
+bool is_kept(const std::string& v) { return v.size() > 4 && v[0] == kKept; }
+void put_kept(std::string& out, const std::string& v, char mark) {
+  if (!mark) {
+    out.append(v, 1, std::string::npos);
+    return;
+  }
+  out += "{{";
+  out += trim(std::string_view(v).substr(3, v.size() - 5));
+  out += '|';
+  out += mark;
+  out += "}}";
+}
+
+}  // namespace
+
 std::string expand_url(std::string_view tmpl, const VarExpander& expand_var) {
   if (tmpl.find("{{") == std::string_view::npos) return normalize_url(tmpl);
-  return normalize_url(substitute(tmpl, expand_var, true, [](std::string& out, const std::string& v, bool in_query) {
-    out += in_query ? query_encode(v) : v;
+  return normalize_url(substitute(tmpl, expand_var, true, [](std::string& out, const std::string& v, char zone) {
+    if (is_kept(v)) put_kept(out, v, zone);  // 'p' / 'q': the core encodes the value as below
+    else out += zone == 'q' ? query_encode(v) : v;
   }));
 }
 
 std::string expand_url(std::string_view tmpl, const VarExpander& expand_var, bool encode) {
   if (encode) return expand_url(tmpl, expand_var);
   if (tmpl.find("{{") == std::string_view::npos) return minimal_url(tmpl);
-  return minimal_url(substitute(tmpl, expand_var, false, [](std::string& out, const std::string& v, bool) { out += v; }));
+  return minimal_url(substitute(tmpl, expand_var, false, [](std::string& out, const std::string& v, char) {
+    if (is_kept(v)) put_kept(out, v, 0);
+    else out += v;
+  }));
+}
+
+std::string expand_text(std::string_view tmpl, const VarExpander& expand_var) {
+  if (tmpl.find("{{") == std::string_view::npos) return std::string(tmpl);
+  return substitute(tmpl, expand_var, false, [](std::string& out, const std::string& v, char) {
+    if (is_kept(v)) put_kept(out, v, 0);
+    else out += v;
+  });
+}
+
+VarExpander keep_script_vars(VarExpander inner, std::vector<std::string> set_names, bool any_name) {
+  return [inner = std::move(inner), names = std::move(set_names), any_name](const std::string& span) -> std::string {
+    if (span.size() > 4 && span.compare(0, 2, "{{") == 0) {
+      const std::string_view name = trim(std::string_view(span).substr(2, span.size() - 4));
+      // An OS environment variable is never kept: the consent prompt and check read the name
+      // as written, and no script sets one.
+      const bool os_env = name.substr(0, 12) == "process.env." || name.substr(0, 5) == "$env.";
+      if (!os_env && (any_name || std::find(names.begin(), names.end(), name) != names.end())) return kKept + span;
+    }
+    return inner(span);
+  };
 }
 
 std::string expand_form(std::string_view tmpl, const VarExpander& expand_var) {
   if (tmpl.find("{{") == std::string_view::npos) return std::string(tmpl);
-  return substitute(tmpl, expand_var, false,
-                    [](std::string& out, const std::string& v, bool) { out += form_encode(v); });
+  return substitute(tmpl, expand_var, false, [](std::string& out, const std::string& v, char) {
+    if (is_kept(v)) put_kept(out, v, 'f');
+    else out += form_encode(v);
+  });
 }
 
 std::string to_bulk(const std::vector<KvItem>& items) {
@@ -2084,6 +2136,178 @@ std::string markdown_to_html(std::string_view md_in) {
   flush_para();
   close_list();
   return out;
+}
+
+std::vector<std::string> script_set_names(std::string_view js, bool* dynamic) {
+  if (dynamic) *dynamic = false;
+  std::vector<std::string> out;
+  // The code with comments blanked out (string contents kept), so a commented-out call or a
+  // "//" inside a URL string is read right.
+  std::string code(js);
+  for (size_t i = 0; i < code.size();) {
+    const char c = code[i];
+    if (c == '"' || c == '\'' || c == '`') {
+      size_t j = i + 1;
+      while (j < code.size() && code[j] != c) j += code[j] == '\\' ? 2 : 1;
+      i = j + 1;
+    } else if (c == '/' && i + 1 < code.size() && code[i + 1] == '/') {
+      while (i < code.size() && code[i] != '\n') code[i++] = ' ';
+    } else if (c == '/' && i + 1 < code.size() && code[i + 1] == '*') {
+      const size_t e = code.find("*/", i + 2);
+      const size_t end = e == std::string::npos ? code.size() : e + 2;
+      for (; i < end; ++i)
+        if (code[i] != '\n') code[i] = ' ';
+    } else {
+      ++i;
+    }
+  }
+  auto ident = [](char ch) { return std::isalnum(static_cast<unsigned char>(ch)) || ch == '_' || ch == '$'; };
+  auto skip_ws = [&](size_t p) {
+    while (p < code.size() && std::isspace(static_cast<unsigned char>(code[p]))) ++p;
+    return p;
+  };
+  // "a.b.c" with optional spaces around the dots, starting at p; returns the end or npos.
+  auto match_path = [&](size_t p, std::initializer_list<std::string_view> parts) -> size_t {
+    bool first = true;
+    for (std::string_view part : parts) {
+      if (!first) {
+        p = skip_ws(p);
+        if (p >= code.size() || code[p] != '.') return std::string::npos;
+        p = skip_ws(p + 1);
+      }
+      first = false;
+      if (code.compare(p, part.size(), part) != 0) return std::string::npos;
+      p += part.size();
+      if (p < code.size() && ident(code[p])) return std::string::npos;
+    }
+    return p;
+  };
+  static const std::vector<std::vector<std::string_view>> setters = {
+      {"pm", "variables", "set"},  {"pm", "environment", "set"}, {"pm", "globals", "set"},
+      {"pm", "collectionVariables", "set"}, {"bru", "setVar"}, {"bru", "setEnvVar"},
+      {"bru", "setGlobalEnvVar"}};
+  for (size_t i = 0; i < code.size(); ++i) {
+    if ((code[i] != 'p' && code[i] != 'b' && code[i] != 'r') || (i > 0 && (ident(code[i - 1]) || code[i - 1] == '.')))
+      continue;
+    // A rewrite of the URL: "pm.request.url = ..." / ".update(" / req.setUrl(...).
+    if (size_t e = match_path(i, {"pm", "request", "url"}); e != std::string::npos) {
+      const size_t q = skip_ws(e);
+      if (q < code.size() && (code[q] == '.' || (code[q] == '=' && (q + 1 >= code.size() || code[q + 1] != '='))))
+        if (dynamic) *dynamic = true;
+      continue;
+    }
+    if (match_path(i, {"req", "setUrl"}) != std::string::npos) {
+      if (dynamic) *dynamic = true;
+      continue;
+    }
+    for (const auto& w : setters) {
+      size_t e = w.size() == 3 ? match_path(i, {w[0], w[1], w[2]}) : match_path(i, {w[0], w[1]});
+      if (e == std::string::npos) continue;
+      e = skip_ws(e);
+      if (e >= code.size() || code[e] != '(') break;
+      e = skip_ws(e + 1);
+      const char q = e < code.size() ? code[e] : '\0';
+      std::string name;
+      bool literal = false;
+      if (q == '"' || q == '\'' || q == '`') {
+        size_t j = e + 1;
+        literal = true;
+        while (j < code.size() && code[j] != q) {
+          if (code[j] == '\\' || (q == '`' && code[j] == '$' && j + 1 < code.size() && code[j + 1] == '{')) {
+            literal = false;
+            break;
+          }
+          name += code[j++];
+        }
+        if (j >= code.size()) literal = false;
+        if (literal) {
+          const size_t after = skip_ws(j + 1);
+          literal = after < code.size() && (code[after] == ',' || code[after] == ')');
+        }
+      }
+      if (literal && !name.empty()) {
+        if (std::find(out.begin(), out.end(), name) == out.end()) out.push_back(std::move(name));
+      } else if (dynamic) {
+        *dynamic = true;
+      }
+      break;
+    }
+  }
+  return out;
+}
+
+namespace {
+std::string pick_lower(std::string_view s) {
+  std::string o(s);
+  for (char& c : o)
+    if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+  return o;
+}
+}  // namespace
+
+std::vector<size_t> rank_pick_matches(const std::vector<PickMatch>& items, std::string_view filter) {
+  std::vector<size_t> out;
+  if (filter.empty()) {
+    for (size_t i = 0; i < items.size(); ++i) out.push_back(i);
+    return out;
+  }
+  const std::string f = pick_lower(filter);
+  std::vector<int> tier(items.size(), -1);
+  for (size_t i = 0; i < items.size(); ++i) {
+    const std::string v = pick_lower(items[i].value);
+    bool exact = v == f, pre = v.starts_with(f);
+    const bool in = pre || v.find(f) != std::string::npos;
+    std::string_view al = items[i].alias;
+    while (!al.empty()) {
+      const size_t sp = al.find(' ');
+      const std::string a = pick_lower(al.substr(0, sp));
+      al = sp == std::string_view::npos ? std::string_view{} : al.substr(sp + 1);
+      if (a.empty()) continue;
+      if (a == f) exact = true;
+      if (a.starts_with(f)) pre = true;
+    }
+    if (exact) tier[i] = 0;
+    else if (pre) tier[i] = 1;
+    else if (in) tier[i] = 2;
+    else if (pick_lower(items[i].desc).find(f) != std::string::npos) tier[i] = 3;
+  }
+  for (int t = 0; t < 4; ++t)
+    for (size_t i = 0; i < items.size(); ++i)
+      if (tier[i] == t) out.push_back(i);
+  return out;
+}
+
+const std::vector<AssertOperator>& assert_operators() {
+  static const std::vector<AssertOperator> ops = {
+      {"eq", "equals (numbers numerically)", "Compare", "== === to.equal to.eql equals"},
+      {"neq", "not equal", "Compare", "!= !== <>"},
+      {"gt", "greater than", "Compare", ">"},
+      {"gte", "greater or equal", "Compare", ">="},
+      {"lt", "less than", "Compare", "<"},
+      {"lte", "less or equal", "Compare", "<="},
+      {"between", "lo, hi (inclusive)", "Compare", ""},
+      {"in", "one of a, b, c", "Compare", ""},
+      {"notIn", "none of a, b, c", "Compare", ""},
+      {"contains", "substring / element / key", "String", "includes to.include has"},
+      {"notContains", "does not contain", "String", ""},
+      {"startsWith", "begins with", "String", ""},
+      {"endsWith", "ends with", "String", ""},
+      {"matches", "regular expression", "String", "regex to.match"},
+      {"notMatches", "regex does not match", "String", ""},
+      {"length", "string / array / object size", "String", "size count len to.have.length"},
+      {"isString", "", "Type", ""},
+      {"isNumber", "", "Type", ""},
+      {"isBoolean", "", "Type", ""},
+      {"isArray", "", "Type", ""},
+      {"isJson", "parses as JSON", "Type", ""},
+      {"isDefined", "present", "Existence", "exists exist to.exist defined present"},
+      {"isUndefined", "missing", "Existence", "undefined to.not.exist notexists missing absent"},
+      {"isNull", "null", "Existence", "null to.be.null"},
+      {"isEmpty", "\"\", [] or {}", "Existence", "empty to.be.empty"},
+      {"isNotEmpty", "", "Existence", ""},
+      {"isTruthy", "", "Existence", ""},
+      {"isFalsy", "false, 0, \"\", null", "Existence", ""}};
+  return ops;
 }
 
 }  // namespace watt::app::http_editor

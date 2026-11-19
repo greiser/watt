@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <thread>
 #include <string>
 #include <vector>
 
@@ -16,6 +17,7 @@
 #include "app/http_editor_cookies.cpp"
 #include "app/http_editor_gql.cpp"
 #include "core/model.h"
+#include "core/script.h"
 
 #include <filesystem>
 #include <fstream>
@@ -1600,4 +1602,342 @@ TEST_CASE("Headers grid by keyboard: a typed value is never replaced by a sugges
   REQUIRE(t.rows.size() == 3);
   CHECK(t.rows[0].desc == "note");
   CHECK(t.headers() == std::vector<std::pair<std::string, std::string>>{{"X-A", "1"}, {"X-B", "2"}});
+}
+
+TEST_CASE("names a pre-request script sets", "[http_editor][script]") {
+  bool dyn = true;
+  CHECK(script_set_names("pm.variables.set('ts', Date.now());\n"
+                         "pm.environment.set(\"tok\", 'x');\n"
+                         "pm . collectionVariables . set( `c` , 1)\n"
+                         "bru.setVar('b1', 2); bru.setEnvVar('b2', 3); bru.setGlobalEnvVar('b3', 4);\n"
+                         "pm.globals.set('ts', 5); // pm.variables.set('commented', 1)\n"
+                         "/* bru.setVar('blocked', 1) */ const u = 'http://h//x'; xpm.variables.set('no', 1);\n"
+                         "pm.variables.get('read')",
+                         &dyn) == std::vector<std::string>{"ts", "tok", "c", "b1", "b2", "b3"});
+  CHECK_FALSE(dyn);
+  CHECK(script_set_names("const n = 'a'; pm.variables.set(n, 1)", &dyn).empty());
+  CHECK(dyn);
+  CHECK(script_set_names("bru.setVar(`id_${i}`, 1)", &dyn).empty());
+  CHECK(dyn);
+  CHECK(script_set_names("pm.variables.set('a' + 'b', 1)", &dyn).empty());
+  CHECK(dyn);
+  CHECK(script_set_names("pm.request.url = 'http://other/'", &dyn).empty());
+  CHECK(dyn);
+  script_set_names("if (pm.request.url == 'x') pm.variables.set('k', 1)", &dyn);
+  CHECK_FALSE(dyn);
+  CHECK(script_set_names("", &dyn).empty());
+  CHECK_FALSE(dyn);
+}
+
+TEST_CASE("a {{var}} set only by the pre-request script is sent with its value", "[http_editor][script]") {
+  const auto dir = std::filesystem::temp_directory_path() / "watt_test_http_editor_prevar";
+  const auto cfg = std::filesystem::temp_directory_path() / "watt_test_http_editor_prevar_cfg";
+  std::filesystem::remove_all(dir);
+  std::filesystem::remove_all(cfg);
+  std::filesystem::create_directories(dir);
+  watt::Workspace::set_user_config_dir(cfg);  // never the real script-trust list
+  watt::Workspace ws = watt::Workspace::create(dir);
+  REQUIRE(ws.trust_scripts(true));
+  watt::SavedRequest r;
+  r.kind = watt::RequestKind::Http;
+  r.name = "ts";
+  r.http.method = "GET";
+  r.http.url = "http://127.0.0.1:18080/echo?t={{ts9}}";
+  r.http.headers = {{"X-Ts", "{{ts9}}"}};
+  r.pre_script = "pm.variables.set('ts9', 'abc');";
+  r.file = dir / "ts.req.json";
+  // The editor counts the name as defined (no "Not sent" banner) ...
+  CHECK(script_set_names(r.pre_script) == std::vector<std::string>{"ts9"});
+  // ... and the send path's first send carries the scripted value.
+  watt::ScriptRun pre = watt::run_pre_script(ws, r);
+  REQUIRE(pre.ok);
+  REQUIRE(watt::apply_script_vars(ws, pre, false));
+  std::string err;
+  const auto sent = ws.http_to_send(r, &err);
+  REQUIRE(sent);
+  CHECK(sent->url == "http://127.0.0.1:18080/echo?t=abc");
+  bool header = false;
+  for (const auto& [k, v] : sent->headers) header = header || (k == "X-Ts" && v == "abc");
+  CHECK(header);
+  std::filesystem::remove_all(dir);
+  std::filesystem::remove_all(cfg);
+}
+
+TEST_CASE("pre-request variables read folder variables and mix text with calls", "[http_editor][pre]") {
+  const auto dir = std::filesystem::temp_directory_path() / "watt_test_pre_folder";
+  std::filesystem::remove_all(dir);
+  std::filesystem::create_directories(dir / "api");
+  watt::Workspace ws = watt::Workspace::create(dir);
+  watt::FolderSettings fs;
+  fs.vars.push_back({"userId", "42"});
+  std::string err;
+  REQUIRE(ws.save_folder_settings(dir / "api", fs, &err));
+  watt::SavedRequest r;
+  r.kind = watt::RequestKind::Http;
+  r.http.method = "POST";
+  r.http.url = "http://127.0.0.1:18080/echo";
+  r.file = dir / "api" / "stamp.req.json";
+  CHECK(pre_eval("{{userId}} + '-' + lower(req.method)", ws, r, &err) == "42-post");
+  CHECK(pre_eval("{{userId}}-x", ws, r) == "42-x");
+  CHECK(pre_eval("{{userId}}-lower(req.method)", ws, r, &err) == "42-post");
+  CHECK(pre_eval("id lower('AB') / upper( 'c' )", ws, r) == "id ab / C");
+  CHECK(check_pre_expr("{{userId}}-lower(req.method)").empty());
+  CHECK(pre_eval("{{userId}}-lowr(req.method)", ws, r, &err) == "<error>");
+  // Outside the folder the variable is not defined.
+  watt::SavedRequest top = r;
+  top.file = dir / "stamp.req.json";
+  CHECK(pre_eval("{{userId}} + '-x'", ws, top) == "<error>");
+  std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("Assert Operator cell: a typed symbol picks its own operator", "[http_editor][kv]") {
+  // The critic's case: "<" then Tab saved neq (its alias "<>" starts with "<"), a test that
+  // passes for nearly any response. The best match is what Tab / Enter picks.
+  std::vector<PickMatch> ops;
+  for (const AssertOperator& o : assert_operators()) ops.push_back({o.value, o.alias, o.desc});
+  auto pick = [&](std::string_view typed) {
+    const auto r = rank_pick_matches(ops, typed);
+    return r.empty() ? std::string() : ops[r.front()].value;
+  };
+  CHECK(pick("==") == "eq");
+  CHECK(pick("===") == "eq");
+  CHECK(pick("!=") == "neq");
+  CHECK(pick("!==") == "neq");
+  CHECK(pick("<>") == "neq");
+  CHECK(pick("<") == "lt");
+  CHECK(pick("<=") == "lte");
+  CHECK(pick(">") == "gt");
+  CHECK(pick(">=") == "gte");
+  CHECK(pick("=") == "eq");
+  CHECK(pick("!") == "neq");
+  // words: a prefix wins over a word that only contains it; case does not matter
+  CHECK(pick("l") == "lt");
+  CHECK(pick("LTE") == "lte");
+  CHECK(pick("cont") == "contains");
+  CHECK(pick("not") == "notIn");
+  CHECK(pick("in") == "in");
+  CHECK(pick("regular") == "matches");  // from the description
+  CHECK(pick("zzz").empty());
+  // Postman / Chai / Bruno words for existence (the critic typed "exists" and got eq)
+  CHECK(pick("exists") == "isDefined");
+  CHECK(pick("exist") == "isDefined");
+  CHECK(pick("to.exist") == "isDefined");
+  CHECK(pick("defined") == "isDefined");
+  CHECK(pick("undefined") == "isUndefined");
+  CHECK(pick("to.not.exist") == "isUndefined");
+  CHECK(pick("in") == "in");
+  CHECK(pick("not") == "notIn");
+  CHECK(pick("includes") == "contains");
+  CHECK(pick("empty") == "isEmpty");
+  CHECK(pick("null") == "isNull");
+  CHECK(pick("le") == "length");
+  CHECK(rank_pick_matches(ops, "").size() == ops.size());
+}
+
+TEST_CASE("an inherited folder pre-script's variable is sent fresh on every send", "[http_editor][script][folders]") {
+  // The critic's case: api/users/folder.json sets a timestamp with bru.setVar, the request uses
+  // it in its URL; from the second send on the request went out with the previous run's value.
+  const auto dir = std::filesystem::temp_directory_path() / "watt_test_http_editor_folderstamp";
+  const auto cfg = std::filesystem::temp_directory_path() / "watt_test_http_editor_folderstamp_cfg";
+  std::filesystem::remove_all(dir);
+  std::filesystem::remove_all(cfg);
+  std::filesystem::create_directories(dir / "api" / "users");
+  watt::Workspace::set_user_config_dir(cfg);
+  watt::Workspace real = watt::Workspace::create(dir);
+  REQUIRE(real.trust_scripts(true));
+  watt::FolderSettings fs;
+  fs.pre_script = "bru.setVar('stamp', 'S' + Date.now());";
+  REQUIRE(real.save_folder_settings(dir / "api" / "users", fs));
+  watt::SavedRequest r = real.new_request(watt::RequestKind::Http, "stamp", dir / "api" / "users");
+  r.http.url = "http://127.0.0.1:18080/echo?s={{stamp}}";
+  REQUIRE(real.save_request(r));
+  std::string previous;
+  for (int send = 0; send < 3; ++send) {
+    // As request_tab.cpp send_http_job: a workspace copy for the worker, the pre-request chain,
+    // its variables into the copy, then the request built from the copy.
+    // The editor builds the URL as sent on the UI thread (sent_url(): {{vars}} encoded where
+    // they stand), from the live workspace whose runtime {{stamp}} is the previous run's.
+    const VarExpander live = [&](const std::string& span) { return real.expand(span, r); };
+    const std::vector<std::string> names = script_set_names(fs.pre_script);
+    REQUIRE(names == std::vector<std::string>{"stamp"});
+    if (!previous.empty())  // the bug: expanded here, the previous value is baked into the URL
+      CHECK(expand_url(r.http.url, live, true) == "http://127.0.0.1:18080/echo?s=" + previous);
+    const std::string built = expand_url(r.http.url, keep_script_vars(live, names, false), true);
+    CHECK(built == "http://127.0.0.1:18080/echo?s={{stamp|q}}");  // encoded by the core
+    CHECK(expand_url(r.http.url, keep_script_vars(live, {}, true), true) == built);  // a computed name
+    watt::Workspace wsc = real;
+    watt::SavedRequest toSend = r;
+    toSend.http.url = built;
+    watt::ScriptRun pre = watt::run_pre_script(wsc, toSend);
+    INFO("send " << send << ": " << pre.error);
+    REQUIRE(pre.ok);
+    REQUIRE(pre.vars_set.size() == 1);
+    const std::string stamp = pre.vars_set[0].value;
+    CHECK(stamp != previous);
+    REQUIRE(watt::apply_script_vars(wsc, pre, false));
+    std::string err;
+    const auto sent = wsc.http_to_send(toSend, &err);
+    INFO(err);
+    REQUIRE(sent);
+    CHECK(sent->url == "http://127.0.0.1:18080/echo?s=" + stamp);
+    REQUIRE(watt::apply_script_vars(real, pre, false));  // the UI thread's copy, as after the send
+    CHECK(real.runtime_vars["stamp"] == stamp);
+    previous = stamp;
+    std::this_thread::sleep_for(std::chrono::milliseconds(3));
+  }
+  std::filesystem::remove_all(dir);
+  std::filesystem::remove_all(cfg);
+}
+
+TEST_CASE("a script-set variable is encoded in the query and a form body as an environment value is",
+          "[http_editor][script][encoding]") {
+  // The critic's case: bru.setVar('user', 'x&admin=1#frag') injected a parameter and cut the
+  // rest of the query off as a fragment; 'dave 1700...' made libcurl reject the URL.
+  const auto dir = std::filesystem::temp_directory_path() / "watt_test_http_editor_scriptenc";
+  const auto cfg = std::filesystem::temp_directory_path() / "watt_test_http_editor_scriptenc_cfg";
+  std::filesystem::remove_all(dir);
+  std::filesystem::remove_all(cfg);
+  std::filesystem::create_directories(dir);
+  watt::Workspace::set_user_config_dir(cfg);
+  watt::Workspace real = watt::Workspace::create(dir);
+  REQUIRE(real.trust_scripts(true));
+  const std::string tmpl = "http://127.0.0.1:18080/echo?u={{user}}&s=1";
+  const std::string form_tmpl = "u={{user}}&s=1";
+  struct Case {
+    std::string value, query, form;
+  };
+  for (const Case& c : {Case{"a b", "u=a%20b", "u=a+b"}, Case{"x&y=1", "u=x%26y%3D1", "u=x%26y%3D1"},
+                        Case{"p#q", "u=p%23q", "u=p%23q"}, Case{"x&admin=1#frag", "u=x%26admin%3D1%23frag", "u=x%26admin%3D1%23frag"}}) {
+    INFO("value '" << c.value << "'");
+    // From an environment (runtime variable): the editor encodes it itself.
+    watt::Workspace env_ws = real;
+    env_ws.runtime_vars["user"] = c.value;
+    const VarExpander env_exp = [&](const std::string& span) { return env_ws.expand(span); };
+    CHECK(expand_url(tmpl, env_exp, true) == "http://127.0.0.1:18080/echo?" + c.query + "&s=1");
+    CHECK(expand_form(form_tmpl, env_exp) == c.form + "&s=1");
+
+    // Set by the pre-request script of this send: kept for the core, which encodes it.
+    watt::SavedRequest r = real.new_request(watt::RequestKind::Http, "enc", dir);
+    r.pre_script = "const k = 'us' + 'er'; bru.setVar(k, " + std::string("decodeURIComponent('") +
+                   query_encode(c.value) + "'));";
+    const VarExpander live = [&](const std::string& span) { return real.expand(span, r); };
+    r.http.url = expand_url(tmpl, keep_script_vars(live, {}, true), true);  // a computed name: any kept
+    CHECK(r.http.url == "http://127.0.0.1:18080/echo?u={{user|q}}&s=1");
+    r.http.method = "POST";
+    r.http.headers = {{"Content-Type", "application/x-www-form-urlencoded"}};
+    r.http.body = expand_form(form_tmpl, keep_script_vars(live, {"user"}, false));
+    CHECK(r.http.body == "u={{user|f}}&s=1");
+    watt::Workspace wsc = real;
+    watt::ScriptRun pre = watt::run_pre_script(wsc, r);
+    INFO(pre.error);
+    REQUIRE(pre.ok);
+    REQUIRE(watt::apply_script_vars(wsc, pre, false));
+    REQUIRE(wsc.runtime_vars["user"] == c.value);
+    std::string err;
+    const auto sent = wsc.http_to_send(r, &err);
+    INFO(err);
+    REQUIRE(sent);
+    CHECK(sent->url == "http://127.0.0.1:18080/echo?" + c.query + "&s=1");
+    CHECK(sent->body == c.form + "&s=1");
+  }
+  // A script reads the template without the marks, and leaving it as read keeps them.
+  {
+    watt::SavedRequest r = real.new_request(watt::RequestKind::Http, "read", dir);
+    r.http.url = "http://127.0.0.1:18080/echo?u={{user|q}}";
+    r.pre_script = "bru.setVar('seen', req.getUrl() === 'http://127.0.0.1:18080/echo?u={{user}}' ? 'plain' : 'marked');";
+    watt::Workspace wsc = real;
+    watt::ScriptRun pre = watt::run_pre_script(wsc, r);
+    INFO(pre.error);
+    REQUIRE(pre.ok);
+    REQUIRE(watt::apply_script_vars(wsc, pre, false));
+    CHECK(wsc.runtime_vars["seen"] == "plain");
+    CHECK(!pre.request_changed);
+    CHECK(r.http.url == "http://127.0.0.1:18080/echo?u={{user|q}}");
+  }
+  // Undefined: left as the plain {{name}} (the send then names it), never with the mark.
+  CHECK(real.expand("u={{nobody|q}}") == "u={{nobody}}");
+  CHECK(watt::strip_var_marks("{{a|q}}/{{b|f}}/{{c}}/{{d|x}}") == "{{a}}/{{b}}/{{c}}/{{d|x}}");
+  std::filesystem::remove_all(dir);
+  std::filesystem::remove_all(cfg);
+}
+
+TEST_CASE("a computed setVar name makes every name script-settable", "[http_editor][script][encoding]") {
+  bool dyn = false;
+  script_set_names("const k = 'us' + 'er';\nbru.setVar(k, 'x&admin=1#frag dave ' + Date.now());\nconsole.log(req.getUrl());", &dyn);
+  CHECK(dyn);
+  // Every name kept for the core (query spans marked), except an OS environment variable.
+  const VarExpander none = [](const std::string& span) { return span; };
+  CHECK(expand_url("{{base}}/a b?u={{user}}&e={{process.env.HOME}}&d={{$env.X}}", keep_script_vars(none, {}, true), true) ==
+        "{{base}}/a%20b?u={{user|q}}&e={{process.env.HOME}}&d={{$env.X}}");
+  CHECK(expand_form("u={{ user }}&e={{process.env.HOME}}", keep_script_vars(none, {}, true)) ==
+        "u={{user|f}}&e={{process.env.HOME}}");
+}
+
+TEST_CASE("variables in the URL path are encoded with and without a pre-request script",
+          "[http_editor][script][encoding]") {
+  // Round 5 critic: with any pre-request script the path spans reached the core unmarked and went
+  // out raw ("Zoë Müller" -> URL rejected); a script that rewrote the URL dropped every mark.
+  const auto dir = std::filesystem::temp_directory_path() / "watt_test_http_editor_pathenc";
+  const auto cfg = std::filesystem::temp_directory_path() / "watt_test_http_editor_pathenc_cfg";
+  std::filesystem::remove_all(dir);
+  std::filesystem::remove_all(cfg);
+  std::filesystem::create_directories(dir);
+  watt::Workspace::set_user_config_dir(cfg);
+  watt::Workspace real = watt::Workspace::create(dir);
+  REQUIRE(real.trust_scripts(true));
+  real.runtime_vars["base"] = "http://127.0.0.1:18080";
+  real.runtime_vars["who"] = "Zo\xC3\xAB M\xC3\xBCller";
+  real.runtime_vars["city"] = "New York";
+  const std::string who_enc = "Zo%C3%AB%20M%C3%BCller";
+  watt::SavedRequest r = real.new_request(watt::RequestKind::Http, "path", dir);
+  const VarExpander live = [&](const std::string& span) { return real.expand(span, r); };
+  auto send = [&](const std::string& url, const std::string& pre_script) {
+    watt::SavedRequest x = r;
+    x.http.url = url;
+    x.pre_script = pre_script;
+    watt::Workspace wsc = real;
+    if (!pre_script.empty()) {
+      watt::ScriptRun pre = watt::run_pre_script(wsc, x);
+      INFO(pre.error);
+      REQUIRE(pre.ok);
+      REQUIRE(watt::apply_script_vars(wsc, pre, false));
+    }
+    std::string err;
+    const auto sent = wsc.http_to_send(x, &err);
+    INFO(err);
+    REQUIRE(sent);
+    return sent->url;
+  };
+  const std::string tmpl = "{{base}}/users/{{who}}?c={{city}}";
+  const std::string want = "http://127.0.0.1:18080/users/" + who_enc + "?c=New%20York";
+  // No script: the editor substitutes and encodes itself.
+  CHECK(expand_url(tmpl, live, true) == want);
+  CHECK(send(expand_url(tmpl, live, true), "") == want);
+  // A pre-request script: every name kept, the path span with the path mark.
+  const std::string kept = expand_url(tmpl, keep_script_vars(live, {}, true), true);
+  CHECK(kept == "{{base}}/users/{{who|p}}?c={{city|q}}");
+  CHECK(send(kept, "console.log(1)") == want);
+  // A path variable (:id) holding {{who}}: the same.
+  const std::string with_id = with_path_values("{{base}}/users/:id?c={{city}}", [](const std::string&) {
+    return std::string("{{who}}");
+  }, true);
+  CHECK(send(expand_url(with_id, keep_script_vars(live, {}, true), true), "console.log(1)") == want);
+  // The path mark keeps reserved characters, encodes a stray %.
+  CHECK(watt::var_mark_encode("a/b?c#d %zz %41\"<>", 'p') == "a/b?c#d%20%25zz%20%41%22%3C%3E");
+  CHECK(watt::strip_var_marks("{{a|p}}/x") == "{{a}}/x");
+
+  // A script that rewrites the URL: the marks come back by position.
+  const std::string q = expand_url("{{base}}/echo/{{who}}?u={{user}}&n={{city}}", keep_script_vars(live, {}, true), true);
+  CHECK(q == "{{base}}/echo/{{who|p}}?u={{user|q}}&n={{city|q}}");
+  const std::string want_q = "http://127.0.0.1:18080/echo/" + who_enc + "?u=x%26admin%3D1&n=New%20York";
+  CHECK(send(q, "pm.request.addQueryParams('ts=1'); bru.setVar('user', 'x&admin=1');") == want_q + "&ts=1");
+  CHECK(send(q, "req.setUrl(req.getUrl() + '&z=1'); bru.setVar('user', 'x&admin=1');") == want_q + "&z=1");
+  CHECK(send(q, "pm.request.url = req.getUrl() + '&p={{city}}'; bru.setVar('user', 'x&admin=1');") ==
+        want_q + "&p=New%20York");
+  CHECK(send(q, "req.setUrl(req.getUrl().replace('/echo/', '/echo/{{city}}/')); bru.setVar('user', 'a b#c');") ==
+        "http://127.0.0.1:18080/echo/New%20York/" + who_enc + "?u=a%20b%23c&n=New%20York");
+  CHECK(watt::mark_url_vars("{{base}}/a/{{x}}?q={{y}}&e={{process.env.HOME}}#{{f}}") ==
+        "{{base}}/a/{{x|p}}?q={{y|q}}&e={{process.env.HOME}}#{{f|p}}");
+  std::filesystem::remove_all(dir);
+  std::filesystem::remove_all(cfg);
 }

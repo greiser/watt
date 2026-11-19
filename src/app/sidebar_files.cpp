@@ -103,7 +103,12 @@ std::optional<fs::path> rename_item(Workspace& ws, const fs::path& from, const s
     if (err) *err = "not a request file";
     return std::nullopt;
   }
-  const fs::path to = from.parent_path() / from_u8(slug(name) + std::string(kReqExt));
+  // Another request of the folder already has that file name: the name stays as typed (two
+  // requests may share a name, as in Postman) and the file gets a suffix (cancel-order-2.req.json).
+  // Never overwrites the other one.
+  fs::path to = from.parent_path() / from_u8(slug(name) + std::string(kReqExt));
+  for (int i = 2; !same_file(to, from) && fs::exists(to, ec) && i < 10000; ++i)
+    to = from.parent_path() / from_u8(slug(name + " " + std::to_string(i)) + std::string(kReqExt));
   if (!same_file(to, from) && fs::exists(to, ec)) {
     if (err) *err = "\"" + u8(to.filename()) + "\" already exists";
     return std::nullopt;
@@ -145,7 +150,9 @@ std::optional<SavedRequest> create_request(Workspace& ws, const fs::path& folder
   SavedRequest r;
   r.kind = kind;
   if (kind != RequestKind::Grpc) r.http.method = "GET";
-  if (kind == RequestKind::WebSocket) r.auth.type = HttpAuth::Type::Inherit;  // as Workspace::new_request()
+  // Every kind starts on Inherit, as Workspace::new_request() and Postman / Insomnia / Bruno do:
+  // the folder's / collection's auth applies until the request picks its own.
+  r.auth.type = HttpAuth::Type::Inherit;
   r.file = free_request_file(folder, name, &r.name);
   if (!ws.save_request(r, err)) return std::nullopt;
   return r;

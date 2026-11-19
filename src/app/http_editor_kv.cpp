@@ -16,6 +16,8 @@
 #include <wx/textctrl.h>
 
 #include <algorithm>
+#include <cctype>
+#include <cstring>
 
 #include "app/http_editor_widgets.h"
 
@@ -221,8 +223,14 @@ class KvRenderer : public wxGridCellStringRenderer {
         return;
       }
       if (!ph.empty()) {
+        // Italic and dim: a hint, never mistaken for a filled-in row.
+        const wxFont was = dc.GetFont();
+        wxFont f = was;
+        f.SetStyle(wxFONTSTYLE_ITALIC);
+        dc.SetFont(f);
         dc.SetTextForeground(t.dim);
         dc.DrawText(ph, x, ty);
+        dc.SetFont(was);
       }
       return;
     }
@@ -298,6 +306,9 @@ KvGrid::KvGrid(wxWindow* parent, Kind kind)
     case Kind::Capture: key_c_ = 1; value_c_ = 2; type_c_ = 3; del_c_ = 4; break;
     case Kind::PreVar: key_c_ = 1; value_c_ = 2; type_c_ = 3; desc_c_ = 4; del_c_ = 5; break;
   }
+  // Window creation failed (the process is at Windows' USER object quota): no table rather than
+  // CreateGrid on a null window (an AV in wxGrid::CalcDimensions -> GetCellAttr).
+  if (!GetHWND()) return;
   CreateGrid(1, del_c_ + 1);
   SetRowLabelSize(0);
   SetColLabelSize(FromDIP(28));
@@ -1304,15 +1315,15 @@ wxString KvGrid::blank_hint(int col) const {
     switch (kind_) {
       case Kind::Headers: return "Header";
       case Kind::Assert: return "res.status";
-      case Kind::Capture: return "token";
-      case Kind::PreVar: return "signature";
+      case Kind::Capture: return "Variable name";
+      case Kind::PreVar: return "name";
       default: return "Key";
     }
   }
   if (col == col_desc()) return kind_ == Kind::PreVar ? wxString() : wxString("Description");
   return kind_ == Kind::Assert    ? "200"
-         : kind_ == Kind::Capture ? "res.body.access_token"
-         : kind_ == Kind::PreVar  ? "hmacSha256({{secret}}, req.url)"
+         : kind_ == Kind::Capture ? "Source, e.g. res.body.id or res.headers.etag"
+         : kind_ == Kind::PreVar  ? "e.g. sha256(req.body)"
                                   : "Value";
 }
 
@@ -1469,8 +1480,15 @@ void KvGrid::update_suggest(wxTextCtrl* tc) {
   }
   suggest_tc_ = tc;
   // A whole-cell list highlights nothing until Up / Down: Enter / Tab keep what was typed
-  // ("X-Api-Version: 1" stays 1). A {{variable}} list takes its best match.
-  p->no_preselect = !s.var;
+  // ("X-Api-Version: 1" stays 1). A {{variable}} list takes its best match, and so does a
+  // header name list (Postman, Insomnia: "content-t" Tab is Content-Type), unless what is typed
+  // is already a known name ("Accept" Enter stays Accept, not Accept-Encoding).
+  bool take_best = s.var;
+  if (!take_best && kind_ == Kind::Headers && col == col_key()) {
+    const wxString typed = tc->GetValue().Lower();
+    take_best = std::none_of(key_choices_.begin(), key_choices_.end(), [&](const wxString& c) { return c.Lower() == typed; });
+  }
+  p->no_preselect = !take_best;
   // A click picks (the popup never takes the focus, so the edit is still open).
   p->on_pick = [this, tc](const wxString& v) { insert_suggest(tc, v); };
   // Showing / resizing it can move the focus (and so close it, which clears suggest_): the
@@ -1554,22 +1572,14 @@ void KvGrid::open_picker(int row, wxChar first) {
   std::vector<PickItem> items;
   const wxString cur_raw = GetCellValue(row, col_type());
   if (kind_ == Kind::Assert) {
-    static const char* const ops[][3] = {
-        {"eq", "equals (numbers numerically)", "Compare"}, {"neq", "not equal", "Compare"},
-        {"gt", "greater than", "Compare"}, {"gte", "greater or equal", "Compare"}, {"lt", "less than", "Compare"},
-        {"lte", "less or equal", "Compare"}, {"between", "lo, hi (inclusive)", "Compare"},
-        {"in", "one of a, b, c", "Compare"}, {"notIn", "none of a, b, c", "Compare"},
-        {"contains", "substring / element / key", "String"}, {"notContains", "does not contain", "String"},
-        {"startsWith", "begins with", "String"}, {"endsWith", "ends with", "String"},
-        {"matches", "regular expression", "String"}, {"notMatches", "regex does not match", "String"},
-        {"length", "string / array / object size", "String"},
-        {"isString", "", "Type"}, {"isNumber", "", "Type"}, {"isBoolean", "", "Type"}, {"isArray", "", "Type"},
-        {"isJson", "parses as JSON", "Type"},
-        {"isDefined", "present", "Existence"}, {"isUndefined", "missing", "Existence"},
-        {"isNull", "null", "Existence"}, {"isEmpty", "\"\", [] or {}", "Existence"},
-        {"isNotEmpty", "", "Existence"}, {"isTruthy", "", "Existence"},
-        {"isFalsy", "false, 0, \"\", null", "Existence"}};
-    for (const auto& o : ops) items.push_back({o[0], o[1], o[2]});
+    for (const AssertOperator& o : assert_operators()) {
+      PickItem it{o.value, o.desc, o.group, o.alias};
+      // the symbol people type for it is shown first ("<  less than")
+      // (a symbol only: the word aliases, "exists" / "to.exist", are for typing)
+      if (*o.alias && !std::isalpha(static_cast<unsigned char>(*o.alias)))
+        it.desc = wxString(o.alias).BeforeFirst(' ') + "  " + it.desc;
+      items.push_back(std::move(it));
+    }
     // an operator this list does not know (from a file) is still offered
     if (!cur_raw.empty() && std::none_of(items.begin(), items.end(), [&](const PickItem& i) { return i.value == cur_raw; }))
       items.push_back({cur_raw, "", "Other"});
@@ -1582,7 +1592,19 @@ void KvGrid::open_picker(int row, wxChar first) {
   }
   wxString cur = kind_ == Kind::Multipart ? wxString(cur_raw == "File" ? "File" : "Text") : cur_raw;
   if (cur.empty()) cur = wxString::FromUTF8(default_type());
-  auto* p = new PickPopup(this, std::move(items), cur);
+  // The operator list is the same every time: one window, reused (building it took ~40 ms).
+  const bool reuse = kind_ == Kind::Assert && items.size() == assert_operators().size();
+  PickPopup* p = nullptr;
+  if (reuse && op_pick_ && op_pick_->is_closed()) {
+    p = op_pick_;
+    p->reopen(cur);
+  } else {
+    p = new PickPopup(this, std::move(items), cur);
+    if (reuse && !op_pick_) {
+      p->keep = true;
+      op_pick_ = p;
+    }
+  }
   pick_ = p;
   pick_row_ = row;
   p->on_close = [this, p] {
@@ -1614,6 +1636,12 @@ void KvGrid::open_picker(int row, wxChar first) {
   r.SetPosition(GetGridWindow()->ClientToScreen(CalcScrolledPosition(r.GetPosition())));
   if (first) p->chr(first);
   p->show_below(r);
+}
+
+void KvGrid::hide_tip() {
+  if (tip_row_ == -2 && tip_col_ == -2) return;
+  tip_row_ = tip_col_ = -2;  // the next mouse move computes it again
+  GetGridWindow()->UnsetToolTip();
 }
 
 void KvGrid::update_tooltip(int row, int col) {

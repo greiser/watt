@@ -52,6 +52,10 @@ struct InheritView {
   std::vector<std::string> errors;     // folder.json files that could not be used
   // Folder / collection variables, nearest level first (name, value as written), enabled only.
   std::vector<std::pair<std::string, std::string>> vars;
+  // Variables the folders' / collection's pre-request scripts set (script_set_names), and
+  // whether one of them may set any name (a computed name): they count as defined {{vars}}.
+  std::vector<std::string> script_vars;
+  bool script_vars_dynamic = false;
   std::string network;  // network_summary() of what the levels above set
   OptionsAbove opts;    // redirect / URL / TLS options set above
   // One line for the Auth tab: "Bearer token from api/users: token abc123...f9e0".

@@ -1629,6 +1629,7 @@ class ResponseView : public wxPanel, public ResponsePanel {
     Bind(wxEVT_SIZE, [this](wxSizeEvent& e) {
       if (!GetSizer()) return e.Skip();
       TraceScope ts("size.layout");
+      wf_->pane_height(e.GetSize().y);
       Layout();
     });
     tl.lap("strips");
@@ -1798,7 +1799,7 @@ class ResponseView : public wxPanel, public ResponsePanel {
                              "again (its delta compares with the run of the same request before it)", -1, true);
     hist_->set_visible(1, false);
     hist_->set_bottom_rule(true);  // the tab strip's rule runs to the pane's right edge
-    hist_->SetMinSize(wxSize(FromDIP(220), -1));
+    hist_->set_fit_width(true);  // only as wide as its chips: the tabs keep the rest
     auto* tabrow = new wxBoxSizer(wxHORIZONTAL);
     tabrow->Add(tabs_, 1, wxEXPAND);
     tabrow->Add(hist_, 0, wxEXPAND);

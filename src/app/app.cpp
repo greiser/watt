@@ -184,6 +184,10 @@ class App : public wxApp {
   bool OnInit() override {
     SetAppearance(Appearance::System);  // must run before the first window is created
     SetAppName("watt");
+    // No window uses wxEVT_UPDATE_UI (no menu bar, no toolbars): without this, every idle pass
+    // (a timer tick, a mouse move) sent one to each of the thousands of windows of the open
+    // tabs, a few ms of CPU per wake-up while nothing happens.
+    wxUpdateUIEvent::SetMode(wxUPDATE_UI_PROCESS_SPECIFIED);
 
     Trace& t = trace();
     std::filesystem::path ws;

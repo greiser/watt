@@ -1531,6 +1531,29 @@ void BodyView::show_doc(int m) {
   start_styling();
   if (resp_ && (wrap_ || m == Wrapped || m == RawWrap)) sync_wrap();
   lap("show.wrap");
+  release_hidden(m);
+}
+
+static void drop_table(JsonTable* t);  // after JsonTable (below)
+
+// A big body shown in one view at a time: the other views' documents (a 10 MB body's Hex dump is
+// ~45 MB of text, held twice by Scintilla with its styles) and the table go once another view
+// is on screen, and are built again on a worker when picked. Pretty (the default view, and the
+// Outline's source) stays.
+void BodyView::release_hidden(int shown) {
+  const int src = shown == Wrapped ? docs_[Wrapped].src : shown == RawWrap ? Raw : -1;
+  for (int i = 0; i < kModes; ++i) {
+    if (i == shown || i == src || i == Pretty || i == Table || i == Preview || i == Visualize) continue;
+    Doc& d = docs_[i];
+    if (!d.doc || d.building || !d.heavy) continue;
+    if (i == Wrapped || i == RawWrap) ++wrap_seq_;
+    stc_->ReleaseDocument(d.doc);
+    d = Doc{};
+  }
+  if (table_win_ && !table_win_->IsShown() && table_gen_ != ~0ull && resp_ && resp_->body.size() > (1u << 20)) {
+    drop_table(table_);
+    table_gen_ = table_fseq_ = ~0ull;
+  }
 }
 
 void BodyView::auto_wrap(const Doc& d) {
@@ -1826,7 +1849,11 @@ void BodyView::on_chip(int id) {
     case kRaw: choose_mode(Raw); break;
     case kHex: choose_mode(Hex); break;
     case kPreview: choose_mode(Preview); break;
-    case kTable: choose_mode(Table); break;
+    case kTable:
+      choose_mode(Table);
+      // The keyboard goes to the table (Ctrl+End, PgDn work at once), as a click on it would.
+      if (table_win_ && table_win_->IsShown()) table_win_->SetFocus();
+      break;
     case kVisualize: choose_mode(Visualize); break;
     case kViewAs: view_as_menu(); break;
     case kWrap:
@@ -2885,6 +2912,10 @@ class JsonTable : public wxWindow {
   uint64_t sort_seq_ = 0;
   std::shared_ptr<bool> alive_;
 };
+
+static void drop_table(JsonTable* t) {
+  if (t) t->set(std::make_shared<TableModel>());
+}
 
 void BodyView::show_table() {
   if (!table_) {

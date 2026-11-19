@@ -131,6 +131,17 @@ class MainFrame : public wxFrame, public SidebarHost {
   wxWindow* spare_park_ = nullptr;              // hidden parent for spares, outside the notebook
   std::vector<wxWindow*> retired_;  // tabs replaced by a spare, parked hidden, destroyed in a quiet moment
   std::vector<RequestTab*> closed_;  // closed tabs, parked hidden, torn down in slices (prebuild_step)
+  // A closed HTTP tab: recycled as the spare when it is a pristine built tab (Ctrl+T, Ctrl+W),
+  // else parked in closed_ (at most kMaxParked: the oldest are destroyed at once beyond that).
+  void park_closed(RequestTab* t);
+  // One teardown slice of closed_ / surplus retired_ tabs, run by reap_timer_ whether or not
+  // the user is typing (parked tabs hold ~76 USER objects each). False: nothing left.
+  bool reap_slice();
+  void reap_later();
+  wxTimer* reap_timer_ = nullptr;
+  // Closes the given pages (indices) in one batch: one save question for the dirty ones.
+  void close_tabs(std::vector<int> idx);
+  void tab_menu(int idx);  // the tab strip's right-click menu
   RequestTab* replace_with_spare(size_t idx, SavedRequest& r, bool preview, bool defer = false);
   // A swap replace_with_spare(defer) loaded but has not shown yet (finish_swap does, from a posted
   // kSwapMsg, or first thing in any call that looks at or changes the pages).

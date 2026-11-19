@@ -463,9 +463,56 @@ class Parser {
     if (i_ < s_.size()) return fail(std::string("unexpected '") + s_[i_] + "'" + (s_[i_] == ')' ? "" : " (join with +)"));
     return true;
   }
+  // Text with {{vars}} and function calls in it, as Bruno / Postman users write a value:
+  // "{{userId}}-lower(req.method)" -> "42-get". Everything else is kept as written; a name
+  // followed by "(" must be one of the functions.
+  bool run_template(std::string& out) {
+    if (s_.size() > kMaxPreExprBytes) return fail("expression longer than " + std::to_string(kMaxPreExprBytes) + " bytes");
+    err_.clear();
+    out.clear();
+    i_ = 0;
+    while (i_ < s_.size() && blank(s_[i_])) ++i_;
+    size_t end = s_.size();
+    while (end > i_ && blank(s_[end - 1])) --end;
+    std::string t;
+    bool calls = false;
+    while (i_ < end) {
+      const char c = s_[i_];
+      if (c == '{' && i_ + 1 < end && s_[i_ + 1] == '{') {
+        const size_t close = s_.find("}}", i_ + 2);
+        if (close == std::string_view::npos || close + 2 > end) return fail("{{ without }}");
+        const std::string_view name = trim_view(s_.substr(i_ + 2, close - i_ - 2));
+        if (name.empty()) return fail("empty {{}}");
+        if (computing()) out += expand_("{{" + std::string(name) + "}}");
+        i_ = close + 2;
+      } else if (ident_start(c) && (i_ == 0 || !word(s_[i_ - 1]))) {
+        const size_t b = i_;
+        while (i_ < end && word(s_[i_])) ++i_;
+        const std::string_view name = s_.substr(b, i_ - b);
+        size_t p = i_;
+        while (p < end && blank(s_[p])) ++p;
+        if (p < end && s_[p] == '(') {
+          i_ = p;
+          if (!call(name, b, t, 1)) return false;
+          out += t;
+          calls = true;
+        } else {
+          out.append(name);
+        }
+      } else if (c == '\'' || c == '"' || c == '+') {
+        return fail("unexpected");  // an expression after all ("{{a}} - 'x'"): its own error stands
+      } else {
+        out += c;
+        ++i_;
+      }
+      if (out.size() > kMaxPreValueBytes) return fail("value too large");
+    }
+    return calls || fail("no call");  // text without calls is template_text()'s
+  }
   const std::string& error() const { return err_; }
 
  private:
+  static bool word(char ch) { return ident_start(ch) || (ch >= '0' && ch <= '9'); }
   bool fail(std::string m) {
     if (err_.empty()) err_ = i_ < s_.size() ? "col " + std::to_string(i_ + 1) + ": " + m : m;
     return false;
@@ -535,7 +582,7 @@ class Parser {
       const std::string_view name = trim_view(s_.substr(i_ + 2, close - i_ - 2));
       if (name.empty()) return fail("empty {{}}");
       i_ = close + 2;
-      if (computing()) out = c_.ws->expand("{{" + std::string(name) + "}}");
+      if (computing()) out = expand_("{{" + std::string(name) + "}}");
       return true;
     }
     if (c == '(') {
@@ -618,18 +665,18 @@ class Parser {
       if (f == "method") {
         out = r.http.method;
       } else if (f == "url") {
-        if (!c_.url) c_.url = c_.ws->expand(r.http.url);
+        if (!c_.url) c_.url = expand_(r.http.url);
         out = *c_.url;
       } else if (f == "body") {
-        if (!c_.body) c_.body = c_.ws->expand(r.http.body);
+        if (!c_.body) c_.body = expand_(r.http.body);
         out = *c_.body;
       } else {
         const std::string want = lower_ascii(std::string(f.substr(8)));
         out.clear();
         for (size_t k = 0; k < r.http.headers.size(); ++k) {
           if (r.disabled_headers.count(k)) continue;
-          if (lower_ascii(c_.ws->expand(r.http.headers[k].first)) == want) {
-            out = c_.ws->expand(r.http.headers[k].second);
+          if (lower_ascii(expand_(r.http.headers[k].first)) == want) {
+            out = expand_(r.http.headers[k].second);
             break;
           }
         }
@@ -638,7 +685,7 @@ class Parser {
     }
     if (!computing()) return true;
     const std::string ref = "{{" + std::string(name) + "}}";
-    out = c_.ws->expand(ref);
+    out = expand_(ref);
     if (out == ref) {
       i_ = at;
       return fail("'" + std::string(name) + "' is not defined (text needs quotes)");
@@ -662,9 +709,12 @@ class Parser {
     }
     if (i_ >= s_.size()) return fail(std::string("closing ") + q + " is missing");
     ++i_;
-    if (vars && computing()) out = c_.ws->expand(out);
+    if (vars && computing()) out = expand_(out);
     return true;
   }
+
+  // {{vars}} as the send expands them: with the request's folder / collection variables.
+  std::string expand_(const std::string& t) const { return c_.r ? c_.ws->expand(t, *c_.r) : c_.ws->expand(t); }
 
   std::string_view s_;
   Ctx& c_;
@@ -714,6 +764,11 @@ std::string check_pre_expr(std::string_view expr) {
   Parser p(expr, c);
   std::string out;
   if (p.run(out) || (template_text(expr) && syntax_fails(expr))) return {};
+  if (syntax_fails(expr)) {
+    Ctx c2;
+    Parser t(expr, c2);
+    if (t.run_template(out)) return {};
+  }
   return with_hint(expr, p.error());
 }
 
@@ -741,8 +796,15 @@ std::vector<PreVarResult> evaluate_pre_vars(const std::vector<PreVar>& rows, con
       std::string v;
       bool parsed = p.run(v);
       if (!parsed && template_text(pv.expr) && syntax_fails(pv.expr)) {
-        v = ws.expand(std::string(trim_view(pv.expr)));  // plain text, e.g. {{userId}}-x
+        v = ws.expand(std::string(trim_view(pv.expr)), r);  // plain text, e.g. {{userId}}-x
         parsed = true;
+      }
+      if (!parsed && syntax_fails(pv.expr)) {
+        Ctx c2;
+        c2.r = &r;
+        c2.ws = &ws;
+        Parser t(pv.expr, c2);
+        if (t.run_template(v)) parsed = true;  // text with calls: {{userId}}-lower(req.method)
       }
       if (!parsed) {
         res.message = with_hint(pv.expr, p.error());

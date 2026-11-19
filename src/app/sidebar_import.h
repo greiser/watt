@@ -85,6 +85,20 @@ struct ImportWritten {
 // workspace's environments: merge r.envs on the UI thread (merge_import_envs).
 ImportWritten write_import(Workspace& ws, const std::filesystem::path& dest, ImportResult& r);
 
+// "Sync requests from spec": writes r (an import parsed again, e.g. an OpenAPI document that
+// changed) into the existing folder `top` it was imported to, keeping what is there. A request
+// whose method + URL any request under top already has, or whose file name exists, is kept as
+// it is (it may have been edited); only the operations that are new get a file. A folder's
+// settings (folder.json) are written only where it has none yet. Nothing is deleted: requests
+// under top that the document no longer has are counted (and named) as stale.
+struct SyncWritten {
+  size_t added = 0, kept = 0;
+  std::vector<std::string> stale;    // "GET /old" requests under top the document has no more
+  std::vector<std::string> skipped;  // parse skips, then write failures
+  std::filesystem::path first_added;
+};
+SyncWritten sync_import(Workspace& ws, const std::filesystem::path& top, ImportResult& r);
+
 // Adds the imported environments to `envs`: a new name is appended, an existing one gets the
 // variables it lacks (its own values win). Returns how many environments were added or changed.
 size_t merge_import_envs(std::vector<Environment>& envs, const std::vector<Environment>& imported);

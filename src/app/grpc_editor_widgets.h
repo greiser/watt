@@ -102,9 +102,12 @@ class TabStrip : public wxControl {
   };
   void paint();
   void layout_tabs(wxDC& dc);
+  void more_menu();
   std::vector<Tab> tabs_;
   size_t sel_ = 0;
-  int hover_ = -1;
+  int hover_ = -1;  // -2: the overflow button
+  // The tabs that do not fit (never the selected one) are listed under this "»" button.
+  wxRect more_rect_;
 };
 
 }  // namespace watt::app::grpced

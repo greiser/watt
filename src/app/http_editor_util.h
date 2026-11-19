@@ -64,6 +64,17 @@ using VarExpander = std::function<std::string(const std::string&)>;
 std::string expand_url(std::string_view tmpl, const VarExpander& expand_var);
 // encode = false: {{var}} values go in as they are and the result is only minimal_url()ed.
 std::string expand_url(std::string_view tmpl, const VarExpander& expand_var, bool encode);
+// The expander the send uses while it builds the request on the UI thread: a {{name}} that this
+// send's pre-request scripts may set (listed in set_names, or any name when one of them computes
+// its names) is kept as written, so the core expands it after the scripts ran. Expanding it here
+// would send the value the previous run left in the runtime variables. A kept name inside the
+// query goes out as {{name|q}}, inside an x-www-form-urlencoded body (expand_form) as
+// {{name|f}}: the core then query_encode()s / form_encode()s the value it substitutes there, so
+// a script-set "a b" or "x&y=1" is sent exactly as the same value from an environment.
+// {{process.env.X}} / {{$env.X}} are never kept (their consent check reads the plain name).
+// Plain text (a raw body): each {{var}} replaced by its value as it is, nothing encoded.
+std::string expand_text(std::string_view tmpl, const VarExpander& expand_var);
+VarExpander keep_script_vars(VarExpander inner, std::vector<std::string> set_names, bool any_name);
 // Path variables: "/:name" segments of the path (Postman, Insomnia, Bruno). The name is
 // [A-Za-z0-9_-]+ right after "/:"; the scheme, the authority (a ":port"), the query, the
 // fragment and {{vars}} are never read as one.
@@ -333,5 +344,32 @@ std::string graphql_body(std::string_view query, std::string_view variables, std
 // pretty printed (2 spaces), operation_name empty when there is none.
 bool split_graphql_body(std::string_view body, std::string& query, std::string& variables,
                         std::string* operation_name = nullptr);
+
+// The {{variables}} a pre-request script sets, read from its text (no script runs): the name
+// given as a string literal to pm.variables / environment / globals / collectionVariables .set
+// and bru.setVar / setEnvVar / setGlobalEnvVar, in order, each once. Comments are skipped.
+// *dynamic is set when such a call names its variable with an expression (or the script
+// rewrites pm.request.url / req.setUrl): then any name may be set by the script.
+std::vector<std::string> script_set_names(std::string_view js, bool* dynamic = nullptr);
+
+// A themed pick list's ranking (the Assert Operator cell and the other PickPopup lists): the
+// indices of the items a typed filter keeps, best first. An exact value or alias comes first
+// ("<" is lt even though neq has the alias "<>"), then a value or alias that starts with the
+// filter, then a value that contains it, then a description that contains it. Case-insensitive
+// (ASCII); list order breaks ties. An empty filter keeps every item in order.
+struct PickMatch {
+  std::string value, alias, desc;  // alias: other spellings, space separated
+};
+std::vector<size_t> rank_pick_matches(const std::vector<PickMatch>& items, std::string_view filter);
+
+// The Assert table's operators, in list order: value, description, group, and the symbols people
+// type for them ("== ===" for eq, "<" for lt; "" for none).
+struct AssertOperator {
+  const char* value;
+  const char* desc;
+  const char* group;
+  const char* alias;
+};
+const std::vector<AssertOperator>& assert_operators();
 
 }  // namespace watt::app::http_editor

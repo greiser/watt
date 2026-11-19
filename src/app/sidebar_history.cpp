@@ -119,6 +119,15 @@ std::string history_when_label(const std::string& iso) {
 HistoryList::HistoryList(wxWindow* parent)
     : wxVListBox(parent, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxBORDER_NONE | wxLB_SINGLE) {
   SetBackgroundColour(window_colour());
+  // The selected row's band follows the focus (OnDrawBackground).
+  Bind(wxEVT_SET_FOCUS, [this](wxFocusEvent& e) {
+    Refresh(false);
+    e.Skip();
+  });
+  Bind(wxEVT_KILL_FOCUS, [this](wxFocusEvent& e) {
+    Refresh(false);
+    e.Skip();
+  });
   // A click opens the row as a preview (the host reuses the preview tab or activates the tab
   // that already shows it, so clicks never pile up tabs); a double click or Enter keeps it.
   // A click on a run's "x60" chip folds / unfolds the run instead.
@@ -614,7 +623,9 @@ wxCoord HistoryList::OnMeasureItem(size_t n) const {
 void HistoryList::OnDrawBackground(wxDC& dc, const wxRect& rect, size_t n) const {
   if (n >= rows_.size() || rows_[n].entry < 0) return;
   wxColour bg;
-  if (IsSelected(n)) bg = highlight_colour();
+  // The entry the shown tab holds: the accent band while the list has the keyboard, a quiet grey
+  // one otherwise (as the tree's unfocused selection), so it never looks like the active control.
+  if (IsSelected(n)) bg = HasFocus() ? highlight_colour() : mix(window_colour(), text_colour(), 0.10);
   else if (static_cast<int>(n) == hover_) bg = mix(window_colour(), text_colour(), 0.06);
   else return;
   dc.SetBrush(wxBrush(bg));

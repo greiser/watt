@@ -950,7 +950,8 @@ bool node_less(const CollectionNode& a, const CollectionNode& b) {
 
 // `on_file(child, entry, key)` fills a request node's badge; key = path relative to the root.
 template <class OnFile>
-void scan_dir(const fs::path& dir, CollectionNode& node, int depth, const std::string& prefix, const OnFile& on_file) {
+void scan_dir(const fs::path& dir, CollectionNode& node, int depth, const std::string& prefix, const OnFile& on_file,
+              std::set<fs::path>* with_folder_file = nullptr) {
   if (depth > 32) return;
   std::error_code ec;
   fs::directory_iterator it(dir, fs::directory_options::skip_permission_denied, ec);
@@ -965,8 +966,10 @@ void scan_dir(const fs::path& dir, CollectionNode& node, int depth, const std::s
       child.name = name;
       child.path = e.path();
       child.is_folder = true;
-      scan_dir(e.path(), child, depth + 1, prefix + name + "/", on_file);
+      scan_dir(e.path(), child, depth + 1, prefix + name + "/", on_file, with_folder_file);
       node.children.push_back(std::move(child));
+    } else if (with_folder_file && name == kFolderFile) {
+      with_folder_file->insert(dir);
     } else if (ends_with(name, kReqExt) && name.size() > std::char_traits<char>::length(kReqExt)) {
       CollectionNode child;
       child.name = name.substr(0, name.size() - std::char_traits<char>::length(kReqExt));
@@ -1417,6 +1420,10 @@ detail::TreeIndex& Workspace::tree_index() const {
   return *tree_index_;
 }
 
+namespace {
+void order_tree(detail::FolderCache& fc, const fs::path& root, CollectionNode& n, const std::set<fs::path>& with_file);
+}  // namespace
+
 CollectionNode Workspace::tree(double badge_budget_ms) const {
   using clock = std::chrono::steady_clock;
   const auto t0 = clock::now();
@@ -1502,6 +1509,7 @@ CollectionNode Workspace::tree(double badge_budget_ms) const {
     grow(queued);
     qcv.notify_one();
   };
+  std::set<fs::path> with_folder_file;
   scan_dir(root_, node, 0, std::string(), [&](CollectionNode& child, const fs::directory_entry& e, std::string key) {
     std::error_code ec;
     const int64_t mtime = mtime_of(e.last_write_time(ec));
@@ -1533,7 +1541,7 @@ CollectionNode Workspace::tree(double badge_budget_ms) const {
     child.kind = it->second.kind;
     child.method = it->second.method;
     seen.insert(std::move(key));
-  });
+  }, &with_folder_file);
   if (seen.size() != idx.entries.size()) {  // deleted or renamed files
     std::vector<std::string> gone;
     for (const auto& kv : idx.entries)
@@ -1592,6 +1600,8 @@ CollectionNode Workspace::tree(double badge_budget_ms) const {
     fill(fill, node, std::string());
   }
   idx.flush();
+  lock.unlock();
+  order_tree(folder_cache(), root_, node, with_folder_file);
   return node;
 }
 
@@ -1725,6 +1735,7 @@ namespace detail {
 
 struct LoadedFolder {
   FolderSettings s;
+  std::vector<std::string> order;           // "order": the folder's item file names (folder_order())
   std::map<std::string, std::string> vars;  // the enabled vars (the first row of a name wins)
   std::string error;                        // why the file cannot be used ("" = it can)
 };
@@ -1773,6 +1784,58 @@ namespace {
 
 SettingsOrigin collection_origin(const fs::path& root) {
   return SettingsOrigin{SettingsOrigin::Level::Collection, root, "Collection"};
+}
+
+// A name an "order" list may hold: one plain file name (a folder.json comes from the workspace,
+// maybe a cloned repository, so never a path).
+bool plain_order_name(std::string_view n) {
+  if (n.empty() || n.size() > 255 || n == "." || n == "..") return false;
+  return std::none_of(n.begin(), n.end(), [](char c) {
+    return c == '/' || c == '\\' || c == ':' || static_cast<unsigned char>(c) < 0x20;
+  });
+}
+
+std::vector<std::string> order_from(const Value& o) {
+  std::vector<std::string> out;
+  auto it = o.FindMember("order");
+  if (it == o.MemberEnd() || !it->value.IsArray()) return out;
+  std::set<std::string> seen;
+  for (const auto& v : it->value.GetArray()) {
+    if (!v.IsString() || out.size() >= 100000) continue;
+    std::string n(v.GetString(), v.GetStringLength());
+    if (plain_order_name(n) && seen.insert(lower_ascii(n)).second) out.push_back(std::move(n));
+  }
+  return out;
+}
+
+// Natural, case-insensitive ("endpoint 2" < "endpoint 10"), as the sidebar and the runner
+// compare names.
+bool natural_name_less(std::string_view a, std::string_view b) {
+  auto digit = [](char c) { return c >= '0' && c <= '9'; };
+  auto low = [](char c) { return c >= 'A' && c <= 'Z' ? static_cast<char>(c - 'A' + 'a') : c; };
+  size_t i = 0, j = 0;
+  while (i < a.size() && j < b.size()) {
+    if (digit(a[i]) && digit(b[j])) {
+      size_t ie = i, je = j;
+      while (ie < a.size() && digit(a[ie])) ++ie;
+      while (je < b.size() && digit(b[je])) ++je;
+      size_t is = i, js = j;
+      while (is + 1 < ie && a[is] == '0') ++is;
+      while (js + 1 < je && b[js] == '0') ++js;
+      if (ie - is != je - js) return ie - is < je - js;
+      if (int c = a.substr(is, ie - is).compare(b.substr(js, je - js)); c != 0) return c < 0;
+      if (ie - i != je - j) return ie - i < je - j;
+      i = ie;
+      j = je;
+      continue;
+    }
+    const char x = low(a[i]), y = low(b[j]);
+    if (x != y) return static_cast<unsigned char>(x) < static_cast<unsigned char>(y);
+    ++i;
+    ++j;
+  }
+  if (a.size() - i != b.size() - j) return a.size() - i < b.size() - j;
+  return a < b;
 }
 
 // The folder.json of `dir` (nullptr when there is none). folder.json comes from the workspace,
@@ -1834,12 +1897,71 @@ std::shared_ptr<const detail::LoadedFolder> load_folder_file(detail::FolderCache
     } else {
       auto l = std::make_shared<detail::LoadedFolder>();
       folder_from_value(d, l->s);
+      l->order = order_from(d);
       for (const auto& v : l->s.vars)
         if (v.enabled) l->vars.emplace(v.name, v.value);
       out = std::move(l);
     }
   }
   return remember(true, mtime, size, std::move(out));
+}
+
+// Each folder's children: subfolders first, then requests, each in the stored order (folders
+// listed in `with_file` have a folder.json), the rest in natural name order.
+void order_tree(detail::FolderCache& fc, const fs::path& root, CollectionNode& n, const std::set<fs::path>& with_file) {
+  std::map<std::string, size_t> rank;
+  if (with_file.count(n.path))
+    if (auto d = load_folder_file(fc, root, n.path); d && d->error.empty() && !d->order.empty()) {
+      n.order = d->order;
+      for (size_t i = 0; i < n.order.size(); ++i) rank.emplace(lower_ascii(n.order[i]), i);
+    }
+  struct Key {
+    size_t rank;
+    CollectionNode* c;
+  };
+  std::vector<Key> keys;
+  keys.reserve(n.children.size());
+  for (auto& c : n.children) {
+    size_t r = SIZE_MAX;
+    if (!rank.empty())
+      if (auto it = rank.find(lower_ascii(to_utf8(c.path.filename()))); it != rank.end()) r = it->second;
+    keys.push_back({r, &c});
+  }
+  std::sort(keys.begin(), keys.end(), [](const Key& a, const Key& b) {
+    if (a.c->is_folder != b.c->is_folder) return a.c->is_folder;
+    if (a.rank != b.rank) return a.rank < b.rank;
+    return natural_name_less(a.c->name, b.c->name);
+  });
+  std::vector<CollectionNode> sorted;
+  sorted.reserve(keys.size());
+  for (const Key& k : keys) sorted.push_back(std::move(*k.c));
+  n.children = std::move(sorted);
+  for (auto& c : n.children)
+    if (c.is_folder) order_tree(fc, root, c, with_file);
+}
+
+std::mutex& folder_write_mutex() {  // folder.json read-modify-writes (settings and order)
+  static std::mutex m;
+  return m;
+}
+
+// The "order" member of `file` as it is on disk now (not the cache: a write must not drop an
+// order saved a moment ago). Empty when there is none or the file is not valid JSON.
+std::vector<std::string> disk_order(const fs::path& file) {
+  std::string text;
+  detail::PathStat st;
+  if (!detail::stat_path(file, st) || st.is_link || st.is_dir || st.size > kFolderFileMax || !detail::read_file(file, text))
+    return {};
+  rapidjson::Document d;
+  d.Parse(text.data(), text.size());
+  if (d.HasParseError() || !d.IsObject()) return {};
+  return order_from(d);
+}
+
+Value order_value(const std::vector<std::string>& names, Alloc& a) {
+  Value arr(rapidjson::kArrayType);
+  for (const auto& n : names) arr.PushBack(jstr(n, a), a);
+  return arr;
 }
 
 bool has_ctl_break(const std::string& s) {
@@ -2067,8 +2189,10 @@ bool Workspace::save_folder_settings(const fs::path& folder, const FolderSetting
     if (err) *err = to_utf8(file) + " is a link: not written";
     return false;
   }
+  std::lock_guard<std::mutex> wlock(folder_write_mutex());
   rapidjson::Document d;
-  const Value v = folder_value(s, d.GetAllocator());
+  Value v = folder_value(s, d.GetAllocator());
+  if (auto keep = disk_order(file); !keep.empty()) v.AddMember("order", order_value(keep, d.GetAllocator()), d.GetAllocator());
   bool ok = true;
   if (v.MemberCount() <= 1) {  // nothing set: no file (a workspace that does not use it never has one)
     if (fs::exists(file, ec)) {
@@ -2084,6 +2208,75 @@ bool Workspace::save_folder_settings(const fs::path& folder, const FolderSetting
   detail::FolderCache& fc = folder_cache();
   std::lock_guard<std::mutex> lock(fc.mu);
   fc.entries.erase(file);  // read again next time (a rewrite within the same mtime tick and size)
+  return ok;
+}
+
+std::vector<std::string> Workspace::folder_order(const fs::path& folder) const {
+  const fs::path dir = (folder.is_relative() && !is_ambiguous_rooted_path(folder) ? root_ / folder : folder).lexically_normal();
+  if (!request_path_inside(root_, dir / kFolderFile, nullptr)) return {};
+  auto d = load_folder_file(folder_cache(), root_, dir);
+  return d && d->error.empty() ? d->order : std::vector<std::string>{};
+}
+
+bool Workspace::save_folder_order(const fs::path& folder, const std::vector<std::string>& names, std::string* err) const {
+  const fs::path file =
+      ((folder.is_relative() && !is_ambiguous_rooted_path(folder) ? root_ / folder : folder) / kFolderFile).lexically_normal();
+  if (!request_path_inside(root_, file, err)) return false;
+  std::error_code ec;
+  if (!fs::is_directory(file.parent_path(), ec)) {  // a folder deleted meanwhile: never re-create it
+    if (names.empty()) return true;
+    if (err) *err = to_utf8(file.parent_path()) + " is not a folder";
+    return false;
+  }
+  if (fs::is_symlink(file, ec)) {
+    if (err) *err = to_utf8(file) + " is a link: not written";
+    return false;
+  }
+  std::lock_guard<std::mutex> wlock(folder_write_mutex());
+  rapidjson::Document d;
+  std::string text;
+  detail::PathStat st;
+  if (detail::stat_path(file, st) && st.exists) {
+    if (st.is_dir || st.size > kFolderFileMax || !detail::read_file(file, text)) {
+      if (err) *err = to_utf8(file) + " cannot be read";
+      return false;
+    }
+    d.Parse(text.data(), text.size());
+    if (d.HasParseError() || !d.IsObject()) {  // never overwrite settings the user is fixing
+      if (err) *err = d.HasParseError() ? parse_error_text(d, file) : to_utf8(file) + ": not a JSON object";
+      return false;
+    }
+  } else {
+    d.SetObject();
+  }
+  std::vector<std::string> clean;
+  std::set<std::string> seen;
+  for (const auto& n : names)
+    if (plain_order_name(n) && seen.insert(lower_ascii(n)).second) clean.push_back(n);
+  Alloc& a = d.GetAllocator();
+  d.RemoveMember("order");
+  if (!d.HasMember("version")) {  // "version" first, as folder_value() writes it
+    Value o(rapidjson::kObjectType);
+    o.AddMember("version", 1, a);
+    for (auto m = d.MemberBegin(); m != d.MemberEnd(); ++m) o.AddMember(m->name, m->value, a);
+    static_cast<Value&>(d).Swap(o);
+  }
+  if (!clean.empty()) d.AddMember("order", order_value(clean, a), a);
+  bool ok = true;
+  if (d.MemberCount() <= 1) {
+    if (fs::exists(file, ec)) {
+      fs::remove(file, ec);
+      if (ec) {
+        if (err) *err = "cannot remove " + to_utf8(file) + ": " + ec.message();
+        ok = false;
+      }
+    }
+  } else {
+    ok = write_if_changed(file, detail::json_pretty(d), err);
+  }
+  detail::FolderCache& fc = folder_cache();
+  std::lock_guard<std::mutex> lock(fc.mu);
+  fc.entries.erase(file);
   return ok;
 }
 
@@ -2917,7 +3110,10 @@ void collect_env_refs(const std::string& s, std::vector<std::string>& out) {
   for (size_t open = s.find("{{"); open != std::string::npos; open = s.find("{{", open + 2)) {
     const size_t close = s.find("}}", open + 2);
     if (close == std::string::npos) return;
-    const std::string var = os_env_name(trim(std::string_view(s).substr(open + 2, close - open - 2)));
+    std::string name = trim(std::string_view(s).substr(open + 2, close - open - 2));
+    // An encode mark ({{process.env.X|q}}) names the same variable: it must be asked for too.
+    if (var_mark(name)) name = trim(std::string_view(name).substr(0, name.size() - 2));
+    const std::string var = os_env_name(name);
     if (var.empty()) continue;
     if (std::none_of(out.begin(), out.end(), [&](const std::string& o) { return same_env_name(o, var); }))
       out.push_back(var);
@@ -2928,6 +3124,132 @@ std::vector<std::string> read_env_allowlist(const fs::path& root);  // below, wi
 fs::path resolved_path(const fs::path& p);
 
 }  // namespace
+
+char var_mark(std::string_view name) {
+  if (name.size() > 2 && name[name.size() - 2] == '|' && (name.back() == 'q' || name.back() == 'f' || name.back() == 'p'))
+    return name.back();
+  return 0;
+}
+
+std::string var_mark_encode(std::string_view v, char mark) {
+  static const char* hex = "0123456789ABCDEF";
+  std::string out;
+  out.reserve(v.size() + 8);
+  for (size_t i = 0; i < v.size();) {
+    if (v[i] == '{' && i + 1 < v.size() && v[i + 1] == '{') {  // a {{var}} left unknown stays readable
+      const size_t close = v.find("}}", i + 2);
+      if (close != std::string_view::npos && v.substr(i + 2, close - i - 2).find_first_of("{\n") == std::string_view::npos) {
+        out.append(v.substr(i, close + 2 - i));
+        i = close + 2;
+        continue;
+      }
+    }
+    const auto c = static_cast<unsigned char>(v[i]);
+    if (mark == 'p') {  // as a typed URL path is normalized
+      bool enc = c <= 0x20 || c >= 0x7F || c == '"' || c == '<' || c == '>' || c == 0x5C || c == '^' || c == '`' ||
+                 c == '{' || c == '|' || c == '}';
+      auto hexd = [](char h) { return (h >= '0' && h <= '9') || (h >= 'a' && h <= 'f') || (h >= 'A' && h <= 'F'); };
+      if (c == '%' && !(i + 2 < v.size() && hexd(v[i + 1]) && hexd(v[i + 2]))) enc = true;
+      if (enc) {
+        out += '%';
+        out += hex[c >> 4];
+        out += hex[c & 15];
+      } else {
+        out += static_cast<char>(c);
+      }
+      ++i;
+      continue;
+    }
+    const bool unreserved = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' ||
+                            c == '.' || c == '_' || c == '~' || c == '*';
+    const bool query_literal = c == '!' || c == '$' || c == '\'' || c == '(' || c == ')' || c == ',' || c == ';' ||
+                               c == ':' || c == '@' || c == '/' || c == '?' || c == '[' || c == ']';
+    if (unreserved || (mark == 'q' && query_literal)) {
+      out += static_cast<char>(c);
+    } else if (mark == 'f' && c == ' ') {
+      out += '+';
+    } else {
+      out += '%';
+      out += hex[c >> 4];
+      out += hex[c & 15];
+    }
+    ++i;
+  }
+  return out;
+}
+
+std::string strip_var_marks(std::string_view s) {
+  std::string out;
+  out.reserve(s.size());
+  for (size_t i = 0; i < s.size();) {
+    const size_t open = s.find("{{", i);
+    if (open == std::string_view::npos) {
+      out.append(s.substr(i));
+      break;
+    }
+    const size_t close = s.find("}}", open + 2);
+    if (close == std::string_view::npos) {
+      out.append(s.substr(i));
+      break;
+    }
+    const std::string_view inner = s.substr(open + 2, close - open - 2);
+    out.append(s.substr(i, open - i));
+    if (inner.find("{{") == std::string_view::npos && var_mark(inner)) {
+      out += "{{";
+      out.append(inner.substr(0, inner.size() - 2));
+      out += "}}";
+      i = close + 2;
+    } else {
+      out += "{{";
+      i = open + 2;
+    }
+  }
+  return out;
+}
+
+std::string mark_url_vars(std::string_view url) {
+  if (url.find("{{") == std::string_view::npos) return std::string(url);
+  // Where the path starts, as the editor's normalize_url() finds it.
+  size_t from = 0;
+  const size_t sch = url.find("://");
+  const size_t first_delim = url.find_first_of("/?#");
+  if (sch != std::string_view::npos && (first_delim == std::string_view::npos || sch < first_delim))
+    from = url.find_first_of("/?#", sch + 3);
+  else
+    from = first_delim;
+  std::string out;
+  out.reserve(url.size() + 16);
+  char zone = 0;  // 0 before the path, then 'p', 'q' (query), 'f' (fragment)
+  for (size_t i = 0; i < url.size();) {
+    if (from != std::string_view::npos && i >= from && zone == 0) zone = 'p';
+    if (url[i] == '{' && i + 1 < url.size() && url[i + 1] == '{') {
+      const size_t close = url.find("}}", i + 2);
+      if (close != std::string_view::npos) {
+        const std::string_view inner = url.substr(i + 2, close - i - 2);
+        if (inner.find_first_of("{}\n|") == std::string_view::npos && !inner.empty()) {
+          const std::string name = trim(inner);
+          const bool os_env = name.rfind("process.env.", 0) == 0 || name.rfind("$env.", 0) == 0;
+          const char mark = zone == 'q' ? 'q' : zone ? 'p' : 0;
+          out += "{{";
+          out += name;
+          if (mark && !os_env && !name.empty()) {
+            out += '|';
+            out += mark;
+          }
+          out += "}}";
+          i = close + 2;
+          continue;
+        }
+      }
+    }
+    const char c = url[i];
+    if (zone == 'p' && c == '?') zone = 'q';
+    else if (zone && c == '#') zone = 'f';
+    out += c;
+    ++i;
+  }
+  return out;
+}
 
 std::string Workspace::expand(const std::string& s) const { return expand_in(s, nullptr); }
 
@@ -3045,15 +3367,20 @@ std::string Workspace::expand_in(const std::string& s, const FolderChain* c) con
         continue;
       }
       std::string value;
-      const std::string name = trim(inner);
+      std::string name = trim(inner);
+      // "{{name|q}}" / "{{name|f}}" (the HTTP editor's mark for a variable a pre-request script
+      // sets, see var_mark_encode()): the value is encoded for the URL query / a form body.
+      const char mark = var_mark(name);
+      if (mark) name = trim(std::string_view(name).substr(0, name.size() - 2));
       if (std::find(stack.begin(), stack.end(), name) == stack.end() && lookup(name, value)) {
         if (stack.size() < 8 && value.find("{{") != std::string::npos) {
           stack.push_back(name);
-          out += self(value, self);
+          value = self(value, self);
           stack.pop_back();
-        } else {
-          out += value;
         }
+        out += mark ? var_mark_encode(value, mark) : value;
+      } else if (mark) {
+        out += "{{" + name + "}}";  // unknown: left as the plain name, without the mark
       } else {
         out.append(in, open, close + 2 - open);  // unknown: leave as-is
       }

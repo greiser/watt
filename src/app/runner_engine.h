@@ -161,9 +161,9 @@ struct Phase {
   const char* name;  // static string: "DNS", "Connect", ...
   double ms;
 };
-// Pre-request vars / script, Auth / token, post-response script: time outside the response time.
+// Pre-request vars / script, post-response script: time outside the response time.
 bool is_script_phase(const Phase& p);
-bool is_setup_phase(const Phase& p);  // Prepare, Queue: StepResult::prep_ms, not response time
+bool is_setup_phase(const Phase& p);  // Prepare, Queue, Auth / token: StepResult::prep_ms, not response time
 
 // One data file row: (column, value) in the file's column order.
 using DataRow = std::vector<std::pair<std::string, std::string>>;
@@ -191,9 +191,10 @@ struct StepResult {
   // are in it.
   Timing timing;
   // The runner's own setup (expansion, files, consent checks), watt's request setup and the
-  // client queue before the first I/O: the Prepare and Queue phases (is_setup_phase).
+  // client queue before the first I/O, and the OAuth token step: the Prepare, Queue and
+  // Auth / token phases (is_setup_phase).
   double prep_ms = 0;
-  // Pre-request vars, pre-request script, Auth / token and post-response script, apart from
+  // Pre-request vars, pre-request script and post-response script, apart from
   // timing.total_ms (the Script column, the "incl. scripts" figures).
   double script_ms = 0;
   // In order; the network phases add up to timing.total_ms, the script ones (is_script_phase)

@@ -251,25 +251,42 @@ class QuickOpenDialog : public wxDialog {
       p = e + 1;
     }
     const FuzzyQuery fq(rest);
+    // A method word is also text: "get" finds "Get user" by its name too, and such name matches
+    // come first (the GET badge alone matches half the collection), with their letters marked.
+    const FuzzyQuery fq_all(have_kind ? q : std::string());
+    constexpr int kNameTier = 1 << 20;
     rows_.clear();
     for (size_t i = 0; i < items_.size(); ++i) {
       const QuickItem& it = items_[i];
+      const size_t ns = it.folder.empty() ? 0 : it.folder.size() + 1;
+      Row r{i, 0, {}};
+      if (!fq_all.empty()) {
+        // Only the name part counts here: a folder called "get" is not a name match.
+        int sc = 0;
+        std::vector<uint16_t> pos;
+        const std::string name = ascii_lower(std::string_view(targets_[i]).substr(std::min(ns, targets_[i].size())));
+        const bool in_name = std::all_of(fq_all.words().begin(), fq_all.words().end(),
+                                         [&](const std::string& w) { return name.find(w) != std::string::npos; });
+        if (in_name && fq_all.match(targets_[i], ns, &sc, &pos) && !pos.empty() && pos.front() >= ns) {
+          r.score = kNameTier + sc;
+          r.pos = std::move(pos);
+          rows_.push_back(std::move(r));
+          continue;
+        }
+      }
       if (have_kind) {
         if (it.kind != want_kind) continue;
         if (want_kind == RequestKind::Http && (!it.badge || ascii_lower(it.method) != want_method)) continue;
       }
-      Row r{i, 0, {}};
-      if (!fq.empty()) {
-        const size_t ns = it.folder.empty() ? 0 : it.folder.size() + 1;
-        if (!fq.match(targets_[i], ns, &r.score, &r.pos)) continue;
-      }
+      if (!fq.empty() && !fq.match(targets_[i], ns, &r.score, &r.pos)) continue;
       rows_.push_back(std::move(r));
     }
+    const bool name_hits = std::any_of(rows_.begin(), rows_.end(), [&](const Row& r) { return r.score >= kNameTier; });
     // Nothing matches every word: the closest, where a word may match only by its start ("svc150"
     // as "svc15": a number typed one digit off), fewest characters dropped first.
     near_ = false;
     if (rows_.empty() && !fq.empty()) near_fill(fq.words(), have_kind, want_kind, want_method);
-    if (fq.empty()) {
+    if (fq.empty() && !name_hits) {
       // Recently used first, then by path.
       std::stable_sort(rows_.begin(), rows_.end(), [this](const Row& a, const Row& b) {
         const int ra = items_[a.item].recent, rb = items_[b.item].recent;

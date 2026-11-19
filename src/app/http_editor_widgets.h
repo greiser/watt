@@ -94,6 +94,8 @@ class CheckButton : public wxControl {
   CheckButton(wxWindow* parent, const wxString& label);
   bool value() const { return on_; }
   void set_value(bool on);
+  void set_label(const wxString& label);
+  const wxString& label() const { return label_; }
   std::function<void()> on_change;
 
  protected:
@@ -131,10 +133,14 @@ class TabStrip : public wxControl {
   };
   void paint();
   void layout_tabs(wxDC& dc);
+  void more_menu();
   std::vector<Tab> tabs_;
   size_t sel_ = 0;
-  int hover_ = -1;
+  int hover_ = -1;  // -2: the overflow button
   int pad_ = 0;  // space around each label (less when the strip is narrow)
+  // The overflow button: the tabs that do not fit (never the selected one) are listed in its
+  // menu instead of being cut at the strip's edge. Empty when every tab fits.
+  wxRect more_rect_;
 };
 
 // A row of themed radio choices (the body modes): owner drawn, so the dark theme never shows a
@@ -170,6 +176,7 @@ struct PickItem {
   wxString value;  // what is picked ("contains")
   wxString desc;   // drawn dim after it ("substring / element / key")
   wxString group;  // header ("String"); "" for none
+  wxString alias;  // other spellings, space separated, matched like the value ("== ===" for eq)
 };
 
 class PickPopup : public wxPopupWindow {
@@ -208,6 +215,11 @@ class PickPopup : public wxPopupWindow {
   // The highlighted item's value, "" when none.
   wxString selected_value() const;
   void close();
+  // Kept for reuse: close() only hides it (callbacks dropped), reopen() arms it again. Building
+  // the window and measuring its items again on every open is what made opening it slow.
+  bool keep = false;
+  void reopen(const wxString& current);
+  bool is_closed() const { return closed_; }
 
  private:
   struct Row {
@@ -230,6 +242,7 @@ class PickPopup : public wxPopupWindow {
   int top_ = 0;   // first row drawn
   bool closed_ = false;
   wxRect anchor_;  // the screen rectangle it was shown under
+  int width_ = -1;  // the widest item's row width (show_below), -1: measure again
 };
 
 }  // namespace watt::app::http_editor

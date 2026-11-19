@@ -144,6 +144,13 @@ InheritView make_inherit_view(const EffectiveSettings& eff) {
   for (const auto& r : eff.vars)
     if (r.from.level != SettingsOrigin::Level::Request && r.row.enabled && !r.overridden && !r.row.name.empty())
       v.vars.emplace_back(r.row.name, r.row.value);
+  for (const auto& sc : eff.pre_scripts) {
+    if (sc.from.level == SettingsOrigin::Level::Request) continue;
+    bool dyn = false;
+    for (auto& n : script_set_names(sc.code, &dyn))
+      if (std::find(v.script_vars.begin(), v.script_vars.end(), n) == v.script_vars.end()) v.script_vars.push_back(n);
+    v.script_vars_dynamic = v.script_vars_dynamic || dyn;
+  }
   const bool from_level = eff.auth_from.level != SettingsOrigin::Level::Request;
   if (from_level) {
     v.source = eff.auth_from.label;

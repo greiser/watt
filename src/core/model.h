@@ -381,6 +381,10 @@ struct CollectionNode {           // folder tree for the sidebar
   bool badge = false;
   RequestKind kind = RequestKind::Http;
   std::string method;
+  // Folders only: the item order stored in the folder's folder.json ("order", file names such
+  // as "list-orders.req.json" or "users"; empty when it has none). `children` are already in
+  // it (see Workspace::tree()).
+  std::vector<std::string> order;
   std::vector<CollectionNode> children;
 };
 
@@ -395,7 +399,9 @@ class Workspace {
   // with badge == false. Right after a git checkout an antivirus scan makes each first open
   // slow, which is why the budget exists: with a budget, reads also stop at the first one
   // slower than 2 ms, and none are made when there is no index yet (fresh clone). The
-  // environments/ folder at the root is not listed.
+  // environments/ folder at the root is not listed. Children: subfolders first, then requests,
+  // each in the folder's stored order (folder_order()), the rest after them in natural name
+  // order (case-insensitive, "2" before "10"), so the sidebar, the runner and the exports agree.
   CollectionNode tree(double badge_budget_ms = 25) const;
 
   bool save_request(SavedRequest& r, std::string* err = nullptr);  // assigns file if empty
@@ -419,6 +425,15 @@ class Workspace {
   bool save_collection_settings(const FolderSettings& s, std::string* err = nullptr) const {
     return save_folder_settings(root_, s, err);
   }
+  // The order of a folder's items (`folder` as for folder_settings(); the root for the
+  // collections at the top), kept in its folder.json as "order": ["list-orders.req.json",
+  // "users", ...] so it is shared through git like Bruno's seq. Names are plain file names of
+  // the folder's children; unknown names are ignored. save_folder_order() keeps the file's
+  // other settings (and save_folder_settings() keeps the order); empty `names` removes the list
+  // (and the file when nothing else is set). It never creates a folder. Disk: worker thread.
+  std::vector<std::string> folder_order(const std::filesystem::path& folder) const;
+  bool save_folder_order(const std::filesystem::path& folder, const std::vector<std::string>& names,
+                         std::string* err = nullptr) const;
   // The settings r inherits (from the folders of r.file up to the root; only the collection for
   // an unsaved request), merged with r's own, each with its origin.
   EffectiveSettings effective_settings(const SavedRequest& r) const;
@@ -709,6 +724,20 @@ std::optional<CurlImport> parse_curl(const std::string& cmd, std::string* err = 
 // no file either: file form parts are sent empty and body_data / header_files / cookie_files /
 // body_file are left out. Prefer parse_curl() (and Workspace::http_to_send()).
 std::optional<HttpRequest> parse_curl_command(const std::string& cmd, std::string* err = nullptr);
+// Encode-on-substitution marks: "{{name|q}}" expands to the value query-encoded (RFC 3986
+// unreserved plus !$'()*,;:@/?[] kept, everything else %XX), "{{name|f}}" to the value
+// x-www-form-urlencoded (space as '+'). The HTTP editor writes them for variables a pre-request
+// script sets, so such a value is encoded as the editor encodes the same value from an
+// environment. var_mark(): 'q', 'f' or 0 for a {{...}} inner text; strip_var_marks(): the text
+// with every mark removed ("{{name|q}}" -> "{{name}}"), as scripts see the request.
+// "{{name|p}}": the value in the URL path, encoded as a typed path is (space, non-ASCII,
+// "<>\^`{|} and a stray % become %XX; / ? # and the other reserved characters stay).
+// mark_url_vars(): every plain {{name}} of a URL given its mark by where it sits (path 'p',
+// query 'q'; none before the path or for an OS environment variable): a URL a script rewrote.
+char var_mark(std::string_view name);
+std::string var_mark_encode(std::string_view value, char mark);
+std::string strip_var_marks(std::string_view s);
+std::string mark_url_vars(std::string_view url);
 // Shell the exported command is written for: bash ('...' quoting, \ continuations), cmd.exe
 // ("..." with ^ continuations) or PowerShell (curl.exe, '...' quoting, ` continuations).
 enum class CurlShell { Bash, Cmd, PowerShell };

@@ -28,8 +28,10 @@ std::filesystem::path free_request_file(const std::filesystem::path& folder, con
                                         std::string* final_name = nullptr);
 
 // Renames a request file or a folder. A request gets the new "name" field and the kebab-case
-// file name; a folder is renamed to file_safe(name). Returns the new path (== from when only
-// the name field changed), or nullopt with *err (the target exists, or a write failed).
+// file name, with "-2", "-3" ... when another request of the folder has that file (the name
+// stays as typed); a folder is renamed to file_safe(name). Returns the new path (== from when
+// only the name field changed), or nullopt with *err (a folder of that name exists, or a write
+// failed). Never overwrites anything.
 std::optional<std::filesystem::path> rename_item(Workspace& ws, const std::filesystem::path& from,
                                                  const std::string& name, std::string* err);
 

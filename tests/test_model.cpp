@@ -480,6 +480,17 @@ TEST_CASE("OS environment variables expand only once allowed for the workspace",
     for (const auto& [k, v] : e.grpc_opts.metadata) CHECK_THAT(v, !ContainsSubstring(value));
     CHECK(ws->blocked_env_vars(g) == std::vector<std::string>{"WATT_TEST_OS_SECRET"});
   }
+  // With an encode mark ({{name|q}}, as the editor writes for script-set variables): still not
+  // expanded, and still reported for the consent prompt.
+  {
+    SavedRequest m = r;
+    m.http.headers.clear();
+    m.http.body.clear();
+    m.http.url = "https://h.test/?k={{process.env.WATT_TEST_OS_SECRET|q}}";
+    CHECK(ws->blocked_env_vars(m) == std::vector<std::string>{"WATT_TEST_OS_SECRET"});
+    CHECK_FALSE(ws->http_to_send(m));
+    CHECK_THAT(ws->expand("{{$env.WATT_TEST_OS_SECRET|p}}"), !ContainsSubstring(value));
+  }
   // Only through the body: blocked too.
   SavedRequest b = r;
   b.http.headers.clear();

@@ -602,7 +602,7 @@ constexpr int kFlex = 2;
 
 struct ColModel {
   int w[kCols] = {52, 44, 0, 136, 90, 78, 86, 110};  // DIP; w[kFlex] unused
-  // Some step had script / token time: the Script column shows (otherwise it takes no room).
+  // Some step had script time: the Script column shows (otherwise it takes no room).
   bool scripts = false;
   int sort = -1;                                 // column, -1: run order
   bool desc = false;
@@ -916,7 +916,7 @@ class ResultsList : public wxVListBox {
     }
     cell(3, U(status_label(r)), bold_, status_colour(r));
     cell(4, r.sent && !r.skipped ? U(fmt_ms(r.timing.total_ms)) : wxString("-"), base, th.fg);
-    // Script / token time, outside the response time (Time): "-" for a step without any.
+    // Script time, outside the response time (Time): "-" for a step without any.
     cell(5, r.sent && !r.skipped && r.script_ms > 0 ? U(fmt_ms(r.script_ms)) : wxString("-"), small_, th.dim);
     cell(6, r.sent && !r.skipped ? U(fmt_bytes(r.size)) : wxString("-"), small_, th.dim);
     if (r.skipped || r.stopped())
@@ -4506,7 +4506,7 @@ class RunnerFrame : public wxPanel {
     }
   }
 
-  // The Script column (script / token time, apart from Time) takes room only when a step has any.
+  // The Script column (script time, apart from Time) takes room only when a step has any.
   void show_script_column(bool on) {
     if (cols_.scripts == on) return;
     cols_.scripts = on;

@@ -96,8 +96,31 @@ wxBitmap render(int which, double scale) {
       label = badge_label(RequestKind::WebSocket, "");
       col = badge_colour(RequestKind::WebSocket, "");
     } else if (which >= kImgGrpcServer && which <= kImgGrpcBidi) {
-      label = "gRPC" + grpc_kind_glyph(which - kImgGrpcServer + 1);
+      // "gRPC" in the same chip as a unary call, its arrow small in the chip's right padding:
+      // a wider chip started left of the other badges and broke the method column.
       col = badge_colour(RequestKind::Grpc, "");
+      const double size = 9.6;
+      gc->SetFont(gc->CreateFont(size * scale, "Segoe UI", wxFONTFLAG_BOLD, col));
+      double tw = 0, th = 0, desc = 0, lead = 0;
+      const wxString g = "gRPC";
+      gc->GetTextExtent(g, &tw, &th, &desc, &lead);
+      const double pw = std::min<double>(w - 1.0 * scale, tw + 6.0 * scale);
+      const double px = w - pw - 0.5 * scale, ph = h - 2.0 * scale, py = 1.0 * scale;
+      gc->SetPen(*wxTRANSPARENT_PEN);
+      gc->SetBrush(wxBrush(is_dark() ? wxColour(0, 0, 0, 105) : wxColour(col.Red(), col.Green(), col.Blue(), 30)));
+      gc->DrawRoundedRectangle(px, py, pw, ph, 3.0 * scale);
+      const wxString arrow = wxString::FromUTF8(grpc_kind_glyph(which - kImgGrpcServer + 1));
+      const wxGraphicsFont small = gc->CreateFont(7.4 * scale, "Segoe UI", wxFONTFLAG_BOLD, col);
+      gc->SetFont(small);
+      double aw = 0, ah = 0;
+      gc->GetTextExtent(arrow, &aw, &ah, &desc, &lead);
+      // The label moves left by what the arrow needs beyond the chip's own padding.
+      const double gx = std::max(px + 1.0 * scale, px + (pw - tw) / 2.0 - std::max(0.0, aw - 2.0 * scale) / 2.0);
+      gc->DrawText(arrow, std::min(gx + tw, px + pw - aw), (h - ah) / 2.0 - 1.0 * scale);
+      gc->SetFont(gc->CreateFont(size * scale, "Segoe UI", wxFONTFLAG_BOLD, col));
+      gc->DrawText(g, gx, (h - th) / 2.0);
+      gc.reset();  // flushes into img
+      return wxBitmap(img);
     } else {
       const auto& k = kinds[which - kImgGet];
       label = badge_label(k.kind, k.method);
@@ -160,6 +183,8 @@ wxColour badge_colour(RequestKind kind, std::string_view method) {
 }
 
 wxColour status_colour(RequestKind kind, long status) {
+  // Cancelled by the user (HTTP -1, gRPC CANCELLED): not a failure of the server.
+  if ((kind == RequestKind::Grpc && status == 1) || (kind != RequestKind::Grpc && status == -1)) return dim_colour();
   if (kind == RequestKind::Grpc) return status == 0 ? pick("#3FCF73", "#127A3A") : pick("#F26B6B", "#B42318");
   if (status >= 200 && status < 300) return pick("#3FCF73", "#127A3A");
   if (status == 101) return pick("#3FCF73", "#127A3A");  // a WebSocket that connected
@@ -178,6 +203,7 @@ std::string status_text(RequestKind kind, long status) {
     if (status >= 0 && status < static_cast<long>(std::size(names))) return names[status];
     return "code " + std::to_string(status);
   }
+  if (status == -1) return "cancelled";
   if (status <= 0) return "failed";
   return std::to_string(status);
 }

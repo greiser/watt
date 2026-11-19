@@ -342,7 +342,7 @@ void StatusStrip::on_motion(const wxPoint& p) {
 
 Waterfall::Waterfall(wxWindow* parent) : wxWindow(parent, wxID_ANY) {
   all_waterfalls().push_back(this);
-  laid_collapsed_ = collapsed_pref();
+  laid_collapsed_ = collapsed();
   SetBackgroundStyle(wxBG_STYLE_PAINT);
   SetBackgroundColour(Theme::get().bg);
   Bind(wxEVT_PAINT, [this](wxPaintEvent&) { on_paint(); });
@@ -366,7 +366,7 @@ Waterfall::Waterfall(wxWindow* parent) : wxWindow(parent, wxID_ANY) {
       return;
     }
     // A phase with parts (Redirects): its row expands / collapses them.
-    if (cur_.valid && !collapsed_pref() && e.GetPosition().y >= header_h()) {
+    if (cur_.valid && !collapsed() && e.GetPosition().y >= header_h()) {
       int row = (e.GetPosition().y - header_h()) / row_h();
       for (const Phase& p : cur_.phases) {
         if (row == 0) {
@@ -386,6 +386,10 @@ Waterfall::Waterfall(wxWindow* parent) : wxWindow(parent, wxID_ANY) {
       }
     }
     if (e.GetPosition().y < header_h()) {
+      if (short_) {  // folded for a short pane: open / fold this one, the saved choice stays
+        short_open_ = !short_open_;
+        return relayout();
+      }
       bool& c = collapsed_pref();
       c = !c;
       if (wxConfigBase* cfg = wxConfigBase::Get()) cfg->Write("Response/TimingCollapsed", c);
@@ -462,7 +466,7 @@ void Waterfall::paint_waiting(wxDC& dc) {
   const int pad = FromDIP(10);
   dc.SetFont(GetFont().Bold());
   dc.SetTextForeground(th.fg);
-  const wxString title = wxString::FromUTF8(collapsed_pref() ? "\xE2\x96\xB8 Timing" : "\xE2\x96\xBE Timing");
+  const wxString title = wxString::FromUTF8(collapsed() ? "\xE2\x96\xB8 Timing" : "\xE2\x96\xBE Timing");
   const wxSize te = dc.GetTextExtent(title);
   dc.DrawText(title, pad, (header_h() - te.y) / 2);
   dc.SetFont(GetFont());
@@ -502,7 +506,7 @@ void Waterfall::paint_waiting(wxDC& dc) {
     head = "receiving \xC2\xB7 " + fmt::human_bytes(live_bytes_) + " \xC2\xB7 " + el_text(el);
   }
   dc.DrawText(wxString::FromUTF8(head), pad + te.x + FromDIP(12), (header_h() - dc.GetCharHeight()) / 2);
-  if (collapsed_pref()) return;
+  if (collapsed()) return;
   static const char* const kHttp[] = {"Prepare", "Queue", "DNS", "Socket", "Connect", "TLS", "Send", "Wait (TTFB)",
                                       "Download", "Process"};
   static const char* const kGrpc[] = {"Queue", "DNS", "Connect", "TLS", "Send", "Wait (TTFB)", "Download", "Other"};
@@ -638,13 +642,23 @@ void Waterfall::paint_waiting(wxDC& dc) {
               pad, header_h() + n * rh + (footer_h() - dc.GetCharHeight()) / 2);
 }
 
+bool Waterfall::collapsed() const { return short_ ? !short_open_ : collapsed_pref(); }
+
+void Waterfall::pane_height(int h) {
+  const bool s = short_ ? h < FromDIP(800) : h < FromDIP(760);  // a little hysteresis
+  if (s == short_) return;
+  short_ = s;
+  short_open_ = false;
+  InvalidateBestSize();  // the caller lays the pane out next
+}
+
 Waterfall::~Waterfall() {
   auto& v = all_waterfalls();
   v.erase(std::remove(v.begin(), v.end(), this), v.end());
 }
 
 void Waterfall::relayout() {
-  laid_collapsed_ = collapsed_pref();
+  laid_collapsed_ = collapsed();
   InvalidateBestSize();
   GetParent()->Layout();
   Refresh(false);
@@ -658,10 +672,10 @@ int Waterfall::row_count(const TimingModel& m) const {
 }
 
 wxSize Waterfall::DoGetBestClientSize() const {
-  laid_collapsed_ = collapsed_pref();
+  laid_collapsed_ = collapsed();
   if (!cur_.valid && !reserved_) return wxSize(FromDIP(200), 0);
   // Collapsed: the header line alone (with the stacked bar and the total in it).
-  if (collapsed_pref()) return wxSize(FromDIP(200), header_h() + FromDIP(2));
+  if (collapsed()) return wxSize(FromDIP(200), header_h() + FromDIP(2));
   const int base = cur_.valid ? static_cast<int>(cur_.phases.size()) : reserve_rows_;
   const bool grpc = cur_.valid ? cur_.kind == "grpc" : reserve_rows_ == 8;
   // One floor for every tab: switching tabs moves nothing either. It starts at the rows of a
@@ -777,7 +791,7 @@ void Waterfall::on_paint() {
   wxAutoBufferedPaintDC dc(this);
   // Safety net: a layout made before the collapsed choice changed (e.g. while this tab was
   // hidden) would leave a gap or overlap; fix it on the first paint.
-  if (laid_collapsed_ != collapsed_pref()) CallAfter([this] { relayout(); });
+  if (laid_collapsed_ != collapsed()) CallAfter([this] { relayout(); });
   const Theme& th = Theme::get();
   const wxRect cr = GetClientRect();
   dc.SetBackground(wxBrush(th.bg));
@@ -815,7 +829,7 @@ void Waterfall::on_paint() {
   dc.SetFont(bold);
   dc.SetTextForeground(fg);
   int x = pad;
-  x += draw_text(dc, collapsed_pref() ? wxString::FromUTF8("\xE2\x96\xB8 Timing") : wxString::FromUTF8("\xE2\x96\xBE Timing"), x, hr);
+  x += draw_text(dc, collapsed() ? wxString::FromUTF8("\xE2\x96\xB8 Timing") : wxString::FromUTF8("\xE2\x96\xBE Timing"), x, hr);
   x += FromDIP(10);
   if (stale_) {
     dc.SetFont(small);
@@ -843,7 +857,7 @@ void Waterfall::on_paint() {
     tips_.push_back({pill, tip});
     x = pill.GetRight() + FromDIP(12);
   }
-  if (collapsed_pref()) {
+  if (collapsed()) {
     // Compact: one line. Every phase as a segment of one stacked bar, the total at the right;
     // the bar's tooltip lists the whole breakdown (Postman's timing popover), each segment its
     // own phase.
@@ -920,7 +934,7 @@ void Waterfall::on_paint() {
 
   // Faint grid in the bar area.
   const int rows_top = header_h();
-  const int nrows = collapsed_pref() ? 1 : row_count(cur_);
+  const int nrows = collapsed() ? 1 : row_count(cur_);
   const int rows_bottom = rows_top + nrows * row_h();
   dc.SetPen(wxPen(th.grid));
   if (!px.broken) {
@@ -962,7 +976,7 @@ void Waterfall::on_paint() {
   };
 
   const int bar_h = FromDIP(10);
-  if (collapsed_pref()) {
+  if (collapsed()) {
     const wxRect r(0, rows_top, cr.width, row_h());
     double off = 0;
     for (const Phase& p : cur_.phases) {
@@ -1133,8 +1147,29 @@ TabStrip::TabStrip(wxWindow* parent, std::function<void(int)> on_select)
     : wxWindow(parent, wxID_ANY), on_select_(std::move(on_select)) {
   SetBackgroundStyle(wxBG_STYLE_PAINT);
   SetBackgroundColour(Theme::get().bg);
+  SetMinSize(wxSize(FromDIP(48), -1));  // shrinks with the pane: what does not fit goes under "»"
   Bind(wxEVT_PAINT, [this](wxPaintEvent&) { on_paint(); });
+  Bind(wxEVT_MOTION, [this](wxMouseEvent& e) {
+    const bool h = more_rect_.Contains(e.GetPosition());
+    if (h == more_hover_) return;
+    more_hover_ = h;
+    if (h) {
+      std::string hidden;
+      for (const Tab& t : tabs_)
+        if (t.shown && t.rect.IsEmpty()) hidden += (hidden.empty() ? "" : ", ") + t.label;
+      SetToolTip(U("More tabs: " + hidden));
+    } else {
+      UnsetToolTip();
+    }
+    Refresh(false);
+  });
+  Bind(wxEVT_LEAVE_WINDOW, [this](wxMouseEvent&) {
+    if (!more_hover_) return;
+    more_hover_ = false;
+    Refresh(false);
+  });
   Bind(wxEVT_LEFT_DOWN, [this](wxMouseEvent& e) {
+    if (more_rect_.Contains(e.GetPosition())) return more_menu();
     // Hit by column, with the gaps between tabs split between their neighbours: a label that
     // grows while a stream runs ("Events 99" -> "Events 100") never leaves a dead spot under
     // the mouse.
@@ -1158,6 +1193,20 @@ TabStrip::TabStrip(wxWindow* parent, std::function<void(int)> on_select)
 }
 
 wxSize TabStrip::DoGetBestClientSize() const { return wxSize(FromDIP(200), FromDIP(30)); }
+
+void TabStrip::more_menu() {
+  wxMenu menu;
+  for (size_t i = 0; i < tabs_.size(); ++i) {
+    const Tab& t = tabs_[i];
+    if (!t.shown || !t.rect.IsEmpty()) continue;
+    menu.Append(static_cast<int>(1000 + i), U(t.count.empty() ? t.label : t.label + "   " + t.count));
+  }
+  if (!menu.GetMenuItemCount()) return;
+  const int id = GetPopupMenuSelectionFromUser(menu, more_rect_.GetBottomLeft());
+  if (id < 1000 || id - 1000 >= static_cast<int>(tabs_.size())) return;
+  select(id - 1000);
+  if (on_select_) on_select_(id - 1000);
+}
 
 int TabStrip::add(const std::string& label) {
   tabs_.push_back({label, {}, true, {}, Tone::Plain});
@@ -1207,10 +1256,42 @@ void TabStrip::on_paint() {
   dc.DrawLine(0, cr.height - 1, cr.width, cr.height - 1);
   const wxFont base = GetFont();
   const wxFont small = base.Smaller();
-  int x = FromDIP(10);
+  // Each tab's width (bold label: selecting one does not shift the others), then which fit: all
+  // with the usual gaps, else tighter gaps, else the selected tab and the ones before it that
+  // fit, with the rest under a "»" button.
+  std::vector<int> widths(tabs_.size(), 0);
+  int sum = 0, nshown = 0;
+  for (size_t i = 0; i < tabs_.size(); ++i) {
+    const Tab& t = tabs_[i];
+    if (!t.shown) continue;
+    dc.SetFont(base.Bold());
+    int w = dc.GetTextExtent(U(t.label)).x;
+    if (!t.count.empty()) {
+      dc.SetFont(t.tone != Tone::Plain ? small.Bold() : small);
+      w += dc.GetTextExtent(U(t.count)).x + (t.tone != Tone::Plain ? FromDIP(16) : FromDIP(4));
+    }
+    widths[i] = w;
+    sum += w;
+    ++nshown;
+  }
+  const int margin = FromDIP(10), more_w = FromDIP(26);
+  int gap = FromDIP(18);
+  if (nshown && 2 * margin + sum + gap * (nshown - 1) > cr.width) gap = FromDIP(12);
+  std::vector<char> fit(tabs_.size(), 1);
+  if (nshown && 2 * margin + sum + gap * (nshown - 1) > cr.width) {
+    const int sel = sel_ >= 0 && sel_ < static_cast<int>(tabs_.size()) && tabs_[static_cast<size_t>(sel_)].shown ? sel_ : -1;
+    int used = margin + (sel >= 0 ? widths[static_cast<size_t>(sel)] + gap : 0);
+    bool full = false;
+    for (size_t i = 0; i < tabs_.size(); ++i) {
+      if (!tabs_[i].shown || static_cast<int>(i) == sel) continue;
+      if (!full && used + widths[i] + gap <= cr.width - more_w) used += widths[i] + gap;
+      else full = true, fit[i] = 0;
+    }
+  }
+  int x = margin;
   for (size_t i = 0; i < tabs_.size(); ++i) {
     Tab& t = tabs_[i];
-    if (!t.shown) {
+    if (!t.shown || !fit[i]) {
       t.rect = wxRect();
       continue;
     }
@@ -1245,13 +1326,31 @@ void TabStrip::on_paint() {
       dc.DrawText(c, x, (cr.height - e.y) / 2 + (e.y - ce.y) / 2);
       x += ce.x;
     }
-    t.rect = wxRect(x0 - FromDIP(6), 0, x - x0 + FromDIP(12), cr.height);
+    t.rect = wxRect(x0 - gap / 3, 0, x - x0 + 2 * (gap / 3), cr.height);
     if (sel) {
       dc.SetPen(*wxTRANSPARENT_PEN);
       dc.SetBrush(wxBrush(th.accent));
       dc.DrawRectangle(x0, cr.height - FromDIP(2), x - x0, FromDIP(2));
     }
-    x += FromDIP(18);
+    x += gap;
+  }
+  more_rect_ = wxRect();
+  if (std::find(fit.begin(), fit.end(), 0) != fit.end()) {
+    more_rect_ = wxRect(std::min(x - gap / 2, cr.width - more_w), 0, more_w, cr.height);
+    // In the error colour when a hidden tab says something failed (Tests "1/4").
+    bool err = false;
+    for (size_t i = 0; i < tabs_.size(); ++i) err = err || (!fit[i] && tabs_[i].shown && tabs_[i].tone == Tone::Err);
+    if (more_hover_) {
+      dc.SetPen(*wxTRANSPARENT_PEN);
+      dc.SetBrush(wxBrush(mix(th.bg, th.fg, th.dark ? 0.08 : 0.05)));
+      dc.DrawRoundedRectangle(more_rect_.Deflate(FromDIP(2), FromDIP(5)), FromDIP(3));
+    }
+    dc.SetFont(base.Bold());
+    dc.SetTextForeground(err ? tone_colour(Tone::Err) : more_hover_ ? th.fg : th.dim);
+    const wxString m = wxString::FromUTF8("\xC2\xBB");
+    const wxSize e = dc.GetTextExtent(m);
+    dc.DrawText(m, more_rect_.x + (more_rect_.width - e.x) / 2, (cr.height - e.y) / 2);
+    x = more_rect_.GetRight() + FromDIP(8);
   }
   if (!note_.empty()) {
     dc.SetFont(small);
@@ -1352,6 +1451,7 @@ void ChipBar::set_visible(int id, bool vis) {
   if (Chip* c = find(id); c && c->visible != vis) {
     c->visible = vis;
     Refresh(false);
+    refit();
   }
 }
 
@@ -1360,7 +1460,24 @@ void ChipBar::set_label(int id, const std::string& label) {
     c->label = label;
     c->ext = wxSize();
     Refresh(false);
+    refit();
   }
+}
+
+void ChipBar::refit() {
+  if (!fit_) return;
+  int w = 0;
+  {
+    wxClientDC dc(this);
+    dc.SetFont(GetFont());
+    for (const Chip& c : chips_)
+      if (c.visible) w += dc.GetTextExtent(U(c.label)).x + FromDIP(18);
+  }
+  if (w) w += FromDIP(16);
+  if (GetMinSize().x == w) return;
+  SetMinSize(wxSize(w, -1));
+  InvalidateBestSize();
+  if (GetParent()) GetParent()->Layout();
 }
 
 void ChipBar::set_note(const std::string& note, Tone tone) {
@@ -1388,10 +1505,11 @@ void ChipBar::on_paint() {
     if (c.ext.x <= 0) c.ext = dc.GetTextExtent(U(c.label));
     return c.ext;
   };
-  // Fitting: full padding, then tighter chips, then right chips (from the last) folded into a
+  // Fitting: full padding, then tighter chips, then right chips (from the first: Wrap / Fold go
+  // before Find / Copy / Save) folded into a
   // "more" chip, until the left chips, the note's first part (the size) and the right chips fit
   // side by side; chips never overlap.
-  static const wxString more_label = wxString::FromUTF8("\xE2\x8B\xAF");  // midline ellipsis
+  static const wxString more_label = wxString::FromUTF8("\xC2\xBB");  // the tab strips' overflow mark
   static const wxString note_sep = wxString::FromUTF8(" \xC2\xB7 ");
   int note_min = 0;
   if (!note_.empty()) {
@@ -1403,13 +1521,15 @@ void ChipBar::on_paint() {
     note_min = std::min(dc.GetTextExtent(first).x, FromDIP(56)) + FromDIP(32);
     dc.SetFont(base);
   }
+  size_t n_right = 0;
+  for (const Chip& c : chips_) n_right += c.right && c.visible;
   auto need = [&](int pad, size_t keep) {
     int w = FromDIP(16), last = -2;
     size_t seen = 0;
     for (Chip& c : chips_) {
       if (!c.visible) continue;
       if (c.right) {
-        if (seen++ >= keep) continue;
+        if (seen++ < n_right - keep) continue;
         w += ext(c).x + 2 * pad + FromDIP(2);
         continue;
       }
@@ -1420,8 +1540,6 @@ void ChipBar::on_paint() {
     if (seen > keep) w += dc.GetTextExtent(more_label).x + 2 * pad + FromDIP(2);
     return w + note_min;
   };
-  size_t n_right = 0;
-  for (const Chip& c : chips_) n_right += c.right && c.visible;
   int padx = FromDIP(8);
   size_t keep = n_right;
   if (need(padx, keep) > cr.width) padx = FromDIP(5);
@@ -1430,7 +1548,7 @@ void ChipBar::on_paint() {
     size_t i = 0;
     for (Chip& c : chips_) {
       c.folded = false;
-      if (c.right && c.visible) c.folded = i++ >= keep;
+      if (c.right && c.visible) c.folded = i++ < n_right - keep;
       if (c.folded) c.rect = wxRect();
     }
   }

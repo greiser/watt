@@ -17,6 +17,7 @@
 #include <condition_variable>
 #include <deque>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <thread>
 
@@ -366,6 +367,44 @@ Timing get_timing(const rapidjson::Value& o) {
   t.bytes_received = u64(v, "received");
   return t;
 }
+// The last run's script results (pass / fail, error, time; not the logs): a restored tab shows
+// the script tests it ran, not only the assertions it can evaluate again.
+void put_script(JWriter& w, const char* k, const std::shared_ptr<const ScriptRun>& r) {
+  if (!r || !r->ran) return;
+  constexpr size_t kMaxTests = 500, kMaxText = 2000;
+  auto cut = [&](const std::string& t) { return t.size() > kMaxText ? t.substr(0, kMaxText) : t; };
+  w.Key(k);
+  w.StartObject();
+  w.Key("ok");
+  w.Bool(r->ok);
+  put(w, "error", cut(r->error));
+  put(w, "elapsed_us", r->elapsed_us);
+  w.Key("tests");
+  w.StartArray();
+  for (size_t i = 0; i < r->tests.size() && i < kMaxTests; ++i) {
+    w.StartObject();
+    put(w, "name", cut(r->tests[i].name));
+    w.Key("pass");
+    w.Bool(r->tests[i].pass);
+    put(w, "message", cut(r->tests[i].message));
+    w.EndObject();
+  }
+  w.EndArray();
+  w.EndObject();
+}
+std::shared_ptr<ScriptRun> get_script(const rapidjson::Value& o, const char* k) {
+  if (!o.HasMember(k) || !o[k].IsObject()) return nullptr;
+  const auto& v = o[k];
+  auto r = std::make_shared<ScriptRun>();
+  r->ran = true;
+  r->ok = flag(v, "ok");
+  r->error = str(v, "error");
+  r->elapsed_us = num(v, "elapsed_us");
+  if (v.HasMember("tests") && v["tests"].IsArray())
+    for (const auto& t : v["tests"].GetArray())
+      if (t.IsObject()) r->tests.push_back(ScriptTest{str(t, "name"), flag(t, "pass"), str(t, "message")});
+  return r;
+}
 template <class F>
 void get_pairs(const rapidjson::Value& o, const char* k, F&& add) {
   if (!o.HasMember(k) || !o[k].IsArray()) return;
@@ -417,6 +456,8 @@ std::string last_response_to_json(const LastResponse& r) {
     if (r.sent) {
       put(w, "sent_method", r.sent->request.method);
       put(w, "sent_url", r.sent->request.url);
+      put_script(w, "pre_script", r.sent->pre_script);
+      put_script(w, "post_script", r.sent->post_script);
     }
     if (!r.inherited_headers.empty()) put_pairs(w, "inherited_headers", r.inherited_headers);
     if (r.ws_log && !r.ws_log->empty()) {
@@ -519,6 +560,8 @@ LastResponse last_response_from_json(const std::string& json, const SavedRequest
       sent->request.method = str(d, "sent_method");
       sent->request.url = str(d, "sent_url");
     }
+    sent->pre_script = get_script(d, "pre_script");
+    sent->post_script = get_script(d, "post_script");
     get_pairs(d, "inherited_headers", [&](const std::string& n, const std::string& v) {
       if (has_header_named(sent->request.headers, n)) return;
       sent->request.headers.emplace_back(n, v);
@@ -918,9 +961,26 @@ void RequestTab::realize() {
   SetSizer(sz);
   // The split stays at 50% until the user drags the sash (SplitVertically before the first size
   // event uses 0, and the first sizes the tab sees while the frame is built are provisional).
-  split_->Bind(wxEVT_SPLITTER_SASH_POS_CHANGED, [this](wxSplitterEvent& e) {
+  // Only a drag of the sash is the user's choice: wxSplitterWindow::OnSize sends CHANGED too
+  // when it moves the sash for a new size, and a drag always sends CHANGING first.
+  // (Splitter events propagate: the editor's and the response view's own splitters send theirs
+  // through split_ too, so each handler looks at split_'s events only.)
+  auto dragging = std::make_shared<bool>(false);
+  split_->Bind(wxEVT_SPLITTER_SASH_POS_CHANGING, [this, dragging](wxSplitterEvent& e) {
     e.Skip();
-    user_sash_ = true;
+    if (e.GetEventObject() == split_) *dragging = true;
+  });
+  split_->Bind(wxEVT_SPLITTER_SASH_POS_CHANGED, [this, dragging](wxSplitterEvent& e) {
+    e.Skip();
+    if (e.GetEventObject() != split_) return;
+    if (*dragging) user_sash_ = true;
+    *dragging = false;
+  });
+  // A resize keeps the split at 50% in the splitter's own size handler, so each resize step lays
+  // the editor and the response view out once (a later SetSashPosition was a second layout).
+  split_->Bind(wxEVT_SPLITTER_SASH_POS_RESIZE, [this](wxSplitterEvent& e) {
+    if (e.GetEventObject() != split_ || user_sash_ || e.GetNewSize() <= 0) return e.Skip();
+    e.SetSashPosition(e.GetNewSize() / 2);
   });
   // wxAuiNotebook sizes every page when the window is resized, the hidden ones too: laying out
   // each tab's editor and response view made one resize step O(tabs) (67-105 ms with 12-25
@@ -928,22 +988,39 @@ void RequestTab::realize() {
   // Bound once: a tab realized again after hibernate() keeps these.
   if (!size_bound_) {
   size_bound_ = true;
-  Bind(wxEVT_SIZE, [this](wxSizeEvent& e) {
+  Bind(wxEVT_SIZE, [this, posted = std::make_shared<bool>(false)](wxSizeEvent& e) {
     if (!IsShown()) {
       layout_pending_ = true;
       return;  // no Skip: no Layout() now
     }
-    e.Skip();
-    if (!user_sash_ && GetClientSize().x > 0) CallAfter([this] { center_sash(); });
+    if (update_split_mode(e.GetSize())) {
+      center_sash();  // the new orientation, at 50%
+      return;
+    }
+    e.Skip();  // one Layout(); the splitter keeps the 50% (SASH_POS_RESIZE above)
+    // A sash position the splitter still holds as requested (set before it had its size) skips
+    // SASH_POS_RESIZE: put it at 50% once afterwards. Nothing to do (no layout) when it is there.
+    if (!user_sash_ && !*posted) {
+      *posted = true;
+      CallAfter([this, posted] {
+        *posted = false;
+        if (!split_ || user_sash_) return;
+        const wxSize cs = split_->GetClientSize();
+        const int axis = split_->GetSplitMode() == wxSPLIT_HORIZONTAL ? cs.y : cs.x;
+        if (std::abs(split_->GetSashPosition() - axis / 2) > 1) center_sash();
+      });
+    }
   });
   Bind(wxEVT_SHOW, [this](wxShowEvent& e) {
     e.Skip();
     if (!e.IsShown() || !layout_pending_) return;
     layout_pending_ = false;
+    update_split_mode(GetSize());
     Layout();
     if (!user_sash_) center_sash();
   });
   }
+  update_split_mode(GetClientSize());
   center_sash();  // realized after the page was laid out (a restored tab)
   Bind(wxEVT_IDLE, &RequestTab::on_idle, this);
 }
@@ -981,6 +1058,7 @@ void RequestTab::prelayout(const wxSize& sz) {
   if (!split_ || sz.x <= 0 || sz.y <= 0) return;
   if (GetSize() != sz) SetSize(sz);  // hidden: the size handler only notes layout_pending_
   layout_pending_ = false;
+  update_split_mode(sz);
   if (user_sash_)
     Layout();
   else
@@ -991,8 +1069,25 @@ void RequestTab::prelayout(const wxSize& sz) {
 void RequestTab::center_sash() {
   if (user_sash_ || !split_ || GetClientSize().x <= 0) return;
   Layout();
-  const int want = split_->GetClientSize().x / 2;
+  const wxSize cs = split_->GetClientSize();
+  const int want = (split_->GetSplitMode() == wxSPLIT_HORIZONTAL ? cs.y : cs.x) / 2;
   if (std::abs(split_->GetSashPosition() - want) > 1) split_->SetSashPosition(want);
+}
+
+bool RequestTab::update_split_mode(const wxSize& sz) {
+  if (!split_ || !split_->IsSplit() || sz.x <= 0 || sz.y <= 0) return false;
+  const bool stacked = split_->GetSplitMode() == wxSPLIT_HORIZONTAL;
+  // Two side-by-side panes under ~500 px each lose their tab strips and toolbars (a Windows Snap
+  // half of a 1920 screen); stacked, each gets the full width. A little hysteresis, so a drag
+  // across the threshold does not flip back and forth.
+  // Stacked only when tall enough for two usable panes (not on a 768 px screen: there the tab
+  // strips' overflow buttons keep everything reachable side by side).
+  const bool want = stacked ? sz.x < FromDIP(1040) && sz.y >= FromDIP(720)
+                            : sz.x < FromDIP(1000) && sz.y >= FromDIP(760);
+  if (want == stacked) return false;
+  split_->SetSplitMode(want ? wxSPLIT_HORIZONTAL : wxSPLIT_VERTICAL);
+  user_sash_ = false;  // a sash dragged in the other orientation means nothing in this one
+  return true;
 }
 
 void RequestTab::on_idle(wxIdleEvent& e) {
@@ -1090,6 +1185,11 @@ bool RequestTab::teardown_step() {
   ++gen_;  // a late result is dropped
   resp_timer_.Stop();
   if (RequestEditorPanel* ed = editor(); ed && ed->teardown_step()) return true;
+  if (resp_ && split_ && last_ && !torn_resp_cleared_) {  // its documents first, then its windows
+    torn_resp_cleared_ = true;
+    resp_->clear();
+    return true;
+  }
   if (resp_ && split_) {  // the response view (its documents) in a step of its own
     wxWindow* w = resp_->window();
     resp_ = nullptr;
@@ -1268,6 +1368,16 @@ std::string RequestTab::suggested_name() const {
         c == '}')
       c = '_';
   if (s.empty() && !req_.name.empty() && req_.name.find("{{") == std::string::npos) s = req_.name;
+  // Nothing but variables or a bare host ("{{base}}", "{{base}}/"): the URL itself, as Postman
+  // names an unsaved request, rather than a generic "request".
+  if (s.empty() && req_.kind != RequestKind::Grpc) {
+    for (char c : req_.http.url.substr(0, req_.http.url.find_first_of("?#"))) {
+      if (c == '{' || c == '}') continue;
+      if (c == '\\' || c == ':' || c == '*' || c == '"' || c == '<' || c == '>' || c == '|' || c == '/') c = ' ';
+      if (c != ' ' || (!s.empty() && s.back() != ' ')) s += c;
+    }
+    while (!s.empty() && s.back() == ' ') s.pop_back();
+  }
   return s.empty() ? std::string("request") : s;
 }
 
@@ -1868,6 +1978,8 @@ void RequestTab::send_http_job(Clock::time_point click, std::shared_ptr<SavedReq
       if (has_pre || (has_post && !wsc->scripts_trusted())) return bounce();
       run_scripts = has_post;
     }
+    // The request a pre-request script may edit (below); history records it as it went out.
+    auto toSend = std::make_shared<SavedRequest>(*saved);
     // Every send that got as far as the network (or failed on its way there: an OAuth token step)
     // is a history row; status 0 is a failed one.
     auto record_history = [&](long status, double total_ms) {
@@ -1879,11 +1991,14 @@ void RequestTab::send_http_job(Clock::time_point click, std::shared_ptr<SavedReq
       // was built from), not the template alone: the history row must say where it went even
       // after the environment is switched (history_summary.h). The URL as written, expanded,
       // not the final request URL, so an OAuth / API key query parameter is not recorded.
-      e.summary = make_history_summary(saved->http.method + " " + saved->http.url,
-                                       wsc->expand(saved->http.url, *saved), wsc->active_env);
+      // After the pre-request script (its URL edits), without the editor's encode marks.
+      e.summary = make_history_summary(saved->http.method + " " + strip_var_marks(saved->http.url),
+                                       wsc->expand(toSend->http.url, *toSend), wsc->active_env);
       e.status = status;
       e.total_ms = total_ms;
       e.request = *saved;
+      e.request.http.url = strip_var_marks(e.request.http.url);
+      e.request.http.body = strip_var_marks(e.request.http.body);
       {
         std::lock_guard lk(history_mutex());
         wsc->append_history(e);
@@ -1894,9 +2009,8 @@ void RequestTab::send_http_job(Clock::time_point click, std::shared_ptr<SavedReq
     };
     auto sent = std::make_shared<SentHttp>();
     sent->scripts_skipped_untrusted = scripts_skipped;
-    // Pre-request script: edits a copy of the request; its variable writes apply to this
+    // Pre-request script: edits a copy of the request (toSend); its variable writes apply to this
     // worker's workspace copy (so this send sees them) and later to the real one (UI thread).
-    auto toSend = std::make_shared<SavedRequest>(*saved);
     std::shared_ptr<ScriptRun> pre, post;
     if (run_scripts && has_pre) {
       pre = std::make_shared<ScriptRun>(run_pre_script(*wsc, *toSend));
@@ -2021,7 +2135,9 @@ void RequestTab::send_http_job(Clock::time_point click, std::shared_ptr<SavedReq
       t.on_http_done(gen, cresp, csent);
     });
 
-    if (!(resp->error == "cancelled")) record_history(resp->status, resp->timing.total_ms);
+    // A cancelled send is a history row too, so it can be opened and sent again: what arrived
+    // and its time when the head was in, else status -1 ("cancelled" in the history list).
+    record_history(resp->error == "cancelled" && resp->status <= 0 ? -1 : resp->status, resp->timing.total_ms);
   });
   editor()->set_in_flight(true);
   response()->show_sending(RequestKind::Http);
@@ -2122,7 +2238,7 @@ void RequestTab::send_grpc(Clock::time_point click) {
     std::shared_ptr<const GrpcResponse> cresp = resp;
     w->post([gen, cresp](RequestTab& t) { t.on_grpc_done(gen, cresp); });
 
-    if (wsc && resp->status_name != "CANCELLED") {
+    if (wsc) {  // a cancelled call too (CANCELLED in the history list), so it can be sent again
       HistoryEntry e;
       e.when_iso = now_iso();
       e.kind = RequestKind::Grpc;
@@ -2170,7 +2286,17 @@ void RequestTab::finish(uint64_t gen) {
 
 void RequestTab::on_http_done(uint64_t gen, std::shared_ptr<const HttpResponse> r,
                               std::shared_ptr<const SentHttp> sent) {
-  if (gen != gen_ || !in_flight_) return;
+  if (gen != gen_) return;
+  if (!in_flight_) {
+    // Cancelled mid-stream (cancel() already showed what arrived): the session still keeps it.
+    if (r && r->error == "cancelled" && r->status > 0) {
+      last_ = LastResponse{r, sent, nullptr};
+      last_.when_iso = now_iso();
+      last_pending_ = false;
+      if (on_response) on_response(this);
+    }
+    return;
+  }
   finish(gen);
   last_ = LastResponse{r, sent, nullptr};
   // The headers it inherited from folders / the collection, as templates (never expanded: no

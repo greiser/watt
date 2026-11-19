@@ -21,9 +21,11 @@ namespace watt::app {
 // starts it, or raises the one already open for it. workspace() returns the live workspace;
 // vars_changed() is called after {{mock}} changed. The tab goes into parent's wxAuiNotebook.
 // start = false opens it stopped (one click on Start); port (non-zero) is put in its Port field
-// (a restart keeps the address {{mock}} had); select = false leaves the current tab selected.
+// (a restart keeps the address {{mock}} had); select = false leaves the current tab selected;
+// at (>= 0) is its place in the tab strip (a restart keeps the order), else it goes last.
 void open_mock(wxWindow* parent, std::function<Workspace*()> workspace, const std::filesystem::path& folder,
-               std::function<void()> vars_changed, bool start = true, unsigned port = 0, bool select = true);
+               std::function<void()> vars_changed, bool start = true, unsigned port = 0, bool select = true,
+               int at = -1);
 
 // True when w is a mock server tab: its folder (empty: the collection), the port to reopen it on
 // and whether it should come back running (it runs, on a loopback address). For the session.
