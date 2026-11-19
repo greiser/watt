@@ -1,5 +1,7 @@
 build/
+dist/
 out/
-.vcpkg-install.log
 bench/refs/
 *.user
+tools/testserver/certs/.tmp-certs/
+__pycache__/

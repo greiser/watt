@@ -2275,7 +2275,7 @@ class Sidebar : public wxPanel, public SidebarPanel {
       std::error_code ec;
       // Not when another watt window has it open (two windows saving the same files).
       if (wxTheApp && wxTheApp->argc <= 1 && !last.empty() && last != ws_->root() &&
-          fs::exists(last / "watt.json", ec) && lock_owner(last) == 0) {
+          is_workspace_dir(last) && lock_owner(last) == 0) {
         switch_workspace(last, false);
         return;
       }
@@ -6142,7 +6142,7 @@ class Sidebar : public wxPanel, public SidebarPanel {
       auto sep = [](wchar_t c) { return c == L'\\' || c == L'/'; };
       if (w.size() >= 2 && sep(w[0]) && sep(w[1])) return false;
       std::error_code ec;
-      return !fs::exists(p / "watt.json", ec);
+      return !is_workspace_dir(p);
     });
     if (out.size() > kMaxRecent) out.resize(kMaxRecent);
     return out;
@@ -6241,7 +6241,7 @@ class Sidebar : public wxPanel, public SidebarPanel {
                       picking_ = false;
                       if (dir.empty()) return;
                       std::error_code ec;
-                      if (!create && !fs::exists(dir / "watt.json", ec)) {
+                      if (!create && !is_workspace_dir(dir)) {
                         if (!confirm(wxGetTopLevelParent(this), "Make this folder a workspace?",
                                      wxString::Format("\"%s\" is not a watt workspace yet. This adds watt.json, "
                                                       ".gitignore and .gitattributes; existing files are not touched.",
@@ -6431,7 +6431,7 @@ class Sidebar : public wxPanel, public SidebarPanel {
       std::unique_ptr<Workspace> ws;
       std::error_code ec;
       try {
-        if (fs::exists(dir / "watt.json", ec)) {
+        if (is_workspace_dir(dir)) {
           if (auto w = Workspace::open(dir, &err)) ws = std::make_unique<Workspace>(std::move(*w));
         } else {
           fs::create_directories(dir, ec);

@@ -135,7 +135,7 @@ class TestServer {
 };
 
 fs::path proto_dir() {
-  fs::path here = fs::path(__FILE__).parent_path().parent_path() / "tools" / "testserver";
+  fs::path here = fs::path(WATT_SOURCE_DIR) / "tools" / "testserver";
   if (fs::exists(here / "test.proto")) return here;
   return exe_dir().parent_path().parent_path() / "tools" / "testserver";
 }

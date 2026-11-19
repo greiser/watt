@@ -1355,7 +1355,7 @@ void fire_head(TransferCtx* ctx) {
   }
 }
 
-constexpr const char* kUserAgent = "watt/0.1";
+constexpr const char* kUserAgent = "watt/" WATT_VERSION;
 
 }  // namespace
 

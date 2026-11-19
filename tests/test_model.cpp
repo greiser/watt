@@ -255,6 +255,17 @@ void require_same(const SavedRequest& a, const SavedRequest& b) {
 
 // ==================================================================== workspace + settings
 
+TEST_CASE("a workspace made in an existing repository gets .watt/ and .env in its .gitignore", "[workspace]") {
+  TempDir t;
+  const fs::path root = t.path / "repo";
+  fs::create_directories(root);
+  spit(root / ".gitignore", "node_modules/\r\n/.env\r\nbuild");  // CRLF, no final newline, .env there
+  Workspace::create(root);
+  CHECK(slurp(root / ".gitignore") == "node_modules/\r\n/.env\r\nbuild\r\n.watt/\r\n");
+  Workspace::create(root);  // opening it again adds nothing
+  CHECK(slurp(root / ".gitignore") == "node_modules/\r\n/.env\r\nbuild\r\n.watt/\r\n");
+}
+
 TEST_CASE("create and open a workspace; settings round-trip", "[workspace]") {
   TempDir t;
   const fs::path root = t.path / "ws";

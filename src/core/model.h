@@ -388,6 +388,10 @@ struct CollectionNode {           // folder tree for the sidebar
   std::vector<CollectionNode> children;
 };
 
+// The workspace settings file, <dir>/watt.json, and whether <dir> has one.
+std::filesystem::path workspace_settings_file(const std::filesystem::path& dir);
+bool is_workspace_dir(const std::filesystem::path& dir);
+
 class Workspace {
  public:
   static std::optional<Workspace> open(const std::filesystem::path& root, std::string* err = nullptr);

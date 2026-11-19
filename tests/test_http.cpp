@@ -922,25 +922,25 @@ TEST_CASE("default User-Agent can be overridden or emptied", "[http]") {
   HttpClient c;
   auto d = c.send(get("/echo"));
   REQUIRE(d.ok);
-  CHECK(d.body.find("\"User-Agent\":\"watt/0.1\"") != std::string::npos);
+  CHECK(d.body.find("\"User-Agent\":\"watt/" WATT_VERSION "\"") != std::string::npos);
 
   HttpRequest own = get("/echo");
   own.headers = {{"user-agent", "mytool/2"}};
   auto o = c.send(own);
   REQUIRE(o.ok);
   CHECK(o.body.find("mytool/2") != std::string::npos);
-  CHECK(o.body.find("watt/0.1") == std::string::npos);
+  CHECK(o.body.find("watt/" WATT_VERSION) == std::string::npos);
 
   HttpRequest empty = get("/echo");
   empty.headers = {{"User-Agent", ""}};
   auto e = c.send(empty);
   REQUIRE(e.ok);
-  CHECK(e.body.find("watt/0.1") == std::string::npos);
+  CHECK(e.body.find("watt/" WATT_VERSION) == std::string::npos);
 
   // and the default comes back once the override is gone
   auto again = c.send(get("/echo"));
   REQUIRE(again.ok);
-  CHECK(again.body.find("\"User-Agent\":\"watt/0.1\"") != std::string::npos);
+  CHECK(again.body.find("\"User-Agent\":\"watt/" WATT_VERSION "\"") != std::string::npos);
 }
 
 TEST_CASE("a failure on a reused connection is booked as waiting, not DNS", "[http][timing]") {
@@ -1068,7 +1068,7 @@ std::filesystem::path test_exe_dir() {
 }
 
 std::filesystem::path testserver_cert_dir() {
-  auto here = std::filesystem::path(__FILE__).parent_path().parent_path() / "tools" / "testserver" / "certs";
+  auto here = std::filesystem::path(WATT_SOURCE_DIR) / "tools" / "testserver" / "certs";
   if (std::filesystem::exists(here / "ca.pem")) return here;
   return test_exe_dir().parent_path().parent_path() / "tools" / "testserver" / "certs";
 }
@@ -1281,12 +1281,12 @@ TEST_CASE("connection info: TLS against the local test server", "[http][conn][tl
   CHECK(t.leaf.issuer_cn == "watt test CA");
   CHECK(t.leaf.subject_alt_names ==
         std::vector<std::string>{"localhost", "watt.test", "127.0.0.1"});
-  CHECK(t.leaf.not_before == "2026-11-16T23:06:29Z");
-  CHECK(t.leaf.not_after == "2126-10-23T23:06:29Z");
-  CHECK(t.leaf.serial == "1D29EDA45D4C26B44DD66472531F028C5556227A");
+  CHECK(t.leaf.not_before == "2026-11-19T14:02:44Z");
+  CHECK(t.leaf.not_after == "2126-10-26T14:02:44Z");
+  CHECK(t.leaf.serial == "73899F4F5BC4C83C7B8FEC33348ED97C1AE61DBA");
   CHECK(t.leaf.sha256_fingerprint ==
-        "F3:01:B3:F3:55:F3:67:49:37:70:D4:E2:EC:C8:42:5D:4C:A5:F2:0B:00:67:85:D7:CD:22:99:FD:3C:"
-        "BA:48:AE");
+        "F9:48:EB:1D:AF:18:EA:C4:48:F2:E2:1E:50:0C:87:4C:42:21:8C:64:1C:10:81:47:EA:22:24:C2:EA:61:"
+        "90:0F");
   CHECK(t.chain_length == 1);  // the server sends its leaf only
   CHECK(t.read_ms < 5.0);
   // Mirrors the response view reads.
@@ -1295,8 +1295,8 @@ TEST_CASE("connection info: TLS against the local test server", "[http][conn][tl
   CHECK(a.cert_subject == "CN=localhost");
   CHECK(a.cert_issuer == "CN=watt test CA");
   CHECK(a.cert_san == "localhost, watt.test, 127.0.0.1");
-  CHECK(a.cert_not_after == "2126-10-23 23:06:29 UTC");
-  CHECK(a.cert_chain.find("localhost  (issued by watt test CA, until 2126-10-23)") == 0);
+  CHECK(a.cert_not_after == "2126-10-26 14:02:44 UTC");
+  CHECK(a.cert_chain.find("localhost  (issued by watt test CA, until 2126-10-26)") == 0);
   CHECK(a.verify_result == t.verify_result);
   CHECK(a.local_ip == ci.local_ip);
   CHECK(a.local_port == ci.local_port);

@@ -1135,6 +1135,13 @@ void expire_folder_cache(FolderCache& fc);  // with the folder settings, below
 }
 using detail::expire_folder_cache;
 
+fs::path workspace_settings_file(const fs::path& dir) { return dir / kSettingsFile; }
+
+bool is_workspace_dir(const fs::path& dir) {
+  std::error_code ec;
+  return fs::exists(dir / kSettingsFile, ec);
+}
+
 std::optional<Workspace> Workspace::open(const fs::path& root, std::string* err) {
   std::error_code ec;
   const fs::path abs = fs::absolute(root, ec).lexically_normal();
@@ -1142,7 +1149,7 @@ std::optional<Workspace> Workspace::open(const fs::path& root, std::string* err)
     if (err) *err = "not a directory: " + to_utf8(root);
     return std::nullopt;
   }
-  const fs::path file = abs / kSettingsFile;
+  const fs::path file = workspace_settings_file(abs);
   std::string text;
   if (!detail::read_file(file, text)) {
     if (err) *err = "not a watt workspace (no watt.json): " + to_utf8(abs);
@@ -1220,15 +1227,39 @@ std::optional<Workspace> Workspace::open(const fs::path& root, std::string* err)
 Workspace Workspace::create(const fs::path& root) {
   std::error_code ec;
   detail::ensure_dir(root);
-  if (fs::exists(root / kSettingsFile, ec)) {
+  if (is_workspace_dir(root)) {
     if (auto ws = open(root)) return std::move(*ws);
   }
   Workspace ws;
   ws.root_ = fs::absolute(root, ec).lexically_normal();
-  if (!fs::exists(ws.root_ / kSettingsFile, ec)) ws.save_settings();
+  if (!is_workspace_dir(ws.root_)) ws.save_settings();
   // History, the active environment and secret values are personal; so is .env.
+  // A folder that already has a .gitignore (an existing repository) gets the missing lines
+  // appended, in its own line-ending style; a link is never written through.
   const fs::path gi = ws.root_ / ".gitignore";
-  if (!fs::exists(gi, ec)) detail::write_file_atomic(gi, ".watt/\n.env\n");
+  std::string text;
+  if (!fs::exists(gi, ec)) {
+    detail::write_file_atomic(gi, ".watt/\n.env\n");
+  } else if (!fs::is_symlink(gi, ec) && detail::read_file(gi, text)) {
+    bool has_priv = false, has_env = false;
+    for (size_t i = 0; i <= text.size();) {
+      size_t e = text.find('\n', i);
+      if (e == std::string::npos) e = text.size();
+      std::string line = text.substr(i, e - i);
+      while (!line.empty() && (line.back() == '\r' || line.back() == ' ' || line.back() == '\t')) line.pop_back();
+      while (!line.empty() && line.front() == '/') line.erase(line.begin());
+      has_priv = has_priv || line == ".watt" || line == ".watt/";
+      has_env = has_env || line == ".env";
+      i = e + 1;
+    }
+    if (!has_priv || !has_env) {
+      const char* eol = text.find("\r\n") != std::string::npos ? "\r\n" : "\n";
+      if (!text.empty() && text.back() != '\n') text += eol;
+      if (!has_priv) text += std::string(".watt/") + eol;
+      if (!has_env) text += std::string(".env") + eol;
+      detail::write_file_atomic(gi, text);
+    }
+  }
   // Saved files stay LF in git and on disk, also with Git for Windows' core.autocrlf=true.
   const fs::path ga = ws.root_ / ".gitattributes";
   if (!fs::exists(ga, ec)) detail::write_file_atomic(ga, "*.json text eol=lf\n");
@@ -1383,7 +1414,7 @@ struct TreeIndex {
     // At exit: changes not written yet are appended to the log, so the next process does not
     // have to open those files.
     std::error_code ec;
-    if (pending.empty() || !fs::exists(file.parent_path().parent_path() / kSettingsFile, ec)) return;
+    if (pending.empty() || !is_workspace_dir(file.parent_path().parent_path())) return;
     flush();
   }
 };
@@ -2456,7 +2487,7 @@ bool Workspace::rename(const fs::path& from, const std::string& new_name) {
 bool Workspace::save_settings(std::string* err) const {
   // watt.json: shared settings only. Keys we do not know about (written by a newer watt or
   // by hand) are kept; the pre-split "environments" and "active_env" keys are dropped.
-  const fs::path file = root_ / kSettingsFile;
+  const fs::path file = workspace_settings_file(root_);
   rapidjson::Document d;
   d.SetObject();
   auto& a = d.GetAllocator();
@@ -3500,7 +3531,8 @@ fs::path default_config_dir() {
   fs::path base;
   if (_wdupenv_s(&v, &n, L"APPDATA") == 0 && v && *v) base = fs::path(v);
   std::free(v);
-  return base.empty() ? fs::path() : base / "watt";
+  if (base.empty()) return {};
+  return base / "watt";
 #else
   if (const char* x = std::getenv("XDG_CONFIG_HOME"); x && *x == '/') return fs::path(x) / "watt";
   if (const char* h = std::getenv("HOME"); h && *h) return fs::path(h) / ".config" / "watt";

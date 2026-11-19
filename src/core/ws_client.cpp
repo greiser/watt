@@ -29,7 +29,7 @@ namespace watt {
 namespace {
 
 constexpr const char* kGuid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
-constexpr const char* kUserAgent = "watt/0.1";
+constexpr const char* kUserAgent = "watt/" WATT_VERSION;
 
 std::string lower(std::string_view s) {
   std::string o(s);

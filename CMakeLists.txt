@@ -1,5 +1,8 @@
-﻿cmake_minimum_required(VERSION 3.25)
-project(watt VERSION 0.1.0 LANGUAGES CXX)
+cmake_minimum_required(VERSION 3.25)
+project(watt VERSION 1.0.0
+  DESCRIPTION "Web API Testing Toolkit: a native REST, gRPC and WebSocket API tester"
+  LANGUAGES CXX)
+set(WATT_PRODUCT_NAME "Web API Testing Toolkit")
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -8,10 +11,20 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 if(MSVC)
   add_compile_options(/W4 /permissive- /utf-8 /Zc:__cplusplus /MP)
   add_compile_definitions(_WIN32_WINNT=0x0A00 NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE)
+  # __FILE__ (in assertion messages) without the folder the source tree was built in, so the
+  # binaries never carry the build machine's paths: "src\app\x.cpp", not "C:\...\src\app\x.cpp".
+  file(TO_NATIVE_PATH "${CMAKE_SOURCE_DIR}/" WATT_SOURCE_PREFIX)
+  add_compile_options("/d1trimfile:${WATT_SOURCE_PREFIX}")
 endif()
+# The version, for the User-Agent, the About box and the executable's version resource.
+add_compile_definitions(
+  WATT_VERSION="${PROJECT_VERSION}"
+  WATT_VERSION_MAJOR=${PROJECT_VERSION_MAJOR} WATT_VERSION_MINOR=${PROJECT_VERSION_MINOR}
+  WATT_VERSION_PATCH=${PROJECT_VERSION_PATCH}
+  WATT_PRODUCT_NAME="${WATT_PRODUCT_NAME}")
 
-# libcurl. build.ps1 installs watt's pinned build (ports/curl overlay: 8.22, static, release,
-# Schannel + nghttp2) into build/_curl822 and passes WATT_CURL_ROOT; 8.22 skips the per-reuse
+# libcurl. build.ps1 installs watt's pinned build (vcpkg/ports/curl overlay: 8.22, static,
+# release, Schannel + nghttp2) into build/_curl822r<port-version> and passes WATT_CURL_ROOT; 8.22 skips the per-reuse
 # liveness poll that 8.20 runs on every warm request. Without it (a hand-made configure) the
 # vcpkg-wide CURL package is used.
 set(WATT_CURL_ROOT "" CACHE PATH "Install prefix of watt's pinned static libcurl (see build.ps1)")
@@ -128,6 +141,8 @@ foreach(t ${TEST_SRC})
   get_filename_component(n ${t} NAME_WE)
   string(REPLACE "test_" "" piece ${n})
   add_executable(watt_${n} ${t})
+  # The tests read fixtures (protos, certificates) from the source tree; __FILE__ is trimmed.
+  target_compile_definitions(watt_${n} PRIVATE WATT_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
   if(TARGET watt_${piece})
     target_link_libraries(watt_${n} PRIVATE watt_${piece} Catch2::Catch2WithMain)
   else()

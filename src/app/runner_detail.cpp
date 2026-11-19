@@ -830,7 +830,7 @@ class DetailPane::Impl {
           host = host.substr(0, host.find_first_of("/?#"));
           if (const size_t at = host.rfind('@'); at != std::string::npos) host.erase(0, at + 1);
           if (!has("host")) implied.push_back({"Host", host});
-          if (!has("user-agent")) implied.push_back({"User-Agent", "watt/0.1"});
+          if (!has("user-agent")) implied.push_back({"User-Agent", "watt/" WATT_VERSION});
           if (!has("accept")) implied.push_back({"Accept", "*/*"});
           if (!has("accept-encoding")) implied.push_back({"Accept-Encoding", "deflate, gzip"});
           if (r.req_body_size && !has("content-length")) implied.push_back({"Content-Length", std::to_string(r.req_body_size)});

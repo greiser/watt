@@ -2217,7 +2217,7 @@ WebResult web_exchange(HttpClient& hc, const GrpcTarget& t, const std::string& p
   req.headers.emplace_back("Content-Type", ctype);
   req.headers.emplace_back("Accept", ctype);
   req.headers.emplace_back("X-Grpc-Web", "1");
-  req.headers.emplace_back("X-User-Agent", "grpc-web-watt/0.1");
+  req.headers.emplace_back("X-User-Agent", "grpc-web-watt/" WATT_VERSION);
   if (!t.user_agent.empty()) req.headers.emplace_back("User-Agent", t.user_agent);
   if (!t.authority.empty()) req.headers.emplace_back("Host", t.authority);
   if (timeout_ms > 0) {

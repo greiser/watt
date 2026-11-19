@@ -226,7 +226,7 @@ class App : public wxApp {
       wxString last;
       std::error_code ec;
       if (wxConfigBase* c = wxConfigBase::Get(); c && c->Read("Workspace/Last", &last) && !last.empty() &&
-          std::filesystem::exists(std::filesystem::path(last.ToStdWstring()) / "watt.json", ec))
+          is_workspace_dir(std::filesystem::path(last.ToStdWstring())))
         ws = last.ToStdWstring();
       else
         ws = std::filesystem::path(wxStandardPaths::Get().GetDocumentsDir().ToStdWstring()) / L"watt";

@@ -7,6 +7,7 @@
 #include <wx/choice.h>
 #include <wx/dialog.h>
 #include <wx/display.h>
+#include <wx/iconbndl.h>
 #include <wx/vlbox.h>
 #include <wx/menu.h>
 #include <wx/msgdlg.h>
@@ -510,6 +511,7 @@ std::shared_ptr<GrpcClient> MainFrame::grpc() {
 MainFrame::MainFrame(std::filesystem::path workspace_dir)
     : wxFrame(nullptr, wxID_ANY, "watt", wxDefaultPosition, wxDefaultSize), ws_dir_(std::move(workspace_dir)) {
   g_frame = this;
+  SetIcons(wxIconBundle("AAA_WATT", nullptr));  // watt.rc: every size of the application icon
   open_workspace_async();  // file scan on a worker while the window is being built
   // Warm libcurl / Winsock / TLS on another core while the window is being built (the first
   // request is 12-21% slower without it); done long before the first paint.
@@ -852,7 +854,7 @@ void MainFrame::open_workspace_async() {
     std::string err;
     std::unique_ptr<Workspace> ws;
     std::error_code ec;
-    if (std::filesystem::exists(dir / "watt.json", ec)) {
+    if (is_workspace_dir(dir)) {
       if (auto w = Workspace::open(dir, &err)) ws = std::make_unique<Workspace>(std::move(*w));
     } else {
       std::filesystem::create_directories(dir, ec);

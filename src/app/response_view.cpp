@@ -4636,7 +4636,7 @@ class ResponseView : public wxPanel, public ResponsePanel {
       if (!u.empty()) row("Host", std::string(u), true);
     }
     for (const auto& h : q.headers) row(h.first, h.second, false);
-    if (!has_header(q.headers, "user-agent")) row("User-Agent", "watt/0.1", true);
+    if (!has_header(q.headers, "user-agent")) row("User-Agent", "watt/" WATT_VERSION, true);
     if (!has_header(q.headers, "accept")) row("Accept", "*/*", true);
     if (!has_header(q.headers, "accept-encoding")) row("Accept-Encoding", "deflate, gzip", true);
     if (!q.body.empty()) {

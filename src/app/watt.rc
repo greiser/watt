@@ -1,4 +1,4 @@
-// Windows resources: wx's standard icons/bitmaps.
+// Windows resources: the application icon, the version block and wx's standard icons/bitmaps.
 //
 // No RT_MANIFEST here on purpose: CMake links MSVC executables with /MANIFEST:EMBED,ID=1, so a
 // manifest resource with ID 1 in this file fails the link (CVT1100 duplicate resource). The
@@ -6,5 +6,45 @@
 // "/manifestdependency:...") in app.cpp, and per-monitor DPI awareness v2 is set in app.cpp
 // before the first window exists (SetProcessDpiAwarenessContext), which is equivalent to
 // <dpiAwareness>PerMonitorV2</dpiAwareness>.
+//
+// WATT_VERSION_MAJOR / _MINOR / _PATCH come from CMakeLists.txt (project VERSION).
+
+#include <winver.h>
+
+// Explorer and the taskbar show the first icon group by name, and names sort before wx's own
+// "wxICON_AAA": this one is the executable's icon. MainFrame loads it by the same name.
+AAA_WATT ICON "../../resources/icon/watt.ico"
+
+#define WATT_STR2(x) #x
+#define WATT_STR(x) WATT_STR2(x)
+#define WATT_VERSION_TEXT WATT_STR(WATT_VERSION_MAJOR) "." WATT_STR(WATT_VERSION_MINOR) "." WATT_STR(WATT_VERSION_PATCH)
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION WATT_VERSION_MAJOR, WATT_VERSION_MINOR, WATT_VERSION_PATCH, 0
+ PRODUCTVERSION WATT_VERSION_MAJOR, WATT_VERSION_MINOR, WATT_VERSION_PATCH, 0
+ FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
+ FILEFLAGS 0
+ FILEOS VOS_NT_WINDOWS32
+ FILETYPE VFT_APP
+ FILESUBTYPE VFT2_UNKNOWN
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    BLOCK "040904B0"
+    BEGIN
+      VALUE "ProductName", "Web API Testing Toolkit"
+      VALUE "FileDescription", "Web API Testing Toolkit"
+      VALUE "InternalName", "watt"
+      VALUE "OriginalFilename", "watt.exe"
+      VALUE "FileVersion", WATT_VERSION_TEXT
+      VALUE "ProductVersion", WATT_VERSION_TEXT
+    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x409, 1200
+  END
+END
+
 #define wxUSE_NO_MANIFEST 1
 #include "wx/msw/wx.rc"

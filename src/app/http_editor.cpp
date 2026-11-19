@@ -3966,7 +3966,7 @@ void HttpEditor::update_auto_headers(bool force) {
     if (const size_t at = u.rfind('@'); at != std::string_view::npos) u.remove_prefix(at + 1);
     rows.emplace_back("Host", u.empty() ? std::string("(from the URL)") : std::string(u));
   }
-  rows.emplace_back("User-Agent", "watt/0.1");
+  rows.emplace_back("User-Agent", "watt/" WATT_VERSION);
   rows.emplace_back("Accept", "*/*");
   rows.emplace_back("Accept-Encoding", "deflate, gzip");
   // The Auth tab's header (as written there; {{vars}} are expanded when sent).

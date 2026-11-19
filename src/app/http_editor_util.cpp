@@ -1384,8 +1384,9 @@ std::string split_row_docs(std::string_view docs, RowDocs& out) {
   while (!body.empty() && (body.back() == '\n' || body.back() == '\r' || body.back() == ' ')) body.remove_suffix(1);
   if (body.size() < 3 || body.substr(body.size() - 3) != "-->") return std::string(docs);
   const size_t open = body.rfind(kRowDocsOpen);
+  const size_t mark = kRowDocsOpen.size();
   if (open == std::string_view::npos || (open > 0 && body[open - 1] != '\n')) return std::string(docs);
-  std::string_view block = body.substr(open + kRowDocsOpen.size(), body.size() - 3 - open - kRowDocsOpen.size());
+  std::string_view block = body.substr(open + mark, body.size() - 3 - open - mark);
   if (block.find("-->") != std::string_view::npos) return std::string(docs);
   // first line is the title (rest of the opening line)
   size_t nl = block.find('\n');
