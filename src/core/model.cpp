@@ -3138,7 +3138,16 @@ std::string var_mark_encode(std::string_view v, char mark) {
   for (size_t i = 0; i < v.size();) {
     if (v[i] == '{' && i + 1 < v.size() && v[i + 1] == '{') {  // a {{var}} left unknown stays readable
       const size_t close = v.find("}}", i + 2);
-      if (close != std::string_view::npos && v.substr(i + 2, close - i - 2).find_first_of("{\n") == std::string_view::npos) {
+      // Only a plain variable name ([A-Za-z0-9_.$-], spaces around it) stays as written: a value
+      // from a response (a capture) must not carry "&", "#", "/" or "?" past the encoding.
+      bool plain = close != std::string_view::npos;
+      if (plain) {
+        const std::string name = trim(v.substr(i + 2, close - i - 2));
+        plain = !name.empty() && std::all_of(name.begin(), name.end(), [](char ch) {
+          return std::isalnum(static_cast<unsigned char>(ch)) || ch == '_' || ch == '.' || ch == '$' || ch == '-';
+        });
+      }
+      if (plain) {
         out.append(v.substr(i, close + 2 - i));
         i = close + 2;
         continue;

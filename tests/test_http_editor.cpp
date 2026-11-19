@@ -1924,6 +1924,11 @@ TEST_CASE("variables in the URL path are encoded with and without a pre-request 
   CHECK(send(expand_url(with_id, keep_script_vars(live, {}, true), true), "console.log(1)") == want);
   // The path mark keeps reserved characters, encodes a stray %.
   CHECK(watt::var_mark_encode("a/b?c#d %zz %41\"<>", 'p') == "a/b?c#d%20%25zz%20%41%22%3C%3E");
+  // An unknown {{name}} stays readable; braces holding anything else are encoded like the rest
+  // (a captured value cannot add query parameters by wrapping them in braces).
+  CHECK(watt::var_mark_encode("x {{later}}", 'q') == "x%20{{later}}");
+  CHECK(watt::var_mark_encode("{{a&admin=1#f}}", 'q').find_first_of("&#") == std::string::npos);
+  CHECK(watt::var_mark_encode("{{a/b?c}}", 'p').find('{') == std::string::npos);
   CHECK(watt::strip_var_marks("{{a|p}}/x") == "{{a}}/x");
 
   // A script that rewrites the URL: the marks come back by position.
