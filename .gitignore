@@ -5,3 +5,4 @@ bench/refs/
 *.user
 tools/testserver/certs/.tmp-certs/
 __pycache__/
+.claude/
