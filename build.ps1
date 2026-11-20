@@ -63,13 +63,12 @@ function Install-PinnedCurl {
   if ($LASTEXITCODE) { exit $LASTEXITCODE }
 }
 
+# The pinned libcurl is release-only (/MD); a Debug tree uses vcpkg's own libcurl. Checked on
+# every Release build (cheap), so a deleted build\_curl822* is installed again.
+if ($Config -eq "Release") { Install-PinnedCurl }
 if (-not (Test-Path "$bdir\build.ninja")) {
-  # The pinned libcurl is release-only (/MD); a Debug tree uses vcpkg's own libcurl.
   $curlArg = "-DWATT_CURL_ROOT="
-  if ($Config -eq "Release") {
-    Install-PinnedCurl
-    $curlArg = "-DWATT_CURL_ROOT=$($curlPrefix.Replace('\', '/'))"
-  }
+  if ($Config -eq "Release") { $curlArg = "-DWATT_CURL_ROOT=$($curlPrefix.Replace('\', '/'))" }
   cmake -S $root -B $bdir -G Ninja "-DCMAKE_BUILD_TYPE=$Config" `
     "-DCMAKE_TOOLCHAIN_FILE=$toolchain" -DVCPKG_TARGET_TRIPLET=x64-windows $curlArg
   if ($LASTEXITCODE) { exit $LASTEXITCODE }
