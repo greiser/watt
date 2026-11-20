@@ -46,7 +46,7 @@ class FlatButton : public wxControl {
   std::vector<wxString> width_labels_;
 };
 
-// A check box drawn in the theme's colours (the native one stays light on the dark theme).
+// A check box drawn in the theme's colors (the native one stays light on the dark theme).
 class CheckBox : public wxControl {
  public:
   CheckBox(wxWindow* parent, const wxString& label);

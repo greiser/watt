@@ -1,6 +1,6 @@
 #pragma once
-// Shared look of the sidebar pieces: method / kind badge colours and labels, the badge images
-// of the collection tree, small fonts, status colours. UI thread only.
+// Shared look of the sidebar pieces: method / kind badge colors and labels, the badge images
+// of the collection tree, small fonts, status colors. UI thread only.
 #include <wx/bmpbndl.h>
 #include <wx/colour.h>
 #include <wx/font.h>
@@ -22,7 +22,7 @@ bool is_dark();
 std::string badge_label(RequestKind kind, std::string_view method);
 wxColour badge_colour(RequestKind kind, std::string_view method);
 
-// Colour for a history status: HTTP 2xx green, 3xx blue, 4xx orange, 5xx / failure red;
+// Color for a history status: HTTP 2xx green, 3xx blue, 4xx orange, 5xx / failure red;
 // gRPC 0 green, else red.
 wxColour status_colour(RequestKind kind, long status);
 // "200", "failed", "OK", "UNAVAILABLE"...
@@ -30,7 +30,7 @@ std::string status_text(RequestKind kind, long status);
 // "0.31 ms", "12.4 ms", "1.24 s"
 std::string format_ms(double ms);
 
-// Text colour helpers (follow the system light / dark appearance).
+// Text color helpers (follow the system light / dark appearance).
 wxColour text_colour();
 wxColour dim_colour();
 wxColour window_colour();

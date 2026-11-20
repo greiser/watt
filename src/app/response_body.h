@@ -99,7 +99,7 @@ class BodyView : public wxPanel {
   // hides the row). The response view keeps one per request.
   const std::string& filter_text() const { return filter_; }
   void set_filter(const std::string& expr);
-  // A new request is in flight: the body shown is the previous response, drawn dimmed and labelled
+  // A new request is in flight: the body shown is the previous response, drawn dimmed and labeled
   // so it is not read as the new answer. Cleared by the next result (and by set_stale(false)).
   void set_stale(bool stale);
 

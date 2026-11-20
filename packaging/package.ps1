@@ -9,7 +9,7 @@
 # The DLLs are found by walking watt.exe's imports (dumpbin /dependents): every DLL it reaches
 # that the build folder holds (vcpkg copies them there), plus the Visual C++ runtime DLLs it
 # reaches, taken from Visual Studio's redistributable folder (app-local, so no VC++ redistributable
-# install is needed). Licence texts of the bundled libraries come from vcpkg (share\<port>\copyright)
+# install is needed). License texts of the bundled libraries come from vcpkg (share\<port>\copyright)
 # and from packaging\licenses. See docs\BUILDING.md.
 param([string]$Dir = "release", [switch]$NoBuild, [string]$VsPath = "", [string]$VcpkgRoot = "")
 $ErrorActionPreference = "Stop"
@@ -111,7 +111,7 @@ $sb = New-Object System.Text.StringBuilder
 [void]$sb.AppendLine("The Visual C++ runtime DLLs (msvcp140*.dll, vcruntime140*.dll) are Microsoft redistributable files.")
 foreach ($k in $notices.Keys) {
   $p = $notices[$k]
-  if (-not (Test-Path $p)) { throw "licence text for $k not found: $p" }
+  if (-not (Test-Path $p)) { throw "license text for $k not found: $p" }
   [void]$sb.AppendLine("")
   [void]$sb.AppendLine(("=" * 78))
   [void]$sb.AppendLine($k)

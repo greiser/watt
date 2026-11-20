@@ -35,7 +35,7 @@ wxColour mix(const wxColour& a, const wxColour& b, double t) {
 
 wxString U(const std::string& s) { return wxString::FromUTF8(s); }
 
-// Text drawn left-aligned and vertically centred in r; returns its width.
+// Text drawn left-aligned and vertically centered in r; returns its width.
 int draw_text(wxDC& dc, const wxString& s, int x, const wxRect& r) {
   const wxSize e = dc.GetTextExtent(s);
   dc.DrawText(s, x, r.y + (r.height - e.y) / 2);
@@ -82,7 +82,7 @@ const Theme& Theme::get() {
     th.dark = wxSystemSettings::GetAppearance().IsDark();
     th.bg = wxSystemSettings::GetColour(wxSYS_COLOUR_WINDOW);
     th.fg = wxSystemSettings::GetColour(wxSYS_COLOUR_WINDOWTEXT);
-    if (th.dark && th.bg.GetLuminance() > 0.5) {  // system colours not themed: pick our own
+    if (th.dark && th.bg.GetLuminance() > 0.5) {  // system colors not themed: pick our own
       th.bg = wxColour(32, 32, 32);
       th.fg = wxColour(220, 220, 220);
     }
@@ -473,7 +473,7 @@ void Waterfall::paint_waiting(wxDC& dc) {
   dc.SetTextForeground(cancelled_ ? th.warn : th.accent);
   const bool grpc = reserve_rows_ == 8;
   const bool paced = grpc && paced_sent_ >= 0;
-  // Cancelled after body data arrived: what was seen until the cancel stays drawn (frozen).
+  // Canceled after body data arrived: what was seen until the cancel stays drawn (frozen).
   const bool got = live_first_ms_ >= 0;
   const bool partial = cancelled_ && got;
   const double shown_el = partial ? cancel_ms_ : el;
@@ -485,11 +485,11 @@ void Waterfall::paint_waiting(wxDC& dc) {
   };
   std::string head;
   if (partial) {
-    head = "cancelled by you after " + fmt::ms(cancel_ms_) + " \xC2\xB7 " +
+    head = "canceled by you after " + fmt::ms(cancel_ms_) + " \xC2\xB7 " +
            (grpc ? std::to_string(live_msgs_) + (live_msgs_ == 1 ? " message" : " messages")
                  : fmt::human_bytes(live_bytes_) + " received");
   } else if (cancelled_) {
-    head = "cancelled after " + fmt::ms(cancel_ms_) + " \xC2\xB7 no response, so no phase breakdown";
+    head = "canceled after " + fmt::ms(cancel_ms_) + " \xC2\xB7 no response, so no phase breakdown";
   } else if (paced && !got) {
     // A Manual stream: open at the user's pace. Nothing is awaited before the client sends.
     head = paced_sent_ == 0 ? (paced_ended_ ? "ended by you, nothing sent \xC2\xB7 waiting for the trailers \xC2\xB7 "
@@ -529,7 +529,7 @@ void Waterfall::paint_waiting(wxDC& dc) {
     }
     dc.SetTextForeground(th.dim);
     dc.SetFont(GetFont().Smaller());
-    dc.DrawText(wxString::FromUTF8("cancelled by you (Esc or Cancel): the engine reports the phases only with a response"),
+    dc.DrawText(wxString::FromUTF8("canceled by you (Esc or Cancel): the engine reports the phases only with a response"),
                 pad, header_h() + n * rh + (footer_h() - dc.GetCharHeight()) / 2);
     return;
   }
@@ -633,7 +633,7 @@ void Waterfall::paint_waiting(wxDC& dc) {
   }
   dc.SetTextForeground(th.dim);
   dc.SetFont(GetFont().Smaller());
-  dc.DrawText(wxString::FromUTF8(partial ? "cancelled by you while it downloaded: the engine reports the exact "
+  dc.DrawText(wxString::FromUTF8(partial ? "canceled by you while it downloaded: the engine reports the exact "
                                            "per-phase split only with a complete response"
                                  : paced ? "user-paced: the split (open idle, your sends, End -> trailers) comes with the trailers"
                                  : got ? (grpc ? "per-phase split with the trailers, when the stream ends"
@@ -680,7 +680,7 @@ wxSize Waterfall::DoGetBestClientSize() const {
   const bool grpc = cur_.valid ? cur_.kind == "grpc" : reserve_rows_ == 8;
   // One floor for every tab: switching tabs moves nothing either. It starts at the rows of a
   // request with a pre-request and a post-response script (Pre-script + 10 phases + Post-script),
-  // so the tab strip sits at the same height on a plain request, a scripted one and a cancelled
+  // so the tab strip sits at the same height on a plain request, a scripted one and a canceled
   // one from the first send on (it only grows for a rarer model: OAuth token + redirects).
   // HTTP starts at its 10 phase rows (no empty band under the total on a plain request); a
   // scripted / redirecting response grows it once, and the tabs stay there from then on.
@@ -1105,7 +1105,7 @@ void Waterfall::on_paint() {
   const int tw = draw_text(dc, layout(brief), x, fr);
   tips_.push_back({wxRect(x, fr.y, tw, fr.height), cur_.total_tip});
   x += tw + gap;
-  // total = server + network + client, each with a swatch in its phase colour family.
+  // total = server + network + client, each with a swatch in its phase color family.
   auto part = [&](const std::string& label, double v, const std::string& tip, const wxColour& c) {
     dc.SetPen(*wxTRANSPARENT_PEN);
     dc.SetBrush(wxBrush(stale_ ? mix(c, th.bg, 0.6) : c));
@@ -1119,7 +1119,7 @@ void Waterfall::on_paint() {
   part(cur_.server_label, cur_.server_wait, cur_.server_tip, th.dark ? wxColour(80, 200, 120) : wxColour(30, 160, 80));
   part("network", cur_.network, cur_.network_tip, th.dark ? wxColour(70, 130, 240) : wxColour(40, 100, 220));
   part("client", cur_.client, cur_.client_tip, th.dark ? wxColour(130, 130, 140) : wxColour(150, 150, 160));
-  if (cur_.auth >= 0) part("auth", cur_.auth, cur_.auth_tip, wxColour(200, 150, 60));  // the Auth / token row's colour
+  if (cur_.auth >= 0) part("auth", cur_.auth, cur_.auth_tip, wxColour(200, 150, 60));  // the Auth / token row's color
   if (cur_.paced >= 0)
     part(brief ? "paced" : "user-paced", cur_.paced, cur_.paced_tip, th.dark ? wxColour(190, 150, 70) : wxColour(190, 130, 30));
   if (has_prev_) {
@@ -1170,7 +1170,7 @@ TabStrip::TabStrip(wxWindow* parent, std::function<void(int)> on_select)
   });
   Bind(wxEVT_LEFT_DOWN, [this](wxMouseEvent& e) {
     if (more_rect_.Contains(e.GetPosition())) return more_menu();
-    // Hit by column, with the gaps between tabs split between their neighbours: a label that
+    // Hit by column, with the gaps between tabs split between their neighbors: a label that
     // grows while a stream runs ("Events 99" -> "Events 100") never leaves a dead spot under
     // the mouse.
     const int x = e.GetPosition().x;
@@ -1304,7 +1304,7 @@ void TabStrip::on_paint() {
     dc.DrawText(l, x, (cr.height - e.y) / 2);
     x += e.x;
     if (!t.count.empty() && t.tone != Tone::Plain) {
-      // A result pill: white text on the tone colour.
+      // A result pill: white text on the tone color.
       dc.SetFont(small.Bold());
       const wxString c = U(t.count);
       const wxSize ce = dc.GetTextExtent(c);
@@ -1337,7 +1337,7 @@ void TabStrip::on_paint() {
   more_rect_ = wxRect();
   if (std::find(fit.begin(), fit.end(), 0) != fit.end()) {
     more_rect_ = wxRect(std::min(x - gap / 2, cr.width - more_w), 0, more_w, cr.height);
-    // In the error colour when a hidden tab says something failed (Tests "1/4").
+    // In the error color when a hidden tab says something failed (Tests "1/4").
     bool err = false;
     for (size_t i = 0; i < tabs_.size(); ++i) err = err || (!fit[i] && tabs_[i].shown && tabs_[i].tone == Tone::Err);
     if (more_hover_) {

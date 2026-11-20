@@ -25,7 +25,7 @@
 #include "app/main_frame.h"        // startup::
 #include "core/oauth2.h"
 #include "core/ws_client.h"
-#include "app/response_widgets.h"  // rv::Theme (the placeholder's colour)
+#include "app/response_widgets.h"  // rv::Theme (the placeholder's color)
 #include "app/ws_view.h"
 
 #include <windows.h>
@@ -931,7 +931,7 @@ void RequestTab::realize() {
                                 wxSP_LIVE_UPDATE | wxSP_NOBORDER | wxSP_THIN_SASH);
   split_->SetSashGravity(0.5);
   split_->SetMinimumPaneSize(FromDIP(240));
-  // The response view is not needed for the first paint: a pane in its colour stands in until the
+  // The response view is not needed for the first paint: a pane in its color stands in until the
   // tab's first idle after it is shown (see on_idle, 6-8 ms build), or until something has to be
   // displayed (response()).
   resp_ph_ = new wxPanel(split_, wxID_ANY);
@@ -1668,7 +1668,7 @@ void RequestTab::send_ws(Clock::time_point click) {
     auto hs = std::make_shared<const WsHandshake>(client->connect(*r));
     auto sent = std::make_shared<const HttpRequest>(std::move(*r));
     w->post([gen, hs, sent, ui_queue](RequestTab& t) { t.on_ws_handshake(gen, hs, sent, ui_queue); });
-    if (wsc && hs->error != "cancelled") {
+    if (wsc && hs->error != "canceled") {
       HistoryEntry e;
       e.when_iso = now_iso();
       e.kind = RequestKind::Http;  // listed like an HTTP row ("WS" badge, 101); the request is a WebSocket one
@@ -1704,7 +1704,7 @@ void RequestTab::on_ws_handshake(uint64_t gen, std::shared_ptr<const WsHandshake
   if (gen != gen_ || !in_flight_) return;
   WsResponsePanel* v = ws_view();
   if (!v) return;
-  if (hs->error == "cancelled") return;  // cancel() showed it already
+  if (hs->error == "canceled") return;  // cancel() showed it already
   v->ws_handshake(hs, sent, queue_ms);
   auto s = std::make_shared<SentHttp>();
   s->request = *sent;
@@ -1821,7 +1821,7 @@ void RequestTab::send_http(Clock::time_point click, bool checked) {
 }
 
 void RequestTab::on_send_bounced(uint64_t gen) {
-  if (gen != gen_ || !in_flight_) return;  // cancelled or superseded meanwhile
+  if (gen != gen_ || !in_flight_) return;  // canceled or superseded meanwhile
   in_flight_ = false;
   // Not in flight until the checked path sends again (send_http_job sets it back): a prompt
   // declined or a "Not sent" banner leaves Send a Send button, never a Cancel that cancels nothing.
@@ -2087,12 +2087,12 @@ void RequestTab::send_http_job(Clock::time_point click, std::shared_ptr<SavedReq
     };
     const auto start = Clock::now();
     const double ui_queue = ms_between(click, start);
-    if (w->is_cancelled(gen)) {  // cancelled while the client was being borrowed
+    if (w->is_cancelled(gen)) {  // canceled while the client was being borrowed
       w->give_back(origin);
       return;
     }
     // The head (status, headers, phases to the first byte) as soon as it arrives: a stream that
-    // never ends, or a send cancelled mid-body, still shows them.
+    // never ends, or a send canceled mid-body, still shows them.
     HeadFn on_head;
     if (tap)
       on_head = [&](const HttpResponse& h) {
@@ -2135,9 +2135,9 @@ void RequestTab::send_http_job(Clock::time_point click, std::shared_ptr<SavedReq
       t.on_http_done(gen, cresp, csent);
     });
 
-    // A cancelled send is a history row too, so it can be opened and sent again: what arrived
-    // and its time when the head was in, else status -1 ("cancelled" in the history list).
-    record_history(resp->error == "cancelled" && resp->status <= 0 ? -1 : resp->status, resp->timing.total_ms);
+    // A canceled send is a history row too, so it can be opened and sent again: what arrived
+    // and its time when the head was in, else status -1 ("canceled" in the history list).
+    record_history(resp->error == "canceled" && resp->status <= 0 ? -1 : resp->status, resp->timing.total_ms);
   });
   editor()->set_in_flight(true);
   response()->show_sending(RequestKind::Http);
@@ -2238,7 +2238,7 @@ void RequestTab::send_grpc(Clock::time_point click) {
     std::shared_ptr<const GrpcResponse> cresp = resp;
     w->post([gen, cresp](RequestTab& t) { t.on_grpc_done(gen, cresp); });
 
-    if (wsc) {  // a cancelled call too (CANCELLED in the history list), so it can be sent again
+    if (wsc) {  // a canceled call too (CANCELLED in the history list), so it can be sent again
       HistoryEntry e;
       e.when_iso = now_iso();
       e.kind = RequestKind::Grpc;
@@ -2288,8 +2288,8 @@ void RequestTab::on_http_done(uint64_t gen, std::shared_ptr<const HttpResponse> 
                               std::shared_ptr<const SentHttp> sent) {
   if (gen != gen_) return;
   if (!in_flight_) {
-    // Cancelled mid-stream (cancel() already showed what arrived): the session still keeps it.
-    if (r && r->error == "cancelled" && r->status > 0) {
+    // Canceled mid-stream (cancel() already showed what arrived): the session still keeps it.
+    if (r && r->error == "canceled" && r->status > 0) {
       last_ = LastResponse{r, sent, nullptr};
       last_.when_iso = now_iso();
       last_pending_ = false;

@@ -2250,11 +2250,11 @@ WebResult web_exchange(HttpClient& hc, const GrpcTarget& t, const std::string& p
     r.message = reader.error();
   } else if (aborted) {
     r.code = grpc::StatusCode::CANCELLED;
-    r.message = "cancelled";
+    r.message = "canceled";
   } else if (!h.ok) {
-    if (h.error == "cancelled") {
+    if (h.error == "canceled") {
       r.code = grpc::StatusCode::CANCELLED;
-      r.message = "cancelled";
+      r.message = "canceled";
     } else if (h.error.find("timed out") != std::string::npos || h.error.find("Timeout") != std::string::npos) {
       r.code = grpc::StatusCode::DEADLINE_EXCEEDED;
       r.message = "deadline exceeded after " + std::to_string(timeout_ms) + " ms";
@@ -2345,7 +2345,7 @@ long web_remaining(Clock::time_point deadline) {
 // ================================================================== Impl
 
 struct GrpcClient::Impl {
-  // One cached channel per target. The slot mutex serialises (re)building so a preconnect and
+  // One cached channel per target. The slot mutex serializes (re)building so a preconnect and
   // a call never race to create two channels.
   struct ChanSlot {
     GrpcTarget target;
@@ -2922,7 +2922,7 @@ GrpcSchema GrpcClient::Impl::reflect_web(const GrpcTarget& t, Clock::time_point 
     std::lock_guard lk(mu);
     alpha = refl_v1alpha.count(key) && refl_v1alpha[key];
   }
-  if (cancelled_since(gen)) return fail(grpc::Status(grpc::StatusCode::CANCELLED, "cancelled"), {});
+  if (cancelled_since(gen)) return fail(grpc::Status(grpc::StatusCode::CANCELLED, "canceled"), {});
   auto hc = web_acquire();
   std::map<std::string, pb::FileDescriptorProto> files;
   std::vector<std::string> services = symbols;
@@ -3254,7 +3254,7 @@ struct GrpcCall::Core {
   std::vector<std::string> pending_docs;
   size_t pending_next = 0;     // next doc to encode (feeder only)
   size_t pending_left = 0;     // docs not yet queued (guarded by m)
-  std::string encode_error;    // a later message failed to encode: the call was cancelled
+  std::string encode_error;    // a later message failed to encode: the call was canceled
   std::string decode_failure;  // the first response message that could not be decoded (call: INTERNAL)
 
   // gRPC-Web (target.web): no gRPC stream; once the send side is closed the queued message goes
@@ -3410,7 +3410,7 @@ struct GrpcCall::Core {
     bool sent = false;
     if (web_cancel || impl->cancelled_since(web_gen)) {
       wr.code = grpc::StatusCode::CANCELLED;
-      wr.message = "cancelled";
+      wr.message = "canceled";
     } else if (web_deadline != Clock::time_point::max() && t_start >= web_deadline) {
       wr.code = grpc::StatusCode::DEADLINE_EXCEEDED;
       wr.message = "deadline exceeded before the request was sent";

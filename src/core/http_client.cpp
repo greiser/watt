@@ -17,7 +17,7 @@
 //  * Loopback connects never retransmit SYNs (SIO_TCP_INITIAL_RTO). Windows retries a SYN to a
 //    refused loopback port instead of failing at once, so "localhost" against an IPv4-only dev
 //    server used to sit on ::1 until curl's 200 ms happy-eyeballs timer fired. Real networks
-//    keep the normal SYN retry behaviour.
+//    keep the normal SYN retry behavior.
 //  * Busy-poll (HttpRequest::busy_poll_ms): for the first 20 ms of a transfer the loop calls
 //    curl_multi_perform again after a few pause instructions instead of sleeping in
 //    curl_multi_poll. A thread that sleeps through the server wait wakes on an idle,
@@ -663,7 +663,7 @@ bool pem_to_pfx(const std::string& cert_pem, const std::string& key_pem, const s
 // store (DPAPI-protected, like any imported .pfx), and libcurl is pointed at it by thumbprint
 // ("CurrentUser\watt\<sha1>"). An already imported certificate with a usable key is reused.
 // "store:CurrentUser\MY\<sha1>" (HttpRequest::client_cert) names a certificate that is already
-// in a Windows store (smart card, enterprise enrolment) and is used as it is.
+// in a Windows store (smart card, enterprise enrollment) and is used as it is.
 std::string install_client_cert(const std::string& pfx, const std::string& pass, std::string& err) {
   CRYPT_DATA_BLOB b{static_cast<DWORD>(pfx.size()), reinterpret_cast<BYTE*>(const_cast<char*>(pfx.data()))};
   if (!PFXIsPFXBlob(&b)) {
@@ -1815,7 +1815,7 @@ HttpResponse HttpClient::send(const HttpRequest& req, const BodyChunkFn& on_chun
   im.cancel_flag.store(false, std::memory_order_relaxed);
 
   if (!im.easy || !im.multi || !im.share) {
-    resp.error = "libcurl initialisation failed";
+    resp.error = "libcurl initialization failed";
     resp.timing.total_ms = resp.prepare_ms = ms_between(t0, Clock::now());
     return resp;
   }
@@ -1934,7 +1934,7 @@ HttpResponse HttpClient::send(const HttpRequest& req, const BodyChunkFn& on_chun
   // Collect results.
   if (cancelled) {
     resp.ok = false;
-    resp.error = "cancelled";
+    resp.error = "canceled";
   } else if (!multi_error.empty()) {
     resp.ok = false;
     resp.error = multi_error;

@@ -178,7 +178,7 @@ TEST_CASE("implicit Windows SSO needs per-user consent per origin", "[auth][ntlm
   CHECK_FALSE(reopened->http_to_send(r));
 
   // Allowed after the user's consent (stored in the per-user config, keyed by the root).
-  REQUIRE(t.ws.allow_sso_host(url("/anything?x")));  // normalised to the origin
+  REQUIRE(t.ws.allow_sso_host(url("/anything?x")));  // normalized to the origin
   CHECK(t.ws.allowed_sso_hosts() == std::vector<std::string>{origin});
   CHECK(fs::exists(Workspace::user_config_dir() / "allowed_sso.json"));
   CHECK(t.ws.blocked_sso_hosts(r).empty());
@@ -218,7 +218,7 @@ TEST_CASE("implicit Windows SSO needs per-user consent per origin", "[auth][ntlm
   CHECK_FALSE(t.ws.blocked_sso_hosts(r).empty());
 }
 
-TEST_CASE("url_origin normalises origins", "[auth][sso]") {
+TEST_CASE("url_origin normalizes origins", "[auth][sso]") {
   CHECK(Workspace::url_origin("HTTPS://Example.COM/a?b") == "https://example.com:443");
   CHECK(Workspace::url_origin("http://host.:8080#x") == "http://host:8080");
   // Parser differentials: the origin is what libcurl will connect to, or nothing at all.

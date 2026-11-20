@@ -1,5 +1,5 @@
 // Start-up cost of request scripts, in its own process so QuickJS is guaranteed cold: a request
-// without scripts pays nothing and never initialises QuickJS; then the first script's cost (cold)
+// without scripts pays nothing and never initializes QuickJS; then the first script's cost (cold)
 // and a typical HMAC pre-request script (warm). One test case, so the order is fixed.
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_string.hpp>
@@ -134,7 +134,7 @@ TEST_CASE("script start-up cost: zero without scripts, lazy QuickJS, warm HMAC p
   }
   std::sort(warm.begin(), warm.end());
   std::sort(empty.begin(), empty.end());
-  std::printf("[perf] script-less request: %.1f ns per run_pre_script call (QuickJS not initialised)\n", ns);
+  std::printf("[perf] script-less request: %.1f ns per run_pre_script call (QuickJS not initialized)\n", ns);
   std::printf("[perf] first script in the process (QuickJS runtime + prelude compile + run): %.2f ms (setup %.0f us)\n",
               cold_ms, first.setup_us);
   std::printf("[perf] HMAC pre-request script, warm: p50 %.0f us, p90 %.0f us, min %.0f us\n", warm[kRuns / 2],

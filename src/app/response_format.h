@@ -48,7 +48,7 @@ void hex_dump(std::string_view in, std::string& out, size_t max_bytes, bool* tru
 
 // Scintilla styling computed off the UI thread (the Lexilla JSON lexer manages ~6 MB/s on the
 // UI thread; this runs at memory speed on the worker). Style ids are Lexilla's SCE_JSON_* so the
-// view's JSON colours apply. styles gets one byte per input byte; levels one Scintilla fold
+// view's JSON colors apply. styles gets one byte per input byte; levels one Scintilla fold
 // level per line (base 0x400 + depth, 0x2000 on lines that open a container).
 namespace json_style {
 enum : char { Default = 0, Number = 1, String = 2, PropertyName = 4, Escape = 5, LineComment = 6,
@@ -96,7 +96,7 @@ std::string human_bytes(uint64_t b);
 std::string ms(double v);
 // Signed delta: "+0.12 ms" / "-3.4 ms".
 std::string delta_ms(double v);
-// A run-to-run difference too small to colour as better / worse: under 2 ms, or under 25% of
+// A run-to-run difference too small to color as better / worse: under 2 ms, or under 25% of
 // the larger of the two (CDN and scheduler jitter on a ~10 ms request is not a regression).
 bool delta_is_noise(double d, double scale);
 

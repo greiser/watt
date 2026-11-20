@@ -302,7 +302,7 @@ bool TestsView::build_step() {
   bar_->add(kEdit, "Edit", "Change the selected check (F2 or double-click)", -1, true);
   bar_->add(kToggle, "On/Off", "Enable or disable the selected check (Space)", -1, true);
   bar_->add(kDelete, "Delete", "Delete the selected check (Del)", -1, true);
-  // Suggestions sit on their own row, left-aligned, and a used one is greyed out rather than
+  // Suggestions sit on their own row, left-aligned, and a used one is grayed out rather than
   // removed: the chip under the cursor never moves after a click.
   hints_ = new ChipBar(this, [this](int id) { on_chip(id); });
   hints_->add(kHintStatus, "+ status 2xx", "Add: the status is in this response's class");
@@ -1185,7 +1185,7 @@ void TestsView::wrap_empty() {
 void TestsView::update_chips() {
   if (!list_) return;
   const int sel = selected();
-  // Always the same chips while editable (greyed without a selection): selecting a row never
+  // Always the same chips while editable (grayed without a selection): selecting a row never
   // moves the chip under the cursor.
   bar_->set_visible(kAdd, editable_);
   for (int id : {kEdit, kToggle, kDelete}) {
@@ -1194,7 +1194,7 @@ void TestsView::update_chips() {
   }
   bar_->Refresh();
   // Suggestions from the shown response. Which ones apply depends on the response only; one
-  // already in the list is greyed (and ticked) in place.
+  // already in the list is grayed (and ticked) in place.
   auto has = [&](const std::string& target) {
     return std::any_of(asserts_.begin(), asserts_.end(), [&](const Assertion& a) { return a.target == target; });
   };

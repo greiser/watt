@@ -98,7 +98,7 @@ class SseTap : public HttpBodyTap {
     return us < 0 ? -1.0 : static_cast<double>(us) / 1000.0;
   }
   // UI thread: the start of a body that is not an event stream (at most kPartialMax bytes), for
-  // a request cancelled while it downloads: what arrived is shown, not thrown away.
+  // a request canceled while it downloads: what arrived is shown, not thrown away.
   std::string partial() const;
   static constexpr size_t kPartialMax = 2u << 20;
   // Between two drains (the UI drains once per frame; these only matter if it stalls): the

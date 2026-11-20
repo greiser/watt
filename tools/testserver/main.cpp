@@ -117,7 +117,7 @@ void echo_metadata(ServerContext* ctx, t::EchoResponse* resp) {
   ctx->AddTrailingMetadata("x-trailer", "done");
 }
 
-// Sleeps in small slices so cancellation and deadlines are honoured promptly.
+// Sleeps in small slices so cancellation and deadlines are honored promptly.
 bool sleep_cancellable(ServerContext* ctx, int ms) {
   auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(ms);
   while (std::chrono::steady_clock::now() < until) {
@@ -210,7 +210,7 @@ class EchoService final : public t::Echo::Service {
   }
 
   Status Slow(ServerContext* ctx, const t::SlowRequest* req, t::EchoResponse* resp) override {
-    if (!sleep_cancellable(ctx, req->delay_ms())) return Status(grpc::StatusCode::CANCELLED, "cancelled");
+    if (!sleep_cancellable(ctx, req->delay_ms())) return Status(grpc::StatusCode::CANCELLED, "canceled");
     resp->set_message("slept " + std::to_string(req->delay_ms()) + "ms");
     *resp->mutable_received_at() = now_ts();
     return Status::OK;

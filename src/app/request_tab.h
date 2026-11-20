@@ -1,8 +1,8 @@
 #pragma once
 // One request tab: owns a SavedRequest, the editor for its kind, a response view, and a worker
 // thread that runs the engines. The UI thread never waits on the network: the worker posts every
-// result back with CallAfter, tagged with a generation number so a cancelled or superseded
-// request's late result is dropped. Closing a tab never blocks: the worker is cancelled and left
+// result back with CallAfter, tagged with a generation number so a canceled or superseded
+// request's late result is dropped. Closing a tab never blocks: the worker is canceled and left
 // to finish on its own (it holds its state by shared_ptr).
 #include <wx/panel.h>
 #include <wx/timer.h>

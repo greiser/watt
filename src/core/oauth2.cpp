@@ -206,7 +206,7 @@ bool token_request(const TokenCall& call, std::vector<std::pair<std::string, std
     client = own.get();
   }
   if (call.hooks.cancel && call.hooks.cancel->load()) {
-    err = "cancelled";
+    err = "canceled";
     return false;
   }
   const HttpResponse resp = client->send(req);
@@ -343,7 +343,7 @@ bool authorization_code(const TokenCall& call, OAuth2Token& t, std::string& err)
   if (!parse_redirect(c.redirect_uri, rd, err)) return false;
   Wsa wsa;
   if (!wsa.ok) {
-    err = "Winsock initialisation failed";
+    err = "Winsock initialization failed";
     return false;
   }
   Sock ls;
@@ -419,7 +419,7 @@ bool authorization_code(const TokenCall& call, OAuth2Token& t, std::string& err)
   std::string code;
   while (code.empty()) {
     if (call.hooks.cancel && call.hooks.cancel->load()) {
-      err = "cancelled";
+      err = "canceled";
       return false;
     }
     if (std::chrono::steady_clock::now() >= deadline) {

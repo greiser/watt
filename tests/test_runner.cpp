@@ -1173,7 +1173,7 @@ std::shared_ptr<StepResult> failed_step(size_t seq, int it, size_t item, const s
 }
 }  // namespace
 
-TEST_CASE("failures group by request, check and message with numbers normalised", "[runner][triage]") {
+TEST_CASE("failures group by request, check and message with numbers normalized", "[runner][triage]") {
   std::vector<std::shared_ptr<const StepResult>> v;
   size_t seq = 0;
   for (int it = 0; it < 4; ++it) {

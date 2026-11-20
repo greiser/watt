@@ -1,5 +1,5 @@
 // Pure helpers of the HTTP request editor (src/app/http_editor_util.*): query encoding between
-// the Params table and the URL, URL normalisation at send time, bulk edit text, header cleaning.
+// the Params table and the URL, URL normalization at send time, bulk edit text, header cleaning.
 #include <catch2/catch_test_macros.hpp>
 
 #include <winsock2.h>  // before anything that may pull in windows.h (the embedded test server)
@@ -535,7 +535,7 @@ TEST_CASE("GraphQL body: built from query and variables, and split back", "[http
   CHECK(graphql_body("{ a }", "{\"id\": {{id}}}") == "{\"query\":\"{ a }\",\"variables\":{\"id\": {{id}}}}");
 }
 
-TEST_CASE("GraphQL body: only plain GraphQL JSON is recognised", "[http_editor]") {
+TEST_CASE("GraphQL body: only plain GraphQL JSON is recognized", "[http_editor]") {
   std::string q, v, op;
   CHECK_FALSE(split_graphql_body("{\"name\":\"Ada\"}", q, v, &op));
   CHECK_FALSE(split_graphql_body("{\"query\":1}", q, v, &op));

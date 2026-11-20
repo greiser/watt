@@ -61,7 +61,7 @@
 // Values are strings: numbers / bools / objects are stored as their JSON text.
 //
 // Cost: a request without scripts pays nothing (the run functions return before touching
-// QuickJS or the trust file). QuickJS is initialised on the first script run of the process
+// QuickJS or the trust file). QuickJS is initialized on the first script run of the process
 // (the prelude that defines the APIs above is compiled once to bytecode then), never at start-up.
 //
 // Typical send path:
@@ -142,7 +142,7 @@ struct ScriptRun {
   bool visualizer_cleared = false;  // pm.visualizer.clear() was called (drops an earlier script's set)
   std::string visualizer_template;
   std::string visualizer_data;      // JSON ("{}" when set() got no data)
-  std::string visualizer_error;     // why set() could not keep it (too large, data not JSON-serialisable)
+  std::string visualizer_error;     // why set() could not keep it (too large, data not JSON-serializable)
 };
 
 // Largest template / data JSON pm.visualizer.set() keeps (a larger one sets visualizer_error).
@@ -161,7 +161,7 @@ ScriptRun run_post_script(const Workspace& ws, const SavedRequest& req, Response
 // ok = false and a message. False if saving failed (*err says why).
 bool apply_script_vars(Workspace& ws, ScriptRun& run, bool persist = true, std::string* err = nullptr);
 
-// Process-wide: whether QuickJS has been initialised (i.e. some script ran), for start-up tests.
+// Process-wide: whether QuickJS has been initialized (i.e. some script ran), for start-up tests.
 bool script_engine_initialized();
 
 }  // namespace watt

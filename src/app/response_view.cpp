@@ -808,7 +808,7 @@ const char* kTlsGrpc = "TCP connected -> channel READY: the TLS handshake and HT
 const char* kReflect =
     "Server reflection before the call: channel READY -> schema resolved (only on the first call "
     "without .proto files).";
-const char* kSendGrpc = "Request message(s) serialised and written to the stream.";
+const char* kSendGrpc = "Request message(s) serialized and written to the stream.";
 const char* kDownloadGrpc = "First response message -> trailers received (all messages decoded).";
 const char* kWaitGrpc =
     "Server wait (TTFB): request sent -> response headers (the first HTTP/2 HEADERS frame). The "
@@ -819,7 +819,7 @@ const char* kOther = "Time inside the call not attributed to any phase above.";
 const char* kTotalGrpc = "Send click -> final status received: the wall time you waited.";
 }  // namespace tips
 
-// Phase colours: setup greys, connection blues/purple, server wait green, transfer amber/blue.
+// Phase colors: setup grays, connection blues/purple, server wait green, transfer amber/blue.
 struct Pal {
   wxColour setup, dns, socket, connect, tls, send, wait, down, redirect;
 };
@@ -1795,7 +1795,7 @@ class ResponseView : public wxPanel, public ResponsePanel {
                "look at it or check it again. Examples are kept per user, in the workspace's private .watt "
                "folder (a response may hold tokens).", -1, true);
     hist_->set_visible(2, false);
-    hist_->add(1, "History", "Earlier responses of this tab, each labelled with its request: pick one to look at it "
+    hist_->add(1, "History", "Earlier responses of this tab, each labeled with its request: pick one to look at it "
                              "again (its delta compares with the run of the same request before it)", -1, true);
     hist_->set_visible(1, false);
     hist_->set_bottom_rule(true);  // the tab strip's rule runs to the pane's right edge
@@ -2301,7 +2301,7 @@ class ResponseView : public wxPanel, public ResponsePanel {
       std::string c = std::to_string(sse_->count()) + (sse_->count() == 1 ? " event" : " events");
       if (sse_comments_) c += " \xC2\xB7 " + std::to_string(sse_comments_) + " comments";
       if (run.cancelled_ms >= 0) {
-        c += " \xC2\xB7 " + (run.cut_label.empty() ? "cancelled by you after " + fmt::ms(run.cancelled_ms)
+        c += " \xC2\xB7 " + (run.cut_label.empty() ? "canceled by you after " + fmt::ms(run.cancelled_ms)
                                                     : "stream ended: " + run.cut_label);
         sse_->set_caption(c, run.cut_label.empty() ? Tone::Warn : Tone::Err);
       } else {
@@ -2420,7 +2420,7 @@ class ResponseView : public wxPanel, public ResponsePanel {
     if (help_shown) {
       body_->show_message("Waiting for the response.");
     } else {
-      // The previous body stays (faded, labelled) only for a short moment, so a fast resend does
+      // The previous body stays (faded, labeled) only for a short moment, so a fast resend does
       // not flash an empty pane; a request still out after that clears it (Bruno does the same):
       // the body pane then shows the request in flight, never an old answer under a small label.
       body_->set_stale(true);
@@ -2518,7 +2518,7 @@ class ResponseView : public wxPanel, public ResponsePanel {
     const bool restored = !awaiting_;
     // A transfer that failed after its head arrived (an idle stream timing out, the server going
     // away mid-body): the status, headers, phases to TTFB and what arrived stay, as on a cancel.
-    if (!restored && r && !r->ok && r->error != "cancelled" && kind_ == RequestKind::Http && tap_)
+    if (!restored && r && !r->ok && r->error != "canceled" && kind_ == RequestKind::Http && tap_)
       if (std::shared_ptr<const HttpResponse> h = tap_->head_response()) {
         ++view_seq_;
         return show_cancelled_with_head(r->timing.total_ms, std::move(h), std::move(sent), r.get());
@@ -2640,7 +2640,7 @@ class ResponseView : public wxPanel, public ResponsePanel {
       extras_cut_size_ = 0;
       extras_body_key_.clear();
     }
-    if (restored && !r->ok && r->status >= 100 && r->headers.size() > 0 && r->error != "cancelled") {
+    if (restored && !r->ok && r->status >= 100 && r->headers.size() > 0 && r->error != "canceled") {
       // A transfer that failed after its head (a timeout mid-body), restored: shown as it was
       // live (status, headers, what arrived, "timed out after ..."), not as a bare failure.
       auto c = std::make_shared<HttpResponse>(*r);
@@ -2812,8 +2812,8 @@ class ResponseView : public wxPanel, public ResponsePanel {
     if (before) add_delta(segs, model, *before, run.label, run.base_at);
     if (run.cancelled_ms >= 0) {
       if (run.cut_label.empty())
-        segs.insert(segs.begin(), StatusSeg{"cancelled after " + fmt::ms(run.cancelled_ms),
-                                            "Cancelled by you (Esc or the Cancel button) while the body arrived: the "
+        segs.insert(segs.begin(), StatusSeg{"canceled after " + fmt::ms(run.cancelled_ms),
+                                            "Canceled by you (Esc or the Cancel button) while the body arrived: the "
                                             "status, headers and phases up to Wait (TTFB) are as received, the body is "
                                             "what arrived before the cancel.\nCtrl+Enter sends it again.",
                                             Tone::Warn, true, 0});
@@ -2976,7 +2976,7 @@ class ResponseView : public wxPanel, public ResponsePanel {
     tl.lap("vis");
     if (run.cancelled_ms >= 0 && r->body.empty() && run.cancelled_bytes > 0 && !run.sse_live) {
       body_->show_message("The " + fmt::human_bytes(run.cancelled_bytes) + " of the body that arrived before it was cut (" +
-                          (run.cut_label.empty() ? "cancelled by you" : run.cut_label) +
+                          (run.cut_label.empty() ? "canceled by you" : run.cut_label) +
                           ") were not kept with this run.\n\nCtrl+Enter sends the request again.");
       ++test_seq_;
       tests_->set_no_response("incomplete response: not checked");
@@ -2985,7 +2985,7 @@ class ResponseView : public wxPanel, public ResponsePanel {
     }
     if (run.cancelled_ms >= 0) {
       const bool cut = r->body.size() < run.cancelled_bytes;
-      body_->set_origin_note((run.cut_label.empty() ? "cancelled after " + fmt::ms(run.cancelled_ms) : run.cut_label) + ": " +
+      body_->set_origin_note((run.cut_label.empty() ? "canceled after " + fmt::ms(run.cancelled_ms) : run.cut_label) + ": " +
                              (cut ? "the first " + fmt::human_bytes(r->body.size()) + " of " +
                                         fmt::human_bytes(run.cancelled_bytes)
                                   : fmt::human_bytes(run.cancelled_bytes) + " received, incomplete"));
@@ -2994,7 +2994,7 @@ class ResponseView : public wxPanel, public ResponsePanel {
     tl.lap("body");
     if (run.cancelled_ms >= 0) {
       ++test_seq_;
-      tests_->set_no_response(run.cut_label.empty() ? std::string("cancelled while the response arrived: not checked")
+      tests_->set_no_response(run.cut_label.empty() ? std::string("canceled while the response arrived: not checked")
                                                     : run.cut_label + " while the response arrived: not checked");
       tests_->set_script({});
       update_tests_label();
@@ -3145,25 +3145,25 @@ class ResponseView : public wxPanel, public ResponsePanel {
     live_ = false;
     awaiting_ = false;
     ++test_seq_;
-    tests_->set_no_response("cancelled, no response");
+    tests_->set_no_response("canceled, no response");
     tests_->set_script({});
     update_tests_label();
     body_->set_stale(false);
-    // Nothing of an earlier run is shown under "Cancelled": the timing keeps its height (the body
-    // does not jump) and says the request was cancelled; the earlier responses stay one click away
+    // Nothing of an earlier run is shown under "Canceled": the timing keeps its height (the body
+    // does not jump) and says the request was canceled; the earlier responses stay one click away
     // in the History chip.
     wf_->set_cancelled(after_ms);
     std::vector<StatusSeg> segs;
-    segs.push_back({"after " + fmt::ms(after_ms), "Cancelled by you (Esc or the Cancel button).", Tone::Plain, true});
+    segs.push_back({"after " + fmt::ms(after_ms), "Canceled by you (Esc or the Cancel button).", Tone::Plain, true});
     if (streamed) {
       // Messages of this very call arrived before the cancel: they stay, with a note.
       segs.push_back({std::to_string(msgs_->count()) + " messages before the cancel",
-                      "These messages arrived before you cancelled the call.", Tone::Dim, false, 3});
-      body_->append_note("cancelled by you after " + fmt::ms(after_ms));
+                      "These messages arrived before you canceled the call.", Tone::Dim, false, 3});
+      body_->append_note("canceled by you after " + fmt::ms(after_ms));
     } else {
       showing_grpc_ = false;
       grpc_last_.reset();
-      body_->show_message("Cancelled after " + fmt::ms(after_ms) + ": no response was received.\n\n" +
+      body_->show_message("Canceled after " + fmt::ms(after_ms) + ": no response was received.\n\n" +
                           (runs_.empty() ? std::string("Ctrl+Enter sends it again.")
                                          : "Ctrl+Enter sends it again. Earlier responses: \"Earlier runs\" (right)."));
       headers_->set({});
@@ -3171,7 +3171,7 @@ class ResponseView : public wxPanel, public ResponsePanel {
       msgs_->reset();
       cookies_->set({});
       request_->set({});
-      fill_log("* Cancelled by you after " + fmt::ms(after_ms) + ": no response.\n");
+      fill_log("* Canceled by you after " + fmt::ms(after_ms) + ": no response.\n");
       set_kind_tabs(false, false);
       tabs_->set_label(kRequest, "Request");
       shown_run_ = runs_.size();  // none of the kept runs is on screen
@@ -3180,15 +3180,15 @@ class ResponseView : public wxPanel, public ResponsePanel {
     if (!runs_.empty() && !streamed)
       segs.push_back({"previous response not shown", "The last response is kept: open it from \"Earlier runs\".",
                       Tone::Dim, false, 4});
-    status_->set("Cancelled", Tone::Warn, std::move(segs));
+    status_->set("Canceled", Tone::Warn, std::move(segs));
   }
 
-  // An HTTP request cancelled after its head arrived (an event stream that never ends, a slow
+  // An HTTP request canceled after its head arrived (an event stream that never ends, a slow
   // download): a run of its own like any response, with the status, headers, connection and the
   // phases up to Wait (TTFB) as measured, Download cut at the cancel, and the events or body
   // bytes that arrived. It stays in "Earlier runs" to look at again.
   // `failed`: not a cancel but a transfer error after the head (a timeout, a reset): the run is
-  // the same, labelled with the error instead of "cancelled".
+  // the same, labeled with the error instead of "canceled".
   void show_cancelled_with_head(double after_ms, std::shared_ptr<const HttpResponse> h,
                                 std::shared_ptr<const SentHttp> sent, const HttpResponse* failed) {
     TraceScope ts("cancel_head");
@@ -3236,7 +3236,7 @@ class ResponseView : public wxPanel, public ResponsePanel {
     run.model.live_cut = true;
     for (Phase& ph : run.model.phases)
       if (ph.name == "Process") ph.has_value = false;  // never ran: the transfer was cut
-    run.model.live_head = (run.cut_label.empty() ? std::string("cancelled by you") : run.cut_label) + " \xC2\xB7 " +
+    run.model.live_head = (run.cut_label.empty() ? std::string("canceled by you") : run.cut_label) + " \xC2\xB7 " +
                           fmt::human_bytes(got) + " received";
     run.model.total_tip = "Send click -> " + why + " (the response was not complete).";
     if (sse && sse_->count() > 0) {
@@ -3280,8 +3280,8 @@ class ResponseView : public wxPanel, public ResponsePanel {
     return "failed after " + fmt::ms(after_ms);
   }
 
-  // An HTTP request cancelled while its body arrived: the events or the bytes so far, the time to
-  // the first of them and the partial transfer in the waterfall, marked cancelled. The engine
+  // An HTTP request canceled while its body arrived: the events or the bytes so far, the time to
+  // the first of them and the partial transfer in the waterfall, marked canceled. The engine
   // hands the status line and headers over only with a complete response, so they are not shown.
   void show_cancelled_partial(double after_ms) {
     sse_timer_.Stop();
@@ -3294,7 +3294,7 @@ class ResponseView : public wxPanel, public ResponsePanel {
     const double fb = tap_->first_ms();
     const size_t events = sse ? sse_->count() : 0;
     ++test_seq_;
-    tests_->set_no_response("cancelled while the response arrived: not checked");
+    tests_->set_no_response("canceled while the response arrived: not checked");
     tests_->set_script({});
     update_tests_label();
     stale_timer_.Stop();
@@ -3302,7 +3302,7 @@ class ResponseView : public wxPanel, public ResponsePanel {
     wf_->set_live(fb, got, 0);
     wf_->set_cancelled(after_ms);
     std::vector<StatusSeg> segs;
-    segs.push_back({"after " + fmt::ms(after_ms), "Cancelled by you (Esc or the Cancel button) while the response arrived.",
+    segs.push_back({"after " + fmt::ms(after_ms), "Canceled by you (Esc or the Cancel button) while the response arrived.",
                     Tone::Plain, true});
     if (sse)
       segs.push_back({std::to_string(events) + (events == 1 ? " event" : " events"),
@@ -3314,21 +3314,21 @@ class ResponseView : public wxPanel, public ResponsePanel {
                       "The first body bytes arrived then (the status line and headers came before them).", Tone::Dim,
                       false, 4});
     segs.push_back({"headers not kept",
-                    "A cancelled transfer ends without its status line, headers and per-phase split (the engine hands "
+                    "A canceled transfer ends without its status line, headers and per-phase split (the engine hands "
                     "them over with a complete response only). What arrived of the body is shown.\nCtrl+Enter sends "
                     "it again.",
                     Tone::Dim, false, 6});
-    status_->set("Cancelled", Tone::Warn, std::move(segs));
+    status_->set("Canceled", Tone::Warn, std::move(segs));
     headers_->set({});
     trailers_->set({});
     msgs_->reset();
     cookies_->set({});
     request_->set({});
-    std::string log = "* Cancelled by you after " + fmt::ms(after_ms) + ": " + fmt::human_bytes(got) +
+    std::string log = "* Canceled by you after " + fmt::ms(after_ms) + ": " + fmt::human_bytes(got) +
                       " of the body had arrived";
     if (fb >= 0) log += " (the first at +" + fmt::ms(fb) + ")";
     if (sse) log += ", " + std::to_string(events) + (events == 1 ? " event" : " events");
-    log += ".\n* The status line and headers are not kept for a cancelled transfer.\n";
+    log += ".\n* The status line and headers are not kept for a canceled transfer.\n";
     fill_log(std::move(log));
     set_kind_tabs(false, false);
     tabs_->set_label(kRequest, "Request");
@@ -3344,7 +3344,7 @@ class ResponseView : public wxPanel, public ResponsePanel {
       r->body = tap_->partial();
     }
     const bool cut = r->body.size() < got;
-    body_->set_origin_note("cancelled after " + fmt::ms(after_ms) + ": " +
+    body_->set_origin_note("canceled after " + fmt::ms(after_ms) + ": " +
                            (cut ? "the first " + fmt::human_bytes(r->body.size()) + " of " + fmt::human_bytes(got)
                                 : fmt::human_bytes(got) + " received, incomplete"));
     body_->set_visualizer(nullptr);
@@ -3352,7 +3352,7 @@ class ResponseView : public wxPanel, public ResponsePanel {
     if (sse) {
       sse_resp_ = r;
       sse_show(true);
-      sse_->set_caption("cancelled by you after " + fmt::ms(after_ms) + " \xC2\xB7 " + std::to_string(events) +
+      sse_->set_caption("canceled by you after " + fmt::ms(after_ms) + " \xC2\xB7 " + std::to_string(events) +
                             (events == 1 ? " event" : " events") + " \xC2\xB7 " + fmt::human_bytes(got),
                         Tone::Warn);
       tabs_->set_label(kBody, "Events", std::to_string(events));
@@ -3528,7 +3528,7 @@ class ResponseView : public wxPanel, public ResponsePanel {
               sf = tests_->script_failed() + tests_->inherited_failed();
     // The send failed before any response: the checks did not run, which counts as a failure.
     if (!tests_->no_response_reason().empty() && on > 0) {
-      // A send that failed or was cancelled fails its checks (as watt --run and the runner
+      // A send that failed or was canceled fails its checks (as watt --run and the runner
       // count it); a restored run without its body only skips them.
       const std::string& why = tests_->no_response_reason();
       const bool skipped = why.rfind("the ", 0) == 0;
@@ -3986,7 +3986,7 @@ class ResponseView : public wxPanel, public ResponsePanel {
             Tone::Warn, false, 1};
   }
 
-  // Labelled like a run read from the history ("last run · 21:18"): the same state reads the same
+  // Labeled like a run read from the history ("last run · 21:18"): the same state reads the same
   // on every tab. The time is the response's Date header when it has one.
   static StatusSeg restored_seg(const HttpResponse* r = nullptr) {
     std::string when = "earlier session";
@@ -4011,7 +4011,7 @@ class ResponseView : public wxPanel, public ResponsePanel {
     std::string text = http_transcript(*run.resp, run.sent.get(), request_->rows(),
                                        run.at.Format("%Y-%m-%d %H:%M:%S").utf8_string());
     if (run.cancelled_ms >= 0)
-      text += (run.cut_label.empty() ? "* Cancelled by you after " + fmt::ms(run.cancelled_ms)
+      text += (run.cut_label.empty() ? "* Canceled by you after " + fmt::ms(run.cancelled_ms)
                                      : "! " + run.cut_label + ": " + run.cut_error) +
               " \xC2\xB7 " + fmt::human_bytes(run.cancelled_bytes) + " of the body had arrived\n";
     if (run.prompt_ms > 0)
@@ -4052,7 +4052,7 @@ class ResponseView : public wxPanel, public ResponsePanel {
     }
     o += '\n';
     auto put = [&](char prefix, const std::string& label, const std::string& text) {
-      // One Log line per text line, each with the prefix (so the colours stay right).
+      // One Log line per text line, each with the prefix (so the colors stay right).
       size_t at = 0;
       bool first = true;
       do {
@@ -4176,7 +4176,7 @@ class ResponseView : public wxPanel, public ResponsePanel {
     }
   }
 
-  // The Log page colours each line by its first character ("*" info, ">" sent, "<" received).
+  // The Log page colors each line by its first character ("*" info, ">" sent, "<" received).
   void fill_log(std::string text) { log_->set(std::move(text)); }
 
   void set_grpc_log(const GrpcResponse& r) {
@@ -4316,10 +4316,10 @@ class ResponseView : public wxPanel, public ResponsePanel {
     const double total = cur.total;
     const double d = total - prev.total;
     // Run-to-run jitter (tens of microseconds locally, a few percent) is not a regression.
-    // Under 1 ms or under 10% of the total is not coloured as a change.
+    // Under 1 ms or under 10% of the total is not colored as a change.
     const bool noise = fmt::delta_is_noise(d, std::max(total, prev.total));
     // One run on a fresh connection, the other on a reused one: the difference is mostly the
-    // handshake, not the server. Said so, and not coloured as a regression / improvement.
+    // handshake, not the server. Said so, and not colored as a regression / improvement.
     const bool conn_changed = cur.reused != prev.reused;
     std::string text = fmt::delta_ms(d) + " vs previous";
     if (conn_changed) text += cur.reused ? " (reused conn.)" : " (new conn.)";
@@ -4352,7 +4352,7 @@ class ResponseView : public wxPanel, public ResponsePanel {
   }
 
   void update_history_chip() {
-    const bool none = shown_run_ >= runs_.size();  // e.g. cancelled: no kept run is on screen
+    const bool none = shown_run_ >= runs_.size();  // e.g. canceled: no kept run is on screen
     const bool any = runs_.size() > 1 || (none && !runs_.empty());
     hist_->set_visible(1, any);
     if (!any) return hist_->Refresh();
@@ -4605,7 +4605,7 @@ class ResponseView : public wxPanel, public ResponsePanel {
       if (!wxTheApp) return;
       wxTheApp->CallAfter([jar, host, alive, this] {
         if (!*alive) return;
-        // Centred on the window, not on this pane (the dialog is wider than the pane).
+        // Centered on the window, not on this pane (the dialog is wider than the pane).
         wxWindow* top = wxGetTopLevelParent(this);
         http_editor::show_cookie_manager(top ? top : this, jar, host, [] {});
       });
@@ -4699,9 +4699,9 @@ class ResponseView : public wxPanel, public ResponsePanel {
     uint64_t not_kept_size = 0;
     std::string body_key;        // cut: the run key its whole body may be kept under (response_keep)
     bool sse_live = false;       // an event stream listed live while it arrived (this send)
-    double cancelled_ms = -1;    // cut after its head arrived (ms after the send): cancelled by the user, or
+    double cancelled_ms = -1;    // cut after its head arrived (ms after the send): canceled by the user, or
     std::string cut_error;       // ... the transfer failed then (a timeout, the server went away): the error
-    std::string cut_label;       // "timed out after 30000 ms" (empty: cancelled by you)
+    std::string cut_label;       // "timed out after 30000 ms" (empty: canceled by you)
     uint64_t cancelled_bytes = 0;  // ... with this much of the body
     std::shared_ptr<const std::vector<double>> sse_at;  // event offsets (live, or kept with the run)
   };

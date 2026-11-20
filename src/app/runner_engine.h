@@ -511,7 +511,7 @@ struct Failure {
 };
 // Every failure of a failed step, in order (empty when it did not fail).
 std::vector<Failure> failures_of(const StepResult& s);
-// Request + check + message with numbers normalised: equal for failures of one cause.
+// Request + check + message with numbers normalized: equal for failures of one cause.
 std::string failure_key(const StepResult& s, const Failure& f);
 bool has_failure(const StepResult& s, const std::string& key);
 struct FailureGroup {
@@ -543,7 +543,7 @@ struct Threshold {
   std::string metric;
   std::string op;
   double value = 0;
-  std::string text;  // as written, normalised: "p95 < 200 ms"
+  std::string text;  // as written, normalized: "p95 < 200 ms"
 };
 bool parse_thresholds(const std::string& spec, std::vector<Threshold>* out, std::string* err);
 struct ThresholdResult {

@@ -170,7 +170,7 @@ class ResourceBlocker final : public ICoreWebView2WebResourceRequestedEventHandl
 };
 
 // Whether an HTML page could paint a background of its own (CSS background / background-color,
-// or a bgcolor attribute), in any common capitalisation. A plain substring scan: false
+// or a bgcolor attribute), in any common capitalization. A plain substring scan: false
 // positives only cost the page the after-load check below.
 bool mentions_background(std::string_view body) {
   for (std::string_view w : {"background", "Background", "BACKGROUND", "bgcolor", "BGCOLOR", "bgColor", "BgColor"})
@@ -180,7 +180,7 @@ bool mentions_background(std::string_view body) {
 
 // Run by the host after each Preview load (page scripts stay off; ExecuteScript is not one of
 // them). When neither the root nor the body paints a background, the canvas would show the
-// WebView's dark default behind black text: give the root the Canvas colour of its own scheme.
+// WebView's dark default behind black text: give the root the Canvas color of its own scheme.
 constexpr wchar_t kCanvasFixScript[] =
     L"(function(){var d=document.documentElement,b=document.body;if(!d)return;"
     L"function t(e){if(!e)return true;var s=getComputedStyle(e);return s.backgroundImage==='none'&&"
@@ -200,7 +200,7 @@ std::string preview_page(std::string_view body, const std::string& base_url) {
   // the WebView2 canvas instead comes up #121212 behind the default black text, whatever the
   // page's color-scheme says (and neither wx nor WEBVIEW2_DEFAULT_BACKGROUND_COLOR reaches the
   // controller's DefaultBackgroundColor). So a page that never mentions a background gets the
-  // canvas of its own colour scheme: Canvas is white for a plain page and stays dark for one
+  // canvas of its own color scheme: Canvas is white for a plain page and stays dark for one
   // that opts into dark (example.com's "color-scheme: light dark"). :where() keeps it below any
   // rule of the page. Pages that do mention a background are checked after load
   // (kCanvasFixScript), where the computed root and body backgrounds are known.
@@ -695,7 +695,7 @@ void BodyView::apply_styles(int lexer) {
   cur_lexer_ = lexer;
   const bool dark = Theme::get().dark;
   const bool preview = lexer == wxSTC_LEX_MARKDOWN;
-  // Reset every lexer style to default, then colour the ones this lexer uses. The Preview reads
+  // Reset every lexer style to default, then color the ones this lexer uses. The Preview reads
   // as a page: proportional font; everything else is monospaced.
   const wxColour fg = stc_->StyleGetForeground(wxSTC_STYLE_DEFAULT);
   const wxFont mono = stc_->StyleGetFont(wxSTC_STYLE_DEFAULT);
@@ -962,7 +962,7 @@ void BodyView::apply_kind(fmt::BodyKind k) {
   }
   // Visualize, when this request's view is Visualize and the run set a template.
   if (vis_ && vis_chosen_) m = Visualize;
-  // A body built on the worker: the previous document stays on screen, faded and labelled, until
+  // A body built on the worker: the previous document stays on screen, faded and labeled, until
   // the new one is swapped in (no flash of an empty pane). A small body replaces it in this turn.
   const bool async = m != Visualize && resp_->body.size() > kSyncBytes && stc_->GetLength() > 0;
   if (async) {
@@ -2583,7 +2583,7 @@ void BodyView::set_stale(bool stale) {
     bar_->set_note("previous response \xC2\xB7 waiting for the new one\xE2\x80\xA6", Tone::Warn);
   } else {
     const int lexer = cur_lexer_;
-    cur_lexer_ = -2;  // force apply_styles to recolour
+    cur_lexer_ = -2;  // force apply_styles to recolor
     apply_styles(lexer);
     if (resp_ || grpc_) update_note();
     else bar_->set_note("");

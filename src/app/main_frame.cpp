@@ -639,7 +639,7 @@ MainFrame::MainFrame(std::filesystem::path workspace_dir)
     }
     if (a == wxID_YES) {
       save_current();
-      if (t->dirty()) e.Veto();  // the save failed or was cancelled: keep the tab
+      if (t->dirty()) e.Veto();  // the save failed or was canceled: keep the tab
     }
     if (e.IsAllowed())
       while (t->teardown_step()) {
@@ -1717,7 +1717,7 @@ void MainFrame::close_tabs(std::vector<int> idx) {
         if (i == wxNOT_FOUND) continue;
         nb_->SetSelection(static_cast<size_t>(i));
         save_current();
-        if (t->dirty()) return;  // a save failed or was cancelled: stop, the rest stays open
+        if (t->dirty()) return;  // a save failed or was canceled: stop, the rest stays open
       }
   }
   FrameLaps laps("close_tabs");
@@ -2389,7 +2389,7 @@ void MainFrame::run_folder(const std::filesystem::path& folder) {
 void MainFrame::start_mock(const std::filesystem::path& folder) {
   // Routes are read and the listener started on worker threads (mock_view.cpp).
   auto open = [this, folder] {
-    // {{mock}} changed: the editors recolour, and the session keeps the tab and its port.
+    // {{mock}} changed: the editors recolor, and the session keeps the tab and its port.
     open_mock(this, [this] { return ws_.get(); }, folder, [this] { vars_changed(); session_changed(); });
   };
   if (!when_workspace(open) && ws_) open();

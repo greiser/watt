@@ -2,7 +2,7 @@
 // WebSocket client (RFC 6455) for watt's WebSocket requests (RequestKind::WebSocket).
 //
 // libcurl does the connection: DNS, TCP, TLS (Schannel, the same trust settings as HttpClient:
-// verify_tls, ca_pem, tls_min_version) and proxies (Env / System / Off / Url, tunnelled with
+// verify_tls, ca_pem, tls_min_version) and proxies (Env / System / Off / Url, tunneled with
 // CONNECT), with CURLOPT_CONNECT_ONLY. The upgrade request and the framing are done here over
 // curl_easy_send / curl_easy_recv, so this works with watt's pinned libcurl, which is built
 // without curl's own WebSocket API (CURL_DISABLE_WEBSOCKETS).
@@ -56,11 +56,11 @@ struct WsHandshake {
 
 struct WsClose {
   // 1000 normal ... as sent in the close frame; 1005: a close frame without a code; 1006: the
-  // connection ended without a close frame (dropped, cancelled, transport error).
+  // connection ended without a close frame (dropped, canceled, transport error).
   int code = 1006;
   std::string reason;
   bool by_client = false;  // this side started the close
-  std::string error;       // transport / protocol error, "cancelled"
+  std::string error;       // transport / protocol error, "canceled"
   double at_ms = 0;        // since the connection opened
   uint64_t messages_in = 0, messages_out = 0, bytes_in = 0, bytes_out = 0;
 };

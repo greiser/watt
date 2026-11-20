@@ -40,7 +40,7 @@
 #pragma comment(linker, "\"/manifestdependency:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 
 namespace {
-// Per-monitor DPI awareness v2, set during static initialisation: before wx (or anything else)
+// Per-monitor DPI awareness v2, set during static initialization: before wx (or anything else)
 // creates a window, exactly as the PerMonitorV2 manifest entry would.
 const bool g_dpi_aware = [] {
   return SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) != FALSE;

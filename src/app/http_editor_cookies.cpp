@@ -30,7 +30,7 @@ ParsedUrl parse(std::string_view url) {
   url = trim(url);
   size_t colon = url.find("://");
   if (colon == std::string_view::npos) {
-    // "127.0.0.1:8080/x" is sent as http:// (as the send path normalises it); "{{base}}/x" and
+    // "127.0.0.1:8080/x" is sent as http:// (as the send path normalizes it); "{{base}}/x" and
     // other text that does not start with a host are not URLs yet.
     if (url.empty() || url.find("{{") != std::string_view::npos || url.front() == '/') return u;
     std::string with = "http://" + std::string(url);

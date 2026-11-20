@@ -710,7 +710,7 @@ HOST_FN(h_send) {
   JS_FreeValue(ctx, v);
   req.timeout_ms = timeout;
   req.keep_body = false;
-  if (h.opts->cancel && h.opts->cancel->load()) return fail("sendRequest: cancelled");
+  if (h.opts->cancel && h.opts->cancel->load()) return fail("sendRequest: canceled");
   if (!h.client) h.client = std::make_unique<HttpClient>();
   std::string body;
   bool too_big = false;
@@ -784,7 +784,7 @@ void set_error(JSContext* ctx, Host& h, JSValue exc, const std::string& file) {
   run.ok = false;
   const ScriptLimits& lim = h.opts->limits;
   if (h.cancelled) {
-    run.error = "cancelled";
+    run.error = "canceled";
     return;
   }
   if (h.cpu_exceeded) {

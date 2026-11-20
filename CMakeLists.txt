@@ -77,7 +77,7 @@ endforeach()
 target_link_libraries(watt_http PUBLIC watt_curl)
 target_link_libraries(watt_grpc PUBLIC watt_http gRPC::grpc++ gRPC::grpc++_reflection protobuf::libprotobuf rapidjson)  # watt_http: gRPC-Web
 # watt_http: scripts' sendRequest and OAuth 2.0 token requests go through HttpClient.
-# qjs is PRIVATE: only core/script.cpp sees QuickJS; it is initialised on the first script run.
+# qjs is PRIVATE: only core/script.cpp sees QuickJS; it is initialized on the first script run.
 target_link_libraries(watt_model PUBLIC rapidjson re2::re2 watt_http bcrypt ws2_32 shell32 PRIVATE qjs)
 add_library(watt_core INTERFACE)
 target_link_libraries(watt_core INTERFACE watt_http watt_grpc watt_model)

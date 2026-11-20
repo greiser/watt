@@ -162,8 +162,8 @@ std::string reindent_json(std::string_view in);
 std::string minify_json(std::string_view in);
 
 // The JSON body's own lexer (Scintilla's LexJSON styles the rest of a line as an error after an
-// unquoted {{var}}): styles in LexJSON's numbering, so the colours and folding stay the same.
-// {{var}} spans are plain text (their indicator colours them), a bare word other than
+// unquoted {{var}}): styles in LexJSON's numbering, so the colors and folding stay the same.
+// {{var}} spans are plain text (their indicator colors them), a bare word other than
 // true / false / null is an error up to its end only.
 enum JsonStyle : char {
   kJsDefault = 0, kJsNumber = 1, kJsString = 2, kJsStringEol = 3, kJsProperty = 4, kJsEscape = 5,
@@ -197,7 +197,7 @@ std::vector<std::pair<int, int>> json_big_blocks(std::string_view text, int min_
 // Find bar: how many times needle occurs in hay (non-overlapping, ASCII case folding unless
 // match_case), and how many of them start before `before` (the "3 of 120" index). Stops after
 // `limit` matches (the count is then a lower bound). One pass, ~10 ms per 10 MB. A set *stop
-// ends the walk early (cancelled: a newer search replaced this one).
+// ends the walk early (canceled: a newer search replaced this one).
 struct MatchCount {
   size_t total = 0;
   size_t before = 0;

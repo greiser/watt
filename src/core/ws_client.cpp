@@ -340,7 +340,7 @@ struct WsClient::Impl {
       }
       if (open.load()) drain(nullptr);
       if (cancelled.load()) {
-        if (err) *err = "cancelled";
+        if (err) *err = "canceled";
         return false;
       }
       if (Clock::now() > until) {
@@ -560,7 +560,7 @@ WsHandshake WsClient::connect(const HttpRequest& req) {
   if (curl_easy_getinfo(e, CURLINFO_USED_PROXY, &used_proxy) == CURLE_OK && used_proxy) h.proxy = redact_proxy(px.empty() ? "(environment proxy)" : px);
   const auto t_conn = Clock::now();
   if (rc != CURLE_OK) {
-    h.error = d.cancelled.load() ? "cancelled" : d.errbuf[0] ? std::string(d.errbuf) : std::string(curl_easy_strerror(rc));
+    h.error = d.cancelled.load() ? "canceled" : d.errbuf[0] ? std::string(d.errbuf) : std::string(curl_easy_strerror(rc));
     h.total_ms = ms_between(t0, t_conn);
     return h;
   }
@@ -643,7 +643,7 @@ WsHandshake WsClient::connect(const HttpRequest& req) {
     }
     const int left = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(until - Clock::now()).count());
     if (!d.wait(false, std::max(left, 0))) {
-      h.error = d.cancelled.load() ? "cancelled" : "timed out waiting for the upgrade response";
+      h.error = d.cancelled.load() ? "canceled" : "timed out waiting for the upgrade response";
       h.total_ms = ms_between(t0, Clock::now());
       return h;
     }
@@ -750,7 +750,7 @@ WsClose WsClient::run(const BatchFn& on_batch, int batch_ms) {
   };
   while (!done) {
     if (d.cancelled.load()) {
-      finish(1006, {}, "cancelled");
+      finish(1006, {}, "canceled");
       break;
     }
     // Incoming.

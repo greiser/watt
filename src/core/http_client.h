@@ -343,7 +343,7 @@ using BodyChunkFn = std::function<void(const char* data, size_t len)>;
 // are 0 and timing.total_ms is the time until the head. It may fire more than once in one send
 // (an authentication retry: Digest / NTLM answer a 401 with a second request); the last one
 // belongs to the response send() returns. A send that never gets a final header block (refused,
-// cut before the blank line) never calls it. It also fires for a send that is then cancelled,
+// cut before the blank line) never calls it. It also fires for a send that is then canceled,
 // which is the point: a stream that never ends still shows its status, headers and phases.
 using HeadFn = std::function<void(const HttpResponse& head)>;
 
@@ -354,7 +354,7 @@ class HttpClient {
   HttpClient(const HttpClient&) = delete;
   HttpClient& operator=(const HttpClient&) = delete;
 
-  // Process-wide start-up warm-up, about 5 ms once: libcurl / TLS initialisation, crypt32's
+  // Process-wide start-up warm-up, about 5 ms once: libcurl / TLS initialization, crypt32's
   // name tables (the first certificate read otherwise pays ~5 ms for them), one
   // pre-built libcurl multi handle (curl_multi_init costs about 0.5 ms), and one throwaway
   // HTTP exchange with an in-process responder over loopback, which loads the Winsock
@@ -368,7 +368,7 @@ class HttpClient {
 
   HttpResponse send(const HttpRequest& req, const BodyChunkFn& on_chunk = {});
   HttpResponse send(const HttpRequest& req, const BodyChunkFn& on_chunk, const HeadFn& on_head);
-  void cancel();  // aborts the in-flight send() ASAP; it returns with ok=false, error="cancelled"
+  void cancel();  // aborts the in-flight send() ASAP; it returns with ok=false, error="canceled"
 
  private:
   struct Impl;

@@ -60,7 +60,7 @@ std::string status_label(const runner::StepResult& r);
 // returns false. Windows in *seen are skipped (and new ones added).
 void hook_keys(wxWindow* w, const std::function<bool(wxKeyEvent&)>& f, std::set<wxWindow*>* seen);
 
-// Method colours as the request tabs draw them (GET green, POST orange, ...; gRPC teal).
+// Method colors as the request tabs draw them (GET green, POST orange, ...; gRPC teal).
 wxColour method_colour(const std::string& method, bool grpc);
 
 }  // namespace watt::app::runner_ui

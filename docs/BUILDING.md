@@ -174,7 +174,7 @@ It builds `watt.exe` in Release, then creates:
 The DLL list is worked out from `watt.exe` itself (`dumpbin /dependents`, followed recursively):
 the libraries vcpkg copied into the build folder, plus the Visual C++ runtime DLLs from Visual
 Studio's redistributable folder. The zip therefore runs on a clean Windows 10 or 11 machine
-without installing the Visual C++ Redistributable. The licence texts come from vcpkg
+without installing the Visual C++ Redistributable. The license texts come from vcpkg
 (`installed\x64-windows\share\<port>\copyright`) and from `packaging\licenses`.
 
 `-NoBuild` packages what `build\release` already contains.
@@ -222,6 +222,6 @@ without installing the Visual C++ Redistributable. The licence texts come from v
 | `tools\httpserver` | The HTTP echo server |
 | `bench` | Benchmarks and startup measurement scripts |
 | `resources\icon` | Application icon and the script that draws it |
-| `packaging` | `package.ps1`, the README for the zip, extra licence texts |
+| `packaging` | `package.ps1`, the README for the zip, extra license texts |
 | `vcpkg` | Overlay port and triplet for the pinned libcurl |
 | `docs` | This guide |

@@ -14,7 +14,7 @@
 
 namespace watt::app::rv {
 
-// Colours shared by the response view (light / dark follow the system appearance).
+// Colors shared by the response view (light / dark follow the system appearance).
 struct Theme {
   bool dark = false;
   wxColour bg, fg, dim, faint, grid, accent;
@@ -42,7 +42,7 @@ struct StatusSeg {
 class StatusStrip : public wxWindow {
  public:
   explicit StatusStrip(wxWindow* parent);
-  // badge: "200 OK" drawn as a coloured pill (empty = none); segments follow, separated by dots.
+  // badge: "200 OK" drawn as a colored pill (empty = none); segments follow, separated by dots.
   void set(const std::string& badge, Tone badge_tone, std::vector<StatusSeg> segs);
   // Running clock: draws "label  12.3 ms" with the time since `since`, repainted ~30x/s until set().
   void set_busy(const std::string& label, Clock::time_point since);
@@ -97,7 +97,7 @@ struct Phase {
   wxColour colour;
   bool reused = false;  // 0 because the connection was reused (drawn as "reused", not a bar)
   bool has_value = true;  // false: "n/a" (e.g. TLS on plaintext, a phase a failed request never reached)
-  bool failed = false;    // the phase the request failed in (drawn in the error colour)
+  bool failed = false;    // the phase the request failed in (drawn in the error color)
   // Parts of this phase (the hops of "Redirects"): shown as rows under it when the user expands
   // it (click the row), each bar where it ran inside the phase.
   std::vector<Phase> sub;
@@ -139,7 +139,7 @@ struct TimingModel {
   double auth = -1;
   std::string auth_tip;
   // A response whose head is in and whose body still arrives (or was cut by a cancel): the phase
-  // at live_row (Download) runs, live_head says what is arriving; live_cut: cancelled.
+  // at live_row (Download) runs, live_head says what is arriving; live_cut: canceled.
   int live_row = -1;
   bool live_cut = false;
   std::string live_head;
@@ -158,7 +158,7 @@ class Waterfall : public wxWindow {
   void set(const TimingModel& cur, const TimingModel* prev);
   // keep_reserve: keep the reserved height (a request is about to run); false: the empty state.
   void clear(bool keep_reserve = true);
-  // While a new request is in flight the old figures stay, dimmed and labelled "previous run".
+  // While a new request is in flight the old figures stay, dimmed and labeled "previous run".
   void set_stale(bool stale);
   // Keep the height of `rows` phase rows from now on, also while no timing is shown, so the tabs
   // and body below do not move when a response arrives or a stream starts (HTTP: 10, gRPC: 8).
@@ -175,8 +175,8 @@ class Waterfall : public wxWindow {
   // clicked. Before the first one the rows say the stream is open and idle, not "waiting for the
   // response". Reset by set_waiting().
   void set_paced(int sent, bool ended);
-  // The request was cancelled: the reserved rows stay (nothing below moves) and say so; the
-  // figures of an earlier run are not shown under a cancelled request. Ends with set() / clear().
+  // The request was canceled: the reserved rows stay (nothing below moves) and say so; the
+  // figures of an earlier run are not shown under a canceled request. Ends with set() / clear().
   void set_cancelled(double after_ms);
   // A live model (TimingModel::live_row) moves on: the running phase's time, the total so far and
   // the header note. Repaints only (no layout).
@@ -232,7 +232,7 @@ class TabStrip : public wxWindow {
   TabStrip(wxWindow* parent, std::function<void(int)> on_select);
   int add(const std::string& label);
   void set_label(int i, const std::string& label, const std::string& count = {});
-  // Colour of the tab's count (e.g. Tests "3/4": Ok when all pass, Err when one fails), drawn as
+  // Color of the tab's count (e.g. Tests "3/4": Ok when all pass, Err when one fails), drawn as
   // a filled pill so it reads at a glance whether the tab is selected or not. Plain: default.
   void set_count_tone(int i, Tone t);
   void show_tab(int i, bool show);
@@ -268,8 +268,8 @@ class TabStrip : public wxWindow {
 // middle and right-aligned action chips. Custom drawn so it looks the same in light and dark.
 // A report-mode list that paints each row once. Under dark mode wx draws a whole row itself on
 // every sub-item notification (columns x columns text draws per row: 15-45 ms for an 8 x 5
-// list's first paint), and the row ends up in the last column's colours. This one draws the row
-// on its item notification, every cell with its own colour and font.
+// list's first paint), and the row ends up in the last column's colors. This one draws the row
+// on its item notification, every cell with its own color and font.
 class FastList : public wxListCtrl {
  public:
   using wxListCtrl::wxListCtrl;

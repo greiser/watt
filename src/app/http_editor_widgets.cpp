@@ -527,7 +527,7 @@ void TabStrip::paint() {
   layout_tabs(dc);
   const wxSize sz = GetClientSize();
   if (!more_rect_.IsEmpty()) {
-    // The overflow button; in the warning colour when a hidden tab has a warning badge.
+    // The overflow button; in the warning color when a hidden tab has a warning badge.
     bool warn = false;
     for (const auto& t : tabs_) warn = warn || (t.rect.IsEmpty() && t.warn);
     if (hover_ == -2) {

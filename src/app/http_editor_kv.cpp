@@ -95,7 +95,7 @@ class CompletingEditor : public wxGridCellTextEditor {
     }
     wxGridCellTextEditor::StartingKey(event);
   }
-  // Single-line editor centred in the row, aligned with the rendered text.
+  // Single-line editor centered in the row, aligned with the rendered text.
   void SetSize(const wxRect& rect) override {
     wxRect r = rect;
     const int h = Text()->GetBestSize().y;
@@ -1010,7 +1010,7 @@ void KvPanel::set_bulk(bool on) {
     // A themed Scintilla editor (a native multi-line box is light, with light scroll bars, in
     // the dark theme), framed like the table.
     const Theme& t = Theme::get();
-    // In a 1 px frame of the border colour, so it reads as a box to type in.
+    // In a 1 px frame of the border color, so it reads as a box to type in.
     auto* frame = new wxPanel(book_);
     frame->SetBackgroundColour(t.border);
     text_ = new wxStyledTextCtrl(frame, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxBORDER_NONE);
@@ -1041,7 +1041,7 @@ void KvPanel::set_bulk(bool on) {
     text_->SetToolTip(grid_->kind() == KvGrid::Kind::Headers
                           ? "One header per line, \"Name: value\"; a line starting with // is kept but not sent"
                           : "One row per line, \"key: value\"; a line starting with // is kept but not sent");
-    // Placeholder: an annotation under the empty first line, in the dim colour.
+    // Placeholder: an annotation under the empty first line, in the dim color.
     text_->StyleSetForeground(2, t.dim);
     text_->StyleSetBackground(2, t.field);
     text_->StyleSetFont(2, f);
@@ -1279,7 +1279,7 @@ void KvGrid::nav_move(bool forward, bool enter) {
   int i;
   if (it != path.end()) {
     i = static_cast<int>(it - path.begin());
-  } else {  // a column off the path (checkbox, Type on Enter, delete): between its neighbours
+  } else {  // a column off the path (checkbox, Type on Enter, delete): between its neighbors
     const int before = static_cast<int>(std::count_if(path.begin(), path.end(), [c](int col) { return col < c; }));
     i = forward ? before - 1 : before;
   }

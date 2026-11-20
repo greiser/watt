@@ -811,7 +811,7 @@ std::string visualize_page(std::string_view body_html, bool dark) {
       "<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; style-src 'unsafe-inline'; "
       "img-src data:; font-src data:; media-src data:; form-action 'none'; base-uri 'none'\">";
   // A base the template builds on (it comes first, so the template's own rules win): the app's
-  // colours, tables with rules and a header band, readable links, code and form controls.
+  // colors, tables with rules and a header band, readable links, code and form controls.
   out += dark ? "<style>:root{color-scheme:dark}html{background:#1e1e1e;color:#d4d4d4}"
                 "th,td{border-bottom:1px solid #3a3a3a}th{background:#262a2e;color:#e8e8e8;font-weight:600}"
                 "tr:hover td{background:#25282b}a{color:#4daafc}hr{border:0;border-top:1px solid #3a3a3a}"

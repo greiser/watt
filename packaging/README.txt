@@ -57,8 +57,8 @@ Delete this folder. To remove your settings too, delete %APPDATA%\watt and the r
 HKEY_CURRENT_USER\Software\watt.
 
 
-Licences
+Licenses
 --------
 
 watt is released under the MIT License (LICENSE.txt). THIRD-PARTY-NOTICES.txt lists the open
-source libraries included in watt and their licences.
+source libraries included in watt and their licenses.

@@ -15,7 +15,7 @@ namespace watt::app::rv {
 struct InfoRow {
   std::string key, value;
   bool section = false;  // a group heading ("TLS", "Certificate"); value unused
-  bool warn = false;     // drawn in the warning colour (e.g. verification off)
+  bool warn = false;     // drawn in the warning color (e.g. verification off)
 };
 
 // Shows the popover under `anchor` (screen coordinates); it closes on any click outside / Esc.

@@ -68,8 +68,8 @@
 #include "app/grpc_editor_tree.h"
 #include "app/grpc_editor_util.h"
 #include "app/grpc_editor_widgets.h"
-#include "app/http_editor_util.h"     // find_vars: the address's {{var}} colours
-#include "app/http_editor_widgets.h"  // http_editor::Theme var colours (as the HTTP URL)
+#include "app/http_editor_util.h"     // find_vars: the address's {{var}} colors
+#include "app/http_editor_widgets.h"  // http_editor::Theme var colors (as the HTTP URL)
 #include "app/panels.h"
 #include "core/timing.h"
 
@@ -94,7 +94,7 @@ constexpr int kSourceProto = 1;
 constexpr int kMdDeleteCol = 2;
 
 // Column labels that never "highlight" the current column: wxGrid's overlay selection paints the
-// current column's label in a lightened selection colour, which leaves the light label text
+// current column's label in a lightened selection color, which leaves the light label text
 // unreadable in the dark theme.
 class FlatColHeaderRenderer : public wxGridColumnHeaderRendererDefault {
  public:
@@ -535,7 +535,7 @@ class GrpcEditor : public wxPanel, public GrpcEditorPanel {
     const double wall = ms_between(load_start_, Clock::now());
     reload_->Enable();
     if (!s->ok) {
-      // Keep the last schema (greyed) only while it is still the same server / file set: methods
+      // Keep the last schema (grayed) only while it is still the same server / file set: methods
       // of another server would be easy to pick by mistake.
       const bool keep = schema_ && schema_->ok && loaded_origin_ == schema_origin();
       std::string hint;
@@ -632,7 +632,7 @@ class GrpcEditor : public wxPanel, public GrpcEditorPanel {
     web_ = new FlatButton(top_, "gRPC-Web", FlatButton::Style::Outline);
     web_->SetToolTip("Call a gRPC-Web endpoint (Envoy, grpcwebproxy, Connect, tonic-web) over HTTP instead of a gRPC "
                      "channel. Unary and server streaming only; the address may carry a scheme and path prefix.");
-    // Rich: {{variables}} are coloured like the HTTP URL's (defined green, missing red).
+    // Rich: {{variables}} are colored like the HTTP URL's (defined green, missing red).
     addr_ = new wxTextCtrl(top_, wxID_ANY, "", wxDefaultPosition, wxDefaultSize, wxTE_PROCESS_ENTER | wxTE_RICH2);
     addr_->SetHint("host:port  or a grpcurl command  (Ctrl+L)");
     wxFont af = addr_->GetFont();
@@ -688,7 +688,7 @@ class GrpcEditor : public wxPanel, public GrpcEditorPanel {
     };
     addr_->Bind(wxEVT_TEXT, [this](wxCommandEvent& e) {
       e.Skip();
-      // A rich edit control can report a restyle (the {{var}} colours) as a text change, even
+      // A rich edit control can report a restyle (the {{var}} colors) as a text change, even
       // after the load is over: only a different value is an edit.
       const wxString now = addr_->GetValue();
       if (loading_ || now == addr_text_) {
@@ -1242,8 +1242,8 @@ class GrpcEditor : public wxPanel, public GrpcEditorPanel {
     md_->SetGridLineColour(th_.border);
     md_->SetLabelBackgroundColour(th_.dark ? wxColour(37, 37, 38) : wxColour(246, 246, 246));
     md_->SetLabelTextColour(th_.fg);
-    // The column label of the current cell is drawn on a lightened selection colour: keep it a
-    // neutral grey so the label text stays readable.
+    // The column label of the current cell is drawn on a lightened selection color: keep it a
+    // neutral gray so the label text stays readable.
     md_->SetSelectionBackground(th_.dark ? wxColour(52, 52, 56) : wxColour(214, 222, 232));
     md_->SetSelectionForeground(th_.fg);
     md_->SetCellHighlightColour(th_.accent);
@@ -1624,10 +1624,10 @@ class GrpcEditor : public wxPanel, public GrpcEditorPanel {
     if (!loading_) host_->changed();
   }
 
-  // The workspace opened or the environment changed: {{var}} colours of the address follow.
+  // The workspace opened or the environment changed: {{var}} colors of the address follow.
   void vars_changed() override { colour_addr_vars(); }
 
-  // {{name}} spans of the address in the var colours (resolved with the request's folders, as
+  // {{name}} spans of the address in the var colors (resolved with the request's folders, as
   // the send does), the resolved address as the tooltip. A few SetStyle calls on a short string.
   void colour_addr_vars() {
     if (!addr_) return;
@@ -1900,7 +1900,7 @@ class GrpcEditor : public wxPanel, public GrpcEditorPanel {
                                                 wxString::FromUTF8(human_size(bytes)),
                                                 wxString::FromUTF8(elapsed_text(worker_ms)),
                                                 wxString::FromUTF8(elapsed_text(ui_ms)),
-                                                plain ? "; large document: no syntax colouring or folding" : ""));
+                                                plain ? "; large document: no syntax coloring or folding" : ""));
     }
     if (breaks > 0) {
       set_status_label(json_status_->GetLabel() + wxString::FromUTF8(" · long lines split (same JSON)"));
@@ -2931,14 +2931,14 @@ class GrpcEditor : public wxPanel, public GrpcEditorPanel {
     // leftover horizontal scrollbar under a three-line message).
     if (len * 2 < checked_len_) body_->SetScrollWidth(1);
     checked_len_ = len;
-    // Back to colouring once a huge document has shrunk (hysteresis, see kLexBytes).
+    // Back to coloring once a huge document has shrunk (hysteresis, see kLexBytes).
     if (plain_ && len < kLexBytes && longest_line(body_->GetCharacterPointer(), len, kLexLine) < kLexLine)
       set_plain(false);
     if (len > kValidateMax) {
       json_status_->SetForegroundColour(th_.muted);
       mark_error(std::string::npos);
       set_status_label(wxString::FromUTF8(human_size(len) + " · checked on send"));
-      json_status_->SetToolTip("Large message: JSON is checked when it is sent; syntax colouring and folding are "
+      json_status_->SetToolTip("Large message: JSON is checked when it is sent; syntax coloring and folding are "
                                "off above 1 MB so editing stays instant.");
     } else {
       const std::string text = body_text();
@@ -3525,7 +3525,7 @@ class GrpcEditor : public wxPanel, public GrpcEditorPanel {
   FlatButton* tls_ = nullptr;
   FlatButton* web_ = nullptr;
   wxTextCtrl* addr_ = nullptr;
-  bool addr_coloured_ = false;  // some of addr_ carries a {{var}} colour
+  bool addr_coloured_ = false;  // some of addr_ carries a {{var}} color
   FlatButton* send_ = nullptr;
   FlatButton* grpcurl_ = nullptr;
   wxSplitterWindow* split_ = nullptr;

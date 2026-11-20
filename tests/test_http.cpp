@@ -251,7 +251,7 @@ TEST_CASE("timeouts", "[http]") {
   const double took = ms_between(t0, Clock::now());
   CHECK_FALSE(r.ok);
   CHECK_FALSE(r.error.empty());
-  CHECK(r.error != "cancelled");
+  CHECK(r.error != "canceled");
   CHECK(took < 1000);
   CHECK(r.timing.total_ms >= 140);
 
@@ -281,7 +281,7 @@ TEST_CASE("cancel", "[http]") {
     const double took = ms_between(t0, Clock::now());
     t.join();
     CHECK_FALSE(r.ok);
-    CHECK(r.error == "cancelled");
+    CHECK(r.error == "canceled");
     CHECK(took < 1000);
   }
   SECTION("mid-body") {
@@ -294,7 +294,7 @@ TEST_CASE("cancel", "[http]") {
     const double took = ms_between(t0, Clock::now());
     t.join();
     CHECK_FALSE(r.ok);
-    CHECK(r.error == "cancelled");
+    CHECK(r.error == "canceled");
     CHECK(took < 1500);
   }
   // A cancel does not poison the next send.
@@ -901,7 +901,7 @@ TEST_CASE("client construction is cheap after global_init and every client start
   const auto t0 = Clock::now();
   auto r = c.send(get("/delay/3000"));
   t.join();
-  CHECK(r.error == "cancelled");
+  CHECK(r.error == "canceled");
   CHECK(ms_between(t0, Clock::now()) < 1000);
   // Many clients alive at once (more than the pool holds) all work.
   std::vector<std::unique_ptr<HttpClient>> many;
@@ -958,7 +958,7 @@ TEST_CASE("a failure on a reused connection is booked as waiting, not DNS", "[ht
   CHECK(r.timing.download_ms == 0);
   CHECK(r.timing.total_ms == Catch::Approx(phase_sum(r)).margin(1e-6));
 
-  // cancelled while waiting on a reused connection: same
+  // canceled while waiting on a reused connection: same
   REQUIRE(c.send(get("/status/200")).ok);
   std::thread t([&] {
     std::this_thread::sleep_for(std::chrono::milliseconds(80));
@@ -966,7 +966,7 @@ TEST_CASE("a failure on a reused connection is booked as waiting, not DNS", "[ht
   });
   auto k = c.send(get("/delay/2000"));
   t.join();
-  CHECK(k.error == "cancelled");
+  CHECK(k.error == "canceled");
   CHECK(k.timing.connection_reused);
   CHECK(k.timing.dns_ms == 0);
   CHECK(k.timing.ttfb_ms >= 70);
@@ -1054,7 +1054,7 @@ TEST_CASE("busy-poll window on and off", "[http][timing]") {
   const auto t0 = Clock::now();
   auto k = c.send(get("/delay/2000"));
   t.join();
-  CHECK(k.error == "cancelled");
+  CHECK(k.error == "canceled");
   CHECK(ms_between(t0, Clock::now()) < 500);
 }
 

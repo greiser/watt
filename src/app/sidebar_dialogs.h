@@ -1,5 +1,5 @@
 #pragma once
-// Small modal dialogs drawn in the app's colours (native message boxes stay light in dark mode).
+// Small modal dialogs drawn in the app's colors (native message boxes stay light in dark mode).
 #include <filesystem>
 #include <functional>
 #include <string>
@@ -21,12 +21,12 @@ bool confirm(wxWindow* parent, const wxString& title, const wxString& message, c
 void notify(wxWindow* parent, const wxString& title, const wxString& message);
 
 // Import a curl command: a multi-line box (prefilled from the clipboard when it holds one) and
-// an optional name. False when cancelled.
+// an optional name. False when canceled.
 bool ask_curl(wxWindow* parent, std::string* command, std::string* name);
 
 // Import from text: one box for a pasted collection (Postman, Insomnia, OpenAPI JSON / YAML,
 // HAR), a curl command, or an http(s) URL to fetch one from. Prefilled from the clipboard when
-// it holds something like that (up to 1 MB). False when cancelled or empty.
+// it holds something like that (up to 1 MB). False when canceled or empty.
 bool ask_import_text(wxWindow* parent, std::string* text);
 
 // Folder settings: its name (renames the folder), how its items are ordered, and what is in it.
@@ -58,7 +58,7 @@ namespace watt::app::sidebar {
 // owner is disabled while it is open). The UI thread keeps painting meanwhile, and the dialog's
 // teardown (30-40 ms of shell work on close) happens on that thread, not in a UI step. `filters`
 // are (label, "*.json;*.yaml") pairs; `done` runs on the UI thread with the chosen file, or an
-// empty path when cancelled. `folders`: pick a folder instead of a file.
+// empty path when canceled. `folders`: pick a folder instead of a file.
 void pick_file_async(wxWindow* owner, const std::wstring& title,
                      const std::vector<std::pair<std::wstring, std::wstring>>& filters, bool folders,
                      std::function<void(const std::filesystem::path&)> done,

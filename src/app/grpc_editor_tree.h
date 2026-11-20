@@ -30,9 +30,9 @@ class MethodTree : public wxPanel {
   void focus_filter();
   // Shown instead of the tree when there are no methods (e.g. "Load a schema ...").
   void set_empty_text(const wxString& text);
-  // Greyed out: the methods of the last good schema while a reload failed or is running.
+  // Grayed out: the methods of the last good schema while a reload failed or is running.
   void set_stale(bool stale);
-  // gRPC-Web: client and bidi streaming methods are drawn greyed with a note (they cannot run).
+  // gRPC-Web: client and bidi streaming methods are drawn grayed with a note (they cannot run).
   void set_web(bool web);
   // Empties the filter (the pane was hidden after a pick: reopening it shows every method).
   void clear_filter();

@@ -469,7 +469,7 @@ class HttpEditor : public wxPanel, public HttpEditorPanel, public wxEventFilter 
   void update_line_margin();
   void setup_var_indicators(wxStyledTextCtrl* stc);
 
-  // behaviour
+  // behavior
   void touched();  // a user edit: tab dirty + badges
   void update_badges();
   void update_auto_headers(bool force = false);
@@ -796,7 +796,7 @@ class HttpEditor : public wxPanel, public HttpEditorPanel, public wxEventFilter 
   // auth
   FlatButton* auth_btn_ = nullptr;  // auth type: a themed dropdown (a native combo is light in the dark theme)
   wxSimplebook* auth_book_ = nullptr;
-  // Token, user and API key fields: one-line editors with {{var}} colouring, tooltips and {{
+  // Token, user and API key fields: one-line editors with {{var}} coloring, tooltips and {{
   // completion like the URL (the password stays a masked native box).
   wxStyledTextCtrl* bearer_ = nullptr;
   wxStyledTextCtrl* basic_user_ = nullptr;
@@ -805,7 +805,7 @@ class HttpEditor : public wxPanel, public HttpEditorPanel, public wxEventFilter 
   wxStyledTextCtrl* key_name_ = nullptr;
   wxStyledTextCtrl* key_value_ = nullptr;
   wxStyledTextCtrl* make_var_field(wxWindow* parent, const char* hint, std::string* val, wxWindow** frame);
-  std::vector<wxWeakRef<wxStyledTextCtrl>> var_fields_;  // every make_var_field, recoloured by vars_changed
+  std::vector<wxWeakRef<wxStyledTextCtrl>> var_fields_;  // every make_var_field, recolored by vars_changed
   ChoiceButton* key_where_ = nullptr;
   AuthMode auth_mode_ = AuthMode::None;
   size_t auth_header_index_ = SIZE_MAX;  // where the auth header was in http.headers
@@ -1500,7 +1500,7 @@ void HttpEditor::setup_url_stc() {
     url_->CallTipCancel();
     method_pick_focus_lost();
     // Focus moved elsewhere in watt (Send, another tab, the body): a left-over selection would
-    // look like the URL is selected and hide the {{var}} colours. A switch to another app keeps
+    // look like the URL is selected and hide the {{var}} colors. A switch to another app keeps
     // it (GetWindow() is null then), like a native text field.
     if (e.GetWindow() && url_->GetSelectionStart() != url_->GetSelectionEnd()) url_->SetEmptySelection(url_->GetCurrentPos());
   });
@@ -1928,7 +1928,7 @@ void HttpEditor::update_line_margin() {
 
 // Setting a lexer resets its keywords and properties, so they are set again each time.
 void HttpEditor::apply_lexer(BodyMode m) {
-  // JSON and XML style numbers overlap: the colours are set for the lexer in use.
+  // JSON and XML style numbers overlap: the colors are set for the lexer in use.
   const Theme& t = Theme::get();
   for (int st = 0; st < 32; ++st) body_->StyleSetForeground(st, t.fg);
   if (m == BodyMode::Json) {
@@ -3821,7 +3821,7 @@ void HttpEditor::focus_url() {
   if (wxWindow::FindFocus() == url_) url_->SelectAll();
 }
 
-// ------------------------------------------------------------------ behaviour
+// ------------------------------------------------------------------ behavior
 
 // The "Not sent" banner goes away once none of the problems it names is left (an edit, another
 // environment, a send that now resolves).
@@ -3863,7 +3863,7 @@ void HttpEditor::touched() {
 
 void HttpEditor::update_badges() {
   // Rows with a value but no key are not counted (they are not sent): the badge turns to the
-  // warning colour instead.
+  // warning color instead.
   const size_t np = params_->enabled_count(), po = params_->orphan_count();
   tabs_->set_badge(strip_of(kTabParams), np || po ? wxString::Format("%zu", np) : wxString(), po > 0);
   tabs_->set_badge(strip_of(kTabBody), body_mode_ == BodyMode::None ? wxString() : wxString::FromUTF8("\xE2\x97\x8F"));
@@ -6894,7 +6894,7 @@ void HttpEditor::show_var_list(wxStyledTextCtrl* s, const std::string& typed) {
         e.Skip();
         return;
       }
-      // Insert the name only (not the value and scope shown next to it): cancelling in this
+      // Insert the name only (not the value and scope shown next to it): canceling in this
       // handler stops Scintilla's own insertion.
       const wxString name = item.Left(static_cast<size_t>(sp));
       const int from = e.GetPosition(), to = s->GetCurrentPos();
@@ -8163,7 +8163,7 @@ std::vector<Capture> HttpEditor::captures_now() const {
 }
 
 // The first problem of the tables, under the assertions (each bad cell is also drawn in the
-// warning colour, with the message as its tooltip).
+// warning color, with the message as its tooltip).
 void HttpEditor::update_tests_hint() {
   if (!tests_hint_) return;
   wxString msg;
@@ -8403,7 +8403,7 @@ void HttpEditor::set_use_jar(bool on) {
   touched();  // badges + the Cookies list
 }
 
-// Finds the workspace's jar (cookie_jar_for canonicalises the root path) and loads it (a file
+// Finds the workspace's jar (cookie_jar_for canonicalizes the root path) and loads it (a file
 // read + DPAPI unseal) on a worker; the cookies come back here as a copy.
 void HttpEditor::refresh_jar() {
   const Workspace* ws = host_->workspace();

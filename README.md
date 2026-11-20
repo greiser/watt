@@ -25,7 +25,7 @@ It is a single native C++ / wxWidgets process: the window is up in about 0.2 s, 
   for the server and download. It also shows whether the connection was reused, the TLS version
   and the certificate chain.
 
-**Organising and automating**
+**Organizing and automating**
 - Workspaces are plain folders of JSON files, so they work with git. Requests inherit headers,
   auth, variables, assertions and scripts from their folder and collection.
 - Environments, with secret values encrypted for your Windows account.
@@ -87,11 +87,11 @@ vcpkg set up:
 | `tools/httpserver` | Local HTTP echo server for manual testing |
 | `bench` | Headless benchmarks and startup measurement scripts |
 | `resources/icon` | Application icon and the script that draws it |
-| `packaging` | Windows distribution script, the end-user README and extra licence texts |
+| `packaging` | Windows distribution script, the end-user README and extra license texts |
 | `vcpkg` | vcpkg overlay port and triplet for the pinned libcurl build |
 | `docs` | Build guide |
 
-## Licence
+## License
 
 watt is released under the [MIT License](LICENSE). The third-party libraries it includes and
-their licences are listed in `THIRD-PARTY-NOTICES.txt` inside the distribution zip.
+their licenses are listed in `THIRD-PARTY-NOTICES.txt` inside the distribution zip.

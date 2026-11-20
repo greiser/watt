@@ -1,5 +1,5 @@
 #pragma once
-// Small owner-drawn controls of the HTTP editor: a colour theme that follows the Windows light /
+// Small owner-drawn controls of the HTTP editor: a color theme that follows the Windows light /
 // dark setting, a flat button (Send, method picker, Copy as curl) and a Postman-style text tab
 // strip with an accent underline. All painting is double buffered and cheap (a few rectangles
 // and strings), so none of these cost anything per keystroke.
@@ -115,7 +115,7 @@ class TabStrip : public wxControl {
   explicit TabStrip(wxWindow* parent);
   void set_tabs(const std::vector<wxString>& labels);
   // A small count / marker after a label ("Headers 3"); empty for none.
-  // warn: drawn in the warning colour (something on that page is not sent as shown).
+  // warn: drawn in the warning color (something on that page is not sent as shown).
   void set_badge(size_t index, const wxString& badge, bool warn = false);
   void select(size_t index);
   size_t selection() const { return sel_; }
@@ -144,7 +144,7 @@ class TabStrip : public wxControl {
 };
 
 // A row of themed radio choices (the body modes): owner drawn, so the dark theme never shows a
-// native light focus rectangle. Left / Right (or Up / Down) pick the neighbour, Home / End the
+// native light focus rectangle. Left / Right (or Up / Down) pick the neighbor, Home / End the
 // ends; a click picks one. on_select runs on a user pick only.
 class RadioStrip : public wxControl {
  public:

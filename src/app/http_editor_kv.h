@@ -68,7 +68,7 @@ class KvGrid : public wxGrid {
   // After any change: how many rows have a value but no key (they are never sent).
   std::function<void(size_t orphans)> on_orphans;
   VarLookup lookup;
-  // Problem with a cell's text ("" when fine), drawn in the warning colour with the message as
+  // Problem with a cell's text ("" when fine), drawn in the warning color with the message as
   // its tooltip (Assert / Capture targets and variable names).
   std::function<std::string(int col, const std::string& text)> check;
   // {{var}} names offered when "{{" is typed in a cell (read on the UI thread when an edit starts).

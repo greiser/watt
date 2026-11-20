@@ -261,7 +261,7 @@ class AccentButton : public wxWindow {
     const auto& th = rv::Theme::get();
     dc.SetBackground(wxBrush(GetParent()->GetBackgroundColour()));
     dc.Clear();
-    // The primary action's colour everywhere (the editors' Send / Connect), not the view accent.
+    // The primary action's color everywhere (the editors' Send / Connect), not the view accent.
     wxColour c = danger_ ? th.err : http_editor::Theme::get().accent;
     if (!IsEnabled()) c = mix(c, th.bg, 0.55);
     else if (hover_) c = mix(c, *wxWHITE, 0.12);
@@ -592,7 +592,7 @@ class SummaryStrip : public wxWindow {
 
 // ------------------------------------------------------------------ results table
 
-// Owner-drawn (wxVListBox): per-column colours, which a dark-mode wxListCtrl cannot do (it
+// Owner-drawn (wxVListBox): per-column colors, which a dark-mode wxListCtrl cannot do (it
 // paints a whole row with one attribute), and only the visible rows are ever drawn. Columns
 // are resized by dragging their edge in the header and sorted by clicking their title.
 constexpr int kCols = 8;
@@ -838,7 +838,7 @@ class ResultsList : public wxVListBox {
     cell(0, wxString::Format("%zu", r.seq + 1), small_, th.dim);
     cell(1, wxString::Format("%d", r.iteration + 1), small_, th.dim);
     {
-      // Method in its colour, the name, then the URL as sent (dim) in the room that is left.
+      // Method in its color, the name, then the URL as sent (dim) in the room that is left.
       const bool grpc = r.kind == RequestKind::Grpc;
       const std::string ms = grpc ? "gRPC" : r.method;
       const wxString m = U(ms);
@@ -1096,7 +1096,7 @@ class StatsList : public wxVListBox {
         const double pct = d / it->second * 100;
         char b[48];
         std::snprintf(b, sizeof b, "%+.0f%%", pct);
-        // Only a change that is both relative and absolute is coloured (noise stays dim).
+        // Only a change that is both relative and absolute is colored (noise stays dim).
         const bool big = std::abs(pct) >= 20 && std::abs(d) >= 0.5;
         right(7, b, big ? bold_ : f, !big ? th.dim : d > 0 ? th.err : th.ok);
       }
@@ -1112,7 +1112,7 @@ class StatsList : public wxVListBox {
 // ------------------------------------------------------------------ failures by cause
 
 // Postman's performance view groups errors by type: one row per request + check + message (its
-// numbers normalised), with how many steps failed that way, of how many sends of that request,
+// numbers normalized), with how many steps failed that way, of how many sends of that request,
 // and the first and last iteration. A click (or Enter) filters Results to exactly those steps.
 class FailList : public wxVListBox {
  public:
@@ -1202,7 +1202,7 @@ class FailList : public wxVListBox {
     const wxString rng = iterations_ > 1 ? wxString::Format("%zu of %d iterations", g.iterations, iterations_)
                                          : wxString::Format("%zu iteration%s", g.iterations, g.iterations == 1 ? "" : "s");
     dc.DrawText(rng, right - dc.GetTextExtent(rng).x, y2);
-    // Request (method colour), check (mono) on the first line; the message on the second.
+    // Request (method color), check (mono) on the first line; the message on the second.
     const bool grpc = g.kind == RequestKind::Grpc;
     const std::string ms = grpc ? "gRPC" : g.method;
     int x = x_req + pad;
@@ -1252,7 +1252,7 @@ class FailList : public wxVListBox {
 // ------------------------------------------------------------------ over time (load mode)
 
 // Postman's performance view, in two panels over the run's wall time that share the time axis:
-// above, the p50 / p95 response time (lines, smoothed over neighbouring buckets); below, the
+// above, the p50 / p95 response time (lines, smoothed over neighboring buckets); below, the
 // sends finished per second (bars, failed part red) and the active workers. One quantity per
 // axis, so no line has to be read through the legend.
 class TimeChart : public wxWindow {
@@ -1310,7 +1310,7 @@ class TimeChart : public wxWindow {
         b_[i].p50 = runner::percentile(t[i], 50);
         b_[i].p95 = runner::percentile(t[i], 95);
       }
-    // The p50 and p95 lines are drawn over a window of neighbouring buckets (until it holds 100
+    // The p50 and p95 lines are drawn over a window of neighboring buckets (until it holds 100
     // sends, two buckets either side at most): with a slow request in the mix (one send in nine
     // at 120 ms, the rest at 2 ms) a single bucket's p95 (and, in a bucket where mostly the slow
     // sends finished, its p50) flips between the two on every bucket. A bucket whose own p95 is
@@ -1356,7 +1356,7 @@ class TimeChart : public wxWindow {
   struct B {
     size_t n = 0, failed = 0;
     double p50 = 0, p95 = 0;
-    double p95s = 0;  // p95 over the bucket and its neighbours (the drawn line)
+    double p95s = 0;  // p95 over the bucket and its neighbors (the drawn line)
     double p50s = 0;  // p50 likewise
     double busy_ms = 0, active = 0;  // send time in the bucket; active = busy_ms / bucket length
     double span_ms = 0;              // the run time it covers (less than a bucket for the last one)
@@ -1431,7 +1431,7 @@ class TimeChart : public wxWindow {
     const wxColour bar = mix(th.bg, th.info, 0.55), fail = th.err, c50 = th.ok, c95 = th.warn;
     const wxColour cact = mix(th.fg, wxColour(190, 140, 255), 0.7);
     // Each panel's title above its left edge, its series' keys after it (the line or box in its
-    // colour): what a line is reads next to the panel it is in.
+    // color): what a line is reads next to the panel it is in.
     struct Key {
       wxString text;
       wxColour colour;
@@ -1589,7 +1589,7 @@ class TimeChart : public wxWindow {
 
 // ------------------------------------------------------------------ request checklist
 
-// The requests to run: a checkbox, the method in its sidebar colour, the path. Space toggles,
+// The requests to run: a checkbox, the method in its sidebar color, the path. Space toggles,
 // Alt+Up / Alt+Down move, a click on the box toggles, a double click opens the request.
 class RequestList : public wxVListBox {
  public:
@@ -3204,7 +3204,7 @@ class RunnerFrame : public wxPanel {
     auto cancelled = [&] {
       run_.reset();
       set_running(false);
-      summary_->set(summary_now(false), "Cancelled", false);
+      summary_->set(summary_now(false), "Canceled", false);
     };
     // While a question is open nothing is sent yet: the runner says it waits, and Run is not a
     // red Stop behind the dialog. Once answered, the run starts its clock from there.

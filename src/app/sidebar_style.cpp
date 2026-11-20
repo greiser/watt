@@ -40,7 +40,7 @@ wxBitmap render(int which, double scale) {
     // The context draws into img when it is destroyed (end of this scope / reset()).
     gc->SetAntialiasMode(wxANTIALIAS_DEFAULT);
     if (which == kImgFolder || which == kImgFolderOpen || which == kImgFolderEmpty) {
-      // A quiet outline in the text colour (not a yellow Explorer folder), as in Bruno / VS Code.
+      // A quiet outline in the text color (not a yellow Explorer folder), as in Bruno / VS Code.
       const wxColour c = mix(window_colour(), text_colour(), 0.62);
       const double s = scale;
       const double off = (kBadgeW - 16) * s;  // right-aligned like the badges, next to the name
@@ -140,7 +140,7 @@ wxBitmap render(int which, double scale) {
       gc->GetTextExtent(s, &tw, &th, &desc, &lead);
     }
     // Right-aligned on a dark (light) chip: the name follows the badge closely, and the label
-    // stays readable on the tree's grey selection fill.
+    // stays readable on the tree's gray selection fill.
     const double pw = std::min<double>(w - 1.0 * scale, tw + 6.0 * scale);
     const double px = w - pw - 0.5 * scale, ph = h - 2.0 * scale, py = 1.0 * scale;
     if (which != kImgUnknown) {
@@ -183,7 +183,7 @@ wxColour badge_colour(RequestKind kind, std::string_view method) {
 }
 
 wxColour status_colour(RequestKind kind, long status) {
-  // Cancelled by the user (HTTP -1, gRPC CANCELLED): not a failure of the server.
+  // Canceled by the user (HTTP -1, gRPC CANCELLED): not a failure of the server.
   if ((kind == RequestKind::Grpc && status == 1) || (kind != RequestKind::Grpc && status == -1)) return dim_colour();
   if (kind == RequestKind::Grpc) return status == 0 ? pick("#3FCF73", "#127A3A") : pick("#F26B6B", "#B42318");
   if (status >= 200 && status < 300) return pick("#3FCF73", "#127A3A");
@@ -203,7 +203,7 @@ std::string status_text(RequestKind kind, long status) {
     if (status >= 0 && status < static_cast<long>(std::size(names))) return names[status];
     return "code " + std::to_string(status);
   }
-  if (status == -1) return "cancelled";
+  if (status == -1) return "canceled";
   if (status <= 0) return "failed";
   return std::to_string(status);
 }

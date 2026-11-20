@@ -205,7 +205,7 @@ TEST_CASE("ws cancel ends run at once") {
   const auto t0 = std::chrono::steady_clock::now();
   const WsClose cl = c.run({});
   t.join();
-  CHECK(cl.error == "cancelled");
+  CHECK(cl.error == "canceled");
   CHECK(std::chrono::steady_clock::now() - t0 < std::chrono::milliseconds(1000));
   std::string err;
   CHECK_FALSE(c.send("x", false, &err));

@@ -175,7 +175,7 @@ class HttpBodyTap {
   // show_http's. Optional (a stream that never ends shows its status and headers from it).
   virtual void head(std::shared_ptr<const HttpResponse> h) { (void)h; }
   // What goes out (a copy, pre-request script included), on the worker right before the send:
-  // a send cancelled or failed after its head still shows the request it made. Optional.
+  // a send canceled or failed after its head still shows the request it made. Optional.
   virtual void sent(std::shared_ptr<const SentHttp> s) { (void)s; }
 };
 
@@ -201,7 +201,7 @@ class ResponsePanel {
   // Final gRPC result. resp->messages holds every message, including those already appended;
   // a panel that appended live should only add messages past the count it already shows.
   virtual void show_grpc(std::shared_ptr<const GrpcResponse> resp) = 0;
-  // The user cancelled (the late engine result, if any, is dropped by the shell).
+  // The user canceled (the late engine result, if any, is dropped by the shell).
   virtual void show_cancelled(double after_ms) = 0;
   // Could not send at all (bad URL, blocked upload file, no method selected, ...).
   virtual void show_error(const std::string& message) = 0;

@@ -623,7 +623,7 @@ wxCoord HistoryList::OnMeasureItem(size_t n) const {
 void HistoryList::OnDrawBackground(wxDC& dc, const wxRect& rect, size_t n) const {
   if (n >= rows_.size() || rows_[n].entry < 0) return;
   wxColour bg;
-  // The entry the shown tab holds: the accent band while the list has the keyboard, a quiet grey
+  // The entry the shown tab holds: the accent band while the list has the keyboard, a quiet gray
   // one otherwise (as the tree's unfocused selection), so it never looks like the active control.
   if (IsSelected(n)) bg = HasFocus() ? highlight_colour() : mix(window_colour(), text_colour(), 0.10);
   else if (static_cast<int>(n) == hover_) bg = mix(window_colour(), text_colour(), 0.06);

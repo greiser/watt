@@ -581,8 +581,8 @@ std::string strip_scheme(std::string s) {
 }
 
 // The collection tree. Its rename box is a native edit the tree creates itself, which neither
-// wx's dark mode nor SetBackgroundColour reach: colour it here, where the tree (its parent)
-// is asked for the edit's colours.
+// wx's dark mode nor SetBackgroundColour reach: color it here, where the tree (its parent)
+// is asked for the edit's colors.
 // Files dropped from Explorer: a collection file (or a Bruno folder) to import.
 class FileDrop : public wxFileDropTarget {
  public:
@@ -610,11 +610,11 @@ class CollectionTree : public wxTreeCtrl {
   std::function<size_t(const wxTreeItemId&)> folder_count;
   wxColour count_colour;
   // Faint vertical lines under each open folder's chevron (VS Code's indent guides; easier to
-  // follow at 4 levels) and the selected row's accent bar at its left edge (the theme's grey
+  // follow at 4 levels) and the selected row's accent bar at its left edge (the theme's gray
   // band alone was hard to see on a folder row).
   wxColour guide_colour, accent_colour;
   // Which row is the active tab's (its accent bar); unset: the caret row. The selection can be
-  // elsewhere (a neighbour after a delete, a row the arrows moved to), the bar stays on the tab.
+  // elsewhere (a neighbor after a delete, a row the arrows moved to), the bar stays on the tab.
   std::function<bool(const wxTreeItemId&, bool caret)> is_active;
   // The sidebar filter (lower-case, space separated words; empty: none): the characters of each
   // row's name that a word matches are underlined, so it is plain why a row is listed.
@@ -659,7 +659,7 @@ class CollectionTree : public wxTreeCtrl {
     }
     if (dragging && (msg == WM_LBUTTONUP || msg == WM_CAPTURECHANGED || msg == WM_CANCELMODE)) {
       clear_drag_mark();
-      if (msg != WM_LBUTTONUP) dragging = false;  // cancelled: no END_DRAG follows
+      if (msg != WM_LBUTTONUP) dragging = false;  // canceled: no END_DRAG follows
     }
     if (msg == WM_PAINT && (folder_count || filter_query)) {
       const WXLRESULT r = wxTreeCtrl::MSWWindowProc(msg, wp, lp);
@@ -757,8 +757,8 @@ class CollectionTree : public wxTreeCtrl {
         SIZE sz{};
         ::GetTextExtentPoint32W(dc, buf, len, &sz);
         const int x = client.right - pad - sz.cx;
-        // On the selected row of the focused tree (the blue band) in its text colour: the dimmed
-        // grey was nearly invisible on blue.
+        // On the selected row of the focused tree (the blue band) in its text color: the dimmed
+        // gray was nearly invisible on blue.
         const UINT st = static_cast<UINT>(
             SendMessage(hw, TVM_GETITEMSTATE, reinterpret_cast<WPARAM>(item), TVIS_SELECTED | TVIS_DROPHILITED));
         const bool on_band = (st & (TVIS_SELECTED | TVIS_DROPHILITED)) && ::GetFocus() == hw;
@@ -777,7 +777,7 @@ class CollectionTree : public wxTreeCtrl {
   }
 
   // Underlines, under the row's name, each span a filter word matches (case-insensitive, every
-  // occurrence). The native control draws the name centred in rc with its own small margin.
+  // occurrence). The native control draws the name centered in rc with its own small margin.
   void underline_matches(HDC dc, HTREEITEM item, const RECT& rc, const std::vector<std::string>& words,
                          HFONT bold_font, HPEN pen) {
     wchar_t buf[260];
@@ -880,7 +880,7 @@ class Sidebar : public wxPanel, public SidebarPanel {
       });
     }
     hist_focus_timer_.Bind(wxEVT_TIMER, [this](wxTimerEvent&) { hist_focus_tick(); });
-    // A tab just switched to: variables a send captured or a script set since it last coloured
+    // A tab just switched to: variables a send captured or a script set since it last colored
     // its {{vars}} (runtime variables) show as defined now. The editor re-reads its folders on a
     // worker (no reload of the editor here).
     vars_timer_.Bind(wxEVT_TIMER, [this](wxTimerEvent&) {
@@ -1262,7 +1262,7 @@ class Sidebar : public wxPanel, public SidebarPanel {
       return;
     }
     // New HTTP request from a folder's menu (first and second time), Enter; then one more,
-    // cancelled with Esc: no file stays behind.
+    // canceled with Esc: no file stays behind.
     if (only == "newreq") {
       auto folder = std::make_shared<fs::path>();
       add("find folder", [this, folder] {
@@ -1338,7 +1338,7 @@ class Sidebar : public wxPanel, public SidebarPanel {
       }, 1500);
       return;
     }
-    // {{vars}} colouring of every tab after a restart and a workspace round trip.
+    // {{vars}} coloring of every tab after a restart and a workspace round trip.
     if (only == "vars") {
       st_build_vars();
       return;
@@ -2094,7 +2094,7 @@ class Sidebar : public wxPanel, public SidebarPanel {
     }, 600);
   }
 
-  // "<file>: ok|BAD|-" per tab: the colour of the first {{var}} in its URL field (the
+  // "<file>: ok|BAD|-" per tab: the color of the first {{var}} in its URL field (the
   // editor's indicators 8 = defined, 10 = undefined), "unrealized" for a tab not built yet.
   std::string st_var_colours() {
     std::string out;
@@ -2131,14 +2131,14 @@ class Sidebar : public wxPanel, public SidebarPanel {
       st_steps_.push_back(TestStep{std::move(n), std::move(fn), wait});
     };
     auto check_all = [this, add](const std::string& when) {
-      add("colours " + when, [this] { st_log_ += st_var_colours(); }, 50);
+      add("colors " + when, [this] { st_log_ += st_var_colours(); }, 50);
       wxAuiNotebook* nb = notebook();
       for (size_t i = 0; nb && i < 6; ++i)
         add("show tab " + std::to_string(i), [this, i] {
           wxAuiNotebook* nb = notebook();
           if (nb && i < nb->GetPageCount()) nb->SetSelection(i);
         }, 1200);
-      add("colours after showing " + when, [this] { st_log_ += st_var_colours(); }, 50);
+      add("colors after showing " + when, [this] { st_log_ += st_var_colours(); }, 50);
     };
     add("wait", [] {}, 2500);
     check_all("start");
@@ -2393,11 +2393,11 @@ class Sidebar : public wxPanel, public SidebarPanel {
       reveal_active_ = false;
       return;
     }
-    redraw_off();  // expanding folders and the centring scroll: one repaint, no smooth-scroll animation
+    redraw_off();  // expanding folders and the centering scroll: one repaint, no smooth-scroll animation
     st_timed("  reveal", [&] { id = item_for(file, true); });
     if (id.IsOk() && tree_->GetSelection() != id) {
       st_timed("  select", [&] { tree_->SelectItem(id); });
-      st_timed("  centre", [&] { centre_item(id); });
+      st_timed("  center", [&] { centre_item(id); });
     } else if (id.IsOk()) {
       centre_item(id);  // selected but scrolled away
     } else if (!filter_q_.empty()) {
@@ -3665,7 +3665,7 @@ class Sidebar : public wxPanel, public SidebarPanel {
 
   void bind_tree() {
     {
-      // A bright accent, not the selection colour (too dark for a 2 px line in dark mode).
+      // A bright accent, not the selection color (too dark for a 2 px line in dark mode).
       const wxColour c = is_dark() ? wxColour(0x4C, 0x9A, 0xFF) : wxColour(0x1A, 0x73, 0xE8);
       SendMessage(static_cast<HWND>(tree_->GetHWND()), TVM_SETINSERTMARKCOLOR, 0,
                   static_cast<LPARAM>(RGB(c.Red(), c.Green(), c.Blue())));
@@ -3892,12 +3892,12 @@ class Sidebar : public wxPanel, public SidebarPanel {
       // A new or duplicated request opens now that it has its name (or kept the proposed one).
       const bool open_after = !from.empty() && from == open_after_edit_;
       if (open_after) open_after_edit_.clear();
-      // The native tree reports Enter on an unchanged name as cancelled too: only the Esc key
+      // The native tree reports Enter on an unchanged name as canceled too: only the Esc key
       // itself (being handled now) cancels a new item.
       const bool esc = e.IsEditCancelled() && ((::GetKeyState(VK_ESCAPE) & 0x8000) != 0 || st_esc_);
       const bool discard = open_after && esc && from == discard_on_esc_;
       if (st_probe_)
-        st_log_ += "# end edit " + u8(from.filename()) + (e.IsEditCancelled() ? " cancelled" : "") +
+        st_log_ += "# end edit " + u8(from.filename()) + (e.IsEditCancelled() ? " canceled" : "") +
                    (discard ? " discard" : "") + " label '" + e.GetLabel().utf8_string() + "'\n";
       const fs::path was_discard = std::move(discard_on_esc_);
       discard_on_esc_.clear();
@@ -4001,9 +4001,9 @@ class Sidebar : public wxPanel, public SidebarPanel {
     tree_->EditLabel(id);  // BEGIN_LABEL_EDIT is sent from in here
     edit_ok_ = false;
     if (!tree_->GetEditControl()) set_label_edits(false);
-    // The native edit box is white; give it the tree's colours (a slightly raised field).
+    // The native edit box is white; give it the tree's colors (a slightly raised field).
     if (wxTextCtrl* ed = tree_->GetEditControl()) {
-      // Dark scroll bars / border for the native edit (its colours: CollectionTree).
+      // Dark scroll bars / border for the native edit (its colors: CollectionTree).
       if (is_dark()) SetWindowTheme(static_cast<HWND>(ed->GetHWND()), L"DarkMode_CFD", nullptr);
       ed->Refresh();
     }
@@ -4118,7 +4118,7 @@ class Sidebar : public wxPanel, public SidebarPanel {
       sel_folder = d->node->is_folder;
     }
     // The highlight follows the active tab (after a save, delete or move the old row's
-    // neighbour must not stay selected); a selected folder stays.
+    // neighbor must not stay selected); a selected folder stays.
     // Not while the user is moving through the rows: Down x3 then a rescan (a git pull, another
     // editor saving) put the highlight back on the previewed row, one short of where the keys went.
     if (!active_file_.empty() && (!sel_folder || reveal_active_) && !(user_sel_ && !sel_path.empty()))
@@ -5533,7 +5533,7 @@ class Sidebar : public wxPanel, public SidebarPanel {
     // The Recycle Bin move runs on a worker: it takes ~0.2 s locally and seconds on a network
     // drive. The row goes at once; a failure puts it back with the rescan.
     // Afterwards: the tab that was active before the deleted one (if the deleted one was
-    // active), else the deleted row's neighbour; never whatever tab the notebook falls back to.
+    // active), else the deleted row's neighbor; never whatever tab the notebook falls back to.
     const bool active_deleted =
         !active_file_.empty() && (active_file_ == p || is_under(active_file_, p));
     fs::path back_to;
@@ -5592,19 +5592,19 @@ class Sidebar : public wxPanel, public SidebarPanel {
                     10000, [this] { undo_delete(); });
         }
         expanded_.erase(p);
-        // The user keeps their place: the deleted request's neighbour row (a request) is shown,
+        // The user keeps their place: the deleted request's neighbor row (a request) is shown,
         // in the preview tab (the deleted request's own tab when it was the preview: no tab is
         // closed or built then); else the tab that was active before it. That happens before
         // its tab closes, so the notebook never falls back to whatever tab it picks (the first
-        // one). Showing the neighbour, closing the tab and the rescan are separate UI steps.
-        // The neighbour always wins, as in Bruno and VS Code: the tree keeps the place where the
+        // one). Showing the neighbor, closing the tab and the rescan are separate UI steps.
+        // The neighbor always wins, as in Bruno and VS Code: the tree keeps the place where the
         // user deleted (the tab that was active before could be far up the tree). It opens in
         // the preview tab, or in the frame's spare tab (built in a quiet moment).
-        // The neighbour row is selected but not opened (a preview tab of it was clutter the user
+        // The neighbor row is selected but not opened (a preview tab of it was clutter the user
         // did not ask for): the tab that was active before comes back, if it is still open.
         fs::path show;
         if (active_deleted && !back_to.empty() && tab_for(back_to)) show = back_to;
-        if (!show.empty()) st_timed("show neighbour", [&] { host_->open_request(show, true); });
+        if (!show.empty()) st_timed("show neighbor", [&] { host_->open_request(show, true); });
         later([this, files, show, neighbour, active_deleted] {
           st_timed("close tab", [&] {
             for (const auto& f : files) {
@@ -5621,7 +5621,7 @@ class Sidebar : public wxPanel, public SidebarPanel {
           if (active_deleted && !shown.empty() && neighbour.empty()) {
             select_file(shown);
           } else if (!neighbour.empty()) {
-            // Another row than the active tab's went: the selection stays on its neighbour (the
+            // Another row than the active tab's went: the selection stays on its neighbor (the
             // active tab's row can be anywhere), so Del, arrows and Enter go on from there.
             if (wxTreeItemId n = item_for(neighbour, false); n.IsOk() && !tree_->IsSelected(n)) {
               syncing_ = true;
@@ -5709,8 +5709,8 @@ class Sidebar : public wxPanel, public SidebarPanel {
     rescan();
   }
 
-  // A new request or copy whose naming was cancelled: its file goes (on a worker), with its row
-  // and its place in the folder's order; the row it was made from (or its neighbour) stays selected.
+  // A new request or copy whose naming was canceled: its file goes (on a worker), with its row
+  // and its place in the folder's order; the row it was made from (or its neighbor) stays selected.
   void discard_fresh(const fs::path& file) {
     if (!ws_ || file.empty() || !is_under(file, ws_->root()) || !is_request_file(file) || tab_for(file)) return;
     const fs::path neighbour = neighbour_of(file);
@@ -6613,7 +6613,7 @@ class Sidebar : public wxPanel, public SidebarPanel {
     });
     sw->has_own = !next.pages.empty() || !next.lost.empty();
     // Select the tab coming back before the old ones go: removing the selected page makes the
-    // notebook show (and lay out) a neighbour first, ~25 ms for nothing. Not when the selected
+    // notebook show (and lay out) a neighbor first, ~25 ms for nothing. Not when the selected
     // tab is a lent one (shown once it holds its request again, below).
     const bool lent_shown = !next.selected && std::any_of(next.lost.begin(), next.lost.end(),
                                                           [](const LostTab& l) { return l.selected; });
@@ -6689,7 +6689,7 @@ class Sidebar : public wxPanel, public SidebarPanel {
         if (const int i = nb->GetPageIndex(carrier); i >= 0) nb->SetPageText(static_cast<size_t>(i), carrier->title());
       }
     } else if (old.selected && nb->GetCurrentPage() == old.selected) {
-      // A start tab stays: shown before the old ones go (no neighbour laid out on the way).
+      // A start tab stays: shown before the old ones go (no neighbor laid out on the way).
       for (size_t i = 0; i < nb->GetPageCount(); ++i)
         if (std::none_of(old.pages.begin(), old.pages.end(), [&](const auto& p) { return p.first == nb->GetPage(i); })) {
           nb->SetSelection(i);
@@ -7087,7 +7087,7 @@ class Sidebar : public wxPanel, public SidebarPanel {
       for (const auto& p : set.pages)
         if (auto* t = dynamic_cast<RequestTab*>(p.first)) dirty += t->dirty();
     if (dirty && e.CanVeto()) {
-      // Names the workspaces, in the app's colours (a native message box stays light in dark mode).
+      // Names the workspaces, in the app's colors (a native message box stays light in dark mode).
       std::string where;
       size_t n = 0;
       for (const auto& [root, set] : tab_sets_) {
@@ -7428,7 +7428,7 @@ class Sidebar : public wxPanel, public SidebarPanel {
         }
       }
     }
-    // A coloured dot marks an active environment, like the env pills of Postman / Insomnia.
+    // A colored dot marks an active environment, like the env pills of Postman / Insomnia.
     const wxString shown = (active ? wxString::FromUTF8("\xE2\x97\x8F  ") : wxString("    ")) + label +
                            wxString::FromUTF8("  \xE2\x96\xBE");
     if (env_menu_btn_->GetLabel() != shown) env_menu_btn_->SetLabel(shown);

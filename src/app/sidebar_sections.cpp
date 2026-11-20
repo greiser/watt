@@ -483,7 +483,7 @@ class SpecPreview : public wxPanel {
   void style_for(bool yaml) {
     const bool dark = is_dark();
     // Keys, values, numbers and keywords each in a clearly different hue (a pale blue next to
-    // light grey text read as plain white): VS Code's YAML / JSON palette.
+    // light gray text read as plain white): VS Code's YAML / JSON palette.
     const wxColour key = dark ? wxColour(0x56, 0x9C, 0xD6) : wxColour(0x04, 0x51, 0xA5);
     const wxColour str = dark ? wxColour(0xCE, 0x91, 0x78) : wxColour(0xA3, 0x15, 0x15);
     const wxColour num = dark ? wxColour(0xB5, 0xCE, 0xA8) : wxColour(0x09, 0x86, 0x58);

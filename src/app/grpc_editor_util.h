@@ -1,5 +1,5 @@
 #pragma once
-// Helpers for the gRPC request editor (grpc_editor.cpp): call-kind badges, theme colours, the
+// Helpers for the gRPC request editor (grpc_editor.cpp): call-kind badges, theme colors, the
 // JSON message editor setup and the small JSON utilities the message list needs.
 #include <wx/bitmap.h>
 #include <wx/colour.h>
@@ -31,7 +31,7 @@ inline bool client_streams(GrpcCallKind k) {
 wxBitmap make_badge(const wxString& text, const wxColour& fill, const wxColour& text_colour, int w, int h,
                     double font_px);
 
-// JSON message editor: colours, line numbers, folding margin; then set_json_lexing(stc, true).
+// JSON message editor: colors, line numbers, folding margin; then set_json_lexing(stc, true).
 void setup_json_editor(wxStyledTextCtrl* stc, const Theme& t);
 // on: JSON lexer + folding, styled in idle chunks. off (huge documents): no lexer, no folding,
 // so an edit never re-lexes megabytes. Lexer and fold properties belong to the document, so

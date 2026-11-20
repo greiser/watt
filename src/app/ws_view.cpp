@@ -43,7 +43,7 @@ std::string lower(std::string_view s) {
 
 bool istarts(std::string_view s, std::string_view p) { return s.size() >= p.size() && lower(s.substr(0, p.size())) == p; }
 
-// A bordered input area (the URL field's frame), its border in the accent colour while focused.
+// A bordered input area (the URL field's frame), its border in the accent color while focused.
 class Frame : public wxPanel {
  public:
   explicit Frame(wxWindow* parent) : wxPanel(parent, wxID_ANY) {
@@ -711,7 +711,7 @@ class WsEditor : public wxPanel, public WsEditorPanel {
     }
   }
 
-  // {{var}} colours in the address and the resolved "Sent as" line (secrets masked).
+  // {{var}} colors in the address and the resolved "Sent as" line (secrets masked).
   void refresh_vars() {
     const std::string text = url_->GetText().utf8_string();
     for (int ind : {kIndOk, kIndBad, kIndOk + 2, kIndBad + 2}) {
@@ -1151,9 +1151,9 @@ class WsView : public wxPanel, public WsResponsePanel {
 
   void show_cancelled(double after_ms) override {
     open_ = false;
-    status_->set("", rv::Tone::Plain, {{"Cancelled", "", rv::Tone::Warn, true}, {"after " + ms_text(after_ms), "", rv::Tone::Dim}});
+    status_->set("", rv::Tone::Plain, {{"Canceled", "", rv::Tone::Warn, true}, {"after " + ms_text(after_ms), "", rv::Tone::Dim}});
     wf_->set_cancelled(after_ms);
-    add_info(LogRow::Bad, "Cancelled after " + ms_text(after_ms));
+    add_info(LogRow::Bad, "Canceled after " + ms_text(after_ms));
   }
 
   void show_error(const std::string& message) override {
@@ -1239,7 +1239,7 @@ class WsView : public wxPanel, public WsResponsePanel {
     std::string what = "Disconnected  " + std::to_string(c.code) + (*name ? std::string(" ") + name : std::string());
     if (!c.reason.empty()) what += ": " + c.reason;
     what += c.by_client ? "  (closed by watt)" : c.code == 1006 ? "" : "  (closed by the server)";
-    if (!c.error.empty() && c.error != "cancelled") what += "  \xC2\xB7 " + c.error;
+    if (!c.error.empty() && c.error != "canceled") what += "  \xC2\xB7 " + c.error;
     add_info(c.code == 1000 || c.code == 1001 || c.code == 1005 ? LogRow::Info : LogRow::Bad, what, open_off_ms_ + c.at_ms);
     std::vector<rv::StatusSeg> segs = last_segs_;
     std::string tag = "Closed " + std::to_string(c.code) + (*name ? std::string(" ") + name : std::string());

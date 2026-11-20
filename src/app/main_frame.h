@@ -87,7 +87,7 @@ class MainFrame : public wxFrame, public SidebarHost {
   int tab_index(RequestTab* t) const;
   void update_title(RequestTab* t);
   void hook_tab(RequestTab* t);  // title and session callbacks
-  bool close_tab(int idx);   // false if the user cancelled
+  bool close_tab(int idx);   // false if the user canceled
   void save_current();
   void vars_changed();
   void quick_open();
